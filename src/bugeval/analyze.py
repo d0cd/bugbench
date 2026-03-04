@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import csv
+import sys
 from pathlib import Path
 from typing import Any
 
 import click
 import yaml
+from pydantic import ValidationError
 
 from bugeval.judge_models import JudgeScore
 from bugeval.models import TestCase
@@ -110,8 +112,6 @@ def load_cases_lookup(cases_dir: Path) -> dict[str, TestCase]:
 
 def load_normalized_lookup(run_dir: Path) -> dict[tuple[str, str], NormalizedResult]:
     """Load all NormalizedResult YAMLs from run_dir. Keys are (test_case_id, tool)."""
-    from pydantic import ValidationError
-
     lookup: dict[tuple[str, str], NormalizedResult] = {}
     for path in run_dir.glob("*.yaml"):
         if path.name == "checkpoint.yaml":
@@ -120,8 +120,8 @@ def load_normalized_lookup(run_dir: Path) -> dict[tuple[str, str], NormalizedRes
         try:
             r = NormalizedResult(**data)
             lookup[(r.test_case_id, r.tool)] = r
-        except ValidationError:
-            pass
+        except ValidationError as exc:
+            print(f"Warning: skipping {path.name} in normalized lookup — {exc}", file=sys.stderr)
     return lookup
 
 
@@ -301,9 +301,7 @@ def analyze(run_dir: str, cases_dir: str, no_charts: bool) -> None:
         click.echo(f"No score files found in {scores_dir}")
         return
 
-    from pydantic import ValidationError
-
-    scores = []
+    scores: list[JudgeScore] = []
     for path in sorted(scores_dir.glob("*.yaml")):
         data = yaml.safe_load(path.read_text()) or {}
         try:
