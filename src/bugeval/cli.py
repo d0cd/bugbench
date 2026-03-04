@@ -4,6 +4,7 @@ import click
 
 from bugeval.curate import curate
 from bugeval.extract_patch import extract_patch
+from bugeval.judge import judge
 from bugeval.manage_forks import manage_forks
 from bugeval.normalize import normalize
 from bugeval.run_agent_eval import run_agent_eval
@@ -27,3 +28,4 @@ cli.add_command(run_pr_eval)
 cli.add_command(run_api_eval)
 cli.add_command(run_agent_eval)
 cli.add_command(normalize)
+cli.add_command(judge)
