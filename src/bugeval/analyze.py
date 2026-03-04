@@ -64,7 +64,7 @@ def generate_markdown(agg: dict[str, dict[str, Any]]) -> str:
 
 def generate_csv(agg: dict[str, dict[str, Any]], path: Path) -> None:
     """Write aggregated scores to CSV."""
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
@@ -157,10 +157,15 @@ def analyze(run_dir: str, no_charts: bool) -> None:
         click.echo(f"No score files found in {scores_dir}")
         return
 
+    from pydantic import ValidationError
+
     scores = []
     for path in sorted(scores_dir.glob("*.yaml")):
         data = yaml.safe_load(path.read_text()) or {}
-        scores.append(JudgeScore(**data))
+        try:
+            scores.append(JudgeScore(**data))
+        except ValidationError as exc:
+            click.echo(f"Warning: skipping {path.name} — {exc}", err=True)
 
     agg = aggregate_scores(scores)
     out_dir = resolved / "analysis"
