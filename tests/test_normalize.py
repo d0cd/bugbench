@@ -128,3 +128,16 @@ def test_discover_raw_dirs_missing(tmp_path: Path) -> None:
     """Returns empty list if raw/ doesn't exist."""
     dirs = discover_raw_dirs(tmp_path)
     assert dirs == []
+
+
+# --- _parse_raw_dir_name ---
+
+
+def test_parse_raw_dir_name() -> None:
+    from bugeval.normalize import _parse_raw_dir_name
+
+    # Regex path: case ID ends in -NNN
+    assert _parse_raw_dir_name("case-001-coderabbit") == ("case-001", "coderabbit")
+    assert _parse_raw_dir_name("aleo-lang-042-anthropic-api") == ("aleo-lang-042", "anthropic-api")
+    # Fallback path: no three-digit suffix
+    assert _parse_raw_dir_name("foo-bar") == ("foo", "bar")
