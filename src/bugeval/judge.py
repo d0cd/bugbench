@@ -160,6 +160,78 @@ def judge_case(
     )
 
 
+def judge_normalized_results(
+    run_dir: Path,
+    cases_dir: Path,
+    dry_run: bool = False,
+    model: str | None = None,
+    tools_filter: str | None = None,
+) -> int:
+    """Judge all normalized results in run_dir. Returns count of results scored.
+
+    Args:
+        run_dir: Directory containing normalized result YAML files.
+        cases_dir: Directory containing test case YAML definitions.
+        dry_run: If True, skip LLM API calls and assign score 0 to every result.
+            Score YAML files are still written to scores/.
+        model: Override the judge model (defaults to claude-opus-4-6 inside judge_case).
+        tools_filter: Comma-separated tool names to judge; all tools are judged if None.
+    """
+    cases = {c.id: c for c in load_cases(cases_dir)}
+    system_prompt = load_judge_prompt()
+
+    # Find normalized result files: *.yaml excluding checkpoint.yaml
+    candidate_files = [p for p in run_dir.glob("*.yaml") if p.name != "checkpoint.yaml"]
+
+    # Parse candidates; skip files that aren't valid NormalizedResult YAML
+    parsed: list[tuple[Path, NormalizedResult]] = []
+    for p in candidate_files:
+        data = yaml.safe_load(p.read_text()) or {}
+        try:
+            parsed.append((p, NormalizedResult(**data)))
+        except (yaml.YAMLError, ValueError) as e:
+            click.echo(f"[skip] {p.name}: {e}", err=True)
+
+    if not parsed:
+        click.echo(f"No normalized results found in {run_dir}")
+        return 0
+
+    if tools_filter:
+        names = {n.strip() for n in tools_filter.split(",")}
+        parsed = [(p, r) for p, r in parsed if r.tool in names]
+
+    scores_dir = run_dir / "scores"
+    scores_dir.mkdir(exist_ok=True)
+
+    judge_kwargs: dict[str, Any] = {"dry_run": dry_run}
+    if model is not None:
+        judge_kwargs["model"] = model
+    api_client = None if dry_run else Anthropic()
+
+    count = 0
+    for path, result in sorted(parsed, key=lambda x: x[0]):
+        case = cases.get(result.test_case_id)
+        if case is None:
+            click.echo(f"[skip] {path.name}: case '{result.test_case_id}' not found")
+            continue
+
+        click.echo(f"[judging] {path.stem}")
+        score = judge_case(
+            case,
+            result,
+            system_prompt=system_prompt,
+            client=api_client,
+            **judge_kwargs,
+        )
+        out = scores_dir / path.name
+        out.write_text(yaml.safe_dump(score.model_dump(mode="json"), sort_keys=False))
+        click.echo(f"[score={score.score}] {path.stem}")
+        count += 1
+
+    click.echo(f"Scores written to {scores_dir}/")
+    return count
+
+
 @click.command("judge")
 @click.option(
     "--run-dir",
@@ -174,69 +246,20 @@ def judge_case(
     type=click.Path(dir_okay=True, file_okay=False),
     help="Directory containing case YAML files",
 )
-@click.option(
-    "--config",
-    "config_path",
-    default="config/config.yaml",
-    show_default=True,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Path to config.yaml",
-)
 @click.option("--tools", "tools_filter", default=None, help="Comma-separated tool names")
 @click.option("--dry-run", is_flag=True, default=False, help="Skip API calls; score everything 0")
 def judge(
     run_dir: str,
     cases_dir: str,
-    config_path: str,
     tools_filter: str | None,
     dry_run: bool,
 ) -> None:
     """Run LLM-as-judge (3× majority vote) on normalized results."""
-    resolved = Path(run_dir)
-    cases = {c.id: c for c in load_cases(Path(cases_dir))}
-    system_prompt = load_judge_prompt()
-
-    # Find normalized result files: *.yaml excluding checkpoint.yaml and scores/ subdir
-    candidate_files = [
-        p
-        for p in resolved.glob("*.yaml")
-        if p.name != "checkpoint.yaml" and not p.name.startswith("scores")
-    ]
-
-    # Parse candidates; skip files that aren't valid NormalizedResult YAML
-    parsed: list[tuple[Path, NormalizedResult]] = []
-    for p in candidate_files:
-        data = yaml.safe_load(p.read_text()) or {}
-        try:
-            parsed.append((p, NormalizedResult(**data)))
-        except Exception:
-            pass
-
-    if not parsed:
-        click.echo(f"No normalized results found in {resolved}")
-        return
-
-    if tools_filter:
-        names = {n.strip() for n in tools_filter.split(",")}
-        parsed = [(p, r) for p, r in parsed if any(p.stem.endswith(f"-{n}") for n in names)]
-
-    scores_dir = resolved / "scores"
-    scores_dir.mkdir(exist_ok=True)
-
-    api_client = None if dry_run else Anthropic()
-
-    for path, result in sorted(parsed, key=lambda x: x[0]):
-        case = cases.get(result.test_case_id)
-        if case is None:
-            click.echo(f"[skip] {path.name}: case '{result.test_case_id}' not found")
-            continue
-
-        click.echo(f"[judging] {path.stem}")
-        score = judge_case(
-            case, result, system_prompt=system_prompt, dry_run=dry_run, client=api_client
-        )
-        out = scores_dir / path.name
-        out.write_text(yaml.safe_dump(score.model_dump(mode="json"), sort_keys=False))
-        click.echo(f"[score={score.score}] {path.stem}")
-
-    click.echo(f"Scores written to {scores_dir}/")
+    count = judge_normalized_results(
+        Path(run_dir),
+        Path(cases_dir),
+        dry_run,
+        None,
+        tools_filter,
+    )
+    click.echo(f"Judged {count} result(s).")

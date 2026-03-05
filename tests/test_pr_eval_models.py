@@ -208,6 +208,14 @@ def test_eval_config_pr_tools_filtering() -> None:
     assert {t.name for t in pr_tools} == {"coderabbit", "bugbot"}
 
 
+def test_run_state_states_method() -> None:
+    rs = RunState()
+    rs.set(CaseToolState(case_id="c1", tool="t1"))
+    rs.set(CaseToolState(case_id="c2", tool="t1"))
+    assert len(rs.states()) == 2
+    assert all(isinstance(s, CaseToolState) for s in rs.states())
+
+
 def test_load_eval_config(tmp_path: Path) -> None:
     config_data = {
         "github": {"eval_org": "provable-eval"},

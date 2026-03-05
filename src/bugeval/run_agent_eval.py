@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -26,6 +27,19 @@ from bugeval.pr_eval_models import (
 )
 from bugeval.repo_setup import cleanup_repo, setup_repo_for_case
 from bugeval.run_pr_eval import load_cases, make_run_id
+
+
+def is_docker_available() -> bool:
+    """Return True if Docker daemon is reachable via `docker info`."""
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 
 def process_case_agent(
@@ -191,6 +205,12 @@ async def _eval_agent_tool(
     help="Maximum number of agentic turns",
 )
 @click.option("--dry-run", is_flag=True, default=False, help="Simulate run without calling APIs")
+@click.option(
+    "--require-docker",
+    is_flag=True,
+    default=False,
+    help="Exit with error if Docker daemon is not reachable.",
+)
 def run_agent_eval(
     config_path: str,
     cases_dir: str,
@@ -200,8 +220,19 @@ def run_agent_eval(
     context_level: str,
     max_turns: int,
     dry_run: bool,
+    require_docker: bool,
 ) -> None:
     """Async orchestrator: run in-house agent evaluation across all (case × tool) pairs."""
+    if not is_docker_available():
+        msg = (
+            "Docker daemon not reachable. "
+            "Agent runs clone to a local temp dir (no container isolation)."
+        )
+        if require_docker:
+            click.echo(f"Error: {msg}", err=True)
+            raise SystemExit(1)
+        click.echo(f"Warning: {msg}", err=True)
+
     config: EvalConfig = load_eval_config(Path(config_path))
 
     run_id = make_run_id()

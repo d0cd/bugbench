@@ -66,6 +66,10 @@ class RunState(BaseModel):
         key = self._key(state.case_id, state.tool)
         self.pairs[key] = state
 
+    def states(self) -> list[CaseToolState]:
+        """Return all stored states."""
+        return list(self.pairs.values())
+
     def save(self, path: Path) -> None:
         """Save checkpoint to YAML."""
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from bugeval.judge import _extract_judge_json, judge_case, load_judge_prompt
+from bugeval.judge import (
+    _extract_judge_json,
+    judge_case,
+    judge_normalized_results,
+    load_judge_prompt,
+)
 from bugeval.result_models import Comment, NormalizedResult
 
 
@@ -163,9 +168,6 @@ def test_judge_no_results(tmp_path: Path) -> None:
 
     from bugeval.cli import cli
 
-    config_data = {"github": {"eval_org": "x"}, "tools": [], "repos": {}}
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.dump(config_data))
     cases_dir = tmp_path / "cases"
     cases_dir.mkdir()
 
@@ -178,9 +180,69 @@ def test_judge_no_results(tmp_path: Path) -> None:
             str(tmp_path),
             "--cases-dir",
             str(cases_dir),
-            "--config",
-            str(config_path),
         ],
     )
     assert result.exit_code == 0
     assert "No normalized results" in result.output
+
+
+# --- judge_normalized_results ---
+
+
+def _write_case_yaml(cases_dir: Path, case_id: str = "case-001") -> None:
+    """Write a minimal TestCase YAML into cases_dir."""
+    from bugeval.io import save_case
+    from tests.conftest import make_case
+
+    case = make_case(id=case_id)
+    save_case(case, cases_dir / f"{case_id}.yaml")
+
+
+def _write_normalized_yaml(
+    run_dir: Path, case_id: str = "case-001", tool: str = "greptile"
+) -> Path:
+    """Write a minimal NormalizedResult YAML into run_dir."""
+    result = NormalizedResult(
+        test_case_id=case_id,
+        tool=tool,
+        comments=[Comment(body="suspicious line", file="src/main.rs", line=42)],
+    )
+    out = run_dir / f"{case_id}-{tool}.yaml"
+    out.write_text(yaml.safe_dump(result.model_dump(mode="json"), sort_keys=False))
+    return out
+
+
+def test_judge_normalized_results_dry_run(tmp_path: Path) -> None:
+    """dry_run=True: scores all results without making LLM calls; score YAMLs are still written."""
+    cases_dir = tmp_path / "cases"
+    cases_dir.mkdir()
+
+    _write_case_yaml(cases_dir)
+    _write_normalized_yaml(tmp_path)
+
+    with patch("bugeval.judge.Anthropic") as mock_anthropic_cls:
+        count = judge_normalized_results(tmp_path, cases_dir, dry_run=True)
+
+    mock_anthropic_cls.assert_not_called()
+    assert count == 1
+    scores_dir = tmp_path / "scores"
+    # scores/ dir is created and score file is written; dry_run only skips the LLM API call
+    assert scores_dir.exists()
+    assert len(list(scores_dir.glob("*.yaml"))) == 1
+
+
+def test_judge_normalized_results_returns_count(tmp_path: Path) -> None:
+    """Returns the count of results that were scored."""
+    cases_dir = tmp_path / "cases"
+    cases_dir.mkdir()
+
+    _write_case_yaml(cases_dir)
+    _write_normalized_yaml(tmp_path)
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _make_mock_response(2)
+
+    with patch("bugeval.judge.Anthropic", return_value=mock_client):
+        count = judge_normalized_results(tmp_path, cases_dir, dry_run=False)
+
+    assert count == 1

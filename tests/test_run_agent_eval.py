@@ -326,6 +326,80 @@ def test_run_agent_eval_unknown_tools_filter_exits(tmp_path: Path) -> None:
     assert result.exit_code == 1
 
 
+def test_is_docker_available_returns_bool() -> None:
+    from bugeval.run_agent_eval import is_docker_available
+
+    result = is_docker_available()
+    assert isinstance(result, bool)
+
+
+def test_run_agent_eval_warns_without_docker(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = _make_config_yaml(
+        tmp_path,
+        tools=[{"name": "claude-code-cli", "type": "agent", "cooldown_seconds": 0}],
+    )
+    cases_dir = tmp_path / "cases"
+    _make_case_yaml(cases_dir)
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (patches_dir / "case-001.patch").write_text("--- a\n+++ b\n")
+    run_dir = tmp_path / "results"
+
+    with patch("bugeval.run_agent_eval.is_docker_available", return_value=False):
+        result = runner.invoke(
+            cli,
+            [
+                "run-agent-eval",
+                "--config",
+                str(config_path),
+                "--cases-dir",
+                str(cases_dir),
+                "--patches-dir",
+                str(patches_dir),
+                "--run-dir",
+                str(run_dir),
+                "--dry-run",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Warning" in result.stderr
+
+
+def test_run_agent_eval_exits_with_require_docker(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = _make_config_yaml(
+        tmp_path,
+        tools=[{"name": "claude-code-cli", "type": "agent", "cooldown_seconds": 0}],
+    )
+    cases_dir = tmp_path / "cases"
+    _make_case_yaml(cases_dir)
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    run_dir = tmp_path / "results"
+
+    with patch("bugeval.run_agent_eval.is_docker_available", return_value=False):
+        result = runner.invoke(
+            cli,
+            [
+                "run-agent-eval",
+                "--config",
+                str(config_path),
+                "--cases-dir",
+                str(cases_dir),
+                "--patches-dir",
+                str(patches_dir),
+                "--run-dir",
+                str(run_dir),
+                "--require-docker",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "Error" in result.stderr
+
+
 def test_run_agent_eval_max_turns_passed_through(tmp_path: Path) -> None:
     from bugeval.agent_models import AgentResult
 
