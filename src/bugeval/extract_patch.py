@@ -43,12 +43,19 @@ def _write_patch(case: TestCase, repo_dir: Path, output_dir: Path) -> Path:
     type=click.Path(file_okay=False, path_type=Path),
     help="Directory to write .patch files.",
 )
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print patches that would be generated without writing.",
+)
 def extract_patch(
     case_id: str | None,
     extract_all: bool,
     repo_dir: Path,
     cases_dir: Path,
     output_dir: Path,
+    dry_run: bool,
 ) -> None:
     """Generate .patch files from base_commit to head_commit for test cases."""
     if not case_id and not extract_all:
@@ -60,8 +67,12 @@ def extract_patch(
             click.echo(f"Case not found: {case_path}", err=True)
             raise SystemExit(1)
         case = load_case(case_path)
-        patch_path = _write_patch(case, repo_dir, output_dir)
-        click.echo(f"Wrote {patch_path}")
+        patch_path = output_dir / f"{case.id}.patch"
+        if dry_run:
+            click.echo(f"Would write {patch_path}")
+            return
+        written = _write_patch(case, repo_dir, output_dir)
+        click.echo(f"Wrote {written}")
         return
 
     # --all
@@ -71,7 +82,14 @@ def extract_patch(
         return
 
     for case in cases:
-        patch_path = _write_patch(case, repo_dir, output_dir)
-        click.echo(f"Wrote {patch_path}")
+        patch_path = output_dir / f"{case.id}.patch"
+        if dry_run:
+            click.echo(f"Would write {patch_path}")
+        else:
+            written = _write_patch(case, repo_dir, output_dir)
+            click.echo(f"Wrote {written}")
 
-    click.echo(f"Extracted {len(cases)} patches to {output_dir}/")
+    if dry_run:
+        click.echo(f"Would extract {len(cases)} patches to {output_dir}/")
+    else:
+        click.echo(f"Extracted {len(cases)} patches to {output_dir}/")

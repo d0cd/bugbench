@@ -278,25 +278,38 @@ def generate_charts(agg: dict[str, dict[str, Any]], out_dir: Path) -> bool:
     return True
 
 
-@click.command("analyze")
-@click.option(
-    "--run-dir",
-    required=True,
-    type=click.Path(exists=True, dir_okay=True, file_okay=False),
-    help="Path to run directory (must contain scores/ subdirectory)",
-)
-@click.option(
-    "--cases-dir",
-    default="cases/",
-    show_default=True,
-    type=click.Path(dir_okay=True, file_okay=False),
-    help="Directory containing case YAML files (for dimensional slicing)",
-)
-@click.option("--no-charts", is_flag=True, default=False, help="Skip matplotlib chart generation")
-def analyze(run_dir: str, cases_dir: str, no_charts: bool) -> None:
-    """Aggregate judge scores into comparison tables and charts."""
-    resolved = Path(run_dir)
-    scores_dir = resolved / "scores"
+def generate_dx_markdown(results: dict[tuple[str, str], NormalizedResult]) -> str:
+    """Produce DX assessment table averaging each dimension by tool."""
+    dimensions = (
+        "actionability",
+        "false_positive_burden",
+        "integration_friction",
+        "response_latency",
+    )
+    by_tool: dict[str, list] = {}
+    for (_, tool), r in results.items():
+        if r.dx is not None:
+            by_tool.setdefault(tool, []).append(r.dx)
+
+    if not by_tool:
+        return ""
+
+    lines = [
+        "## DX Assessment",
+        "",
+        "| Tool | Actionability | FP Burden | Integration | Latency |",
+        "|------|--------------|-----------|------------|---------|",
+    ]
+    for tool in sorted(by_tool.keys()):
+        dxs = by_tool[tool]
+        avgs = [sum(getattr(d, dim) for d in dxs) / len(dxs) for dim in dimensions]
+        lines.append(f"| {tool} | {avgs[0]:.1f} | {avgs[1]:.1f} | {avgs[2]:.1f} | {avgs[3]:.1f} |")
+    return "\n".join(lines)
+
+
+def run_analyze(run_dir: Path, cases_dir: Path, no_charts: bool = False) -> None:
+    """Run the full analysis pipeline on a completed run directory."""
+    scores_dir = run_dir / "scores"
     if not scores_dir.exists() or not list(scores_dir.glob("*.yaml")):
         click.echo(f"No score files found in {scores_dir}")
         return
@@ -310,10 +323,10 @@ def analyze(run_dir: str, cases_dir: str, no_charts: bool) -> None:
             click.echo(f"Warning: skipping {path.name} — {exc}", err=True)
 
     agg = aggregate_scores(scores)
-    cases = load_cases_lookup(Path(cases_dir))
-    results = load_normalized_lookup(resolved)
+    cases = load_cases_lookup(cases_dir)
+    results = load_normalized_lookup(run_dir)
 
-    out_dir = resolved / "analysis"
+    out_dir = run_dir / "analysis"
     out_dir.mkdir(exist_ok=True)
 
     md_lines = [generate_markdown(agg)]
@@ -336,12 +349,17 @@ def analyze(run_dir: str, cases_dir: str, no_charts: bool) -> None:
 
     # Dimensional slices by TestCase fields
     if cases:
-        for dim in ("category", "difficulty", "severity", "pr_size", "language"):
+        for dim in ("category", "difficulty", "severity", "pr_size", "language", "visibility"):
             md_lines.append(generate_slice_markdown(scores, cases, dim))
 
     # Context-level slice
     if results:
         md_lines.append(generate_slice_markdown_context(scores, results))
+
+    # DX assessment (only if any result has dx data)
+    dx_md = generate_dx_markdown(results)
+    if dx_md:
+        md_lines.append(dx_md)
 
     full_report = "\n\n".join(md_lines)
     (out_dir / "report.md").write_text(full_report)
@@ -357,3 +375,23 @@ def analyze(run_dir: str, cases_dir: str, no_charts: bool) -> None:
             click.echo("Charts skipped (matplotlib not installed)", err=True)
 
     click.echo("\n" + generate_markdown(agg))
+
+
+@click.command("analyze")
+@click.option(
+    "--run-dir",
+    required=True,
+    type=click.Path(exists=True, dir_okay=True, file_okay=False),
+    help="Path to run directory (must contain scores/ subdirectory)",
+)
+@click.option(
+    "--cases-dir",
+    default="cases/",
+    show_default=True,
+    type=click.Path(dir_okay=True, file_okay=False),
+    help="Directory containing case YAML files (for dimensional slicing)",
+)
+@click.option("--no-charts", is_flag=True, default=False, help="Skip matplotlib chart generation")
+def analyze(run_dir: str, cases_dir: str, no_charts: bool) -> None:
+    """Aggregate judge scores into comparison tables and charts."""
+    run_analyze(Path(run_dir), Path(cases_dir), no_charts)

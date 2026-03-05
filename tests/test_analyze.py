@@ -16,7 +16,15 @@ from bugeval.analyze import (
     generate_markdown,
 )
 from bugeval.judge_models import JudgeScore, NoiseStats
-from bugeval.models import Category, Difficulty, ExpectedFinding, PRSize, Severity, TestCase
+from bugeval.models import (
+    Category,
+    Difficulty,
+    ExpectedFinding,
+    PRSize,
+    Severity,
+    TestCase,
+    Visibility,
+)
 
 
 def _make_scores(data: list[tuple[str, str, int, float]]) -> list[JudgeScore]:
@@ -231,6 +239,83 @@ def test_compute_cost_per_tool() -> None:
     assert cost["greptile"]["total_cost_usd"] == pytest.approx(0.15)
     assert cost["greptile"]["cost_per_review"] == pytest.approx(0.075)
     assert cost["greptile"]["cost_per_bug_caught"] == pytest.approx(0.15)
+
+
+def test_slice_scores_by_visibility() -> None:
+    from bugeval.analyze import slice_scores
+
+    scores = _make_scores(
+        [
+            ("c1", "greptile", 2, 0.5),
+            ("c2", "greptile", 0, 0.0),
+        ]
+    )
+    cases = {
+        "c1": TestCase(
+            id="c1",
+            repo="org/repo",
+            base_commit="abc",
+            head_commit="def",
+            fix_commit="ghi",
+            category=Category("logic"),
+            difficulty=Difficulty("medium"),
+            severity=Severity("high"),
+            language="rust",
+            pr_size=PRSize("small"),
+            description="test",
+            expected_findings=[ExpectedFinding(file="a.rs", line=1, summary="bug")],
+            visibility=Visibility.public,
+        ),
+        "c2": TestCase(
+            id="c2",
+            repo="org/repo",
+            base_commit="abc",
+            head_commit="def",
+            fix_commit="ghi",
+            category=Category("logic"),
+            difficulty=Difficulty("medium"),
+            severity=Severity("high"),
+            language="rust",
+            pr_size=PRSize("small"),
+            description="test",
+            expected_findings=[ExpectedFinding(file="a.rs", line=1, summary="bug")],
+            visibility=Visibility.private,
+        ),
+    }
+    groups = slice_scores(scores, cases, "visibility")
+    assert set(groups.keys()) == {"public", "private"}
+    assert len(groups["public"]) == 1
+    assert len(groups["private"]) == 1
+
+
+def test_generate_dx_markdown() -> None:
+    from bugeval.analyze import generate_dx_markdown
+    from bugeval.result_models import DxAssessment, NormalizedResult
+
+    results = {
+        ("c1", "greptile"): NormalizedResult(
+            test_case_id="c1",
+            tool="greptile",
+            dx=DxAssessment(
+                actionability=4, false_positive_burden=2, integration_friction=3, response_latency=5
+            ),
+        ),
+    }
+    md = generate_dx_markdown(results)
+    assert "DX Assessment" in md
+    assert "greptile" in md
+    assert "4.0" in md
+
+
+def test_analyze_skips_dx_when_absent() -> None:
+    from bugeval.analyze import generate_dx_markdown
+    from bugeval.result_models import NormalizedResult
+
+    results = {
+        ("c1", "greptile"): NormalizedResult(test_case_id="c1", tool="greptile"),
+    }
+    md = generate_dx_markdown(results)
+    assert md == ""
 
 
 def test_generate_slice_markdown() -> None:

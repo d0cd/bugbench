@@ -38,6 +38,11 @@ class PRSize(StrEnum):
     xl = "xl"
 
 
+class Visibility(StrEnum):
+    public = "public"
+    private = "private"
+
+
 class ExpectedFinding(BaseModel):
     file: str
     line: int
@@ -65,6 +70,7 @@ class TestCase(BaseModel):
     description: str
     expected_findings: list[ExpectedFinding]
     stats: CaseStats | None = None
+    visibility: Visibility = Visibility.public
 
 
 class Candidate(BaseModel):

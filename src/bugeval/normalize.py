@@ -55,8 +55,20 @@ def normalize_api_result(
         )
         for item in raw
     ]
+    meta_path = raw_dir / "metadata.json"
+    metadata = ResultMetadata()
+    if meta_path.exists():
+        meta_data = json.loads(meta_path.read_text())
+        metadata = ResultMetadata(
+            time_seconds=meta_data.get("time_seconds", 0.0),
+            cost_usd=meta_data.get("cost_usd", 0.0),
+        )
     return NormalizedResult(
-        test_case_id=case_id, tool=tool, context_level=context_level, comments=comments
+        test_case_id=case_id,
+        tool=tool,
+        context_level=context_level,
+        comments=comments,
+        metadata=metadata,
     )
 
 
@@ -133,7 +145,13 @@ def _parse_raw_dir_name(name: str) -> tuple[str, str]:
     type=click.Choice(["diff-only", "diff+repo", "diff+repo+domain"]),
     help="Context level used for API tools (not needed for PR or agent tools)",
 )
-def normalize(run_dir: str, config_path: str, context_level: str) -> None:
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print what would be normalized without writing output.",
+)
+def normalize(run_dir: str, config_path: str, context_level: str, dry_run: bool) -> None:
     """Normalize raw tool outputs into a common schema YAML per (case × tool)."""
     resolved = Path(run_dir)
     config: EvalConfig = load_eval_config(Path(config_path))
@@ -162,10 +180,16 @@ def normalize(run_dir: str, config_path: str, context_level: str) -> None:
                 continue
 
             out_path = resolved / f"{case_id}-{tool_name}.yaml"
-            out_path.write_text(yaml.safe_dump(result.model_dump(mode="json"), sort_keys=False))
-            click.echo(f"[ok] {out_path.name}")
+            if dry_run:
+                click.echo(f"[dry-run] would write {out_path.name}")
+            else:
+                out_path.write_text(yaml.safe_dump(result.model_dump(mode="json"), sort_keys=False))
+                click.echo(f"[ok] {out_path.name}")
             success += 1
         except Exception as exc:
             click.echo(f"[error] {raw_dir.name}: {exc}", err=True)
 
-    click.echo(f"Normalized {success}/{len(raw_dirs)} results → {resolved}/")
+    if dry_run:
+        click.echo(f"Would normalize {success}/{len(raw_dirs)} results → {resolved}/")
+    else:
+        click.echo(f"Normalized {success}/{len(raw_dirs)} results → {resolved}/")

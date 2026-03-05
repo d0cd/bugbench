@@ -14,6 +14,7 @@ from bugeval.models import (
     ScrapeState,
     Severity,
     TestCase,
+    Visibility,
 )
 
 
@@ -169,3 +170,21 @@ class TestCaseStats:
         stats = CaseStats(lines_added=10, lines_deleted=5, files_changed=2, hunks=3)
         assert stats.lines_added == 10
         assert stats.hunks == 3
+
+
+class TestVisibility:
+    def test_visibility_enum_values(self) -> None:
+        assert Visibility.public == "public"
+        assert Visibility.private == "private"
+
+    def test_test_case_default_visibility(self) -> None:
+        case = TestCase(**make_test_case())  # type: ignore[arg-type]
+        assert case.visibility == Visibility.public
+
+    def test_test_case_explicit_visibility(self) -> None:
+        case = TestCase(**make_test_case(visibility="private"))  # type: ignore[arg-type]
+        assert case.visibility == Visibility.private
+
+    def test_test_case_invalid_visibility(self) -> None:
+        with pytest.raises(ValidationError):
+            TestCase(**make_test_case(visibility="internal"))  # type: ignore[arg-type]

@@ -29,7 +29,13 @@ from bugeval.io import load_all_cases, save_case
     is_flag=True,
     help="Auto-populate stats (lines_added, files_changed, etc.) and save.",
 )
-def validate_cases(repo_dir: Path, cases_dir: Path, update_stats: bool) -> None:
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report validation results without writing stats back.",
+)
+def validate_cases(repo_dir: Path, cases_dir: Path, update_stats: bool, dry_run: bool) -> None:
     """Validate test cases in cases-dir against a repo checkout."""
     if not cases_dir.exists():
         click.echo(f"Cases directory not found: {cases_dir}", err=True)
@@ -68,7 +74,7 @@ def validate_cases(repo_dir: Path, cases_dir: Path, update_stats: bool) -> None:
             continue
 
         # Auto-populate stats
-        if update_stats:
+        if update_stats and not dry_run:
             stats = get_diff_stats(case.base_commit, case.head_commit, repo_dir)
             updated = case.model_copy(update={"stats": stats})
             save_case(updated, cases_dir / f"{case.id}.yaml")

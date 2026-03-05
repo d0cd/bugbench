@@ -2,9 +2,17 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
+from pydantic import ValidationError
 
-from bugeval.result_models import Comment, CommentType, NormalizedResult, ResultMetadata
+from bugeval.result_models import (
+    Comment,
+    CommentType,
+    DxAssessment,
+    NormalizedResult,
+    ResultMetadata,
+)
 
 
 def test_comment_defaults() -> None:
@@ -49,3 +57,30 @@ def test_normalized_result_defaults() -> None:
     assert r.metadata.tokens == 0
     assert r.metadata.cost_usd == 0.0
     assert r.metadata.time_seconds == 0.0
+
+
+class TestDxAssessment:
+    def test_dx_assessment_valid(self) -> None:
+        dx = DxAssessment(
+            actionability=4, false_positive_burden=2, integration_friction=3, response_latency=5
+        )
+        assert dx.actionability == 4
+        assert dx.response_latency == 5
+
+    def test_dx_assessment_out_of_range(self) -> None:
+        with pytest.raises(ValidationError):
+            DxAssessment(actionability=0)
+        with pytest.raises(ValidationError):
+            DxAssessment(actionability=6)
+
+    def test_dx_assessment_defaults(self) -> None:
+        dx = DxAssessment()
+        assert dx.actionability == 3
+        assert dx.false_positive_burden == 3
+        assert dx.integration_friction == 3
+        assert dx.response_latency == 3
+        assert dx.notes == ""
+
+    def test_normalized_result_dx_none_default(self) -> None:
+        r = NormalizedResult(test_case_id="x", tool="y")
+        assert r.dx is None

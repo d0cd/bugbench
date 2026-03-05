@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -52,14 +53,19 @@ def process_case_tool_api(
         adapter = adapter_cls(api_endpoint=tool.api_endpoint, api_key=api_key)
 
         state.status = CaseToolStatus.submitting
+        t0 = time.monotonic()
         findings: list[dict[str, Any]] = asyncio.run(
             adapter.submit(case, patch_content, context_level)
         )
+        elapsed = time.monotonic() - t0
 
         state.status = CaseToolStatus.collecting
         out_dir = run_dir / "raw" / f"{case.id}-{tool.name}"
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "findings.json").write_text(json.dumps(findings, indent=2))
+        (out_dir / "metadata.json").write_text(
+            json.dumps({"time_seconds": round(elapsed, 2), "cost_usd": 0.0})
+        )
 
     except Exception as exc:
         state.status = CaseToolStatus.failed

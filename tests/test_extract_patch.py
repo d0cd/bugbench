@@ -155,6 +155,62 @@ class TestExtractPatchSingle:
         assert result.exit_code != 0
 
 
+class TestExtractPatchDryRun:
+    def test_extract_patch_dry_run_no_file(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        base = get_sha(repo)
+        head = add_commit(repo, "fn foo() { 1 }\n")
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        patches_dir = tmp_path / "patches"
+        save_case(make_case("dr-001", base, head), cases_dir / "dr-001.yaml")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            extract_patch,
+            [
+                "--case",
+                "dr-001",
+                "--repo-dir",
+                str(repo),
+                "--cases-dir",
+                str(cases_dir),
+                "--output-dir",
+                str(patches_dir),
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0
+        assert not (patches_dir / "dr-001.patch").exists()
+
+    def test_extract_patch_dry_run_prints_path(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        base = get_sha(repo)
+        head = add_commit(repo, "fn foo() { 2 }\n")
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        patches_dir = tmp_path / "patches"
+        save_case(make_case("dr-002", base, head), cases_dir / "dr-002.yaml")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            extract_patch,
+            [
+                "--case",
+                "dr-002",
+                "--repo-dir",
+                str(repo),
+                "--cases-dir",
+                str(cases_dir),
+                "--output-dir",
+                str(patches_dir),
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "dr-002.patch" in result.output
+
+
 class TestExtractPatchAll:
     def test_all_creates_multiple_patches(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "repo")

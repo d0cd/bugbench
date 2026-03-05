@@ -8,12 +8,16 @@ from bugeval.extract_patch import extract_patch
 from bugeval.human_judge import human_judge
 from bugeval.judge import judge
 from bugeval.manage_forks import manage_forks
+from bugeval.mine_candidates_cmd import mine_candidates
 from bugeval.normalize import normalize
+from bugeval.pipeline import pipeline
 from bugeval.run_agent_eval import run_agent_eval
 from bugeval.run_api_eval import run_api_eval
 from bugeval.run_pr_eval import run_pr_eval
 from bugeval.scrape_github_cmd import scrape_github
+from bugeval.status_cmd import status
 from bugeval.validate_cases import validate_cases
+from bugeval.validate_env import validate_env
 
 
 @click.group()
@@ -31,5 +35,9 @@ cli.add_command(run_api_eval)
 cli.add_command(run_agent_eval)
 cli.add_command(normalize)
 cli.add_command(judge)
+cli.add_command(pipeline)
 cli.add_command(analyze)
 cli.add_command(human_judge)
+cli.add_command(mine_candidates)
+cli.add_command(validate_env)
+cli.add_command(status)

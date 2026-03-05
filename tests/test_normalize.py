@@ -6,6 +6,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import yaml
+from click.testing import CliRunner
+
 from bugeval.normalize import (
     discover_raw_dirs,
     normalize_agent_result,
@@ -130,6 +133,26 @@ def test_discover_raw_dirs_missing(tmp_path: Path) -> None:
     assert dirs == []
 
 
+def test_normalize_api_result_reads_metadata(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "case-001-greptile"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "findings.json").write_text("[]")
+    (raw_dir / "metadata.json").write_text(json.dumps({"time_seconds": 1.5, "cost_usd": 0.03}))
+    result = normalize_api_result("case-001", "greptile", "diff-only", raw_dir)
+    assert result.metadata.time_seconds == 1.5
+    assert result.metadata.cost_usd == 0.03
+
+
+def test_normalize_api_result_missing_metadata(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "case-001-greptile"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "findings.json").write_text("[]")
+    # No metadata.json
+    result = normalize_api_result("case-001", "greptile", "diff-only", raw_dir)
+    assert result.metadata.time_seconds == 0.0
+    assert result.metadata.cost_usd == 0.0
+
+
 # --- _parse_raw_dir_name ---
 
 
@@ -141,3 +164,49 @@ def test_parse_raw_dir_name() -> None:
     assert _parse_raw_dir_name("aleo-lang-042-anthropic-api") == ("aleo-lang-042", "anthropic-api")
     # Fallback path: no three-digit suffix
     assert _parse_raw_dir_name("foo-bar") == ("foo", "bar")
+
+
+def _make_config_yaml(tmp_path: Path) -> Path:
+    config_data = {
+        "github": {"eval_org": "provable-eval"},
+        "tools": [{"name": "greptile", "type": "api", "cooldown_seconds": 0}],
+        "repos": {},
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.dump(config_data))
+    return config_path
+
+
+def test_normalize_dry_run_no_files(tmp_path: Path) -> None:
+    from bugeval.cli import cli
+
+    config_path = _make_config_yaml(tmp_path)
+    raw_dir = tmp_path / "raw" / "case-001-greptile"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "findings.json").write_text("[]")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["normalize", "--run-dir", str(tmp_path), "--config", str(config_path), "--dry-run"],
+    )
+    assert result.exit_code == 0
+    # No output YAML should have been created
+    assert not (tmp_path / "case-001-greptile.yaml").exists()
+
+
+def test_normalize_dry_run_prints_summary(tmp_path: Path) -> None:
+    from bugeval.cli import cli
+
+    config_path = _make_config_yaml(tmp_path)
+    raw_dir = tmp_path / "raw" / "case-001-greptile"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "findings.json").write_text("[]")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["normalize", "--run-dir", str(tmp_path), "--config", str(config_path), "--dry-run"],
+    )
+    assert result.exit_code == 0
+    assert "dry-run" in result.output or "Would normalize" in result.output

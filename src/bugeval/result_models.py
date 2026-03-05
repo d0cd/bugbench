@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CommentType(StrEnum):
@@ -30,6 +30,16 @@ class ResultMetadata(BaseModel):
     time_seconds: float = 0.0
 
 
+class DxAssessment(BaseModel):
+    """Developer experience assessment on a 1–5 scale per dimension."""
+
+    actionability: int = Field(ge=1, le=5, default=3)
+    false_positive_burden: int = Field(ge=1, le=5, default=3)
+    integration_friction: int = Field(ge=1, le=5, default=3)
+    response_latency: int = Field(ge=1, le=5, default=3)
+    notes: str = ""
+
+
 class NormalizedResult(BaseModel):
     """Common output schema for all tool evaluation modes."""
 
@@ -38,3 +48,4 @@ class NormalizedResult(BaseModel):
     context_level: str = ""
     comments: list[Comment] = []
     metadata: ResultMetadata = ResultMetadata()
+    dx: DxAssessment | None = None

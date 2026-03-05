@@ -330,6 +330,77 @@ def test_run_api_eval_context_level_passed(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
 
+def test_process_case_api_writes_metadata_json(tmp_path: Path) -> None:
+    case = make_case()
+    tool = ToolDef(
+        name="greptile",
+        type=ToolType.api,
+        api_endpoint="https://api.greptile.com/v2/review",
+        api_key_env="GREPTILE_API_KEY",
+        cooldown_seconds=0,
+    )
+
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.json = AsyncMock(return_value=[])
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(return_value=mock_response)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        process_case_tool_api(
+            case=case,
+            tool=tool,
+            patch_content="patch",
+            run_dir=tmp_path,
+            context_level="diff-only",
+            dry_run=False,
+        )
+
+    metadata_file = tmp_path / "raw" / "case-001-greptile" / "metadata.json"
+    assert metadata_file.exists()
+
+
+def test_metadata_json_has_time_seconds(tmp_path: Path) -> None:
+    case = make_case()
+    tool = ToolDef(
+        name="greptile",
+        type=ToolType.api,
+        api_endpoint="https://api.greptile.com/v2/review",
+        api_key_env="GREPTILE_API_KEY",
+        cooldown_seconds=0,
+    )
+
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.json = AsyncMock(return_value=[])
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=False)
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(return_value=mock_response)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        process_case_tool_api(
+            case=case,
+            tool=tool,
+            patch_content="patch",
+            run_dir=tmp_path,
+            context_level="diff-only",
+            dry_run=False,
+        )
+
+    metadata_file = tmp_path / "raw" / "case-001-greptile" / "metadata.json"
+    meta = json.loads(metadata_file.read_text())
+    assert "time_seconds" in meta
+    assert isinstance(meta["time_seconds"], float)
+    assert "cost_usd" in meta
+
+
 def test_run_api_eval_unknown_tools_filter_exits(tmp_path: Path) -> None:
     config_path = _make_config_yaml(tmp_path)
     cases_dir = tmp_path / "cases"

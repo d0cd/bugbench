@@ -154,6 +154,41 @@ class TestValidateCasesEmptyDiff:
         assert "FAIL" in result.output
 
 
+class TestValidateCasesDryRun:
+    def test_validate_cases_dry_run_no_stats_written(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        base = get_sha(repo)
+        head = add_commit(repo, "fn main() { let x = 1; }\n")
+
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        case = TestCase(
+            id="dr-001",
+            repo="foo/bar",
+            base_commit=base,
+            head_commit=head,
+            fix_commit=head,
+            category=Category.logic,
+            difficulty=Difficulty.easy,
+            severity=Severity.low,
+            language="rust",
+            pr_size=PRSize.tiny,
+            description="Test case",
+            expected_findings=[],
+        )
+        save_case(case, cases_dir / "dr-001.yaml")
+        original_mtime = (cases_dir / "dr-001.yaml").stat().st_mtime
+
+        runner = CliRunner()
+        result = runner.invoke(
+            validate_cases,
+            ["--repo-dir", str(repo), "--cases-dir", str(cases_dir), "--update-stats", "--dry-run"],
+        )
+        assert result.exit_code == 0
+        # File should not have been modified
+        assert (cases_dir / "dr-001.yaml").stat().st_mtime == original_mtime
+
+
 class TestValidateCasesBadCommit:
     def test_bad_commit_fails(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "repo")
