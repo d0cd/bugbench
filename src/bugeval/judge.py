@@ -72,10 +72,11 @@ def _build_judge_prompt(case: TestCase, result: NormalizedResult) -> str:
         or "  (no comments)"
     )
 
+    # Tool name is intentionally omitted to prevent judge bias (self-eval pitfall mitigation).
     return (
         f"## Test Case: {case.id}\n"
         f"### Expected Bug\n{findings_text}\n\n"
-        f"### Tool Comments ({result.tool}, {len(result.comments)} total)\n"
+        f"### Tool Comments ({len(result.comments)} total)\n"
         f"{comments_text}\n\n"
         f"Score this tool's output 0–3 and classify each comment."
     )

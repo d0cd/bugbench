@@ -25,6 +25,12 @@ from bugeval.io import load_all_cases, save_case
     help="Directory containing test case YAML files.",
 )
 @click.option(
+    "--patches-dir",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="If provided, verify that a .patch file exists for each case.",
+)
+@click.option(
     "--update-stats",
     is_flag=True,
     help="Auto-populate stats (lines_added, files_changed, etc.) and save.",
@@ -35,7 +41,13 @@ from bugeval.io import load_all_cases, save_case
     default=False,
     help="Report validation results without writing stats back.",
 )
-def validate_cases(repo_dir: Path, cases_dir: Path, update_stats: bool, dry_run: bool) -> None:
+def validate_cases(
+    repo_dir: Path,
+    cases_dir: Path,
+    patches_dir: Path | None,
+    update_stats: bool,
+    dry_run: bool,
+) -> None:
     """Validate test cases in cases-dir against a repo checkout."""
     if not cases_dir.exists():
         click.echo(f"Cases directory not found: {cases_dir}", err=True)
@@ -67,6 +79,12 @@ def validate_cases(repo_dir: Path, cases_dir: Path, update_stats: bool, dry_run:
                     errors.append("empty diff between base_commit and head_commit")
             except Exception as exc:
                 errors.append(f"could not compute diff: {exc}")
+
+        # Check patch file exists (if patches_dir provided)
+        if patches_dir is not None:
+            patch_path = patches_dir / f"{case.id}.patch"
+            if not patch_path.exists():
+                errors.append(f"patch file missing: {patch_path}")
 
         if errors:
             click.echo(f"  FAIL {case.id}: {'; '.join(errors)}")

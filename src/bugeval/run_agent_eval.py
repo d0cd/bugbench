@@ -77,6 +77,9 @@ def process_case_agent(
         else:
             raise ValueError(f"Unknown agent tool: {tool.name!r}")
 
+        # Stamp context_level so normalize can populate the context-level slice.
+        result.context_level = context_level
+
         state.status = CaseToolStatus.collecting
         out_dir = run_dir / "raw" / f"{case.id}-{tool.name}"
         out_dir.mkdir(parents=True, exist_ok=True)

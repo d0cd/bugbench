@@ -106,6 +106,12 @@ def test_process_case_agent_cli_mode(tmp_path: Path) -> None:
 
     assert state.status == CaseToolStatus.done
 
+    # Verify context_level is stamped into metadata.json for normalize
+    import json
+
+    meta = json.loads((tmp_path / "raw" / "case-001-claude-code-cli" / "metadata.json").read_text())
+    assert meta.get("context_level") == "diff-only"
+
 
 def test_process_case_agent_api_mode(tmp_path: Path) -> None:
     from bugeval.agent_models import AgentResult

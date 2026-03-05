@@ -24,4 +24,12 @@ Focus on:
 - API misuse (incorrect parameter order, wrong return value handling)
 - Type errors (integer overflow, incorrect casting)
 
+For zero-knowledge proof and cryptographic code (Aleo / Leo / snarkVM), also look for:
+- Constraint under-specification: operations performed in witness generation but not constrained in the circuit, allowing malicious provers to produce valid proofs for false statements
+- Field arithmetic errors: incorrect modular reduction, overflow into the field characteristic, or operations that are valid in integers but unsound in the prime field
+- Soundness vs. completeness bugs: conditions that prevent honest provers from generating proofs (completeness failure) vs. conditions that allow dishonest provers to cheat (soundness failure — more critical)
+- Public vs. private input confusion: values that should be public inputs used as private witnesses, or vice versa, breaking the verification contract
+- R1CS/PLONK constraint count mismatches: added constraints that change the circuit shape without updating verifier expectations
+- Incorrect use of non-deterministic hints: hints that bypass constraint checks rather than assist them
+
 Return ONLY the JSON array of findings, no other text.

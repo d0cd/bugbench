@@ -59,6 +59,20 @@ def test_select_sample_min_one() -> None:
     assert len(sample) >= 1
 
 
+def test_select_sample_stratified_by_tool() -> None:
+    # 10 scores per tool — stratified sampling should include both tools
+    tools = ["greptile", "coderabbit"]
+    scores = [_make_judge_score(f"c{i:03d}", t, 2) for t in tools for i in range(10)]
+    sample = select_sample(scores, sample_rate=0.25)
+    sampled_tools = {s.tool for s in sample}
+    assert "greptile" in sampled_tools
+    assert "coderabbit" in sampled_tools
+
+
+def test_select_sample_empty() -> None:
+    assert select_sample([], sample_rate=0.25) == []
+
+
 # --- export_sample ---
 
 

@@ -189,6 +189,76 @@ class TestValidateCasesDryRun:
         assert (cases_dir / "dr-001.yaml").stat().st_mtime == original_mtime
 
 
+class TestValidateCasesPatchesDir:
+    def _make_case(self, repo: Path, cases_dir: Path, case_id: str) -> tuple[str, str]:
+        base = get_sha(repo)
+        head = add_commit(repo, f"fn main() {{ let x = {case_id}; }}\n")
+        case = TestCase(
+            id=case_id,
+            repo="foo/bar",
+            base_commit=base,
+            head_commit=head,
+            fix_commit=head,
+            category=Category.logic,
+            difficulty=Difficulty.easy,
+            severity=Severity.low,
+            language="rust",
+            pr_size=PRSize.tiny,
+            description="Test",
+            expected_findings=[],
+        )
+        save_case(case, cases_dir / f"{case_id}.yaml")
+        return base, head
+
+    def test_patches_dir_missing_patch_fails(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        patches_dir = tmp_path / "patches"
+        patches_dir.mkdir()
+        self._make_case(repo, cases_dir, "p-001")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            validate_cases,
+            [
+                "--repo-dir",
+                str(repo),
+                "--cases-dir",
+                str(cases_dir),
+                "--patches-dir",
+                str(patches_dir),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "patch file missing" in result.output
+
+    def test_patches_dir_present_patch_passes(self, tmp_path: Path) -> None:
+        repo = make_repo(tmp_path / "repo")
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        patches_dir = tmp_path / "patches"
+        patches_dir.mkdir()
+        self._make_case(repo, cases_dir, "p-002")
+        # Create a stub patch file
+        (patches_dir / "p-002.patch").write_text("--- stub patch ---\n")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            validate_cases,
+            [
+                "--repo-dir",
+                str(repo),
+                "--cases-dir",
+                str(cases_dir),
+                "--patches-dir",
+                str(patches_dir),
+            ],
+        )
+        assert result.exit_code == 0
+        assert "PASS" in result.output
+
+
 class TestValidateCasesBadCommit:
     def test_bad_commit_fails(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "repo")

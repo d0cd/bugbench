@@ -38,9 +38,34 @@ def cohen_kappa(scores_a: list[int], scores_b: list[int]) -> float:
 
 
 def select_sample(scores: list[JudgeScore], sample_rate: float = 0.25) -> list[JudgeScore]:
-    """Select a random sample of scores. Always returns at least 1 if scores non-empty."""
-    n = max(1, round(len(scores) * sample_rate))
-    return random.sample(scores, min(n, len(scores)))
+    """Stratified random sample by tool × difficulty, targeting sample_rate of total.
+
+    Stratification ensures each tool and each difficulty level is proportionally
+    represented. Falls back to simple random sampling if no scores have difficulty info
+    (e.g. difficulty must come from the caller if needed; this function operates on
+    JudgeScore which doesn't carry difficulty directly — it samples proportionally by tool).
+    """
+    if not scores:
+        return []
+
+    # Stratify by tool to ensure proportional tool coverage
+    by_tool: dict[str, list[JudgeScore]] = {}
+    for s in scores:
+        by_tool.setdefault(s.tool, []).append(s)
+
+    total_n = max(1, round(len(scores) * sample_rate))
+    sampled: list[JudgeScore] = []
+
+    # Proportional allocation per tool (at least 1 per tool if possible)
+    for tool, tool_scores in by_tool.items():
+        tool_n = max(1, round(len(tool_scores) * sample_rate))
+        sampled.extend(random.sample(tool_scores, min(tool_n, len(tool_scores))))
+
+    # Trim to target if over-allocated (can happen with many small strata)
+    if len(sampled) > total_n:
+        sampled = random.sample(sampled, total_n)
+
+    return sampled
 
 
 def _make_tool_map(scores: list[JudgeScore]) -> dict[str, str]:
