@@ -91,6 +91,7 @@ def test_run_claude_cli_docker_calls_docker(tmp_path: Path) -> None:
     assert args[0] == "docker"
     assert "run" in args
     assert "--rm" in args
+    assert f"{tmp_path.resolve()}:/work" in args
     assert "bugeval-agent" in args
     assert "--max-turns" in args
     assert "5" in args
@@ -114,4 +115,4 @@ def test_run_claude_cli_docker_nonzero_exit(tmp_path: Path) -> None:
     with patch("subprocess.run", return_value=mock_result):
         result = run_claude_cli_docker(tmp_path, "prompt", image="bugeval-agent")
     assert result.error is not None
-    assert "1" in result.error
+    assert "code 1" in result.error

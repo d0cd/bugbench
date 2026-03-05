@@ -108,6 +108,7 @@ def run_claude_cli_docker(
 
     The container is removed after execution (--rm). The repo directory is
     mounted at /work which is also the working directory.
+    No network isolation is applied beyond Docker's default (full outbound access).
     """
     cmd = [
         "docker",
