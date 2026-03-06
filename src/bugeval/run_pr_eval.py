@@ -91,13 +91,14 @@ def process_case_tool(
 
         # --- polling ---
         state.status = CaseToolStatus.polling
-        found = poll_for_review(fork_repo, pr_number)
+        poll_for_review(fork_repo, pr_number)  # waits for tool to respond; scrape regardless
 
         # --- scraping ---
+        # Always scrape all three endpoints (reviews, inline, issue_comments).
+        # Some tools post findings only to issue_comments without a formal review,
+        # so conditioning on poll result would silently miss their output.
         state.status = CaseToolStatus.scraping
-        comments: list[dict[str, Any]] = []
-        if found:
-            comments = scrape_review_comments(fork_repo, pr_number)
+        comments: list[dict[str, Any]] = scrape_review_comments(fork_repo, pr_number)
 
         # Save comments
         out_dir = run_dir / "raw" / f"{case.id}-{tool.name}"

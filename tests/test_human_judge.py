@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from bugeval.human_judge import (
+    _format_comments,
     cohen_kappa,
     compute_kappa_report,
     export_sample,
@@ -15,6 +16,7 @@ from bugeval.human_judge import (
     select_sample,
 )
 from bugeval.judge_models import JudgeScore
+from bugeval.result_models import Comment, NormalizedResult
 
 
 def _make_judge_score(case_id: str, tool: str, score: int) -> JudgeScore:
@@ -73,6 +75,43 @@ def test_select_sample_empty() -> None:
     assert select_sample([], sample_rate=0.25) == []
 
 
+# --- _format_comments ---
+
+
+def test_format_comments_none() -> None:
+    assert _format_comments(None) == "(no comments)"
+
+
+def test_format_comments_empty() -> None:
+    r = NormalizedResult(test_case_id="c001", tool="greptile", comments=[])
+    assert _format_comments(r) == "(no comments)"
+
+
+def test_format_comments_with_comments() -> None:
+    r = NormalizedResult(
+        test_case_id="c001",
+        tool="greptile",
+        comments=[
+            Comment(file="src/main.rs", line=42, body="Off-by-one error here"),
+            Comment(body="PR looks suspicious overall"),
+        ],
+    )
+    out = _format_comments(r)
+    assert "src/main.rs:42" in out
+    assert "Off-by-one error here" in out
+
+
+def test_format_comments_truncates() -> None:
+    long_body = "x" * 1000
+    r = NormalizedResult(
+        test_case_id="c001",
+        tool="greptile",
+        comments=[Comment(body=long_body) for _ in range(5)],
+    )
+    out = _format_comments(r, max_chars=100)
+    assert len(out) <= 102  # 100 chars + possible ellipsis
+
+
 # --- export_sample ---
 
 
@@ -94,6 +133,23 @@ def test_export_sample_writes_csv(tmp_path: Path) -> None:
     assert "coderabbit" not in tool_values
     # tool_map.yaml must exist
     assert (tmp_path / "human_judge" / "tool_map.yaml").exists()
+    # tool_comments column must be present
+    assert "tool_comments" in rows[0]
+
+
+def test_export_sample_includes_comments_when_results_provided(tmp_path: Path) -> None:
+    scores = [_make_judge_score("c001", "greptile", 2)]
+    results = {
+        ("c001", "greptile"): NormalizedResult(
+            test_case_id="c001",
+            tool="greptile",
+            comments=[Comment(file="src/main.rs", line=10, body="Potential overflow")],
+        )
+    }
+    out_path = tmp_path / "sample.csv"
+    export_sample(scores, run_dir=tmp_path, output_path=out_path, sample_rate=1.0, results=results)
+    rows = list(csv.DictReader(out_path.read_text().splitlines()))
+    assert "Potential overflow" in rows[0]["tool_comments"]
 
 
 # --- import_scores ---

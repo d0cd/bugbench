@@ -14,7 +14,7 @@ from bugeval.pipeline import pipeline
 from bugeval.run_agent_eval import run_agent_eval
 from bugeval.run_api_eval import run_api_eval
 from bugeval.run_pr_eval import run_pr_eval
-from bugeval.scrape_github_cmd import scrape_github
+from bugeval.scrape_github_cmd import scrape_benchmark, scrape_github
 from bugeval.status_cmd import status
 from bugeval.validate_cases import validate_cases
 from bugeval.validate_env import validate_env
@@ -26,6 +26,7 @@ def cli() -> None:
 
 
 cli.add_command(scrape_github)
+cli.add_command(scrape_benchmark)
 cli.add_command(validate_cases)
 cli.add_command(extract_patch)
 cli.add_command(curate)

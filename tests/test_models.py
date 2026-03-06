@@ -87,8 +87,8 @@ class TestTestCase:
         assert case.stats is None
 
     def test_optional_stats_present(self) -> None:
-        case = TestCase(  # type: ignore[arg-type]
-            **make_test_case(
+        case = TestCase(
+            **make_test_case(  # type: ignore[arg-type]
                 stats={"lines_added": 10, "lines_deleted": 5, "files_changed": 2, "hunks": 3}
             )
         )

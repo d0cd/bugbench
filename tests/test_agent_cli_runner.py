@@ -91,6 +91,8 @@ def test_run_claude_cli_docker_calls_docker(tmp_path: Path) -> None:
     assert args[0] == "docker"
     assert "run" in args
     assert "--rm" in args
+    assert "-e" in args
+    assert "ANTHROPIC_API_KEY" in args
     assert f"{tmp_path.resolve()}:/work" in args
     assert "bugeval-agent" in args
     assert "--max-turns" in args

@@ -12,6 +12,7 @@ from bugeval.git_miner import (
     parse_fix_commits,
     score_git_candidate,
 )
+from bugeval.github_scraper import enrich_git_candidates_with_github
 from bugeval.io import save_candidates
 
 
@@ -55,6 +56,19 @@ from bugeval.io import save_candidates
     default=False,
     help="Print candidates that would be saved without writing.",
 )
+@click.option(
+    "--enrich-from-github",
+    is_flag=True,
+    default=False,
+    help="Cross-reference top commits with GitHub PRs to get labels, body, and diff findings.",
+)
+@click.option(
+    "--enrich-top-n",
+    default=300,
+    show_default=True,
+    type=int,
+    help="Number of top candidates (by confidence) to enrich from GitHub.",
+)
 def mine_candidates(
     repo_dir: Path,
     repo_name: str | None,
@@ -64,6 +78,8 @@ def mine_candidates(
     output_dir: Path,
     use_llm: bool,
     dry_run: bool,
+    enrich_from_github: bool,
+    enrich_top_n: int,
 ) -> None:
     """Mine bug-fix commits from a local git repository and save as candidates."""
     name = repo_name or repo_dir.name
@@ -111,6 +127,13 @@ def mine_candidates(
                         click.echo(f"[llm] {cand.fix_commit[:12]}: {exc}", err=True)
         except ImportError:
             click.echo("LLM fallback skipped: anthropic package not available.", err=True)
+
+    # Optionally enrich top candidates with GitHub PR metadata before confidence filter
+    if enrich_from_github:
+        # Sort by confidence descending so we enrich the best candidates first
+        candidates.sort(key=lambda c: c.confidence, reverse=True)
+        click.echo(f"Enriching top {min(enrich_top_n, len(candidates))} candidates from GitHub...")
+        candidates = enrich_git_candidates_with_github(name, candidates, top_n=enrich_top_n)
 
     # Filter by min confidence
     filtered = [c for c in candidates if c.confidence >= min_confidence]

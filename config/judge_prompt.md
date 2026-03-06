@@ -25,4 +25,15 @@ Return a JSON object with:
   - `classification`: "TP" (relevant to the bug), "FP" (irrelevant/wrong), or "low-value" (generic advice)
   - `relevance`: "direct" | "adjacent" | "unrelated"
 
-Return ONLY the JSON object, no other text.
+Return ONLY the JSON object, no other text. Example:
+
+```json
+{
+  "score": 2,
+  "reasoning": "Comment [1] correctly identifies the off-by-one on line 142 but does not suggest a fix.",
+  "comment_judgments": [
+    {"id": 0, "classification": "FP", "relevance": "unrelated"},
+    {"id": 1, "classification": "TP", "relevance": "direct"}
+  ]
+}
+```

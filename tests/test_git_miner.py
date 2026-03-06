@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bugeval.git_miner import (
+    _has_code_files,
     detect_fix_keywords,
     find_introducing_commit,
     parse_fix_commits,
@@ -102,6 +103,23 @@ def test_detect_fix_keywords_both() -> None:
     signals = detect_fix_keywords("fix: closes #99 buffer overflow")
     assert "keyword:fix" in signals
     assert "keyword:issue_ref" in signals
+
+
+def test_detect_fix_keywords_bare_hash_not_issue_ref() -> None:
+    # Bare "#123" without an action verb should NOT fire keyword:issue_ref
+    signals = detect_fix_keywords("update config see #123")
+    assert "keyword:issue_ref" not in signals
+
+
+def test_detect_fix_keywords_domain_keywords() -> None:
+    for msg in [
+        "fix: integer overflow in field arithmetic",
+        "panic: constraint not satisfied in circuit",
+        "resolve underflow in witness generation",
+        "soundness issue in proof verification",
+    ]:
+        signals = detect_fix_keywords(msg)
+        assert "keyword:fix" in signals, f"expected keyword:fix for: {msg!r}"
 
 
 # --- score_git_candidate ---
@@ -227,4 +245,74 @@ def test_find_introducing_commit_no_overlap(tmp_path: Path) -> None:
 
     result = find_introducing_commit(fix_sha, ["main.rs"], repo)
     # main.rs was never modified before fix, so no introducing commit found
+    assert result is None
+
+
+# --- _has_code_files ---
+
+
+def test_has_code_files_with_rust() -> None:
+    assert _has_code_files(["src/main.rs"]) is True
+
+
+def test_has_code_files_with_python() -> None:
+    assert _has_code_files(["utils.py", "Cargo.toml"]) is True
+
+
+def test_has_code_files_only_toml_lock() -> None:
+    """Commits touching only non-code files should return False."""
+    assert _has_code_files(["Cargo.toml", "Cargo.lock"]) is False
+
+
+def test_has_code_files_only_docs() -> None:
+    assert _has_code_files(["README.md", "CHANGELOG.md"]) is False
+
+
+def test_has_code_files_mixed_non_code_and_code() -> None:
+    assert _has_code_files(["Cargo.toml", "src/lib.rs"]) is True
+
+
+def test_has_code_files_empty_list() -> None:
+    assert _has_code_files([]) is False
+
+
+def test_has_code_files_yaml_only() -> None:
+    assert _has_code_files([".github/workflows/ci.yml", "config.yaml"]) is False
+
+
+def test_build_git_candidates_skips_non_code_commits(tmp_path: Path) -> None:
+    """build_git_candidates must drop commits where all files are non-code."""
+    from bugeval.git_miner import build_git_candidates
+
+    commits = [
+        {
+            "sha": "aaa" * 13 + "a",
+            "message": "fix: bump dependencies",
+            "lines_added": 5,
+            "lines_deleted": 2,
+            "files": ["Cargo.toml", "Cargo.lock"],
+            "is_merge": False,
+        },
+        {
+            "sha": "bbb" * 13 + "b",
+            "message": "fix: off-by-one in parser",
+            "lines_added": 3,
+            "lines_deleted": 1,
+            "files": ["src/parser.rs"],
+            "is_merge": False,
+        },
+    ]
+    with patch("bugeval.git_miner.find_introducing_commit", return_value=None):
+        candidates = build_git_candidates("owner/repo", commits, tmp_path)
+
+    shas = [c.fix_commit for c in candidates]
+    assert "bbb" * 13 + "b" in shas
+    assert "aaa" * 13 + "a" not in shas
+
+
+def test_find_introducing_commit_malformed_sha_skipped(tmp_path: Path) -> None:
+    """Malformed SHAs in git log output are silently skipped (not passed to git)."""
+    malformed_log = "not-a-sha\n../../../etc/passwd\n\x00injected"
+    with patch("bugeval.git_miner.run_git", return_value=malformed_log):
+        result = find_introducing_commit("abc" * 13 + "d", ["main.rs"], tmp_path)
     assert result is None

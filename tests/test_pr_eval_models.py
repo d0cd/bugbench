@@ -73,27 +73,27 @@ def test_run_state_load_nonexistent(tmp_path: Path) -> None:
 
 
 def test_tool_def_is_pr_tool() -> None:
-    pr_tool = ToolDef(name="coderabbit", type="pr")
-    api_tool = ToolDef(name="greptile", type="api")
-    cli_tool = ToolDef(name="claude-code-cli", type="cli")
+    pr_tool = ToolDef(name="coderabbit", type=ToolType.pr)
+    api_tool = ToolDef(name="greptile", type=ToolType.api)
+    agent_tool = ToolDef(name="claude-code-cli", type=ToolType.agent)
     assert pr_tool.is_pr_tool is True
     assert api_tool.is_pr_tool is False
-    assert cli_tool.is_pr_tool is False
+    assert agent_tool.is_pr_tool is False
 
 
 def test_tool_def_is_api_tool() -> None:
-    pr_tool = ToolDef(name="coderabbit", type="pr")
-    api_tool = ToolDef(name="greptile", type="api")
-    cli_tool = ToolDef(name="claude-code-cli", type="cli")
+    pr_tool = ToolDef(name="coderabbit", type=ToolType.pr)
+    api_tool = ToolDef(name="greptile", type=ToolType.api)
+    agent_tool = ToolDef(name="claude-code-cli", type=ToolType.agent)
     assert pr_tool.is_api_tool is False
     assert api_tool.is_api_tool is True
-    assert cli_tool.is_api_tool is False
+    assert agent_tool.is_api_tool is False
 
 
 def test_tool_def_api_fields() -> None:
     tool = ToolDef(
         name="greptile",
-        type="api",
+        type=ToolType.api,
         api_endpoint="https://api.greptile.com/v2/review",
         api_key_env="GREPTILE_API_KEY",
     )
@@ -102,16 +102,16 @@ def test_tool_def_api_fields() -> None:
 
 
 def test_tool_def_api_fields_optional() -> None:
-    tool = ToolDef(name="greptile", type="api")
+    tool = ToolDef(name="greptile", type=ToolType.api)
     assert tool.api_endpoint is None
     assert tool.api_key_env is None
 
 
 def test_eval_config_api_tools_filtering() -> None:
     tools = [
-        ToolDef(name="coderabbit", type="pr"),
-        ToolDef(name="greptile", type="api"),
-        ToolDef(name="anthropic-api", type="api"),
+        ToolDef(name="coderabbit", type=ToolType.pr),
+        ToolDef(name="greptile", type=ToolType.api),
+        ToolDef(name="anthropic-api", type=ToolType.api),
     ]
     config = EvalConfig(eval_org="my-org", tools=tools)
     api_tools = config.api_tools
@@ -162,7 +162,6 @@ def test_load_eval_config_with_api_fields(tmp_path: Path) -> None:
 def test_tool_type_enum_values() -> None:
     assert ToolType.pr == "pr"
     assert ToolType.api == "api"
-    assert ToolType.cli == "cli"
     assert ToolType.agent == "agent"
 
 
@@ -172,18 +171,18 @@ def test_case_tool_status_agent_values() -> None:
 
 
 def test_tool_def_is_agent_tool() -> None:
-    agent_tool = ToolDef(name="claude-code-cli", type="agent")
-    pr_tool = ToolDef(name="coderabbit", type="pr")
+    agent_tool = ToolDef(name="claude-code-cli", type=ToolType.agent)
+    pr_tool = ToolDef(name="coderabbit", type=ToolType.pr)
     assert agent_tool.is_agent_tool is True
     assert pr_tool.is_agent_tool is False
 
 
 def test_eval_config_agent_tools_filtering() -> None:
     tools = [
-        ToolDef(name="coderabbit", type="pr"),
-        ToolDef(name="greptile", type="api"),
-        ToolDef(name="claude-code-cli", type="agent"),
-        ToolDef(name="anthropic-api", type="agent"),
+        ToolDef(name="coderabbit", type=ToolType.pr),
+        ToolDef(name="greptile", type=ToolType.api),
+        ToolDef(name="claude-code-cli", type=ToolType.agent),
+        ToolDef(name="anthropic-api", type=ToolType.agent),
     ]
     config = EvalConfig(eval_org="my-org", tools=tools)
     agent_tools = config.agent_tools
@@ -193,14 +192,14 @@ def test_eval_config_agent_tools_filtering() -> None:
 
 def test_tool_def_rejects_invalid_type() -> None:
     with pytest.raises(Exception):
-        ToolDef(name="bad", type="unknown")
+        ToolDef(name="bad", type="unknown")  # type: ignore[arg-type]
 
 
 def test_eval_config_pr_tools_filtering() -> None:
     tools = [
-        ToolDef(name="coderabbit", type="pr"),
-        ToolDef(name="greptile", type="api"),
-        ToolDef(name="bugbot", type="pr"),
+        ToolDef(name="coderabbit", type=ToolType.pr),
+        ToolDef(name="greptile", type=ToolType.api),
+        ToolDef(name="bugbot", type=ToolType.pr),
     ]
     config = EvalConfig(eval_org="my-org", tools=tools)
     pr_tools = config.pr_tools

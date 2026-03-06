@@ -85,6 +85,8 @@ def execute_tool(tool_name: str, tool_input: dict[str, Any], repo_dir: Path) -> 
             return f"Error reading file: {e}"
 
     elif tool_name == "list_directory":
+        if (repo_dir / tool_input["path"]).is_symlink():
+            return "Error: symlinks are not allowed"
         path = _safe_path(tool_input["path"], repo_dir)
         try:
             entries = sorted(os.listdir(path))
@@ -94,12 +96,20 @@ def execute_tool(tool_name: str, tool_input: dict[str, Any], repo_dir: Path) -> 
 
     elif tool_name == "search_code":
         pattern = tool_input["pattern"]
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            return f"Invalid regex pattern: {e}"
         search_path = _safe_path(tool_input["path"], repo_dir)
-        result = subprocess.run(
-            ["grep", "-rn", pattern, str(search_path)],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["grep", "-rn", pattern, str(search_path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return "search_code timed out"
         return result.stdout[:10000] if result.stdout else "(no matches)"
 
     else:

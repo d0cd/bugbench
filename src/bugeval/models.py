@@ -89,6 +89,7 @@ class Candidate(BaseModel):
     expected_findings: list[ExpectedFinding]
     language: str
     pr_size: PRSize
+    reviewer_notes: list[str] = []  # reviewer comments that identified the bug
 
 
 class ScrapeState(BaseModel):

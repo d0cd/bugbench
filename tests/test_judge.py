@@ -54,6 +54,7 @@ def test_extract_judge_json_valid() -> None:
 def test_extract_judge_json_bare_object() -> None:
     text = '{"score": 3, "reasoning": "great", "comment_judgments": []}'
     data = _extract_judge_json(text)
+    assert data is not None
     assert data["score"] == 3
 
 
@@ -108,6 +109,28 @@ def test_judge_case_majority_vote(tmp_path: Path) -> None:
     # New assertions:
     assert score.noise.total_comments == 1  # _make_result() has 1 comment
     assert score.noise.snr == pytest.approx(1.0)  # all judgments are TP
+
+
+def test_judge_case_reasoning_captured(tmp_path: Path) -> None:
+    """judge_case reasoning comes from the LLM response, not just vote counts."""
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _make_mock_response(2),
+        _make_mock_response(2),
+        _make_mock_response(2),
+    ]
+
+    with patch("bugeval.judge.Anthropic", return_value=mock_client):
+        score = judge_case(case, result, system_prompt="judge this")
+
+    assert score.score == 2
+    # Reasoning should contain the LLM's text, not just "Votes: ..."
+    assert "Score is 2" in score.reasoning
 
 
 def test_judge_case_dry_run(tmp_path: Path) -> None:

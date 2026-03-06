@@ -133,6 +133,30 @@ def test_open_pr_extracts_number_from_url() -> None:
     assert result == 42
 
 
+def test_open_pr_uses_correct_base_branch() -> None:
+    """PR must be opened on the fork repo with --base main (not owner:repo:branch format).
+
+    Tools are installed on fork repos, so intra-fork PRs (bug_branch → main)
+    correctly trigger the review tools.
+    """
+    case = _make_case()
+    with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
+        mock_gh.return_value = "https://github.com/eval-org/aleo-lang-coderabbit/pull/1\n"
+        open_pr(
+            fork_repo="eval-org/aleo-lang-coderabbit",
+            upstream_repo="provable-org/aleo-lang",
+            branch="bugeval/case-001-coderabbit",
+            case=case,
+            dry_run=False,
+        )
+    call_args = mock_gh.call_args[0]
+    # Verify --repo is the fork (not upstream)
+    assert "eval-org/aleo-lang-coderabbit" in call_args
+    # Verify --base is just "main", not "provable-org:aleo-lang:main"
+    base_idx = list(call_args).index("--base")
+    assert call_args[base_idx + 1] == "main"
+
+
 def test_poll_for_review_gh_error_continues() -> None:
     """GhError during polling is swallowed; loop continues until timeout."""
     with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
@@ -172,26 +196,71 @@ def test_poll_for_review_success() -> None:
 
 
 def test_scrape_review_comments_partial_failure() -> None:
-    """If reviews endpoint fails, inline comments are still returned."""
+    """If reviews endpoint fails, inline and issue comments are still returned."""
     inline = '[{"id": 2, "body": "wrong line"}]'
+    issue_comments = '[{"id": 3, "body": "tool finding"}]'
     with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
-        mock_gh.side_effect = [GhError(["gh", "api", "..."], "not found"), inline]
+        mock_gh.side_effect = [GhError(["gh", "api", "..."], "not found"), inline, issue_comments]
         result = scrape_review_comments("eval-org/aleo-lang-coderabbit", 42)
-    assert len(result) == 1
-    assert result[0]["source"] == "inline_comment"
+    assert len(result) == 2
+    sources = {r["source"] for r in result}
+    assert sources == {"inline_comment", "issue_comment"}
 
 
 def test_scrape_review_comments_combines_sources() -> None:
     reviews = '[{"id": 1, "body": "issue found", "state": "COMMENTED"}]'
     inline = '[{"id": 2, "body": "wrong line", "path": "src/main.rs"}]'
+    issue_comments = '[{"id": 3, "body": "tool comment on PR thread"}]'
 
     with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
-        mock_gh.side_effect = [reviews, inline]
+        mock_gh.side_effect = [reviews, inline, issue_comments]
         result = scrape_review_comments("eval-org/aleo-lang-coderabbit", 42)
 
+    assert len(result) == 3
+    sources = {r["source"] for r in result}
+    assert sources == {"review", "inline_comment", "issue_comment"}
+
+
+def test_scrape_review_comments_issue_comment_failure_continues() -> None:
+    """If issue comments endpoint fails, reviews and inline comments still returned."""
+    reviews = '[{"id": 1, "body": "review body"}]'
+    inline = '[{"id": 2, "body": "inline body", "path": "src/lib.rs"}]'
+    with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
+        mock_gh.side_effect = [reviews, inline, GhError(["gh", "api", "..."], "forbidden")]
+        result = scrape_review_comments("eval-org/aleo-lang-coderabbit", 42)
     assert len(result) == 2
     sources = {r["source"] for r in result}
     assert sources == {"review", "inline_comment"}
+
+
+def test_open_pr_returns_zero_when_fallback_empty() -> None:
+    """When gh pr create output has no /pull/ and pr list returns empty, return 0."""
+    case = _make_case()
+    with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
+        mock_gh.side_effect = [
+            "https://github.com/eval-org/aleo-lang-coderabbit\n",  # no /pull/
+            "[]",  # empty pr list
+        ]
+        result = open_pr(
+            fork_repo="eval-org/aleo-lang-coderabbit",
+            upstream_repo="provable-org/aleo-lang",
+            branch="bugeval/case-001-coderabbit",
+            case=case,
+            dry_run=False,
+        )
+    assert result == 0
+
+
+def test_scrape_inline_comment_failure_continues() -> None:
+    """If inline comments endpoint fails, reviews and issue comments still returned."""
+    reviews = '[{"id": 1, "body": "review body"}]'
+    issue_comments = '[{"id": 3, "body": "pr thread comment"}]'
+    with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
+        mock_gh.side_effect = [reviews, GhError(["gh", "api", "..."], "not found"), issue_comments]
+        result = scrape_review_comments("eval-org/aleo-lang-coderabbit", 42)
+    assert len(result) == 2
+    sources = {r["source"] for r in result}
+    assert sources == {"review", "issue_comment"}
 
 
 def test_close_pr_dry_run_no_call() -> None:

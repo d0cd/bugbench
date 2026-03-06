@@ -246,6 +246,41 @@ def test_process_case_tool_with_repo_dir_applies_patch(tmp_path: Path) -> None:
     assert state.status == CaseToolStatus.done
 
 
+def test_scrape_always_called_even_when_poll_times_out(tmp_path: Path) -> None:
+    """scrape_review_comments must be called even when poll_for_review returns False.
+
+    Tools that post findings only to issue_comments (not formal reviews) would
+    be silently missed if scraping is gated on poll_for_review returning True.
+    """
+    from bugeval.pr_eval_models import load_eval_config
+
+    config_path = _make_config_file(tmp_path)
+    config = load_eval_config(config_path)
+    tool = config.pr_tools[0]
+
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (patches_dir / "case-001.patch").write_text("--- a\n+++ b\n")
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    run_dir = tmp_path / "results"
+
+    case = _make_case()
+
+    with (
+        patch("bugeval.run_pr_eval.apply_patch_to_branch"),
+        patch("bugeval.run_pr_eval.open_pr", return_value=7),
+        patch("bugeval.run_pr_eval.poll_for_review", return_value=False),  # timeout
+        patch("bugeval.run_pr_eval.scrape_review_comments", return_value=[]) as mock_scrape,
+        patch("bugeval.run_pr_eval.close_pr_delete_branch"),
+    ):
+        state = process_case_tool(case, tool, config, patches_dir, run_dir, repo_dir, dry_run=False)
+
+    # Scrape MUST be called even though poll timed out (issue_comment tools)
+    mock_scrape.assert_called_once()
+    assert state.status == CaseToolStatus.done
+
+
 def test_checkpoint_resume_skips_done(tmp_path: Path) -> None:
     config_path = _make_config_file(tmp_path)
     cases_dir = tmp_path / "cases"

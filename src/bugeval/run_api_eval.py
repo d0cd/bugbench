@@ -63,9 +63,7 @@ def process_case_tool_api(
         out_dir = run_dir / "raw" / f"{case.id}-{tool.name}"
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "findings.json").write_text(json.dumps(findings, indent=2))
-        (out_dir / "metadata.json").write_text(
-            json.dumps({"time_seconds": round(elapsed, 2), "cost_usd": 0.0})
-        )
+        (out_dir / "metadata.json").write_text(json.dumps({"time_seconds": round(elapsed, 2)}))
 
     except Exception as exc:
         state.status = CaseToolStatus.failed

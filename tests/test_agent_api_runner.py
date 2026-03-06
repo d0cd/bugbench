@@ -49,6 +49,31 @@ def test_execute_tool_unknown_tool(tmp_path: Path) -> None:
         execute_tool("rm_rf", {"path": "."}, tmp_path)
 
 
+def test_execute_tool_search_code_invalid_regex(tmp_path: Path) -> None:
+    """Invalid regex pattern returns an error string, not subprocess error."""
+    result = execute_tool("search_code", {"pattern": "[unclosed", "path": "."}, tmp_path)
+    assert "Invalid" in result
+
+
+def test_execute_tool_search_code_timeout(tmp_path: Path) -> None:
+    """Subprocess timeout from grep returns a readable error string."""
+    import subprocess as sp
+
+    with patch("subprocess.run", side_effect=sp.TimeoutExpired(cmd="grep", timeout=30)):
+        result = execute_tool("search_code", {"pattern": "x", "path": "."}, tmp_path)
+    assert "timed out" in result.lower() or "timeout" in result.lower()
+
+
+def test_execute_tool_list_directory_symlink_blocked(tmp_path: Path) -> None:
+    """list_directory rejects symlinks even if they resolve within repo_dir."""
+    target = tmp_path / "real_dir"
+    target.mkdir()
+    link = tmp_path / "link_dir"
+    link.symlink_to(target)
+    result = execute_tool("list_directory", {"path": "link_dir"}, tmp_path)
+    assert "symlink" in result.lower() or "Error" in result
+
+
 # ---------------------------------------------------------------------------
 # run_agent_api tests
 # ---------------------------------------------------------------------------

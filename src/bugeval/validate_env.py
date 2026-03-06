@@ -32,9 +32,10 @@ def check_env(config: EvalConfig, cases_dir: Path | None = None) -> EnvCheckResu
         else:
             result.errors.append(f"{key} is not set")
 
-    # Tool-specific API keys
+    # Tool-specific API keys (skip keys already checked in the always-required list above)
+    _always_checked = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN"}
     for tool in config.tools:
-        if tool.api_key_env:
+        if tool.api_key_env and tool.api_key_env not in _always_checked:
             if os.environ.get(tool.api_key_env):
                 result.ok.append(f"{tool.api_key_env} is set (for {tool.name})")
             else:

@@ -398,7 +398,7 @@ def test_metadata_json_has_time_seconds(tmp_path: Path) -> None:
     meta = json.loads(metadata_file.read_text())
     assert "time_seconds" in meta
     assert isinstance(meta["time_seconds"], float)
-    assert "cost_usd" in meta
+    assert "cost_usd" not in meta
 
 
 def test_run_api_eval_unknown_tools_filter_exits(tmp_path: Path) -> None:

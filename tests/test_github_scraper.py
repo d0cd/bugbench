@@ -1,20 +1,31 @@
 """Tests for GitHub scraper: scoring, linking, and utility functions. No gh calls."""
 
+import json
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from bugeval.github_scraper import (
+    GhError,
+    _batch_fetch_pr_reviews_graphql,
     _extract_issue_numbers,
+    build_candidates,
+    build_labeled_pr_candidates,
+    build_pr_only_candidates,
     compute_pr_size,
     detect_language,
+    enrich_git_candidates_with_github,
+    enrich_with_reviews,
     extract_expected_findings,
+    extract_reviewer_bug_signals,
+    fetch_prs_by_label,
     filter_already_processed,
     link_issues_to_prs,
     load_scrape_state,
     save_scrape_state,
     score_candidate,
 )
-from bugeval.models import PRSize, ScrapeState
+from bugeval.models import Candidate, CaseStats, PRSize, ScrapeState
 
 
 def make_issue(
@@ -288,6 +299,382 @@ class TestExtractExpectedFindings:
         ]
         findings = extract_expected_findings(pr_diff_files)
         assert findings[0].summary.startswith("[auto]")
+
+
+class TestExtractReviewerBugSignals:
+    def test_reviewer_explicit_bug_word(self) -> None:
+        reviews = [{"body": "This is a bug — the counter overflows", "_source": "review"}]
+        signals, notes = extract_reviewer_bug_signals(reviews)
+        assert "reviewer_bug_feedback" in signals
+        assert len(notes) == 1
+        assert "[review]" in notes[0]
+
+    def test_changes_requested_adds_signal(self) -> None:
+        reviews = [{"body": "Please fix this", "state": "CHANGES_REQUESTED", "_source": "review"}]
+        signals, _ = extract_reviewer_bug_signals(reviews)
+        assert "reviewer_changes_requested" in signals
+
+    def test_empty_body_skipped(self) -> None:
+        reviews = [{"body": "", "_source": "inline"}]
+        signals, notes = extract_reviewer_bug_signals(reviews)
+        assert signals == []
+        assert notes == []
+
+    def test_no_bug_language_no_signal(self) -> None:
+        reviews = [{"body": "Looks good to me, nice work!", "_source": "thread"}]
+        signals, notes = extract_reviewer_bug_signals(reviews)
+        assert "reviewer_bug_feedback" not in signals
+        assert notes == []
+
+    def test_deduplication_of_signals(self) -> None:
+        reviews = [
+            {"body": "This will panic here", "_source": "inline"},
+            {"body": "Also this crashes", "_source": "inline"},
+        ]
+        signals, notes = extract_reviewer_bug_signals(reviews)
+        assert signals.count("reviewer_bug_feedback") == 1
+        assert len(notes) == 2
+
+    def test_note_capped_at_300_chars(self) -> None:
+        long_body = "This is wrong. " * 30  # > 300 chars
+        reviews = [{"body": long_body, "_source": "review"}]
+        _, notes = extract_reviewer_bug_signals(reviews)
+        assert len(notes[0]) <= 310  # "[review] " prefix + 300
+
+
+class TestBuildPrOnlyCandidates:
+    def test_bug_labeled_pr_included(self) -> None:
+        pr = make_pr(200, title="Fix edge case", labels=["bug"])
+        result = build_pr_only_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert len(result) == 1
+        assert result[0].pr_number == 200
+        assert "pr_only" in result[0].signals
+        assert "has_bug_label" in result[0].signals
+
+    def test_fix_keyword_in_title_included(self) -> None:
+        pr = make_pr(201, title="fix: resolve integer overflow", labels=[])
+        result = build_pr_only_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert len(result) == 1
+        assert "fix_keywords_in_title" in result[0].signals
+
+    def test_already_matched_pr_skipped(self) -> None:
+        pr = make_pr(202, title="fix bug", labels=["bug"])
+        result = build_pr_only_candidates("owner/repo", [pr], existing_pr_numbers={202})
+        assert len(result) == 0
+
+    def test_unrelated_pr_excluded(self) -> None:
+        pr = make_pr(203, title="Add new feature", labels=["enhancement"])
+        result = build_pr_only_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert len(result) == 0
+
+    def test_small_diff_boosts_confidence(self) -> None:
+        pr = make_pr(204, title="fix: off-by-one", labels=["bug"], additions=5, deletions=3)
+        result = build_pr_only_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert result[0].confidence > 0.3
+
+
+class TestEnrichWithReviews:
+    def test_reviewer_feedback_boosts_confidence(self) -> None:
+        issue = make_issue(1, labels=["bug"])
+        pr = make_pr(100, title="Fix bug", body="Fixes #1")
+        candidates = build_candidates("owner/repo", [issue], [pr])
+        graphql_data = {
+            100: [{"body": "This will panic on empty input", "_source": "inline", "state": ""}]
+        }
+        mock_fn = "bugeval.github_scraper._batch_fetch_pr_reviews_graphql"
+        with patch(mock_fn, return_value=graphql_data):
+            enriched = enrich_with_reviews("owner/repo", candidates)
+        c = next(c for c in enriched if c.pr_number == 100)
+        assert "reviewer_bug_feedback" in c.signals
+        assert len(c.reviewer_notes) == 1
+        assert c.confidence > 0.5
+
+    def test_pr_only_candidate_gets_reviewer_boost(self) -> None:
+        pr = make_pr(201, title="fix: crash on null", labels=["bug"])
+        candidates = build_candidates("owner/repo", [], [pr])
+        graphql_data = {
+            201: [{"body": "This crashes when the field is None", "_source": "thread", "state": ""}]
+        }
+        mock_fn = "bugeval.github_scraper._batch_fetch_pr_reviews_graphql"
+        with patch(mock_fn, return_value=graphql_data):
+            enriched = enrich_with_reviews("owner/repo", candidates)
+        c = next(c for c in enriched if c.pr_number == 201)
+        assert "reviewer_bug_feedback" in c.signals
+        assert c.reviewer_notes
+
+    def test_no_reviews_means_no_change(self) -> None:
+        issue = make_issue(1, labels=["bug"])
+        pr = make_pr(100, body="Fixes #1")
+        candidates = build_candidates("owner/repo", [issue], [pr])
+        original_conf = candidates[0].confidence
+        with patch("bugeval.github_scraper._batch_fetch_pr_reviews_graphql", return_value={}):
+            enriched = enrich_with_reviews("owner/repo", candidates)
+        assert enriched[0].confidence == original_conf
+
+    def test_batches_in_chunks_of_25(self) -> None:
+        """More than 25 candidates should trigger multiple GraphQL calls."""
+        prs = [make_pr(i, title=f"fix bug {i}", labels=["bug"]) for i in range(1, 35)]
+        candidates = build_candidates("owner/repo", [], prs)
+        mock_fn = "bugeval.github_scraper._batch_fetch_pr_reviews_graphql"
+        with patch(mock_fn, return_value={}) as mock_gql:
+            enrich_with_reviews("owner/repo", candidates, top_n=30)
+        assert mock_gql.call_count == 2  # 25 + 5
+
+
+class TestBatchFetchPrReviewsGraphql:
+    def test_returns_empty_on_graphql_error(self) -> None:
+        with patch("bugeval.github_scraper.run_gh", side_effect=GhError(["gh"], "error")):
+            result = _batch_fetch_pr_reviews_graphql("owner", "repo", [1, 2])
+        assert result == {}
+
+    def test_empty_pr_list_returns_empty(self) -> None:
+        result = _batch_fetch_pr_reviews_graphql("owner", "repo", [])
+        assert result == {}
+
+    def test_parses_review_bodies(self) -> None:
+        graphql_response = json.dumps({
+            "data": {
+                "repository": {
+                    "pr_42": {
+                        "reviews": {"nodes": [
+                            {"body": "This is wrong", "state": "CHANGES_REQUESTED"}
+                        ]},
+                        "reviewThreads": {"nodes": []},
+                        "comments": {"nodes": []},
+                    }
+                }
+            }
+        })
+        with patch("bugeval.github_scraper.run_gh", return_value=graphql_response):
+            result = _batch_fetch_pr_reviews_graphql("owner", "repo", [42])
+        assert 42 in result
+        assert result[42][0]["body"] == "This is wrong"
+        assert result[42][0]["state"] == "CHANGES_REQUESTED"
+        assert result[42][0]["_source"] == "review"
+
+
+class TestFetchPrsByLabel:
+    def test_deduplicates_across_labels(self) -> None:
+        """The same PR returned under two labels should appear only once."""
+        pr = make_pr(500, title="fix: crash on null", labels=["bug"])
+        pr_json = json.dumps([pr])
+
+        with patch("bugeval.github_scraper.run_gh", return_value=pr_json):
+            result = fetch_prs_by_label("owner/repo", labels=["bug", "bugfix"])
+
+        assert len(result) == 1
+        assert result[0]["number"] == 500
+
+    def test_skips_label_on_gh_error(self) -> None:
+        """A GhError for one label should be silently skipped."""
+        pr = make_pr(501, title="fix: overflow", labels=["bugfix"])
+        pr_json = json.dumps([pr])
+
+        def side_effect(*args: str) -> str:
+            if "--label" in args and args[list(args).index("--label") + 1] == "bug":
+                raise GhError(list(args), "label not found")
+            return pr_json
+
+        with patch("bugeval.github_scraper.run_gh", side_effect=side_effect):
+            result = fetch_prs_by_label("owner/repo", labels=["bug", "bugfix"])
+
+        assert len(result) == 1
+        assert result[0]["number"] == 501
+
+    def test_returns_empty_on_all_label_errors(self) -> None:
+        """All labels failing should return empty list, not raise."""
+        with patch("bugeval.github_scraper.run_gh", side_effect=GhError(["gh"], "error")):
+            result = fetch_prs_by_label("owner/repo", labels=["bug"])
+        assert result == []
+
+    def test_default_labels_used_when_none(self) -> None:
+        """When labels=None the function uses its built-in default list."""
+        with patch("bugeval.github_scraper.run_gh", return_value="[]") as mock_gh:
+            fetch_prs_by_label("owner/repo", labels=None)
+        # Should have been called once per default label
+        assert mock_gh.call_count > 1
+
+    def test_since_forwarded_to_search(self) -> None:
+        """The since parameter should be included in the --search argument."""
+        with patch("bugeval.github_scraper.run_gh", return_value="[]") as mock_gh:
+            fetch_prs_by_label("owner/repo", labels=["bug"], since="2024-06-01")
+        call_args = mock_gh.call_args[0]
+        assert "created:>2024-06-01" in " ".join(call_args)
+
+
+class TestBuildLabeledPrCandidates:
+    def _make_labeled_pr(
+        self,
+        number: int = 300,
+        title: str = "fix: crash on null",
+        additions: int = 10,
+        deletions: int = 5,
+        labels: list[str] | None = None,
+        body: str = "",
+    ) -> dict[str, object]:
+        return {
+            "number": number,
+            "title": title,
+            "body": body,
+            "labels": [{"name": lbl} for lbl in (labels or ["bug"])],
+            "mergeCommit": {"oid": "aabbccdd" * 5},
+            "additions": additions,
+            "deletions": deletions,
+            "changedFiles": 1,
+            "files": [{"path": "src/lib.rs"}],
+        }
+
+    def test_base_confidence_is_0_4(self) -> None:
+        # Large diff (no small_diff bonus), generic title, no issue ref → only base 0.4
+        pr = self._make_labeled_pr(
+            title="chore: cleanup", additions=300, deletions=300, body=""
+        )
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert len(result) == 1
+        assert result[0].confidence == 0.4
+
+    def test_labeled_bug_signal_always_present(self) -> None:
+        pr = self._make_labeled_pr()
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert "labeled_bug" in result[0].signals
+
+    def test_small_diff_boosts_confidence(self) -> None:
+        pr = self._make_labeled_pr(additions=10, deletions=5)
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert result[0].confidence > 0.4
+        assert "small_diff" in result[0].signals
+
+    def test_fix_keyword_in_title_boosts_confidence(self) -> None:
+        pr = self._make_labeled_pr(title="fix: null pointer", additions=300, deletions=300)
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert "fix_keywords_in_title" in result[0].signals
+        assert result[0].confidence > 0.4
+
+    def test_issue_ref_in_body_boosts_confidence(self) -> None:
+        pr = self._make_labeled_pr(
+            title="chore: cleanup", additions=300, deletions=300, body="Fixes #42"
+        )
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert "has_issue_ref" in result[0].signals
+        assert result[0].confidence > 0.4
+
+    def test_existing_pr_skipped(self) -> None:
+        pr = self._make_labeled_pr(number=300)
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers={300})
+        assert result == []
+
+    def test_confidence_capped_at_1(self) -> None:
+        # All bonuses: small diff + fix kw + issue ref = 0.4 + 0.1 + 0.1 + 0.1 = 0.7
+        pr = self._make_labeled_pr(title="fix bug", additions=5, deletions=3, body="Fixes #1")
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert result[0].confidence <= 1.0
+
+    def test_language_detected_from_files(self) -> None:
+        pr = self._make_labeled_pr()
+        result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
+        assert result[0].language == "rust"
+
+    def test_empty_prs_list_returns_empty(self) -> None:
+        result = build_labeled_pr_candidates("owner/repo", [], existing_pr_numbers=set())
+        assert result == []
+
+
+def make_git_candidate(
+    fix_commit: str = "a" * 40,
+    confidence: float = 0.6,
+    repo: str = "ProvableHQ/snarkVM",
+) -> Candidate:
+    return Candidate(
+        repo=repo,
+        pr_number=0,
+        fix_commit=fix_commit,
+        base_commit=None,
+        head_commit=fix_commit,
+        confidence=confidence,
+        signals=["keyword:fix", "signal:has_introducing"],
+        title="fix: off by one in field arithmetic",
+        body="",
+        labels=[],
+        files_changed=["src/lib.rs"],
+        diff_stats=CaseStats(lines_added=5, lines_deleted=3, files_changed=1, hunks=1),
+        expected_findings=[],
+        language="rust",
+        pr_size=PRSize.small,
+    )
+
+
+class TestEnrichGitCandidatesWithGithub:
+    def test_enriches_with_pr_metadata(self) -> None:
+        candidate = make_git_candidate()
+        api_response = json.dumps([{"number": 42}])
+        pr_detail = json.dumps({
+            "number": 42,
+            "title": "Fix: integer overflow in BLS12 field",
+            "body": "Fixes #101 — overflow in field arithmetic",
+            "labels": [{"name": "bug"}],
+            "additions": 10,
+            "deletions": 4,
+            "files": [{"path": "src/field.rs"}],
+        })
+        side_effects = [api_response, pr_detail, GhError([], "")]
+        with patch("bugeval.github_scraper.run_gh", side_effect=side_effects):
+            result = enrich_git_candidates_with_github("ProvableHQ/snarkVM", [candidate])
+
+        assert len(result) == 1
+        enriched = result[0]
+        assert enriched.pr_number == 42
+        assert enriched.title == "Fix: integer overflow in BLS12 field"
+        assert "bug" in enriched.labels
+        assert "has_bug_label" in enriched.signals
+        assert "github_pr" in enriched.signals
+        assert enriched.confidence > candidate.confidence
+
+    def test_no_pr_found_leaves_candidate_unchanged(self) -> None:
+        candidate = make_git_candidate()
+        with patch("bugeval.github_scraper.run_gh", return_value="[]"):
+            result = enrich_git_candidates_with_github("ProvableHQ/snarkVM", [candidate])
+        assert result[0].pr_number == candidate.pr_number
+        assert result[0].confidence == candidate.confidence
+
+    def test_gh_error_leaves_candidate_unchanged(self) -> None:
+        candidate = make_git_candidate()
+        with patch("bugeval.github_scraper.run_gh", side_effect=GhError([], "network error")):
+            result = enrich_git_candidates_with_github("ProvableHQ/snarkVM", [candidate])
+        assert result[0].pr_number == candidate.pr_number
+
+    def test_respects_top_n_limit(self) -> None:
+        candidates = [make_git_candidate(fix_commit=c * 40, confidence=0.5 + i * 0.1)
+                      for i, c in enumerate("abcde")]
+        # top_n=2: only first 2 should be enriched; rest passed through
+        call_count = 0
+        def mock_gh(*args: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return "[]"  # no PR found → passthrough
+
+        with patch("bugeval.github_scraper.run_gh", side_effect=mock_gh):
+            result = enrich_git_candidates_with_github("ProvableHQ/snarkVM", candidates, top_n=2)
+
+        assert len(result) == 5
+        assert call_count == 2  # only 2 gh api calls made
+
+    def test_no_bug_label_does_not_boost_confidence(self) -> None:
+        candidate = make_git_candidate()
+        api_response = json.dumps([{"number": 7}])
+        pr_detail = json.dumps({
+            "number": 7,
+            "title": "refactor: clean up imports",
+            "body": "",
+            "labels": [{"name": "cleanup"}],
+            "additions": 5,
+            "deletions": 3,
+            "files": [{"path": "src/lib.rs"}],
+        })
+        side_effects = [api_response, pr_detail, GhError([], "")]
+        with patch("bugeval.github_scraper.run_gh", side_effect=side_effects):
+            result = enrich_git_candidates_with_github("ProvableHQ/snarkVM", [candidate])
+        assert result[0].confidence == candidate.confidence
+        assert "has_bug_label" not in result[0].signals
 
 
 class TestScrapeStateRoundTrip:

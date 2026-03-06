@@ -11,10 +11,22 @@ from bugeval.github_scraper import compute_pr_size, detect_language
 from bugeval.models import Candidate, CaseStats, ExpectedFinding
 
 _FIX_KEYWORDS = re.compile(
-    r"\b(fix(es|ed|ing)?|bug|issue|revert|patch|correct(ed|ing)?|repair)\b",
+    r"\b(fix(es|ed|ing)?|bug|issue|revert|patch|correct(ed|ing)?|repair"
+    r"|panic|overflow|underflow|soundness|constraint|witness|circuit)\b",
     re.IGNORECASE,
 )
-_ISSUE_REF = re.compile(r"(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*#\d+|#\d+", re.IGNORECASE)
+# Require an explicit action verb before the issue number to avoid matching bare
+# fragment references (e.g. "#123" in code comments or rust doc links).
+_ISSUE_REF = re.compile(r"(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*#\d+", re.IGNORECASE)
+
+_CODE_EXTENSIONS = frozenset(
+    ".rs .py .ts .tsx .js .jsx .go .java .cpp .cc .c .h .rb .swift .kt .sol .leo".split()
+)
+
+
+def _has_code_files(files: list[str]) -> bool:
+    """Return True if at least one file has a recognized code extension."""
+    return any(Path(f).suffix.lower() in _CODE_EXTENSIONS for f in files)
 
 _LLM_MODEL = "claude-haiku-4-5-20251001"
 _COMMIT_SEP = "COMMIT_START"
@@ -167,7 +179,8 @@ def find_introducing_commit(
     except GitError:
         return None
 
-    prior_shas = [s.strip() for s in log_output.splitlines() if s.strip()]
+    _sha_re = re.compile(r"^[0-9a-f]{40}$")
+    prior_shas = [s.strip() for s in log_output.splitlines() if _sha_re.match(s.strip())]
 
     for prior_sha in prior_shas[:window]:
         try:
@@ -187,6 +200,9 @@ def build_git_candidates(repo: str, commits: list[dict[str, Any]], cwd: Path) ->
     """Assemble Candidate objects from scored commit dicts."""
     candidates: list[Candidate] = []
     for i, commit in enumerate(commits):
+        # Skip commits that only touched non-code files (e.g. dependency bumps)
+        if not _has_code_files(commit["files"]):
+            continue
         introducing = find_introducing_commit(commit["sha"], commit["files"], cwd)
         confidence, signals = score_git_candidate(commit, has_introducing=introducing is not None)
 

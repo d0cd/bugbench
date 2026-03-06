@@ -8,10 +8,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import anyio
 import click
 import yaml
-from anthropic import Anthropic
-from dotenv import load_dotenv
+from claude_agent_sdk import ClaudeAgentOptions, query
 
 from bugeval.git_utils import GitError, run_git
 from bugeval.io import load_candidates, save_case
@@ -24,7 +24,7 @@ from bugeval.models import (
     TestCase,
 )
 
-load_dotenv()
+_CHECKPOINT_FILE = ".curate_checkpoint.json"
 
 # Default system prompt (overridable by config/curate_prompt.md)
 _DEFAULT_SYSTEM_PROMPT = """\
@@ -194,31 +194,29 @@ def _extract_json_from_text(text: str) -> dict[str, Any] | None:
         return None
 
 
-def curate_candidate(
-    client: Anthropic,
+async def _curate_async(
     candidate: Candidate,
     diff_context: str,
     git_log: str,
     case_id: str,
     system_prompt: str,
 ) -> TestCase | None:
-    """Curate a single candidate using the LLM. Returns TestCase or None on failure."""
+    """Async core: call Claude via the Agent SDK and parse the response."""
     prompt = build_curation_prompt(candidate, diff_context, git_log)
 
-    response = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=2048,
-        thinking={"type": "adaptive"},
-        system=system_prompt,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    # Find the text block (thinking blocks appear before text blocks)
     text = ""
-    for block in response.content:
-        if block.type == "text":
-            text = block.text
-            break
+    async for message in query(
+        prompt=prompt,
+        options=ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            allowed_tools=[],
+        ),
+    ):
+        # AssistantMessage has a .content list of blocks; each text block has .text
+        for block in getattr(message, "content", []):
+            block_text = getattr(block, "text", None)
+            if block_text:
+                text += block_text
 
     data = _extract_json_from_text(text)
     if data is None:
@@ -228,6 +226,17 @@ def curate_candidate(
         return parse_llm_response(data, case_id, candidate)
     except (KeyError, ValueError):
         return None
+
+
+def curate_candidate(
+    candidate: Candidate,
+    diff_context: str,
+    git_log: str,
+    case_id: str,
+    system_prompt: str,
+) -> TestCase | None:
+    """Curate a single candidate via the Claude Agent SDK (uses Pro Max quota)."""
+    return anyio.run(_curate_async, candidate, diff_context, git_log, case_id, system_prompt)
 
 
 @click.command("curate")
@@ -265,6 +274,26 @@ def curate_candidate(
     help="Seconds to wait between API calls (rate limiting).",
 )
 @click.option("--dry-run", is_flag=True, help="Print prompts without calling the API.")
+@click.option(
+    "--limit",
+    default=0,
+    show_default=True,
+    type=int,
+    help="Max candidates to process in this run (0 = no limit). Use for safe batching.",
+)
+@click.option(
+    "--fail-after",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Abort after this many consecutive errors (prevents runaway on persistent failures).",
+)
+@click.option(
+    "--no-checkpoint",
+    is_flag=True,
+    default=False,
+    help="Ignore existing checkpoint and re-process all candidates.",
+)
 def curate(
     candidates_path: Path,
     repo_dir: Path | None,
@@ -272,11 +301,31 @@ def curate(
     min_confidence: float,
     api_delay: float,
     dry_run: bool,
+    limit: int,
+    fail_after: int,
+    no_checkpoint: bool,
 ) -> None:
     """LLM-assisted enrichment of candidates into fully specified test cases."""
     candidates = load_candidates(candidates_path)
     filtered = [c for c in candidates if c.confidence >= min_confidence]
-    click.echo(f"Curating {len(filtered)} candidates (min_confidence={min_confidence}).")
+    filtered.sort(key=lambda c: c.confidence, reverse=True)
+
+    # Checkpoint: skip already-processed fix_commits
+    checkpoint_path = Path(output_dir) / _CHECKPOINT_FILE
+    done_commits: set[str] = set()
+    if not no_checkpoint and checkpoint_path.exists():
+        try:
+            done_commits = set(json.loads(checkpoint_path.read_text()))
+            click.echo(f"Resuming: {len(done_commits)} already curated (from checkpoint).")
+        except Exception:
+            pass
+    filtered = [c for c in filtered if c.fix_commit not in done_commits]
+
+    if limit > 0:
+        filtered = filtered[:limit]
+        click.echo(f"Curating up to {limit} candidates (min_confidence={min_confidence}).")
+    else:
+        click.echo(f"Curating {len(filtered)} candidates (min_confidence={min_confidence}).")
 
     if not filtered:
         click.echo("No candidates to curate.")
@@ -293,11 +342,12 @@ def curate(
             click.echo(prompt[:300] + "...")
         return
 
-    client = Anthropic()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
-    for candidate in filtered:
+    consecutive_errors = 0
+
+    for i, candidate in enumerate(filtered):
         case_id = _generate_case_id(candidate.repo, output_dir)
 
         diff_context = ""
@@ -305,19 +355,34 @@ def curate(
         if repo_dir is not None:
             diff_context, git_log = get_git_context(candidate, repo_dir)
 
-        click.echo(f"  Curating PR #{candidate.pr_number}: {candidate.title[:50]}...")
+        click.echo(
+            f"  [{i + 1}/{len(filtered)}] PR #{candidate.pr_number}: "
+            f"{candidate.title[:50]}..."
+        )
 
         try:
             case = curate_candidate(
-                client=client,
                 candidate=candidate,
                 diff_context=diff_context,
                 git_log=git_log,
                 case_id=case_id,
                 system_prompt=system_prompt,
             )
+            consecutive_errors = 0  # reset on any non-exception response
         except Exception as e:
-            click.echo(f"  FAIL PR #{candidate.pr_number}: {e}", err=True)
+            consecutive_errors += 1
+            click.echo(
+                f"  FAIL PR #{candidate.pr_number}: {e} "
+                f"(consecutive errors: {consecutive_errors}/{fail_after})",
+                err=True,
+            )
+            if consecutive_errors >= fail_after:
+                click.echo(
+                    f"Aborting: {consecutive_errors} consecutive errors — "
+                    "check SDK auth or network and resume with checkpoint.",
+                    err=True,
+                )
+                break
             if api_delay > 0:
                 time.sleep(api_delay)
             continue
@@ -329,6 +394,10 @@ def curate(
             save_case(case, case_path)
             click.echo(f"  DONE {case_id} → {case_path}")
             success_count += 1
+
+        # Save checkpoint after each candidate
+        done_commits.add(candidate.fix_commit)
+        checkpoint_path.write_text(json.dumps(sorted(done_commits)))
 
         if api_delay > 0:
             time.sleep(api_delay)

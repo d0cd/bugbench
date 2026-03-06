@@ -63,20 +63,21 @@ def open_pr(
     if dry_run:
         return 0
 
-    owner, name = upstream_repo.split("/", 1)
     title = f"[bugeval] {case.id} — {case.description[:60]}"
     body = (
         f"Automated bugeval PR for case `{case.id}`.\n\n"
         f"Repo: {upstream_repo}\n"
         f"Base commit: `{case.base_commit}`\n"
     )
+    # PR is opened on the fork repo (tools are installed there).
+    # --base main: intra-fork PR from bug branch → fork's main (clean state).
     output = run_gh(
         "pr",
         "create",
         "--repo",
         fork_repo,
         "--base",
-        f"{owner}:{name}:main",
+        "main",
         "--head",
         branch,
         "--title",
@@ -132,9 +133,12 @@ def poll_for_review(
 
 
 def scrape_review_comments(fork_repo: str, pr_number: int) -> list[dict[str, Any]]:
-    """Fetch all reviews and inline comments for a PR.
+    """Fetch all reviews, inline comments, and PR issue comments for a PR.
 
-    Returns a combined list of comment dicts with a 'source' key.
+    Returns a combined list of comment dicts with a 'source' key:
+    - 'review': PR-level review summaries
+    - 'inline_comment': inline review comments (line-level)
+    - 'issue_comment': regular PR comments (many tools post findings here)
     """
     owner, repo = fork_repo.split("/", 1)
     results: list[dict[str, Any]] = []
@@ -149,12 +153,22 @@ def scrape_review_comments(fork_repo: str, pr_number: int) -> list[dict[str, Any
     except GhError:
         pass
 
-    # Inline review comments
+    # Inline review comments (line-level)
     try:
         output = run_gh("api", f"repos/{owner}/{repo}/pulls/{pr_number}/comments")
         comments: list[dict[str, Any]] = json.loads(output)
         for c in comments:
             c["source"] = "inline_comment"
+            results.append(c)
+    except GhError:
+        pass
+
+    # PR issue comments (regular comments on the PR thread — many tools post here)
+    try:
+        output = run_gh("api", f"repos/{owner}/{repo}/issues/{pr_number}/comments")
+        issue_comments: list[dict[str, Any]] = json.loads(output)
+        for c in issue_comments:
+            c["source"] = "issue_comment"
             results.append(c)
     except GhError:
         pass

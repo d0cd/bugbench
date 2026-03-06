@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 class ToolType(StrEnum):
     pr = "pr"
     api = "api"
-    cli = "cli"
     agent = "agent"
 
 

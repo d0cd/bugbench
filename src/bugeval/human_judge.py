@@ -12,6 +12,7 @@ import click
 import yaml
 
 from bugeval.judge_models import JudgeScore
+from bugeval.result_models import NormalizedResult
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -38,12 +39,11 @@ def cohen_kappa(scores_a: list[int], scores_b: list[int]) -> float:
 
 
 def select_sample(scores: list[JudgeScore], sample_rate: float = 0.25) -> list[JudgeScore]:
-    """Stratified random sample by tool × difficulty, targeting sample_rate of total.
+    """Stratified random sample by tool, targeting approximately sample_rate of total.
 
-    Stratification ensures each tool and each difficulty level is proportionally
-    represented. Falls back to simple random sampling if no scores have difficulty info
-    (e.g. difficulty must come from the caller if needed; this function operates on
-    JudgeScore which doesn't carry difficulty directly — it samples proportionally by tool).
+    Each tool contributes proportionally to the sample (at least 1 per tool if possible).
+    Difficulty stratification is not applied here because JudgeScore does not carry
+    difficulty metadata; callers needing difficulty stratification must pre-filter scores.
     """
     if not scores:
         return []
@@ -74,15 +74,30 @@ def _make_tool_map(scores: list[JudgeScore]) -> dict[str, str]:
     return {t: f"Tool-{chr(65 + i)}" for i, t in enumerate(tools)}
 
 
+def _format_comments(result: NormalizedResult | None, max_chars: int = 800) -> str:
+    """Render tool comments as a readable string for the human rater CSV."""
+    if result is None or not result.comments:
+        return "(no comments)"
+    parts = []
+    for i, c in enumerate(result.comments):
+        loc = f"{c.file}:{c.line}" if c.file else "PR-level"
+        parts.append(f"[{i}] {loc}: {c.body[:200]}")
+    joined = " | ".join(parts)
+    return joined[:max_chars] + ("…" if len(joined) > max_chars else "")
+
+
 def export_sample(
     scores: list[JudgeScore],
     run_dir: Path,
     output_path: Path,
     sample_rate: float = 0.25,
+    results: dict[tuple[str, str], NormalizedResult] | None = None,
 ) -> None:
     """Select sample, blind tool names, write CSV for human raters.
 
     Writes tool_map.yaml to run_dir/human_judge/ for later de-blinding.
+    The CSV includes a 'tool_comments' column so raters can evaluate the findings
+    without knowing which tool produced them.
     """
     sample = select_sample(scores, sample_rate)
     tool_map = _make_tool_map(scores)
@@ -94,16 +109,26 @@ def export_sample(
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["row_id", "test_case_id", "tool", "llm_score", "human_score", "notes"],
+            fieldnames=[
+                "row_id",
+                "test_case_id",
+                "tool",
+                "llm_score",
+                "tool_comments",
+                "human_score",
+                "notes",
+            ],
         )
         writer.writeheader()
         for i, s in enumerate(sample):
+            normalized = results.get((s.test_case_id, s.tool)) if results else None
             writer.writerow(
                 {
                     "row_id": f"{i:04d}",
                     "test_case_id": s.test_case_id,
                     "tool": tool_map.get(s.tool, s.tool),
                     "llm_score": s.score,
+                    "tool_comments": _format_comments(normalized),
                     "human_score": "",
                     "notes": "",
                 }
@@ -256,9 +281,21 @@ def export_cmd(run_dir: str, output_path: str | None, sample_rate: float) -> Non
         click.echo("No scores found.")
         return
 
+    # Load normalized results so the CSV includes tool comments for raters.
+    normalized: dict[tuple[str, str], NormalizedResult] = {}
+    for path in resolved.glob("*.yaml"):
+        if path.name == "checkpoint.yaml":
+            continue
+        data = yaml.safe_load(path.read_text()) or {}
+        try:
+            r = NormalizedResult(**data)
+            normalized[(r.test_case_id, r.tool)] = r
+        except Exception:
+            pass
+
     out = Path(output_path) if output_path else resolved / "human_judge" / "sample.csv"
     out.parent.mkdir(exist_ok=True)
-    export_sample(scores, resolved, out, sample_rate)
+    export_sample(scores, resolved, out, sample_rate, results=normalized)
     click.echo(f"Exported {round(len(scores) * sample_rate)} rows → {out}")
     click.echo(f"Tool map → {resolved / 'human_judge' / 'tool_map.yaml'}")
 

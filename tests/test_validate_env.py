@@ -87,6 +87,24 @@ def test_check_env_cases_dir_empty(tmp_path):
     assert any("No case" in w for w in result.warnings)
 
 
+def test_check_env_no_duplicate_anthropic_key_message(tmp_path):
+    """ANTHROPIC_API_KEY is in always-required; should not produce duplicate ok message."""
+    tools = [
+        {
+            "name": "anthropic-api",
+            "type": "agent",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "cooldown_seconds": 0,
+        }
+    ]
+    config = load_eval_config(_make_config(tmp_path, tools=tools))
+    env = {"ANTHROPIC_API_KEY": "sk-ant-x", "GITHUB_TOKEN": "ghp_x"}
+    with patch.dict("os.environ", env, clear=True):
+        result = check_env(config)
+    anthropic_ok = [m for m in result.ok if "ANTHROPIC_API_KEY" in m]
+    assert len(anthropic_ok) == 1, f"Expected 1 ANTHROPIC_API_KEY ok message, got: {anthropic_ok}"
+
+
 def test_validate_env_cli_exits_nonzero_on_failure(tmp_path):
     config_path = _make_config(tmp_path)
     runner = CliRunner()

@@ -114,6 +114,8 @@ def run_claude_cli_docker(
         "docker",
         "run",
         "--rm",
+        "-e",
+        "ANTHROPIC_API_KEY",  # pass through from host environment
         "-v",
         f"{repo_dir.resolve()}:/work",
         "-w",

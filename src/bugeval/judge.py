@@ -105,14 +105,15 @@ def judge_case(
     user_prompt = _build_judge_prompt(case, result)
     votes: list[int] = []
     parse_failures = 0
-    all_valid_judgments: list[list[CommentJudgment]] = []
+    # Parallel lists for successful parses: (score, reasoning, comment_judgments)
+    parsed_votes: list[tuple[int, str, list[CommentJudgment]]] = []
 
     for _ in range(n_votes):
         response = _client.messages.create(
             model=model,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],  # type: ignore[arg-type]
-            max_tokens=1024,
+            max_tokens=2048,
         )
         text = ""
         for block in response.content:
@@ -124,7 +125,9 @@ def judge_case(
             parse_failures += 1
             votes.append(0)
             continue
-        votes.append(int(data.get("score", 0)))
+        vote_score = int(data.get("score", 0))
+        vote_reasoning = str(data.get("reasoning", ""))
+        votes.append(vote_score)
         raw_judgments = data.get("comment_judgments", [])
         parsed: list[CommentJudgment] = []
         for j in raw_judgments:
@@ -138,15 +141,22 @@ def judge_case(
                 )
             except (KeyError, ValueError):
                 pass
-        all_valid_judgments.append(parsed)
+        parsed_votes.append((vote_score, vote_reasoning, parsed))
 
     score = majority_vote(votes)
-    last_judgments = all_valid_judgments[-1] if all_valid_judgments else []
+    # Use the first parsed vote that matches the majority score for reasoning and
+    # comment judgments (consistent: the vote whose score determined the outcome).
+    winning_vote = next((pv for pv in parsed_votes if pv[0] == score), None)
+    last_judgments = winning_vote[2] if winning_vote else []
     tp_count = sum(1 for j in last_judgments if j.classification == CommentClassification.tp)
     total = len(result.comments)
     snr = tp_count / total if total > 0 else 0.0
 
-    reasoning = f"Votes: {votes}. Majority: {score}."
+    reasoning = (
+        winning_vote[1]
+        if winning_vote and winning_vote[1]
+        else f"Votes: {votes}. Majority: {score}."
+    )
     if parse_failures:
         reasoning += f" ({parse_failures}/{n_votes} votes failed to parse.)"
 

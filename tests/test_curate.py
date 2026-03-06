@@ -1,6 +1,7 @@
 """Tests for the curate command: prompt construction, response parsing, CLI."""
 
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -150,6 +151,20 @@ class TestCurateCliHelp:
         assert "--output-dir" in result.output
 
 
+def make_mock_query(response_data: dict[str, object]):
+    """Return an async generator function that yields a single mock AssistantMessage."""
+    text = json.dumps(response_data)
+
+    async def _mock_query(
+        prompt: str, options: object = None
+    ) -> AsyncIterator[MagicMock]:
+        msg = MagicMock()
+        msg.content = [MagicMock(text=text)]
+        yield msg
+
+    return _mock_query
+
+
 class TestCurateDryRun:
     def test_dry_run_does_not_call_api(self, tmp_path: Path) -> None:
         candidates = [make_candidate(1)]
@@ -157,7 +172,7 @@ class TestCurateDryRun:
         save_candidates(candidates, candidates_path)
 
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic") as mock_cls:
+        with patch("bugeval.curate.query") as mock_query:
             result = runner.invoke(
                 curate,
                 [
@@ -169,7 +184,7 @@ class TestCurateDryRun:
                 ],
             )
         assert result.exit_code == 0
-        mock_cls.assert_not_called()
+        mock_query.assert_not_called()
 
     def test_dry_run_prints_candidate_info(self, tmp_path: Path) -> None:
         candidate = make_candidate(42)
@@ -177,7 +192,7 @@ class TestCurateDryRun:
         save_candidates([candidate], candidates_path)
 
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic"):
+        with patch("bugeval.curate.query"):
             result = runner.invoke(
                 curate,
                 [
@@ -192,27 +207,125 @@ class TestCurateDryRun:
         assert "42" in result.output  # PR number
 
 
-class TestCurateWithMockedApi:
-    def _make_mock_client(self, response_data: dict[str, object]) -> MagicMock:
-        mock_response = MagicMock()
-        mock_response.content = [
-            MagicMock(type="thinking", thinking="Analyzing the bug..."),
-            MagicMock(type="text", text=json.dumps(response_data)),
-        ]
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
-        return mock_client
+class TestCurateControls:
+    """Tests for runaway-prevention controls: --limit, --fail-after, checkpoint."""
 
+    def test_limit_caps_candidates(self, tmp_path: Path) -> None:
+        candidates = [make_candidate(i) for i in range(1, 6)]
+        candidates_path = tmp_path / "candidates.yaml"
+        save_candidates(candidates, candidates_path)
+
+        cases_dir = tmp_path / "cases"
+        runner = CliRunner()
+        with patch("bugeval.curate.query", new=make_mock_query(make_llm_response_data())):
+            result = runner.invoke(
+                curate,
+                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
+                 "--api-delay", "0", "--limit", "2"],
+            )
+        assert result.exit_code == 0
+        assert len(list(cases_dir.glob("*.yaml"))) == 2
+
+    def test_fail_after_aborts_on_consecutive_errors(self, tmp_path: Path) -> None:
+        candidates = [make_candidate(i) for i in range(1, 6)]
+        candidates_path = tmp_path / "candidates.yaml"
+        save_candidates(candidates, candidates_path)
+
+        cases_dir = tmp_path / "cases"
+        runner = CliRunner()
+
+        async def always_fail(prompt: str, options: object = None) -> AsyncIterator[MagicMock]:
+            raise RuntimeError("SDK failure")
+            yield  # make it an async generator  # noqa: unreachable
+
+        with patch("bugeval.curate.query", new=always_fail):
+            result = runner.invoke(
+                curate,
+                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
+                 "--api-delay", "0", "--fail-after", "2"],
+            )
+        assert result.exit_code == 0  # exits cleanly, not with exception
+        assert "Aborting" in result.output
+
+    def test_checkpoint_skips_already_done(self, tmp_path: Path) -> None:
+        # Give each candidate a distinct fix_commit so checkpoint filtering works
+        candidates = [
+            make_candidate(i).model_copy(update={"fix_commit": f"{str(i) * 40}"[:40]})
+            for i in range(1, 4)
+        ]
+        candidates_path = tmp_path / "candidates.yaml"
+        save_candidates(candidates, candidates_path)
+
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+
+        # Pre-populate checkpoint with first candidate's commit
+        done_commit = candidates[0].fix_commit
+        checkpoint = cases_dir / ".curate_checkpoint.json"
+        checkpoint.write_text(json.dumps([done_commit]))
+
+        call_count = 0
+
+        async def counting_query(
+            prompt: str, options: object = None
+        ) -> AsyncIterator[MagicMock]:
+            nonlocal call_count
+            call_count += 1
+            msg = MagicMock()
+            msg.content = [MagicMock(text=json.dumps(make_llm_response_data()))]
+            yield msg
+
+        runner = CliRunner()
+        with patch("bugeval.curate.query", new=counting_query):
+            runner.invoke(
+                curate,
+                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
+                 "--api-delay", "0"],
+            )
+        # Only 2 of 3 candidates should have been processed (first was checkpointed)
+        assert call_count == 2
+
+    def test_no_checkpoint_flag_reprocesses_all(self, tmp_path: Path) -> None:
+        candidates = [make_candidate(1)]
+        candidates_path = tmp_path / "candidates.yaml"
+        save_candidates(candidates, candidates_path)
+
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        # Mark the candidate as already done
+        checkpoint = cases_dir / ".curate_checkpoint.json"
+        checkpoint.write_text(json.dumps([candidates[0].fix_commit]))
+
+        call_count = 0
+
+        async def counting_query(
+            prompt: str, options: object = None
+        ) -> AsyncIterator[MagicMock]:
+            nonlocal call_count
+            call_count += 1
+            msg = MagicMock()
+            msg.content = [MagicMock(text=json.dumps(make_llm_response_data()))]
+            yield msg
+
+        runner = CliRunner()
+        with patch("bugeval.curate.query", new=counting_query):
+            runner.invoke(
+                curate,
+                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
+                 "--api-delay", "0", "--no-checkpoint"],
+            )
+        assert call_count == 1  # processed despite checkpoint
+
+
+class TestCurateWithMockedApi:
     def test_curate_writes_case_file(self, tmp_path: Path) -> None:
         candidate = make_candidate(1)
         candidates_path = tmp_path / "candidates.yaml"
         save_candidates([candidate], candidates_path)
 
-        mock_client = self._make_mock_client(make_llm_response_data())
         cases_dir = tmp_path / "cases"
-
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        with patch("bugeval.curate.query", new=make_mock_query(make_llm_response_data())):
             result = runner.invoke(
                 curate,
                 [
@@ -234,11 +347,9 @@ class TestCurateWithMockedApi:
         candidates_path = tmp_path / "candidates.yaml"
         save_candidates([candidate], candidates_path)
 
-        mock_client = self._make_mock_client(make_llm_response_data())
         cases_dir = tmp_path / "cases"
-
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        with patch("bugeval.curate.query", new=make_mock_query(make_llm_response_data())):
             result = runner.invoke(
                 curate,
                 [
@@ -253,31 +364,5 @@ class TestCurateWithMockedApi:
                 ],
             )
         assert result.exit_code == 0
-        # No cases created since confidence is below threshold
         yaml_files = list(cases_dir.glob("*.yaml"))
         assert len(yaml_files) == 0
-
-    def test_api_called_with_correct_model(self, tmp_path: Path) -> None:
-        candidate = make_candidate(1)
-        candidates_path = tmp_path / "candidates.yaml"
-        save_candidates([candidate], candidates_path)
-
-        mock_client = self._make_mock_client(make_llm_response_data())
-        cases_dir = tmp_path / "cases"
-
-        runner = CliRunner()
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
-            runner.invoke(
-                curate,
-                [
-                    "--candidates",
-                    str(candidates_path),
-                    "--output-dir",
-                    str(cases_dir),
-                    "--api-delay",
-                    "0",
-                ],
-            )
-        call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs is not None
-        assert call_kwargs.kwargs["model"] == "claude-opus-4-6"
