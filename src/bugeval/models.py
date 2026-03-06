@@ -71,6 +71,7 @@ class TestCase(BaseModel):
     expected_findings: list[ExpectedFinding]
     stats: CaseStats | None = None
     visibility: Visibility = Visibility.public
+    needs_manual_review: bool = False
 
 
 class Candidate(BaseModel):

@@ -8,6 +8,7 @@ from bugeval.extract_patch import extract_patch
 from bugeval.human_judge import human_judge
 from bugeval.judge import judge
 from bugeval.manage_forks import manage_forks
+from bugeval.merge_cases import merge_cases
 from bugeval.mine_candidates_cmd import mine_candidates
 from bugeval.normalize import normalize
 from bugeval.pipeline import pipeline
@@ -30,6 +31,7 @@ cli.add_command(scrape_benchmark)
 cli.add_command(validate_cases)
 cli.add_command(extract_patch)
 cli.add_command(curate)
+cli.add_command(merge_cases)
 cli.add_command(manage_forks)
 cli.add_command(run_pr_eval)
 cli.add_command(run_api_eval)

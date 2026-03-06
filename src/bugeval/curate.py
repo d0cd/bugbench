@@ -161,6 +161,7 @@ def parse_llm_response(
         description=str(data["description"]),
         expected_findings=findings,
         stats=None,
+        needs_manual_review=bool(data.get("needs_manual_review", False)),
     )
 
 
@@ -294,6 +295,13 @@ def curate_candidate(
     default=False,
     help="Ignore existing checkpoint and re-process all candidates.",
 )
+@click.option(
+    "--shard",
+    default=None,
+    metavar="K/N",
+    help="Process shard K of N (0-indexed). E.g. --shard 0/3 takes every 3rd candidate "
+         "starting at 0. Use a separate --output-dir per shard to avoid ID conflicts.",
+)
 def curate(
     candidates_path: Path,
     repo_dir: Path | None,
@@ -304,11 +312,23 @@ def curate(
     limit: int,
     fail_after: int,
     no_checkpoint: bool,
+    shard: str | None,
 ) -> None:
     """LLM-assisted enrichment of candidates into fully specified test cases."""
     candidates = load_candidates(candidates_path)
     filtered = [c for c in candidates if c.confidence >= min_confidence]
     filtered.sort(key=lambda c: c.confidence, reverse=True)
+
+    # Sharding: process every Nth candidate starting at offset K
+    if shard is not None:
+        try:
+            k, n = (int(x) for x in shard.split("/"))
+            if n < 1 or k < 0 or k >= n:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise click.BadParameter("must be in format K/N, e.g. 0/3", param_hint="--shard")
+        filtered = filtered[k::n]
+        click.echo(f"Shard {k}/{n}: {len(filtered)} candidates.")
 
     # Checkpoint: skip already-processed fix_commits
     checkpoint_path = Path(output_dir) / _CHECKPOINT_FILE

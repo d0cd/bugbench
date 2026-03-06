@@ -133,6 +133,19 @@ class TestParseLlmResponse:
         case = parse_llm_response(data, case_id="bar-003", candidate=candidate)
         assert case.expected_findings == []
 
+    def test_needs_manual_review_saved(self) -> None:
+        candidate = make_candidate()
+        data = {**make_llm_response_data(), "needs_manual_review": True}
+        case = parse_llm_response(data, case_id="bar-005", candidate=candidate)
+        assert case.needs_manual_review is True
+
+    def test_needs_manual_review_defaults_false(self) -> None:
+        candidate = make_candidate()
+        data = make_llm_response_data()  # needs_manual_review: True in fixture
+        data["needs_manual_review"] = False
+        case = parse_llm_response(data, case_id="bar-006", candidate=candidate)
+        assert case.needs_manual_review is False
+
     def test_null_commits_fallback(self) -> None:
         candidate = make_candidate()
         data = make_llm_response_data()  # head_commit: None, base_commit: None
@@ -284,6 +297,39 @@ class TestCurateControls:
             )
         # Only 2 of 3 candidates should have been processed (first was checkpointed)
         assert call_count == 2
+
+    def test_shard_splits_candidates(self, tmp_path: Path) -> None:
+        # 6 candidates; shard 0/3 should process indices 0, 3 → 2 cases
+        candidates = [
+            make_candidate(i).model_copy(update={"fix_commit": f"{str(i) * 40}"[:40]})
+            for i in range(1, 7)
+        ]
+        candidates_path = tmp_path / "candidates.yaml"
+        save_candidates(candidates, candidates_path)
+
+        cases_dir = tmp_path / "cases"
+        runner = CliRunner()
+        with patch("bugeval.curate.query", new=make_mock_query(make_llm_response_data())):
+            result = runner.invoke(
+                curate,
+                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
+                 "--api-delay", "0", "--shard", "0/3"],
+            )
+        assert result.exit_code == 0
+        assert len(list(cases_dir.glob("*.yaml"))) == 2
+
+    def test_shard_invalid_raises_error(self, tmp_path: Path) -> None:
+        candidates = [make_candidate(1)]
+        candidates_path = tmp_path / "candidates.yaml"
+        save_candidates(candidates, candidates_path)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            curate,
+            ["--candidates", str(candidates_path), "--output-dir", str(tmp_path / "cases"),
+             "--shard", "bad"],
+        )
+        assert result.exit_code != 0
 
     def test_no_checkpoint_flag_reprocesses_all(self, tmp_path: Path) -> None:
         candidates = [make_candidate(1)]
