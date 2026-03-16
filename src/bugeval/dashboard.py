@@ -33,6 +33,7 @@ from bugeval.result_models import DxAssessment, NormalizedResult
 # Sidecar review-state helpers
 # ---------------------------------------------------------------------------
 
+
 def _sidecar_path(cases_dir: Path, repo: str) -> Path:
     return cases_dir / repo / ".review_state.json"
 
@@ -68,6 +69,7 @@ def is_reviewed(cases_dir: Path, case_id: str, repo: str) -> bool:
 # Case YAML helpers
 # ---------------------------------------------------------------------------
 
+
 def _find_case_yaml(cases_dir: Path, case_id: str) -> Path | None:
     for path in cases_dir.rglob("*.yaml"):
         if path.stem == case_id:
@@ -102,6 +104,7 @@ def save_case(cases_dir: Path, case: TestCase) -> None:
 # Diff fetching
 # ---------------------------------------------------------------------------
 
+
 def fetch_diff(repo: str, head_commit: str) -> str:
     """Fetch commit diff via gh CLI. Returns diff text or error message."""
     owner_repo = repo if "/" in repo else f"provable-labs/{repo}"
@@ -129,6 +132,7 @@ def fetch_diff(repo: str, head_commit: str) -> str:
 # ---------------------------------------------------------------------------
 # Pipeline progress helpers
 # ---------------------------------------------------------------------------
+
 
 def _run_dirs(results_dir: Path) -> list[Path]:
     if not results_dir.exists():
@@ -165,6 +169,7 @@ def _pipeline_status(run_dir: Path, total_cases: int) -> dict[str, Any]:
 # Score loading helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_scores(run_dir: Path) -> list[JudgeScore]:
     scores_dir = run_dir / "scores"
     scores = []
@@ -196,6 +201,7 @@ def _load_normalized(run_dir: Path) -> dict[tuple[str, str], NormalizedResult]:
 # ---------------------------------------------------------------------------
 # Flask app factory
 # ---------------------------------------------------------------------------
+
 
 def create_app(cases_dir: Path, results_dir: Path) -> Flask:
     template_dir = Path(__file__).parent / "templates"
@@ -318,10 +324,18 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
 
         repos = sorted({c.repo for c in cases})
         filter_query = urlencode(
-            {k: v for k, v in {
-                "repo": f_repo, "category": f_cat, "difficulty": f_diff,
-                "severity": f_sev, "needs_manual_review": f_nmr, "reviewed": f_reviewed,
-            }.items() if v}
+            {
+                k: v
+                for k, v in {
+                    "repo": f_repo,
+                    "category": f_cat,
+                    "difficulty": f_diff,
+                    "severity": f_sev,
+                    "needs_manual_review": f_nmr,
+                    "reviewed": f_reviewed,
+                }.items()
+                if v
+            }
         )
         return render_template(
             "case_list.html",
@@ -665,6 +679,7 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
 # Private helpers
 # ---------------------------------------------------------------------------
 
+
 def _count_field(cases: list[TestCase], field: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for c in cases:
@@ -731,6 +746,7 @@ def _compute_dx_summary(
 # ---------------------------------------------------------------------------
 # CLI command
 # ---------------------------------------------------------------------------
+
 
 @click.command("dashboard")
 @click.option("--port", default=5000, show_default=True, help="Port to listen on")

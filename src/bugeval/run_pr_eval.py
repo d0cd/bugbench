@@ -11,7 +11,7 @@ from typing import Any
 
 import click
 
-from bugeval.io import load_all_cases
+from bugeval.io import load_all_cases, write_run_metadata
 from bugeval.manage_forks import fork_name
 from bugeval.models import TestCase
 from bugeval.pr_eval_models import (
@@ -268,6 +268,16 @@ def run_pr_eval(
         if not pr_tools:
             click.echo(f"No PR tools matched: {tools_filter}", err=True)
             sys.exit(1)
+
+    write_run_metadata(
+        resolved_run_dir,
+        [t.name for t in pr_tools],
+        "pr",
+        Path(cases_dir),
+        limit=limit,
+        patches_dir=Path(patches_dir),
+        config_path=config_path,
+    )
 
     resolved_repo_dir = Path(repo_dir) if repo_dir else None
     resolved_patches_dir = Path(patches_dir)

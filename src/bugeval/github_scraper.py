@@ -112,18 +112,27 @@ def fetch_fix_prs(repo: str, limit: int = 200, since: str | None = None) -> list
 
     # If we hit the limit exactly, try fetching older page via date windowing
     if len(collected) == limit and since:
-        oldest = min(
-            (pr.get("closedAt") or pr.get("mergedAt") or "") for pr in collected if pr
-        ) if collected else ""
+        oldest = (
+            min((pr.get("closedAt") or pr.get("mergedAt") or "") for pr in collected if pr)
+            if collected
+            else ""
+        )
         if oldest:
             try:
                 args2 = [
-                    "pr", "list", "--repo", repo, "--state", "merged",
+                    "pr",
+                    "list",
+                    "--repo",
+                    repo,
+                    "--state",
+                    "merged",
                     "--json",
                     "number,title,body,labels,mergeCommit,baseRefName,headRefName,files,"
                     "additions,deletions,changedFiles",
-                    "--limit", str(limit),
-                    "--search", f"created:>{since} created:<{oldest[:10]}",
+                    "--limit",
+                    str(limit),
+                    "--search",
+                    f"created:>{since} created:<{oldest[:10]}",
                 ]
                 output2 = run_gh(*args2)
                 page2: list[dict[str, Any]] = json.loads(output2)
@@ -189,11 +198,13 @@ def _batch_fetch_pr_reviews_graphql(
         items: list[dict[str, Any]] = []
 
         for review in (pr_data.get("reviews") or {}).get("nodes") or []:
-            items.append({
-                "body": review.get("body") or "",
-                "state": review.get("state") or "",
-                "_source": "review",
-            })
+            items.append(
+                {
+                    "body": review.get("body") or "",
+                    "state": review.get("state") or "",
+                    "_source": "review",
+                }
+            )
 
         for thread in (pr_data.get("reviewThreads") or {}).get("nodes") or []:
             for comment in (thread.get("comments") or {}).get("nodes") or []:
@@ -207,9 +218,7 @@ def _batch_fetch_pr_reviews_graphql(
     return result
 
 
-def enrich_with_reviews(
-    repo: str, candidates: list[Candidate], top_n: int = 50
-) -> list[Candidate]:
+def enrich_with_reviews(repo: str, candidates: list[Candidate], top_n: int = 50) -> list[Candidate]:
     """Batch-fetch reviewer comments for the top_n candidates via a single GraphQL query.
 
     Uses GitHub's GraphQL API to retrieve reviews, inline review thread comments,
@@ -441,7 +450,6 @@ def score_candidate(issue: dict[str, Any], pr: dict[str, Any]) -> tuple[float, l
         confidence += 0.2
         signals.append("has_linked_issue")
 
-
     return min(confidence, 1.0), signals
 
 
@@ -596,12 +604,19 @@ def fetch_prs_by_label(
     for label in labels:
         try:
             args = [
-                "pr", "list", "--repo", repo, "--state", "merged",
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "merged",
                 "--json",
                 "number,title,body,labels,mergeCommit,baseRefName,headRefName,"
                 "files,additions,deletions,changedFiles",
-                "--label", label,
-                "--limit", str(limit),
+                "--label",
+                label,
+                "--limit",
+                str(limit),
             ]
             if since:
                 args.extend(["--search", f"created:>{since}"])
@@ -772,7 +787,8 @@ def enrich_git_candidates_with_github(
             raw = run_gh(
                 "api",
                 f"repos/{owner}/{name}/commits/{sha}/pulls",
-                "--header", "Accept: application/vnd.github.v3+json",
+                "--header",
+                "Accept: application/vnd.github.v3+json",
             )
             prs: list[dict[str, Any]] = json.loads(raw)
         except (GhError, json.JSONDecodeError):
@@ -792,8 +808,13 @@ def enrich_git_candidates_with_github(
         # Fetch richer PR detail (labels, body, additions, deletions, files)
         try:
             detail_raw = run_gh(
-                "pr", "view", str(pr_number), "--repo", repo,
-                "--json", "number,title,body,labels,additions,deletions,files",
+                "pr",
+                "view",
+                str(pr_number),
+                "--repo",
+                repo,
+                "--json",
+                "number,title,body,labels,additions,deletions,files",
             )
             detail: dict[str, Any] = json.loads(detail_raw)
         except (GhError, json.JSONDecodeError):
@@ -801,9 +822,7 @@ def enrich_git_candidates_with_github(
             continue
 
         labels = [str(lbl.get("name", "")) for lbl in (detail.get("labels") or [])]
-        has_bug_label = any(
-            "bug" in lbl.lower() or "fix" in lbl.lower() for lbl in labels
-        )
+        has_bug_label = any("bug" in lbl.lower() or "fix" in lbl.lower() for lbl in labels)
 
         # Update signals and confidence
         new_signals = list(candidate.signals)

@@ -227,8 +227,16 @@ class TestCurateControls:
         with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
-                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
-                 "--api-delay", "0", "--limit", "2"],
+                [
+                    "--candidates",
+                    str(candidates_path),
+                    "--output-dir",
+                    str(cases_dir),
+                    "--api-delay",
+                    "0",
+                    "--limit",
+                    "2",
+                ],
             )
         assert result.exit_code == 0
         assert len(list(cases_dir.glob("*.yaml"))) == 2
@@ -249,8 +257,16 @@ class TestCurateControls:
         with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
-                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
-                 "--api-delay", "0", "--fail-after", "2"],
+                [
+                    "--candidates",
+                    str(candidates_path),
+                    "--output-dir",
+                    str(cases_dir),
+                    "--api-delay",
+                    "0",
+                    "--fail-after",
+                    "2",
+                ],
             )
         assert result.exit_code == 0  # exits cleanly, not with exception
         assert "Aborting" in result.output
@@ -277,8 +293,14 @@ class TestCurateControls:
         with patch("subprocess.run", return_value=mock_sub) as mock_run:
             runner.invoke(
                 curate,
-                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
-                 "--api-delay", "0"],
+                [
+                    "--candidates",
+                    str(candidates_path),
+                    "--output-dir",
+                    str(cases_dir),
+                    "--api-delay",
+                    "0",
+                ],
             )
         # Only 2 of 3 candidates should have been processed (first was checkpointed)
         assert mock_run.call_count == 2
@@ -298,8 +320,16 @@ class TestCurateControls:
         with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
-                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
-                 "--api-delay", "0", "--shard", "0/3"],
+                [
+                    "--candidates",
+                    str(candidates_path),
+                    "--output-dir",
+                    str(cases_dir),
+                    "--api-delay",
+                    "0",
+                    "--shard",
+                    "0/3",
+                ],
             )
         assert result.exit_code == 0
         assert len(list(cases_dir.glob("*.yaml"))) == 2
@@ -312,8 +342,14 @@ class TestCurateControls:
         runner = CliRunner()
         result = runner.invoke(
             curate,
-            ["--candidates", str(candidates_path), "--output-dir", str(tmp_path / "cases"),
-             "--shard", "bad"],
+            [
+                "--candidates",
+                str(candidates_path),
+                "--output-dir",
+                str(tmp_path / "cases"),
+                "--shard",
+                "bad",
+            ],
         )
         assert result.exit_code != 0
 
@@ -333,8 +369,15 @@ class TestCurateControls:
         with patch("subprocess.run", return_value=mock_sub) as mock_run:
             runner.invoke(
                 curate,
-                ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
-                 "--api-delay", "0", "--no-checkpoint"],
+                [
+                    "--candidates",
+                    str(candidates_path),
+                    "--output-dir",
+                    str(cases_dir),
+                    "--api-delay",
+                    "0",
+                    "--no-checkpoint",
+                ],
             )
         assert mock_run.call_count == 1  # processed despite checkpoint
 

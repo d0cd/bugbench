@@ -208,7 +208,11 @@ def compute_kappa_report(run_dir: Path) -> dict[str, Any]:
     threshold = default_judging().calibration_threshold
     if not scores_dir.exists() or not hj_dir.exists():
         return {
-            "kappa": 0.0, "n_pairs": 0, "threshold": threshold, "calibrated": False, "pairs": []
+            "kappa": 0.0,
+            "n_pairs": 0,
+            "threshold": threshold,
+            "calibrated": False,
+            "pairs": [],
         }
 
     llm_lookup: dict[tuple[str, str], int] = {}

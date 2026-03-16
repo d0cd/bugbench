@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import subprocess
 import sys
@@ -22,7 +21,9 @@ from bugeval.agent_cli_runner import (
 )
 from bugeval.agent_models import AgentResult
 from bugeval.agent_prompts import build_user_prompt, load_agent_prompt
+from bugeval.agent_sdk_runner import run_agent_sdk
 from bugeval.google_api_runner import run_google_api
+from bugeval.io import write_run_metadata
 from bugeval.models import TestCase
 from bugeval.openai_api_runner import run_openai_api
 from bugeval.pr_eval_models import (
@@ -143,6 +144,17 @@ def process_case_agent(
                 model=agent_model,
                 context_level=context_level,
             )
+        elif tool.name.startswith("claude-agent-sdk"):
+            agent_model = tool.model or "claude-sonnet-4-6"
+            result = asyncio.run(
+                run_agent_sdk(
+                    repo_dir,
+                    system_prompt,
+                    user_prompt,
+                    max_turns=max_turns,
+                    model=agent_model,
+                )
+            )
         else:
             raise ValueError(f"Unknown agent tool: {tool.name!r}")
 
@@ -251,46 +263,6 @@ async def _eval_agent_tool(
         if tool.cooldown_seconds > 0 and not dry_run:
             await asyncio.sleep(tool.cooldown_seconds)
 
-
-def _write_run_metadata(
-    run_dir: Path,
-    config_path: str,
-    context_level: str,
-    agent_tools: list[ToolDef],
-) -> None:
-    """Write run_metadata.json for reproducibility tracing."""
-    git_sha = ""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        git_sha = result.stdout.strip() if result.returncode == 0 else ""
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    config_content = Path(config_path).read_bytes()
-    config_hash = "sha256:" + hashlib.sha256(config_content).hexdigest()
-
-    agent_prompt_hash = ""
-    agent_prompt_path = Path("config") / "agent_prompt.md"
-    if agent_prompt_path.exists():
-        agent_prompt_hash = "sha256:" + hashlib.sha256(agent_prompt_path.read_bytes()).hexdigest()
-
-    import sys as _sys
-
-    metadata = {
-        "created_at": datetime.now(tz=UTC).isoformat(),
-        "git_sha": git_sha,
-        "config_hash": config_hash,
-        "context_level": context_level,
-        "tools": [t.name for t in agent_tools],
-        "agent_prompt_hash": agent_prompt_hash,
-        "python_version": _sys.version.split()[0],
-    }
-    (run_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
 @click.command("run-agent-eval")
@@ -429,7 +401,15 @@ def run_agent_eval(
             sys.exit(1)
 
     # Write run_metadata.json for reproducibility tracing.
-    _write_run_metadata(resolved_run_dir, config_path, context_level, agent_tools)
+    write_run_metadata(
+        resolved_run_dir,
+        [t.name for t in agent_tools],
+        context_level,
+        Path(cases_dir),
+        limit=limit,
+        patches_dir=Path(patches_dir),
+        config_path=config_path,
+    )
 
     resolved_patches_dir = Path(patches_dir)
     concurrency = max_concurrent if max_concurrent is not None else config.max_concurrent

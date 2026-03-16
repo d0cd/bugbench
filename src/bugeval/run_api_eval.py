@@ -14,6 +14,7 @@ from typing import Any
 import click
 
 from bugeval.adapters import get_adapter
+from bugeval.io import write_run_metadata
 from bugeval.models import TestCase
 from bugeval.pr_eval_models import (
     CaseToolState,
@@ -238,6 +239,16 @@ def run_api_eval(
         if not api_tools:
             click.echo(f"No API tools matched: {tools_filter}", err=True)
             sys.exit(1)
+
+    write_run_metadata(
+        resolved_run_dir,
+        [t.name for t in api_tools],
+        context_level,
+        Path(cases_dir),
+        limit=limit,
+        patches_dir=Path(patches_dir),
+        config_path=config_path,
+    )
 
     resolved_patches_dir = Path(patches_dir)
     concurrency = max_concurrent if max_concurrent is not None else config.max_concurrent

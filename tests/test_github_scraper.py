@@ -433,19 +433,21 @@ class TestBatchFetchPrReviewsGraphql:
         assert result == {}
 
     def test_parses_review_bodies(self) -> None:
-        graphql_response = json.dumps({
-            "data": {
-                "repository": {
-                    "pr_42": {
-                        "reviews": {"nodes": [
-                            {"body": "This is wrong", "state": "CHANGES_REQUESTED"}
-                        ]},
-                        "reviewThreads": {"nodes": []},
-                        "comments": {"nodes": []},
+        graphql_response = json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "pr_42": {
+                            "reviews": {
+                                "nodes": [{"body": "This is wrong", "state": "CHANGES_REQUESTED"}]
+                            },
+                            "reviewThreads": {"nodes": []},
+                            "comments": {"nodes": []},
+                        }
                     }
                 }
             }
-        })
+        )
         with patch("bugeval.github_scraper.run_gh", return_value=graphql_response):
             result = _batch_fetch_pr_reviews_graphql("owner", "repo", [42])
         assert 42 in result
@@ -527,9 +529,7 @@ class TestBuildLabeledPrCandidates:
 
     def test_base_confidence_is_0_4(self) -> None:
         # Large diff (no small_diff bonus), generic title, no issue ref → only base 0.4
-        pr = self._make_labeled_pr(
-            title="chore: cleanup", additions=300, deletions=300, body=""
-        )
+        pr = self._make_labeled_pr(title="chore: cleanup", additions=300, deletions=300, body="")
         result = build_labeled_pr_candidates("owner/repo", [pr], existing_pr_numbers=set())
         assert len(result) == 1
         assert result[0].confidence == 0.4
@@ -608,15 +608,17 @@ class TestEnrichGitCandidatesWithGithub:
     def test_enriches_with_pr_metadata(self) -> None:
         candidate = make_git_candidate()
         api_response = json.dumps([{"number": 42}])
-        pr_detail = json.dumps({
-            "number": 42,
-            "title": "Fix: integer overflow in BLS12 field",
-            "body": "Fixes #101 — overflow in field arithmetic",
-            "labels": [{"name": "bug"}],
-            "additions": 10,
-            "deletions": 4,
-            "files": [{"path": "src/field.rs"}],
-        })
+        pr_detail = json.dumps(
+            {
+                "number": 42,
+                "title": "Fix: integer overflow in BLS12 field",
+                "body": "Fixes #101 — overflow in field arithmetic",
+                "labels": [{"name": "bug"}],
+                "additions": 10,
+                "deletions": 4,
+                "files": [{"path": "src/field.rs"}],
+            }
+        )
         side_effects = [api_response, pr_detail, GhError([], "")]
         with patch("bugeval.github_scraper.run_gh", side_effect=side_effects):
             result = enrich_git_candidates_with_github("ProvableHQ/snarkVM", [candidate])
@@ -644,10 +646,13 @@ class TestEnrichGitCandidatesWithGithub:
         assert result[0].pr_number == candidate.pr_number
 
     def test_respects_top_n_limit(self) -> None:
-        candidates = [make_git_candidate(fix_commit=c * 40, confidence=0.5 + i * 0.1)
-                      for i, c in enumerate("abcde")]
+        candidates = [
+            make_git_candidate(fix_commit=c * 40, confidence=0.5 + i * 0.1)
+            for i, c in enumerate("abcde")
+        ]
         # top_n=2: only first 2 should be enriched; rest passed through
         call_count = 0
+
         def mock_gh(*args: str) -> str:
             nonlocal call_count
             call_count += 1
@@ -662,15 +667,17 @@ class TestEnrichGitCandidatesWithGithub:
     def test_no_bug_label_does_not_boost_confidence(self) -> None:
         candidate = make_git_candidate()
         api_response = json.dumps([{"number": 7}])
-        pr_detail = json.dumps({
-            "number": 7,
-            "title": "refactor: clean up imports",
-            "body": "",
-            "labels": [{"name": "cleanup"}],
-            "additions": 5,
-            "deletions": 3,
-            "files": [{"path": "src/lib.rs"}],
-        })
+        pr_detail = json.dumps(
+            {
+                "number": 7,
+                "title": "refactor: clean up imports",
+                "body": "",
+                "labels": [{"name": "cleanup"}],
+                "additions": 5,
+                "deletions": 3,
+                "files": [{"path": "src/lib.rs"}],
+            }
+        )
         side_effects = [api_response, pr_detail, GhError([], "")]
         with patch("bugeval.github_scraper.run_gh", side_effect=side_effects):
             result = enrich_git_candidates_with_github("ProvableHQ/snarkVM", [candidate])

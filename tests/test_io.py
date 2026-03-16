@@ -1,10 +1,18 @@
 """Tests for YAML I/O round-trips."""
 
+import json
 from pathlib import Path
 
 import pytest
 
-from bugeval.io import load_all_cases, load_candidates, load_case, save_candidates, save_case
+from bugeval.io import (
+    load_all_cases,
+    load_candidates,
+    load_case,
+    save_candidates,
+    save_case,
+    write_run_metadata,
+)
 from bugeval.models import (
     Candidate,
     CaseStats,
@@ -120,3 +128,55 @@ class TestLoadAllCases:
         cases_dir.mkdir()
         loaded = load_all_cases(cases_dir)
         assert loaded == []
+
+
+class TestWriteRunMetadata:
+    def test_creates_metadata_file(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        write_run_metadata(tmp_path, ["tool-a"], "diff-only", cases_dir)
+        assert (tmp_path / "run_metadata.json").exists()
+
+    def test_contains_required_fields(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        write_run_metadata(tmp_path, ["tool-a", "tool-b"], "diff+repo", cases_dir, limit=5)
+        data = json.loads((tmp_path / "run_metadata.json").read_text())
+        assert data["tools"] == ["tool-a", "tool-b"]
+        assert data["context_level"] == "diff+repo"
+        assert data["cases_dir"] == str(cases_dir)
+        assert data["limit"] == 5
+        assert "git_sha" in data
+        assert "created_at" in data
+
+    def test_dataset_commit_is_hex_or_empty(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        write_run_metadata(tmp_path, ["tool-a"], "diff-only", cases_dir)
+        data = json.loads((tmp_path / "run_metadata.json").read_text())
+        dc = data["dataset_commit"]
+        assert dc == "" or (len(dc) == 40 and all(c in "0123456789abcdef" for c in dc))
+
+    def test_total_cases_matches_case_count(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        save_case(make_test_case("case-001"), cases_dir / "case-001.yaml")
+        save_case(make_test_case("case-002"), cases_dir / "case-002.yaml")
+        write_run_metadata(tmp_path, ["tool-a"], "diff-only", cases_dir)
+        data = json.loads((tmp_path / "run_metadata.json").read_text())
+        assert data["total_cases"] == 2
+
+    def test_patches_dir_stored(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        patches_dir = tmp_path / "patches"
+        write_run_metadata(tmp_path, ["tool-a"], "diff-only", cases_dir, patches_dir=patches_dir)
+        data = json.loads((tmp_path / "run_metadata.json").read_text())
+        assert data["patches_dir"] == str(patches_dir)
+
+    def test_limit_zero_by_default(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        write_run_metadata(tmp_path, ["tool-a"], "diff-only", cases_dir)
+        data = json.loads((tmp_path / "run_metadata.json").read_text())
+        assert data["limit"] == 0

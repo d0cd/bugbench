@@ -95,16 +95,18 @@ class TestMergeCasesBasic:
         assert not out.exists()
         assert "[dry-run]" in result.output
 
-
     def test_deduplicates_within_same_dir(self, tmp_path: Path) -> None:
         """Two files in the same shard dir with the same fix_commit → one output case."""
         same_commit = "e" * 40
         d = tmp_path / "shard0"
         # Manually write two files with different IDs but identical fix_commit
-        populate_dir(d, [
-            make_case("bar-001", fix_commit=same_commit),
-            make_case("bar-002", fix_commit=same_commit),
-        ])
+        populate_dir(
+            d,
+            [
+                make_case("bar-001", fix_commit=same_commit),
+                make_case("bar-002", fix_commit=same_commit),
+            ],
+        )
 
         out = tmp_path / "merged"
         runner = CliRunner()
@@ -118,24 +120,25 @@ class TestMergeCasesBasic:
         same_commit = "d" * 40
         for i in range(3):
             d = tmp_path / f"shard{i}"
-            populate_dir(d, [make_case(f"bar-00{i+1}", fix_commit=same_commit)])
+            populate_dir(d, [make_case(f"bar-00{i + 1}", fix_commit=same_commit)])
 
         out = tmp_path / "merged"
         runner = CliRunner()
-        result = runner.invoke(
-            merge_cases, ["-i", str(tmp_path / "shard*"), "-o", str(out)]
-        )
+        result = runner.invoke(merge_cases, ["-i", str(tmp_path / "shard*"), "-o", str(out)])
         assert result.exit_code == 0
         assert len(list(out.glob("*.yaml"))) == 1
         assert "2 duplicates skipped" in result.output
 
     def test_multiple_repos_numbered_independently(self, tmp_path: Path) -> None:
         d = tmp_path / "mixed"
-        populate_dir(d, [
-            make_case("foo-001", repo="org/foo", fix_commit="a" * 40),
-            make_case("bar-001", repo="org/bar", fix_commit="b" * 40),
-            make_case("foo-002", repo="org/foo", fix_commit="c" * 40),
-        ])
+        populate_dir(
+            d,
+            [
+                make_case("foo-001", repo="org/foo", fix_commit="a" * 40),
+                make_case("bar-001", repo="org/bar", fix_commit="b" * 40),
+                make_case("foo-002", repo="org/foo", fix_commit="c" * 40),
+            ],
+        )
         out = tmp_path / "merged"
         runner = CliRunner()
         runner.invoke(merge_cases, ["-i", str(d), "-o", str(out)])
@@ -211,12 +214,10 @@ class TestMergeCasesSafety:
     def test_glob_pattern_expands_dirs(self, tmp_path: Path) -> None:
         for i in range(3):
             d = tmp_path / f"shard{i}"
-            populate_dir(d, [make_case(f"bar-00{i+1}", fix_commit=str(i) * 40)])
+            populate_dir(d, [make_case(f"bar-00{i + 1}", fix_commit=str(i) * 40)])
 
         out = tmp_path / "merged"
         runner = CliRunner()
-        result = runner.invoke(
-            merge_cases, ["-i", str(tmp_path / "shard*"), "-o", str(out)]
-        )
+        result = runner.invoke(merge_cases, ["-i", str(tmp_path / "shard*"), "-o", str(out)])
         assert result.exit_code == 0
         assert len(list(out.glob("*.yaml"))) == 3

@@ -222,17 +222,17 @@ class TestFetchByLabelFlag:
         with (
             patch("bugeval.scrape_github_cmd.fetch_bug_issues", return_value=[]),
             patch("bugeval.scrape_github_cmd.fetch_fix_prs", return_value=[]),
-            patch(
-                "bugeval.scrape_github_cmd.fetch_prs_by_label", return_value=[]
-            ) as mock_label,
+            patch("bugeval.scrape_github_cmd.fetch_prs_by_label", return_value=[]) as mock_label,
         ):
             result = runner.invoke(
                 scrape_github,
                 [
-                    "--repo", "foo/bar",
+                    "--repo",
+                    "foo/bar",
                     "--fetch-by-label",
                     "--dry-run",
-                    "--output-dir", str(tmp_path),
+                    "--output-dir",
+                    str(tmp_path),
                 ],
             )
 
@@ -246,16 +246,16 @@ class TestFetchByLabelFlag:
         with (
             patch("bugeval.scrape_github_cmd.fetch_bug_issues", return_value=[]),
             patch("bugeval.scrape_github_cmd.fetch_fix_prs", return_value=[]),
-            patch(
-                "bugeval.scrape_github_cmd.fetch_prs_by_label", return_value=[]
-            ) as mock_label,
+            patch("bugeval.scrape_github_cmd.fetch_prs_by_label", return_value=[]) as mock_label,
         ):
             runner.invoke(
                 scrape_github,
                 [
-                    "--repo", "foo/bar",
+                    "--repo",
+                    "foo/bar",
                     "--dry-run",
-                    "--output-dir", str(tmp_path),
+                    "--output-dir",
+                    str(tmp_path),
                 ],
             )
 
@@ -307,11 +307,14 @@ class TestFetchByLabelFlag:
             result = runner.invoke(
                 scrape_github,
                 [
-                    "--repo", "foo/bar",
+                    "--repo",
+                    "foo/bar",
                     "--fetch-by-label",
-                    "--min-confidence", "0.0",
+                    "--min-confidence",
+                    "0.0",
                     "--dry-run",
-                    "--output-dir", str(tmp_path),
+                    "--output-dir",
+                    str(tmp_path),
                 ],
             )
 
@@ -349,7 +352,7 @@ class TestScrapeBenchmarkCommand:
             "bugeval.scrape_github_cmd.run_gh",
             side_effect=[
                 json.dumps([fork_pr]),  # fork PR list for first fork
-                json.dumps([]),          # title search in original repo
+                json.dumps([]),  # title search in original repo
                 # remaining forks raise GhError → skipped
                 *([GhErr(["gh"], "not found")] * 10),
             ],

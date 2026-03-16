@@ -283,7 +283,7 @@ def curate_candidate(
     default=None,
     metavar="K/N",
     help="Process shard K of N (0-indexed). E.g. --shard 0/3 takes every 3rd candidate "
-         "starting at 0. Use a separate --output-dir per shard to avoid ID conflicts.",
+    "starting at 0. Use a separate --output-dir per shard to avoid ID conflicts.",
 )
 def curate(
     candidates_path: Path,
@@ -359,8 +359,7 @@ def curate(
             diff_context, git_log = get_git_context(candidate, repo_dir)
 
         click.echo(
-            f"  [{i + 1}/{len(filtered)}] PR #{candidate.pr_number}: "
-            f"{candidate.title[:50]}..."
+            f"  [{i + 1}/{len(filtered)}] PR #{candidate.pr_number}: {candidate.title[:50]}..."
         )
 
         try:

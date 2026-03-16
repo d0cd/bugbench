@@ -337,11 +337,16 @@ def test_run_pr_eval_limit_slices_cases(tmp_path: Path) -> None:
     result = runner.invoke(
         run_pr_eval,
         [
-            "--config", str(config_path),
-            "--cases-dir", str(cases_dir),
-            "--patches-dir", str(patches_dir),
-            "--run-dir", str(run_dir),
-            "--limit", "2",
+            "--config",
+            str(config_path),
+            "--cases-dir",
+            str(cases_dir),
+            "--patches-dir",
+            str(patches_dir),
+            "--run-dir",
+            str(run_dir),
+            "--limit",
+            "2",
             "--dry-run",
         ],
     )
@@ -366,11 +371,16 @@ def test_run_pr_eval_fail_after_aborts(tmp_path: Path) -> None:
     result = runner.invoke(
         run_pr_eval,
         [
-            "--config", str(config_path),
-            "--cases-dir", str(cases_dir),
-            "--patches-dir", str(patches_dir),
-            "--run-dir", str(run_dir),
-            "--fail-after", "2",
+            "--config",
+            str(config_path),
+            "--cases-dir",
+            str(cases_dir),
+            "--patches-dir",
+            str(patches_dir),
+            "--run-dir",
+            str(run_dir),
+            "--fail-after",
+            "2",
         ],
     )
     assert result.exit_code == 0

@@ -164,9 +164,7 @@ def scrape_github(
         click.echo(f"\n--- Dry run: {len(filtered)} candidates for {repo} ---")
         for c in filtered:
             rev_flag = " [reviewer]" if c.reviewer_notes else ""
-            click.echo(
-                f"  PR #{c.pr_number} | conf={c.confidence:.2f}{rev_flag} | {c.title[:60]}"
-            )
+            click.echo(f"  PR #{c.pr_number} | conf={c.confidence:.2f}{rev_flag} | {c.title[:60]}")
         return
 
     # 8. Write candidates file
@@ -210,10 +208,18 @@ def scrape_benchmark(output_dir: str, dry_run: bool) -> None:
         click.echo(f"Fetching benchmark bugs from {fork_repo}...")
         try:
             args: list[str] = [
-                "pr", "list", "--repo", fork_repo, "--state", "all",
-                "--json", "number,title,body,additions,deletions,files,mergeCommit,labels",
-                "--limit", "12",
-                "--search", "created:>2025-01-01 -author:app/dependabot",
+                "pr",
+                "list",
+                "--repo",
+                fork_repo,
+                "--state",
+                "all",
+                "--json",
+                "number,title,body,additions,deletions,files,mergeCommit,labels",
+                "--limit",
+                "12",
+                "--search",
+                "created:>2025-01-01 -author:app/dependabot",
             ]
             output = run_gh(*args)
             fork_prs: list[dict[str, Any]] = json.loads(output)
@@ -223,7 +229,8 @@ def scrape_benchmark(output_dir: str, dry_run: bool) -> None:
 
         # Filter to likely benchmark PRs (not Bump/sync/chore deps)
         bug_prs = [
-            pr for pr in fork_prs
+            pr
+            for pr in fork_prs
             if not any(
                 kw in (pr.get("title") or "").lower()
                 for kw in ("bump", "chore(deps", "sync", "dependabot")
@@ -243,10 +250,18 @@ def scrape_benchmark(output_dir: str, dry_run: bool) -> None:
             fix_commit = ""
             try:
                 search_args: list[str] = [
-                    "pr", "list", "--repo", original_repo, "--state", "merged",
-                    "--json", "number,mergeCommit",
-                    "--search", title[:60],
-                    "--limit", "3",
+                    "pr",
+                    "list",
+                    "--repo",
+                    original_repo,
+                    "--state",
+                    "merged",
+                    "--json",
+                    "number,mergeCommit",
+                    "--search",
+                    title[:60],
+                    "--limit",
+                    "3",
                 ]
                 search_out = run_gh(*search_args)
                 matches: list[dict[str, Any]] = json.loads(search_out)

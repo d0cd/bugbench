@@ -483,6 +483,7 @@ def test_case_list_page_2_no_error(client) -> None:
 def test_case_list_pagination_shown_with_many_cases(client, cases_dir: Path) -> None:
     """Pagination controls appear when cases exceed per_page (50)."""
     from unittest.mock import patch as mock_patch
+
     many = [_make_case(f"leo-{i:03d}") for i in range(51)]
     with mock_patch("bugeval.dashboard.load_all_cases", return_value=many):
         resp = client.get("/cases")
@@ -493,6 +494,7 @@ def test_case_list_pagination_shown_with_many_cases(client, cases_dir: Path) -> 
 def test_case_list_pagination_next_link_no_page_duplication(client, cases_dir: Path) -> None:
     """Pagination next-page link must not duplicate the page= parameter."""
     from unittest.mock import patch as mock_patch
+
     many = [_make_case(f"leo-{i:03d}") for i in range(51)]
     with mock_patch("bugeval.dashboard.load_all_cases", return_value=many):
         resp = client.get("/cases?sort=id")
@@ -500,6 +502,7 @@ def test_case_list_pagination_next_link_no_page_duplication(client, cases_dir: P
     body = resp.data.decode()
     # The next-page link should contain page=2 exactly once
     import re
+
     next_href = re.search(r'href="([^"]*page=2[^"]*)"', body)
     assert next_href is not None
     assert next_href.group(1).count("page=") == 1
@@ -605,8 +608,12 @@ def test_index_shows_pipeline_run(client, results_dir: Path) -> None:
     checkpoint = {"leo-001::greptile": {"case_id": "leo-001", "tool": "greptile", "status": "done"}}
     (run_dir / "checkpoint.yaml").write_text(yaml.safe_dump(checkpoint, sort_keys=False))
     nr = {
-        "test_case_id": "leo-001", "tool": "greptile", "context_level": "diff-only",
-        "comments": [], "metadata": {"tokens": 0, "cost_usd": 0.0, "time_seconds": 0.0}, "dx": None,
+        "test_case_id": "leo-001",
+        "tool": "greptile",
+        "context_level": "diff-only",
+        "comments": [],
+        "metadata": {"tokens": 0, "cost_usd": 0.0, "time_seconds": 0.0},
+        "dx": None,
     }
     (run_dir / "leo-001--greptile.yaml").write_text(yaml.safe_dump(nr, sort_keys=False))
 
@@ -620,8 +627,12 @@ def test_index_pipeline_status_normalize_count(client, results_dir: Path) -> Non
     run_dir = results_dir / "run-2026-03-07"
     run_dir.mkdir()
     nr = {
-        "test_case_id": "leo-001", "tool": "greptile", "context_level": "diff-only",
-        "comments": [], "metadata": {"tokens": 0, "cost_usd": 0.0, "time_seconds": 0.0}, "dx": None,
+        "test_case_id": "leo-001",
+        "tool": "greptile",
+        "context_level": "diff-only",
+        "comments": [],
+        "metadata": {"tokens": 0, "cost_usd": 0.0, "time_seconds": 0.0},
+        "dx": None,
     }
     (run_dir / "leo-001--greptile.yaml").write_text(yaml.safe_dump(nr, sort_keys=False))
 

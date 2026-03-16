@@ -45,7 +45,7 @@ def _max_index(repo: str, output_dir: Path) -> int:
     max_index = 0
     for f in output_dir.glob(f"{prefix}*.yaml"):
         try:
-            max_index = max(max_index, int(f.stem[len(prefix):]))
+            max_index = max(max_index, int(f.stem[len(prefix) :]))
         except ValueError:
             pass
     return max_index
@@ -53,13 +53,15 @@ def _max_index(repo: str, output_dir: Path) -> int:
 
 @click.command("merge-cases")
 @click.option(
-    "--input-dirs", "-i",
+    "--input-dirs",
+    "-i",
     multiple=True,
     required=True,
     help="Input directories to merge. Glob patterns accepted, e.g. 'cases/leo-*'.",
 )
 @click.option(
-    "--output-dir", "-o",
+    "--output-dir",
+    "-o",
     required=True,
     type=click.Path(file_okay=False, path_type=Path),
     help="Directory to write merged cases into.",
@@ -100,9 +102,7 @@ def merge_cases(
     # 2. Safety: refuse non-empty output unless --force or --dry-run
     existing_cases: list[Path] = []
     if output_dir.exists():
-        existing_cases = [
-            f for f in output_dir.glob("*.yaml") if "checkpoint" not in f.name
-        ]
+        existing_cases = [f for f in output_dir.glob("*.yaml") if "checkpoint" not in f.name]
     if existing_cases and not force and not dry_run:
         raise click.UsageError(
             f"\nOutput dir '{output_dir}' already contains {len(existing_cases)} case file(s).\n"

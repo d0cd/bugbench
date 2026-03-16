@@ -28,6 +28,7 @@ def _has_code_files(files: list[str]) -> bool:
     """Return True if at least one file has a recognized code extension."""
     return any(Path(f).suffix.lower() in _CODE_EXTENSIONS for f in files)
 
+
 _LLM_MODEL = "claude-haiku-4-5-20251001"
 _COMMIT_SEP = "COMMIT_START"
 
