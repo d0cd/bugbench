@@ -393,3 +393,21 @@ def test_load_eval_config_parses_pricing(tmp_path: Path) -> None:
     assert isinstance(config.pricing, PricingConfig)
     cost = config.pricing.estimate_cost("claude-sonnet-4-6", 1_000_000, 0)
     assert cost == pytest.approx(3.0)
+
+
+def test_eval_config_max_concurrent_default() -> None:
+    config = EvalConfig(eval_org="test-org", tools=[])
+    assert config.max_concurrent == 1
+
+
+def test_load_eval_config_parses_max_concurrent(tmp_path: Path) -> None:
+    config_data = {
+        "github": {"eval_org": "test-org"},
+        "tools": [],
+        "repos": {},
+        "max_concurrent": 4,
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.dump(config_data))
+    config = load_eval_config(config_path)
+    assert config.max_concurrent == 4

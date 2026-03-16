@@ -130,6 +130,7 @@ async def _eval_tool(
     run_state: RunState,
     checkpoint_path: Path,
     dry_run: bool,
+    semaphore: asyncio.Semaphore,
     fail_after: int = 5,
 ) -> None:
     """Evaluate all cases against one tool, sequentially."""
@@ -141,16 +142,17 @@ async def _eval_tool(
             continue
 
         click.echo(f"[start] {case.id} x {tool.name}")
-        final_state = await asyncio.to_thread(
-            process_case_tool,
-            case,
-            tool,
-            config,
-            patches_dir,
-            run_dir,
-            repo_dir,
-            dry_run,
-        )
+        async with semaphore:
+            final_state = await asyncio.to_thread(
+                process_case_tool,
+                case,
+                tool,
+                config,
+                patches_dir,
+                run_dir,
+                repo_dir,
+                dry_run,
+            )
         run_state.set(final_state)
         run_state.save(checkpoint_path)
         click.echo(f"[{final_state.status}] {case.id} x {tool.name}")
@@ -220,6 +222,12 @@ async def _eval_tool(
     type=int,
     help="Abort tool after N consecutive failures (0 = no limit)",
 )
+@click.option(
+    "--max-concurrent",
+    default=None,
+    type=int,
+    help="Max simultaneous PR submissions (overrides config max_concurrent; default: 1).",
+)
 def run_pr_eval(
     config_path: str,
     cases_dir: str,
@@ -230,6 +238,7 @@ def run_pr_eval(
     dry_run: bool,
     limit: int,
     fail_after: int,
+    max_concurrent: int | None,
 ) -> None:
     """Async orchestrator: run PR-mode evaluation across all (case × tool) pairs."""
     config: EvalConfig = load_eval_config(Path(config_path))
@@ -262,8 +271,10 @@ def run_pr_eval(
 
     resolved_repo_dir = Path(repo_dir) if repo_dir else None
     resolved_patches_dir = Path(patches_dir)
+    concurrency = max_concurrent if max_concurrent is not None else config.max_concurrent
 
     async def _run() -> None:
+        semaphore = asyncio.Semaphore(concurrency)
         await asyncio.gather(
             *[
                 _eval_tool(
@@ -276,6 +287,7 @@ def run_pr_eval(
                     run_state,
                     checkpoint_path,
                     dry_run,
+                    semaphore,
                     fail_after,
                 )
                 for tool in pr_tools

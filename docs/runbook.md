@@ -19,8 +19,23 @@ Required env vars:
 - `GEMINI_API_KEY` — Gemini CLI and Google API tools
 - `OPENAI_API_KEY` — Codex CLI and OpenAI API tools
 
-**Current dataset:** 827 cases across 6 repos in `cases/final/`
-(leo, sdk, snarkOS, snarkVM, grafana, keycloak)
+**Current dataset:** 1,110 cases across 9 repos in `cases/final/`
+
+| Repo | Cases | Patches |
+|------|-------|---------|
+| leo | 304 | 304 ✓ |
+| snarkVM | 232 | 232 ✓ |
+| snarkOS | 223 | 223 ✓ |
+| sdk | 56 | 56 ✓ |
+| sentry | 63 | 63 ✓ |
+| cal.com | 64 | 64 ✓ |
+| discourse | 67 | 67 ✓ |
+| grafana | 50 | 50 ✓ |
+| keycloak | 51 | 51 ✓ |
+| **Total** | **1,110** | **1,110** |
+
+> **Patch extraction for public repos** (sentry, cal.com, discourse, grafana, keycloak) requires bare clones.
+> See Phase 1e below.
 
 ---
 
@@ -85,7 +100,7 @@ docker build -t bugeval-agent .
 
 ## Phase 1 — Dataset Construction (already complete for v1)
 
-The `cases/final/` directory has 827 cases. Skip to Phase 2 unless adding new cases.
+The `cases/final/` directory has 1,110 cases across 9 repos. Skip to Phase 2 unless adding new cases.
 
 ### 1a. Mine candidates from local repos
 
@@ -107,11 +122,22 @@ uv run bugeval scrape-github \
 
 ### 1c. Curate candidates into test cases
 
+LLM-assisted enrichment (claude-opus-4-6 + adaptive thinking). Resumes automatically from checkpoint on re-run.
+
 ```bash
 uv run bugeval curate \
-  --candidates-file candidates/snarkVM.yaml \
-  --output-dir cases/
+  --candidates candidates/snarkVM.yaml \
+  --output-dir cases/final/snarkVM/
 ```
+
+Useful flags:
+- `--limit N` — process only N candidates per run (safe batching for large repos)
+- `--fail-after N` — abort after N consecutive errors (default: 5)
+- `--shard K/N` — split work across parallel processes (use separate `--output-dir` per shard)
+- `--dry-run` — preview prompts without calling the API
+- `--no-checkpoint` — re-process all candidates, ignoring prior checkpoint
+
+**For public repos** (sentry, cal.com, discourse, grafana, keycloak), candidates are scraped directly from GitHub (step 1b). These repos don't require a local checkout for curation.
 
 ### 1d. Validate cases
 
@@ -121,12 +147,33 @@ uv run bugeval validate-cases --cases-dir cases/ --dry-run
 
 ### 1e. Extract patches
 
+**Private repos** (leo, snarkVM, snarkOS, sdk) — use a full or bare clone:
+
 ```bash
-uv run bugeval extract-patch \
-  --cases-dir cases/ \
-  --repo-dir /path/to/snarkVM \
-  --output-dir patches/
+uv run bugeval extract-patch --all \
+  --cases-dir cases/final/snarkVM/ \
+  --repo-dir /path/to/snarkVM
 ```
+
+**Public repos** (sentry, cal.com, discourse, grafana, keycloak) — create bare clones first (faster, no working tree):
+
+```bash
+# One-time bare clone (only needed if not already cloned)
+git clone --bare https://github.com/getsentry/sentry /tmp/sentry-bare
+git clone --bare https://github.com/calcom/cal.com  /tmp/calcom-bare
+git clone --bare https://github.com/discourse/discourse /tmp/discourse-bare
+git clone --bare https://github.com/grafana/grafana /tmp/grafana-bare
+git clone --bare https://github.com/keycloak/keycloak /tmp/keycloak-bare
+
+# Extract patches using the bare clones
+uv run bugeval extract-patch --all --repo-dir /tmp/sentry-bare   --cases-dir cases/final/sentry/
+uv run bugeval extract-patch --all --repo-dir /tmp/calcom-bare   --cases-dir cases/final/cal.com/
+uv run bugeval extract-patch --all --repo-dir /tmp/discourse-bare --cases-dir cases/final/discourse/
+uv run bugeval extract-patch --all --repo-dir /tmp/grafana-bare  --cases-dir cases/final/grafana/
+uv run bugeval extract-patch --all --repo-dir /tmp/keycloak-bare --cases-dir cases/final/keycloak/
+```
+
+Commits not present in the bare clone will be skipped (non-fatal).
 
 ### 1f. Tag the dataset
 
@@ -184,6 +231,7 @@ uv run bugeval dashboard --run-dir $RUN/agent
 uv run bugeval run-pr-eval \
   --cases-dir cases/final \
   --patches-dir patches/ \
+  --max-concurrent 3 \
   --run-dir results/run-$(date +%Y-%m-%d)-pr
 ```
 
@@ -199,6 +247,7 @@ uv run bugeval run-api-eval \
   --cases-dir cases/final \
   --patches-dir patches/ \
   --context-level diff-only \
+  --max-concurrent 4 \
   --run-dir results/run-$(date +%Y-%m-%d)-api
 ```
 
@@ -216,11 +265,22 @@ for level in diff-only diff+repo diff+repo+domain; do
     --use-docker \
     --docker-image bugeval-agent \
     --require-docker \
+    --max-concurrent 2 \
     --run-dir results/run-$(date +%Y-%m-%d)-agent-$level
 done
 ```
 
 Runs resume automatically from `checkpoint.yaml` if interrupted.
+
+### Rate limiting
+
+All eval commands support `--max-concurrent` to cap simultaneous API calls. The default comes from `config/config.yaml` (`max_concurrent` per tool). A `cooldown_seconds` between requests can also be configured there.
+
+Recommended starting values:
+- PR tools: `--max-concurrent 3` (webhook-driven, low API pressure)
+- API tools (Greptile): `--max-concurrent 4`
+- Agent tools (Claude, Gemini, OpenAI): `--max-concurrent 2` (avoid rate limits)
+- Use `--fail-after 5` (default) to abort a tool after 5 consecutive errors
 
 ---
 

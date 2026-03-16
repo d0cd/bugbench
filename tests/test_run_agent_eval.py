@@ -228,6 +228,7 @@ def test_run_agent_eval_help() -> None:
     assert "--use-docker" in result.output
     assert "--docker-image" in result.output
     assert "--require-docker" in result.output
+    assert "--max-concurrent" in result.output
 
 
 def test_run_agent_eval_no_cases(tmp_path: Path) -> None:

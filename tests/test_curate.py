@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from anthropic.types import TextBlock
 from click.testing import CliRunner
 
 from bugeval.curate import build_curation_prompt, curate, parse_llm_response
@@ -164,14 +163,13 @@ class TestCurateCliHelp:
         assert "--output-dir" in result.output
 
 
-def make_mock_client(response_data: dict[str, object]) -> MagicMock:
-    """Return a mock Anthropic client whose messages.create returns the given data."""
-    text = json.dumps(response_data)
-    mock_response = MagicMock()
-    mock_response.content = [TextBlock(type="text", text=text)]
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_response
-    return mock_client
+def make_mock_subprocess(response_data: dict[str, object]) -> MagicMock:
+    """Return a mock subprocess.run result that outputs JSON."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps(response_data)
+    mock_result.stderr = ""
+    return mock_result
 
 
 class TestCurateDryRun:
@@ -181,7 +179,7 @@ class TestCurateDryRun:
         save_candidates(candidates, candidates_path)
 
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic") as mock_cls:
+        with patch("subprocess.run") as mock_run:
             result = runner.invoke(
                 curate,
                 [
@@ -193,7 +191,7 @@ class TestCurateDryRun:
                 ],
             )
         assert result.exit_code == 0
-        mock_cls.assert_not_called()
+        mock_run.assert_not_called()
 
     def test_dry_run_prints_candidate_info(self, tmp_path: Path) -> None:
         candidate = make_candidate(42)
@@ -201,17 +199,16 @@ class TestCurateDryRun:
         save_candidates([candidate], candidates_path)
 
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic"):
-            result = runner.invoke(
-                curate,
-                [
-                    "--candidates",
-                    str(candidates_path),
-                    "--dry-run",
-                    "--output-dir",
-                    str(tmp_path / "cases"),
-                ],
-            )
+        result = runner.invoke(
+            curate,
+            [
+                "--candidates",
+                str(candidates_path),
+                "--dry-run",
+                "--output-dir",
+                str(tmp_path / "cases"),
+            ],
+        )
         assert result.exit_code == 0
         assert "42" in result.output  # PR number
 
@@ -226,8 +223,8 @@ class TestCurateControls:
 
         cases_dir = tmp_path / "cases"
         runner = CliRunner()
-        mock_client = make_mock_client(make_llm_response_data())
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        mock_sub = make_mock_subprocess(make_llm_response_data())
+        with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
                 ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
@@ -244,10 +241,12 @@ class TestCurateControls:
         cases_dir = tmp_path / "cases"
         runner = CliRunner()
 
-        mock_client = MagicMock()
-        mock_client.messages.create.side_effect = RuntimeError("API failure")
+        mock_sub = MagicMock()
+        mock_sub.returncode = 1
+        mock_sub.stderr = "API failure"
+        mock_sub.stdout = ""
 
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
                 ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
@@ -273,16 +272,16 @@ class TestCurateControls:
         checkpoint = cases_dir / ".curate_checkpoint.json"
         checkpoint.write_text(json.dumps([done_commit]))
 
-        mock_client = make_mock_client(make_llm_response_data())
+        mock_sub = make_mock_subprocess(make_llm_response_data())
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        with patch("subprocess.run", return_value=mock_sub) as mock_run:
             runner.invoke(
                 curate,
                 ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
                  "--api-delay", "0"],
             )
         # Only 2 of 3 candidates should have been processed (first was checkpointed)
-        assert mock_client.messages.create.call_count == 2
+        assert mock_run.call_count == 2
 
     def test_shard_splits_candidates(self, tmp_path: Path) -> None:
         # 6 candidates; shard 0/3 should process indices 0, 3 → 2 cases
@@ -295,8 +294,8 @@ class TestCurateControls:
 
         cases_dir = tmp_path / "cases"
         runner = CliRunner()
-        mock_client = make_mock_client(make_llm_response_data())
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        mock_sub = make_mock_subprocess(make_llm_response_data())
+        with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
                 ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
@@ -329,15 +328,15 @@ class TestCurateControls:
         checkpoint = cases_dir / ".curate_checkpoint.json"
         checkpoint.write_text(json.dumps([candidates[0].fix_commit]))
 
-        mock_client = make_mock_client(make_llm_response_data())
+        mock_sub = make_mock_subprocess(make_llm_response_data())
         runner = CliRunner()
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        with patch("subprocess.run", return_value=mock_sub) as mock_run:
             runner.invoke(
                 curate,
                 ["--candidates", str(candidates_path), "--output-dir", str(cases_dir),
                  "--api-delay", "0", "--no-checkpoint"],
             )
-        assert mock_client.messages.create.call_count == 1  # processed despite checkpoint
+        assert mock_run.call_count == 1  # processed despite checkpoint
 
 
 class TestCurateWithMockedApi:
@@ -348,8 +347,8 @@ class TestCurateWithMockedApi:
 
         cases_dir = tmp_path / "cases"
         runner = CliRunner()
-        mock_client = make_mock_client(make_llm_response_data())
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        mock_sub = make_mock_subprocess(make_llm_response_data())
+        with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
                 [
@@ -373,8 +372,8 @@ class TestCurateWithMockedApi:
 
         cases_dir = tmp_path / "cases"
         runner = CliRunner()
-        mock_client = make_mock_client(make_llm_response_data())
-        with patch("bugeval.curate.Anthropic", return_value=mock_client):
+        mock_sub = make_mock_subprocess(make_llm_response_data())
+        with patch("subprocess.run", return_value=mock_sub):
             result = runner.invoke(
                 curate,
                 [
@@ -391,3 +390,41 @@ class TestCurateWithMockedApi:
         assert result.exit_code == 0
         yaml_files = list(cases_dir.glob("*.yaml"))
         assert len(yaml_files) == 0
+
+
+class TestCurateCandidateBackend:
+    """curate_candidate must delegate subprocess calls to run_claude_cli."""
+
+    def test_uses_run_claude_cli_backend(self) -> None:
+        from bugeval.curate import curate_candidate
+
+        candidate = make_candidate(1)
+        mock_sub = make_mock_subprocess(make_llm_response_data())
+        with patch("subprocess.run", return_value=mock_sub) as mock_run:
+            result = curate_candidate(
+                candidate=candidate,
+                diff_context="diff here",
+                git_log="",
+                case_id="bar-001",
+                system_prompt="classify this",
+            )
+        assert result is not None
+        assert isinstance(result, __import__("bugeval.models", fromlist=["TestCase"]).TestCase)
+        # subprocess.run must have been called (via run_claude_cli)
+        assert mock_run.call_count == 1
+
+    def test_timeout_is_at_least_300s(self) -> None:
+        from bugeval.curate import curate_candidate
+
+        candidate = make_candidate(1)
+        mock_sub = make_mock_subprocess(make_llm_response_data())
+        with patch("subprocess.run", return_value=mock_sub) as mock_run:
+            curate_candidate(
+                candidate=candidate,
+                diff_context="",
+                git_log="",
+                case_id="bar-002",
+                system_prompt="classify this",
+            )
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("timeout", 0) >= 300

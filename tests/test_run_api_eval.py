@@ -148,6 +148,7 @@ def test_run_api_eval_help() -> None:
     assert "--context-level" in result.output
     assert "--dry-run" in result.output
     assert "--cases-dir" in result.output
+    assert "--max-concurrent" in result.output
 
 
 def test_run_api_eval_no_cases(tmp_path: Path) -> None:

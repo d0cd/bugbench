@@ -10,8 +10,8 @@ from typing import Any
 
 import click
 import yaml
-from anthropic import Anthropic
 
+from bugeval.agent_cli_runner import run_claude_cli
 from bugeval.git_utils import GitError, run_git
 from bugeval.io import load_candidates, save_case
 from bugeval.models import (
@@ -201,21 +201,20 @@ def curate_candidate(
     case_id: str,
     system_prompt: str,
     model: str = "claude-opus-4-6",
+    timeout_seconds: int = 300,
 ) -> TestCase | None:
-    """Curate a single candidate via the Anthropic API."""
-    prompt = build_curation_prompt(candidate, diff_context, git_log)
-    client = Anthropic()
-    response = client.messages.create(
+    """Curate a single candidate via the claude CLI (uses run_claude_cli backend)."""
+    full_prompt = f"{system_prompt}\n\n{build_curation_prompt(candidate, diff_context, git_log)}"
+    agent_result = run_claude_cli(
+        Path("."),
+        full_prompt,
+        max_turns=1,
+        timeout_seconds=timeout_seconds,
         model=model,
-        max_tokens=2048,
-        system=system_prompt,
-        messages=[{"role": "user", "content": prompt}],
     )
-    from anthropic.types import TextBlock
-    text = "".join(
-        block.text for block in response.content if isinstance(block, TextBlock)
-    )
-    data = _extract_json_from_text(text)
+    if agent_result.error:
+        raise RuntimeError(agent_result.error)
+    data = _extract_json_from_text(agent_result.stdout or "")
     if data is None:
         return None
     try:

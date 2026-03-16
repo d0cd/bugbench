@@ -6,7 +6,7 @@ from pathlib import Path
 
 import click
 
-from bugeval.git_utils import format_patch
+from bugeval.git_utils import GitError, format_patch
 from bugeval.io import load_all_cases, load_case
 from bugeval.models import TestCase
 
@@ -81,15 +81,25 @@ def extract_patch(
         click.echo("No cases found.")
         return
 
+    written_count = 0
+    skipped_count = 0
     for case in cases:
         patch_path = output_dir / f"{case.id}.patch"
         if dry_run:
             click.echo(f"Would write {patch_path}")
         else:
-            written = _write_patch(case, repo_dir, output_dir)
-            click.echo(f"Wrote {written}")
+            try:
+                written = _write_patch(case, repo_dir, output_dir)
+                click.echo(f"Wrote {written}")
+                written_count += 1
+            except GitError as exc:
+                click.echo(f"SKIP {case.id}: {exc}", err=True)
+                skipped_count += 1
 
     if dry_run:
         click.echo(f"Would extract {len(cases)} patches to {output_dir}/")
     else:
-        click.echo(f"Extracted {len(cases)} patches to {output_dir}/")
+        summary = f"Extracted {written_count} patches to {output_dir}/"
+        if skipped_count:
+            summary += f" ({skipped_count} skipped — commit not in repo)"
+        click.echo(summary)

@@ -190,6 +190,7 @@ async def _eval_agent_tool(
     checkpoint_path: Path,
     dry_run: bool,
     max_turns: int,
+    semaphore: asyncio.Semaphore,
     use_docker: bool = False,
     docker_image: str = "bugeval-agent",
     fail_after: int = 5,
@@ -222,18 +223,19 @@ async def _eval_agent_tool(
             continue
 
         click.echo(f"[start] {case.id} x {tool.name}")
-        final_state = await asyncio.to_thread(
-            process_case_agent,
-            case,
-            tool,
-            patch_path,
-            run_dir,
-            context_level,
-            dry_run,
-            max_turns,
-            use_docker,
-            docker_image,
-        )
+        async with semaphore:
+            final_state = await asyncio.to_thread(
+                process_case_agent,
+                case,
+                tool,
+                patch_path,
+                run_dir,
+                context_level,
+                dry_run,
+                max_turns,
+                use_docker,
+                docker_image,
+            )
         run_state.set(final_state)
         run_state.save(checkpoint_path)
         click.echo(f"[{final_state.status}] {case.id} x {tool.name}")
@@ -368,6 +370,12 @@ def _write_run_metadata(
     show_default=True,
     help="Docker image name to use with --use-docker.",
 )
+@click.option(
+    "--max-concurrent",
+    default=None,
+    type=int,
+    help="Max simultaneous agent calls (overrides config max_concurrent; default: 1).",
+)
 def run_agent_eval(
     config_path: str,
     cases_dir: str,
@@ -382,6 +390,7 @@ def run_agent_eval(
     require_docker: bool,
     use_docker: bool,
     docker_image: str,
+    max_concurrent: int | None,
 ) -> None:
     """Async orchestrator: run in-house agent evaluation across all (case × tool) pairs."""
     if not is_docker_available():
@@ -423,8 +432,10 @@ def run_agent_eval(
     _write_run_metadata(resolved_run_dir, config_path, context_level, agent_tools)
 
     resolved_patches_dir = Path(patches_dir)
+    concurrency = max_concurrent if max_concurrent is not None else config.max_concurrent
 
     async def _run() -> None:
+        semaphore = asyncio.Semaphore(concurrency)
         await asyncio.gather(
             *[
                 _eval_agent_tool(
@@ -437,6 +448,7 @@ def run_agent_eval(
                     checkpoint_path,
                     dry_run,
                     max_turns,
+                    semaphore,
                     use_docker,
                     docker_image,
                     fail_after,

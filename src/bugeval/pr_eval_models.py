@@ -181,6 +181,7 @@ class EvalConfig(BaseModel):
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     judging: JudgingConfig = Field(default_factory=JudgingConfig)
     pricing: PricingConfig = Field(default_factory=PricingConfig)
+    max_concurrent: int = 1
 
     @property
     def pr_tools(self) -> list[ToolDef]:
@@ -220,6 +221,8 @@ def load_eval_config(path: Path) -> EvalConfig:
     raw_pricing = data.get("pricing")
     pricing = PricingConfig(rates=raw_pricing) if raw_pricing else PricingConfig()
 
+    max_concurrent = int(data.get("max_concurrent") or 1)
+
     return EvalConfig(
         eval_org=eval_org,
         tools=tools,
@@ -227,4 +230,5 @@ def load_eval_config(path: Path) -> EvalConfig:
         scoring=scoring,
         judging=judging,
         pricing=pricing,
+        max_concurrent=max_concurrent,
     )

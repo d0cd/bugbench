@@ -211,6 +211,43 @@ class TestExtractPatchDryRun:
         assert "dr-002.patch" in result.output
 
 
+class TestExtractPatchAllSkipsMissingCommit:
+    def test_all_skips_missing_commit_and_continues(self, tmp_path: Path) -> None:
+        """--all should warn and skip cases whose commits are absent (non-fatal)."""
+        repo = make_repo(tmp_path / "repo")
+        base = get_sha(repo)
+        head = add_commit(repo, "fn foo() { 1 }\n")
+
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        patches_dir = tmp_path / "patches"
+
+        # Valid case
+        save_case(make_case("skip-001", base, head), cases_dir / "skip-001.yaml")
+        # Invalid case: head commit that doesn't exist in repo
+        bad_base = "deadbeef" * 5
+        bad_head = "cafebabe" * 5
+        save_case(make_case("skip-002", bad_base, bad_head), cases_dir / "skip-002.yaml")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            extract_patch,
+            [
+                "--all",
+                "--repo-dir",
+                str(repo),
+                "--cases-dir",
+                str(cases_dir),
+                "--output-dir",
+                str(patches_dir),
+            ],
+        )
+        assert result.exit_code == 0
+        assert (patches_dir / "skip-001.patch").exists()
+        assert not (patches_dir / "skip-002.patch").exists()
+        assert "SKIP" in result.output or "skip-002" in result.output
+
+
 class TestExtractPatchAll:
     def test_all_creates_multiple_patches(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path / "repo")
