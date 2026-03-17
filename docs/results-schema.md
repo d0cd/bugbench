@@ -9,12 +9,13 @@ Reference documentation for run output files produced by `run-*-eval`, `normaliz
 ```
 results/run-YYYY-MM-DD/
 ├── run_metadata.json          # Reproducibility metadata (git SHA, tools, dataset commit)
-├── checkpoint.yaml            # Resumable progress state (case × tool status)
+├── checkpoint.yaml            # Resumable progress state (case x tool status)
 ├── raw/
 │   └── <case-id>-<tool>/      # One directory per (case, tool) pair
 │       ├── findings.json      # Raw tool output (agent: structured findings list)
 │       ├── conversation.json  # Full message history (agent tools only)
 │       ├── metadata.json      # Timing, cost, token counts
+│       ├── prompt.txt         # Prompt sent to the agent (agent tools only)
 │       └── stdout.txt         # CLI stdout (CLI tools only)
 ├── <case-id>-<tool>.yaml      # Normalized result (NormalizedResult schema)
 ├── judge/
@@ -22,7 +23,7 @@ results/run-YYYY-MM-DD/
 └── analysis/
     ├── report.md              # Human-readable summary tables
     ├── scores.csv             # One row per (case, tool) pair
-    ├── catch_rate.png         # Catch rate (score ≥ 2) per tool, bar chart
+    ├── catch_rate.png         # Catch rate (score >= 2) per tool, bar chart
     └── score_dist.png         # Score distribution per tool, stacked bar chart
 ```
 
@@ -49,6 +50,20 @@ Written at run start by all three `run-*-eval` commands.
 
 ---
 
+## `metadata.json` (per raw result)
+
+Written alongside each raw tool output in `raw/<case-id>-<tool>/`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `time_seconds` | float | Wall-clock time for the tool call |
+| `cost_usd` | float | Estimated cost based on token usage and model pricing |
+| `tokens` | int | Total tokens consumed (input + output) |
+
+Cost is calculated using per-model pricing rates defined in `config/config.yaml` under the `pricing` section.
+
+---
+
 ## Normalized result YAML (`NormalizedResult`)
 
 One file per `(case_id, tool)` pair, named `<case-id>-<tool>.yaml`.
@@ -62,7 +77,7 @@ One file per `(case_id, tool)` pair, named `<case-id>-<tool>.yaml`.
 | `metadata.tokens` | int | Total tokens used (0 if unavailable) |
 | `metadata.cost_usd` | float | Estimated cost in USD (0.0 if unavailable) |
 | `metadata.time_seconds` | float | Wall-clock time for the tool call |
-| `dx` | object or null | Developer experience assessment (optional) |
+| `dx` | object or null | Developer experience assessment (optional, see below) |
 
 ### `Comment` fields
 
@@ -72,11 +87,21 @@ One file per `(case_id, tool)` pair, named `<case-id>-<tool>.yaml`.
 | `line` | int | Line number (0 if not applicable) |
 | `body` | string | Full text of the comment or finding |
 | `type` | string | `inline`, `pr-level`, or `summary` |
-| `confidence` | float or null | Tool-reported confidence (0–1) |
+| `confidence` | float or null | Tool-reported confidence (0-1) |
 | `severity` | string or null | Tool-reported severity label |
 | `category` | string or null | Tool-reported category (e.g. `logic`, `security`) |
 | `suggested_fix` | string or null | Suggested code fix, if any |
 | `reasoning` | string or null | Tool's reasoning for the finding |
+
+### `DxAssessment` fields (optional)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `actionability` | int (1-5) | How actionable are the tool's comments? |
+| `false_positive_burden` | int (1-5) | How much noise/false positives? (5 = low burden) |
+| `integration_friction` | int (1-5) | Ease of integration into workflow (5 = frictionless) |
+| `response_latency` | int (1-5) | Speed of response (5 = fast) |
+| `notes` | string | Free-text notes |
 
 ---
 
@@ -88,13 +113,14 @@ One file per `(case_id, tool)` pair under `judge/`.
 |-------|------|-------------|
 | `test_case_id` | string | Case identifier |
 | `tool` | string | Tool name |
-| `score` | int (0–3) | Majority-vote score from LLM judges |
+| `score` | int (0-3) | Majority-vote score from LLM judges |
 | `votes` | list of int | Individual judge votes (typically 3) |
 | `reasoning` | string | Judge's explanation for the final score |
 | `comment_judgments` | list | Per-comment TP/FP/low-value classifications |
 | `noise.total_comments` | int | Total comments in the normalized result |
 | `noise.true_positives` | int | Comments classified as TP |
 | `noise.snr` | float | Signal-to-noise ratio (TP / total) |
+| `vote_agreement` | float | Agreement ratio among judge votes |
 
 ### Scoring scale
 
@@ -105,19 +131,22 @@ One file per `(case_id, tool)` pair under `judge/`.
 | 2 | correct-id | Correct file + line, no actionable fix |
 | 3 | correct-id-and-fix | Correct identification + actionable fix suggestion |
 
-A score ≥ 2 counts as a "catch" for catch-rate metrics.
+A score >= 2 counts as a "catch" for catch-rate metrics.
 
 ---
 
 ## `analysis/report.md`
 
-Human-readable Markdown with three sections:
+Human-readable Markdown with sections:
 
-1. **Catch rate by tool** — percentage of cases where score ≥ 2, sorted descending
-2. **Mean score by tool** — average score (0–3), sorted descending
+1. **Catch rate by tool** — percentage of cases where score >= 2, sorted descending
+2. **Mean score by tool** — average score (0-3), sorted descending
 3. **Score distribution** — counts of 0/1/2/3 per tool
+4. **Pairwise comparisons** — permutation p-values between tools
+5. **Cost analysis** — cost per review, cost per detection (when cost data is present)
+6. **DX assessment** — developer experience scores (when DX data is present)
 
-Slices are also broken down by: context level, category, difficulty, severity, repo, language, and visibility.
+Slices are broken down by: context level, category, difficulty, severity, repo, language, visibility, PR size, and verified status.
 
 ---
 
@@ -129,8 +158,10 @@ One row per `(case_id, tool)` pair.
 |--------|-------------|
 | `case_id` | Test case identifier |
 | `tool` | Tool name |
-| `score` | Judge score (0–3) |
-| `votes` | Pipe-separated individual votes (e.g. `2|2|3`) |
+| `score` | Judge score (0-3) |
+| `votes` | Pipe-separated individual votes (e.g. `2\|2\|3`) |
+| `catch_rate_ci_lo` | Bootstrap 95% CI lower bound |
+| `catch_rate_ci_hi` | Bootstrap 95% CI upper bound |
 | `category` | Bug category from the test case |
 | `difficulty` | Difficulty label |
 | `severity` | Severity label |
@@ -144,8 +175,8 @@ One row per `(case_id, tool)` pair.
 
 ## Charts
 
-**`catch_rate.png`** — Bar chart showing the fraction of cases each tool scored ≥ 2.
-Higher is better. The dashed line marks the catch threshold (default: score ≥ 2).
+**`catch_rate.png`** — Bar chart showing the fraction of cases each tool scored >= 2.
+Higher is better. The dashed line marks the catch threshold (default: score >= 2).
 
 **`score_dist.png`** — Stacked bar chart showing the count of 0/1/2/3 scores per tool.
 Reveals whether a tool misses completely (0s) or gets close but not quite (1s).
