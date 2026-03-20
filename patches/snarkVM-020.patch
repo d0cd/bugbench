@@ -1,144 +1,967 @@
-diff --git a/ledger/src/advance.rs b/ledger/src/advance.rs
-index 13dc94d8e..76449cd03 100644
---- a/ledger/src/advance.rs
-+++ b/ledger/src/advance.rs
-@@ -257,18 +257,9 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
-                 let previous_committee_lookback = {
-                     // Calculate the penultimate round, which is the round before the anchor round.
-                     let penultimate_round = subdag.anchor_round().saturating_sub(1);
--                    // Get the round number for the previous committee. Note, we subtract 2 from odd rounds,
--                    // because committees are updated in even rounds.
--                    let previous_penultimate_round = match penultimate_round % 2 == 0 {
--                        true => penultimate_round.saturating_sub(1),
--                        false => penultimate_round.saturating_sub(2),
--                    };
--                    // Get the previous committee lookback round.
--                    let penultimate_committee_lookback_round =
--                        previous_penultimate_round.saturating_sub(Committee::<N>::COMMITTEE_LOOKBACK_RANGE);
--                    // Output the previous committee lookback.
--                    self.get_committee_for_round(penultimate_committee_lookback_round)?
--                        .ok_or(anyhow!("Failed to fetch committee for round {penultimate_committee_lookback_round}"))?
-+                    // Output the committee lookback for the penultimate round.
-+                    self.get_committee_lookback_for_round(penultimate_round)?
-+                        .ok_or(anyhow!("Failed to fetch committee lookback for round {penultimate_round}"))?
-                 };
-                 // Return the timestamp for the given committee lookback.
-                 subdag.timestamp(&previous_committee_lookback)
-diff --git a/ledger/src/check_next_block.rs b/ledger/src/check_next_block.rs
-index 06bacb412..3e79c3625 100644
---- a/ledger/src/check_next_block.rs
-+++ b/ledger/src/check_next_block.rs
-@@ -81,36 +81,17 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
-         )?;
+diff --git a/ledger/query/src/query/rest.rs b/ledger/query/src/query/rest.rs
+index 3b1c546ae..7f795c0ed 100644
+--- a/ledger/query/src/query/rest.rs
++++ b/ledger/query/src/query/rest.rs
+@@ -33,12 +33,19 @@ use std::str::FromStr;
+ #[derive(Clone)]
+ pub struct RestQuery<N: Network> {
+     base_url: http::Uri,
++    /// `true` if the api version is already contained in the base URL.
++    has_api_version: bool,
+     _marker: std::marker::PhantomData<N>,
+ }
  
-         // Retrieve the committee lookback.
--        let committee_lookback = {
--            // Determine the round number for the previous committee. Note, we subtract 2 from odd rounds,
--            // because committees are updated in even rounds.
--            let previous_round = match block.round() % 2 == 0 {
--                true => block.round().saturating_sub(1),
--                false => block.round().saturating_sub(2),
--            };
--            // Determine the committee lookback round.
--            let committee_lookback_round = previous_round.saturating_sub(Committee::<N>::COMMITTEE_LOOKBACK_RANGE);
--            // Output the committee lookback.
--            self.get_committee_for_round(committee_lookback_round)?
--                .ok_or(anyhow!("Failed to fetch committee for round {committee_lookback_round}"))?
--        };
-+        let committee_lookback = self
-+            .get_committee_lookback_for_round(block.round())?
-+            .ok_or(anyhow!("Failed to fetch committee lookback for round {}", block.round()))?;
+ impl<N: Network> From<http::Uri> for RestQuery<N> {
+     fn from(base_url: http::Uri) -> Self {
+-        Self { base_url, _marker: Default::default() }
++        // Avoid trailing slash when checking the version
++        let path = base_url.path().strip_suffix('/').unwrap_or(base_url.path());
++
++        let has_api_version = path.ends_with(Self::API_V1) || path.ends_with(Self::API_V2);
++
++        Self { base_url, has_api_version, _marker: Default::default() }
+     }
+ }
  
-         // Retrieve the previous committee lookback.
-         let previous_committee_lookback = {
-             // Calculate the penultimate round, which is the round before the anchor round.
-             let penultimate_round = block.round().saturating_sub(1);
--            // Determine the round number for the previous committee. Note, we subtract 2 from odd rounds,
--            // because committees are updated in even rounds.
--            let previous_penultimate_round = match penultimate_round % 2 == 0 {
--                true => penultimate_round.saturating_sub(1),
--                false => penultimate_round.saturating_sub(2),
--            };
--            // Determine the previous committee lookback round.
--            let penultimate_committee_lookback_round =
--                previous_penultimate_round.saturating_sub(Committee::<N>::COMMITTEE_LOOKBACK_RANGE);
--            // Output the previous committee lookback.
--            self.get_committee_for_round(penultimate_committee_lookback_round)?
--                .ok_or(anyhow!("Failed to fetch committee for round {penultimate_committee_lookback_round}"))?
-+            // Output the committee lookback for the penultimate round.
-+            self.get_committee_lookback_for_round(penultimate_round)?
-+                .ok_or(anyhow!("Failed to fetch committee lookback for round {penultimate_round}"))?
+@@ -78,6 +85,7 @@ impl<N: Network> FromStr for RestQuery<N> {
+     fn from_str(str_representation: &str) -> Result<Self> {
+         let base_url = str_representation.parse::<http::Uri>().with_context(|| "Failed to parse URL")?;
+ 
++        // Perform checks.
+         if let Some(scheme) = base_url.scheme()
+             && *scheme != uri::Scheme::HTTP
+             && *scheme != uri::Scheme::HTTPS
+@@ -97,7 +105,7 @@ impl<N: Network> FromStr for RestQuery<N> {
+             bail!("Base URL for REST endpoints cannot contain a query");
+         }
+ 
+-        Ok(Self { base_url, _marker: Default::default() })
++        Ok(Self::from(base_url))
+     }
+ }
+ 
+@@ -153,8 +161,8 @@ impl<N: Network> QueryTrait<N> for RestQuery<N> {
+ }
+ 
+ impl<N: Network> RestQuery<N> {
+-    /// The API version to use when querying REST endpoints.
+-    const API_VERSION: &str = "v2";
++    const API_V1: &str = "v1";
++    const API_V2: &str = "v2";
+ 
+     /// Returns the transaction for the given transaction ID.
+     pub fn get_transaction(&self, transaction_id: &N::TransactionID) -> Result<Transaction<N>> {
+@@ -187,22 +195,15 @@ impl<N: Network> RestQuery<N> {
+         // This function is only called internally but check for additional sanity.
+         ensure!(!route.starts_with('/'), "path cannot start with a slash");
+ 
++        // Add the API version if it is not already contained in the base URL.
++        let api_version = if self.has_api_version { "" } else { "v2/" };
++
+         // Work around a bug in the `http` crate where empty paths will be set to '/' but other paths are not appended with a slash.
+         // See [this issue](https://github.com/hyperium/http/issues/507).
+         let path = if self.base_url.path().ends_with('/') {
+-            format!(
+-                "{base_url}{api_version}/{network}/{route}",
+-                base_url = self.base_url,
+-                api_version = Self::API_VERSION,
+-                network = N::SHORT_NAME
+-            )
++            format!("{base_url}{api_version}{network}/{route}", base_url = self.base_url, network = N::SHORT_NAME)
+         } else {
+-            format!(
+-                "{base_url}/{api_version}/{network}/{route}",
+-                base_url = self.base_url,
+-                api_version = Self::API_VERSION,
+-                network = N::SHORT_NAME
+-            )
++            format!("{base_url}/{api_version}{network}/{route}", base_url = self.base_url, network = N::SHORT_NAME)
          };
  
-         // Ensure the block is correct.
-@@ -125,6 +106,9 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
-             ratified_finalize_operations,
-         )?;
- 
-+        // Ensure the certificates in the block subdag have met quorum requirements.
-+        self.check_block_subdag_quorum(block)?;
+         Ok(path)
+@@ -225,10 +226,23 @@ impl<N: Network> RestQuery<N> {
+         if response.status().is_success() {
+             response.body_mut().read_json().with_context(|| "Failed to parse JSON response")
+         } else {
++            let content_type = response
++                .headers()
++                .get("Content-Type")
++                .ok_or_else(|| anyhow!("Endpoint return error without ContentType"))?
++                .to_str()
++                .with_context(|| "Endpoint returned invalid ContentType")?;
 +
-         // Determine if the block subdag is correctly constructed and is not a combination of multiple subdags.
-         self.check_block_subdag_atomicity(block)?;
- 
-@@ -145,6 +129,47 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
-         Ok(())
+             // Convert returned error into an `anyhow::Error`.
+-            let error: RestError =
+-                response.body_mut().read_json().with_context(|| "Failed to parse JSON error response")?;
+-            Err(error.parse().context(format!("Failed to fetch from {endpoint}")))
++            // Depending on the API version, the error is either encoded as a string or as a JSON.
++            if content_type.contains("json") {
++                let error: RestError =
++                    response.body_mut().read_json().with_context(|| "Failed to parse JSON error response")?;
++                Err(error.parse().context(format!("Failed to fetch from {endpoint}")))
++            } else {
++                let error = response.body_mut().read_to_string().with_context(|| "Failed to read error message")?;
++                Err(anyhow!(error).context(format!("Failed to fetch from {endpoint}")))
++            }
+         }
      }
  
-+    /// Check that the certificates in the block subdag have met quorum requirements.
-+    fn check_block_subdag_quorum(&self, block: &Block<N>) -> Result<()> {
-+        // Check if the block has a subdag.
-+        let subdag = match block.authority() {
-+            Authority::Quorum(subdag) => subdag,
-+            _ => return Ok(()),
-+        };
+@@ -304,6 +318,8 @@ mod tests {
+         let base = "http://localhost:3030/a/prefix";
+         let route = "a/route";
+         let query = base.parse::<CurrentQuery>().unwrap();
++        let Query::REST(rest_query) = &query else { panic!() };
++        assert!(!rest_query.has_api_version);
+ 
+         // Test without trailing slash.
+         let Query::REST(rest) = query else { panic!() };
+@@ -316,4 +332,17 @@ mod tests {
+ 
+         Ok(())
+     }
 +
-+        // Check that all certificates on each round have met quorum requirements.
-+        cfg_iter!(subdag).try_for_each(|(round, certificates)| {
-+            // Retrieve the committee lookback for the round.
-+            let committee_lookback = self
-+                .get_committee_lookback_for_round(*round)?
-+                .ok_or_else(|| anyhow!("No committee lookback found for round {round}"))?;
++    #[test]
++    fn test_rest_url_parse_with_api_version() {
++        let base = "http://localhost:3030/a/prefix/v1";
++        let query = base.parse::<CurrentQuery>().unwrap();
++        let Query::REST(rest_query) = &query else { panic!() };
++        assert!(rest_query.has_api_version);
 +
-+            // Check that each certificate for this round has met quorum requirements.
-+            // Note that we do not need to check the quorum requirement for the previous certificates
-+            // because that is done during construction in `BatchCertificate::new`.
-+            cfg_iter!(certificates).try_for_each(|certificate| {
-+                // Collect the certificate signers.
-+                let mut signers: HashSet<_> =
-+                    certificate.signatures().map(|signature| signature.to_address()).collect();
-+                // Append the certificate author.
-+                signers.insert(certificate.author());
-+
-+                // Ensure that the signers of the certificate reach the quorum threshold.
-+                ensure!(
-+                    committee_lookback.is_quorum_threshold_reached(&signers),
-+                    "Certificate '{}' for round {round} does not meet quorum requirements",
-+                    certificate.id()
-+                );
-+
-+                Ok::<_, Error>(())
-+            })?;
-+
-+            Ok::<_, Error>(())
-+        })?;
-+
-+        Ok(())
++        let base = "http://localhost:3030/a/prefix/v2/";
++        let query = base.parse::<CurrentQuery>().unwrap();
++        let Query::REST(rest_query) = &query else { panic!() };
++        assert!(rest_query.has_api_version);
++    }
+ }
+diff --git a/ledger/src/advance.rs b/ledger/src/advance.rs
+index 25fd6f0f1..3ef9e403f 100644
+--- a/ledger/src/advance.rs
++++ b/ledger/src/advance.rs
+@@ -345,10 +345,14 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
+             latest_coinbase_target,
+         )?;
+ 
++        // Determine if the block timestamp should be included.
++        let next_block_timestamp =
++            (next_height >= N::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default()).then_some(next_timestamp);
+         // Construct the finalize state.
+         let state = FinalizeGlobalState::new::<N>(
+             next_round,
+             next_height,
++            next_block_timestamp,
+             next_cumulative_weight,
+             next_cumulative_proof_target,
+             previous_block.hash(),
+diff --git a/ledger/src/check_next_block.rs b/ledger/src/check_next_block.rs
+index f6a65bd09..5a141dc55 100644
+--- a/ledger/src/check_next_block.rs
++++ b/ledger/src/check_next_block.rs
+@@ -42,10 +42,14 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
+             }
+         }
+ 
++        // Determine if the block timestamp should be included.
++        let block_timestamp = (block.height() >= N::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default())
++            .then_some(block.timestamp());
+         // Construct the finalize state.
+         let state = FinalizeGlobalState::new::<N>(
+             block.round(),
+             block.height(),
++            block_timestamp,
+             block.cumulative_weight(),
+             block.cumulative_proof_target(),
+             block.previous_hash(),
+diff --git a/synthesizer/process/src/stack/evaluate.rs b/synthesizer/process/src/stack/evaluate.rs
+index 7f47391c9..2ec214fd3 100644
+--- a/synthesizer/process/src/stack/evaluate.rs
++++ b/synthesizer/process/src/stack/evaluate.rs
+@@ -83,6 +83,8 @@ impl<N: Network> Stack<N> {
+                     Operand::Caller => Ok(Value::Plaintext(Plaintext::from(Literal::Address(registers.caller()?)))),
+                     // If the operand is the block height, throw an error.
+                     Operand::BlockHeight => bail!("Cannot retrieve the block height from a closure scope."),
++                    // If the operand is the block timestamp, throw an error.
++                    Operand::BlockTimestamp => bail!("Cannot retrieve the block timestamp from a closure scope."),
+                     // If the operand is the network id, throw an error.
+                     Operand::NetworkID => bail!("Cannot retrieve the network ID from a closure scope."),
+                     // If the operand is the program checksum, throw an error.
+@@ -237,6 +239,8 @@ impl<N: Network> Stack<N> {
+                     Operand::Caller => Ok(Value::Plaintext(Plaintext::from(Literal::Address(registers.caller()?)))),
+                     // If the operand is the block height, throw an error.
+                     Operand::BlockHeight => bail!("Cannot retrieve the block height from a function scope."),
++                    // If the operand is the block timestamp, throw an error.
++                    Operand::BlockTimestamp => bail!("Cannot retrieve the block timestamp from a function scope."),
+                     // If the operand is the network id, throw an error.
+                     Operand::NetworkID => bail!("Cannot retrieve the network ID from a function scope."),
+                     // If the operand is the program checksum, throw an error.
+diff --git a/synthesizer/process/src/stack/execute.rs b/synthesizer/process/src/stack/execute.rs
+index ccafc7b78..a95bbb8c3 100644
+--- a/synthesizer/process/src/stack/execute.rs
++++ b/synthesizer/process/src/stack/execute.rs
+@@ -115,6 +115,10 @@ impl<N: Network> Stack<N> {
+                     Operand::BlockHeight => {
+                         bail!("Illegal operation: cannot retrieve the block height in a closure scope")
+                     }
++                    // If the operand is the block timestamp, throw an error.
++                    Operand::BlockTimestamp => {
++                        bail!("Illegal operation: cannot retrieve the block timestamp in a closure scope")
++                    }
+                     // If the operand is the network id, throw an error.
+                     Operand::NetworkID => {
+                         bail!("Illegal operation: cannot retrieve the network id in a closure scope")
+@@ -365,6 +369,10 @@ impl<N: Network> Stack<N> {
+                     Operand::BlockHeight => {
+                         bail!("Illegal operation: cannot retrieve the block height in a function scope")
+                     }
++                    // If the operand is the block timestamp, throw an error.
++                    Operand::BlockTimestamp => {
++                        bail!("Illegal operation: cannot retrieve the block timestamp in a function scope")
++                    }
+                     // If the operand is the network id, throw an error.
+                     Operand::NetworkID => {
+                         bail!("Illegal operation: cannot retrieve the network id in a function scope")
+diff --git a/synthesizer/process/src/stack/finalize_registers/mod.rs b/synthesizer/process/src/stack/finalize_registers/mod.rs
+index 355bd306e..82b2798b5 100644
+--- a/synthesizer/process/src/stack/finalize_registers/mod.rs
++++ b/synthesizer/process/src/stack/finalize_registers/mod.rs
+@@ -19,7 +19,7 @@ use crate::FinalizeTypes;
+ use console::{
+     network::prelude::*,
+     program::{Identifier, Literal, Plaintext, Register, Value},
+-    types::{U16, U32},
++    types::{I64, U16, U32},
+ };
+ use snarkvm_synthesizer_program::{FinalizeGlobalState, FinalizeRegistersState, Operand, RegistersTrait, StackTrait};
+ 
+diff --git a/synthesizer/process/src/stack/finalize_registers/registers_trait.rs b/synthesizer/process/src/stack/finalize_registers/registers_trait.rs
+index 1917345d9..416244d57 100644
+--- a/synthesizer/process/src/stack/finalize_registers/registers_trait.rs
++++ b/synthesizer/process/src/stack/finalize_registers/registers_trait.rs
+@@ -41,6 +41,13 @@ impl<N: Network> RegistersTrait<N> for FinalizeRegisters<N> {
+             Operand::BlockHeight => {
+                 return Ok(Value::Plaintext(Plaintext::from(Literal::U32(U32::new(self.state.block_height())))));
+             }
++            // If the operand is the block timestamp, load the block timestamp.
++            Operand::BlockTimestamp => match self.state.block_timestamp() {
++                Some(timestamp) => {
++                    return Ok(Value::Plaintext(Plaintext::from(Literal::I64(I64::new(timestamp)))));
++                }
++                None => bail!("The block timestamp is not available until ConsensusVersion::V12"),
++            },
+             // If the operand is the network ID, load the network ID.
+             Operand::NetworkID => {
+                 return Ok(Value::Plaintext(Plaintext::from(Literal::U16(U16::new(N::ID)))));
+diff --git a/synthesizer/process/src/stack/finalize_types/matches.rs b/synthesizer/process/src/stack/finalize_types/matches.rs
+index 67bdecf06..922b09ae5 100644
+--- a/synthesizer/process/src/stack/finalize_types/matches.rs
++++ b/synthesizer/process/src/stack/finalize_types/matches.rs
+@@ -64,9 +64,10 @@ impl<N: Network> FinalizeTypes<N> {
+                         "Struct member '{struct_name}.{member_name}' expects {member_type}, but found '{plaintext_type}' in the operand '{operand}'.",
+                     )
+                 }
+-                // Ensure the program ID, block height, network ID, checksum, edition, and program owner types matches the member type.
++                // Ensure the program ID, block height, block timestamp, network ID, checksum, edition, and program owner types matches the member type.
+                 Operand::ProgramID(..)
+                 | Operand::BlockHeight
++                | Operand::BlockTimestamp
+                 | Operand::NetworkID
+                 | Operand::Checksum(_)
+                 | Operand::Edition(_)
+@@ -144,6 +145,7 @@ impl<N: Network> FinalizeTypes<N> {
+                 // Ensure the program ID, block height, network ID, checksum, edition, and program owner types matches the element type.
+                 Operand::ProgramID(..)
+                 | Operand::BlockHeight
++                | Operand::BlockTimestamp
+                 | Operand::NetworkID
+                 | Operand::Checksum(_)
+                 | Operand::Edition(_)
+diff --git a/synthesizer/process/src/stack/finalize_types/mod.rs b/synthesizer/process/src/stack/finalize_types/mod.rs
+index e76db2ebb..32a87ec00 100644
+--- a/synthesizer/process/src/stack/finalize_types/mod.rs
++++ b/synthesizer/process/src/stack/finalize_types/mod.rs
+@@ -106,6 +106,7 @@ impl<N: Network> FinalizeTypes<N> {
+             Operand::Signer => bail!("'self.signer' is not a valid operand in a finalize context."),
+             Operand::Caller => bail!("'self.caller' is not a valid operand in a finalize context."),
+             Operand::BlockHeight => FinalizeType::Plaintext(PlaintextType::Literal(LiteralType::U32)),
++            Operand::BlockTimestamp => FinalizeType::Plaintext(PlaintextType::Literal(LiteralType::I64)),
+             Operand::NetworkID => FinalizeType::Plaintext(PlaintextType::Literal(LiteralType::U16)),
+             Operand::Checksum(_) => FinalizeType::Plaintext(PlaintextType::Array(ArrayType::new(
+                 PlaintextType::Literal(LiteralType::U8),
+diff --git a/synthesizer/process/src/stack/register_types/matches.rs b/synthesizer/process/src/stack/register_types/matches.rs
+index 7dace1e09..13b878393 100644
+--- a/synthesizer/process/src/stack/register_types/matches.rs
++++ b/synthesizer/process/src/stack/register_types/matches.rs
+@@ -88,6 +88,10 @@ impl<N: Network> RegisterTypes<N> {
+                 Operand::BlockHeight => bail!(
+                     "Struct member '{struct_name}.{member_name}' cannot be from a block height in a non-finalize scope"
+                 ),
++                // If the operand is a block timestamp type, throw an error.
++                Operand::BlockTimestamp => bail!(
++                    "Struct member '{struct_name}.{member_name}' cannot be from a block timestamp in a non-finalize scope"
++                ),
+                 // If the operand is a network ID type, throw an error.
+                 Operand::NetworkID => bail!(
+                     "Struct member '{struct_name}.{member_name}' cannot be from a network ID in a non-finalize scope"
+@@ -181,6 +185,10 @@ impl<N: Network> RegisterTypes<N> {
+                 }
+                 // If the operand is a block height type, throw an error.
+                 Operand::BlockHeight => bail!("Array element cannot be from a block height in a non-finalize scope"),
++                // If the operand is a block timestamp type, throw an error.
++                Operand::BlockTimestamp => {
++                    bail!("Array element cannot be from a block timestamp in a non-finalize scope")
++                }
+                 // If the operand is a network ID type, throw an error.
+                 Operand::NetworkID => bail!("Array element cannot be from a network ID in a non-finalize scope"),
+                 // If the operand is a checksum type, throw an error.
+@@ -252,6 +260,9 @@ impl<N: Network> RegisterTypes<N> {
+             Operand::BlockHeight => {
+                 bail!("Forbidden operation: Cannot cast a block height as a record owner")
+             }
++            Operand::BlockTimestamp => {
++                bail!("Forbidden operation: Cannot cast a block timestamp as a record owner")
++            }
+             Operand::NetworkID => {
+                 bail!("Forbidden operation: Cannot cast a network ID as a record owner")
+             }
+@@ -324,6 +335,12 @@ impl<N: Network> RegisterTypes<N> {
+                                 "Record entry '{record_name}.{entry_name}' expects a '{plaintext_type}', but found a block height in the operand '{operand}'."
+                             )
+                         }
++                        // Fail if the operand is a block timestamp.
++                        Operand::BlockTimestamp => {
++                            bail!(
++                                "Record entry '{record_name}.{entry_name}' expects a '{plaintext_type}', but found a block timestamp in the operand '{operand}'."
++                            )
++                        }
+                         // Fail if the operand is a network ID.
+                         Operand::NetworkID => {
+                             bail!(
+diff --git a/synthesizer/process/src/stack/register_types/mod.rs b/synthesizer/process/src/stack/register_types/mod.rs
+index d958f8543..cc5f96193 100644
+--- a/synthesizer/process/src/stack/register_types/mod.rs
++++ b/synthesizer/process/src/stack/register_types/mod.rs
+@@ -97,6 +97,9 @@ impl<N: Network> RegisterTypes<N> {
+                 RegisterType::Plaintext(PlaintextType::Literal(LiteralType::Address))
+             }
+             Operand::BlockHeight => bail!("'block.height' is not a valid operand in a non-finalize context."),
++            Operand::BlockTimestamp => {
++                bail!("'block.timestamp' is not a valid operand in a non-finalize context.")
++            }
+             Operand::NetworkID => bail!("'network.id' is not a valid operand in a non-finalize context."),
+             Operand::Checksum(_) => bail!("'checksum' is not a valid operand in a non-finalize context."),
+             Operand::Edition(_) => bail!("'edition' is not a valid operand in a non-finalize context."),
+diff --git a/synthesizer/process/src/stack/registers/registers_circuit.rs b/synthesizer/process/src/stack/registers/registers_circuit.rs
+index cbca3a7ad..0ad907b25 100644
+--- a/synthesizer/process/src/stack/registers/registers_circuit.rs
++++ b/synthesizer/process/src/stack/registers/registers_circuit.rs
+@@ -102,6 +102,8 @@ impl<N: Network, A: circuit::Aleo<Network = N>> RegistersCircuit<N, A> for Regis
+             }
+             // If the operand is the block height, throw an error.
+             Operand::BlockHeight => bail!("Cannot load the block height in a non-finalize context"),
++            // If the operand is the block timestamp, throw an error.
++            Operand::BlockTimestamp => bail!("Cannot load the block timestamp in a non-finalize context"),
+             // If the operand is the network ID, throw an error.
+             Operand::NetworkID => bail!("Cannot load the network ID in a non-finalize context"),
+             // If the operand is the checksum, throw an error.
+diff --git a/synthesizer/process/src/stack/registers/registers_trait.rs b/synthesizer/process/src/stack/registers/registers_trait.rs
+index 626866da8..bccec3df1 100644
+--- a/synthesizer/process/src/stack/registers/registers_trait.rs
++++ b/synthesizer/process/src/stack/registers/registers_trait.rs
+@@ -88,6 +88,8 @@ impl<N: Network, A: circuit::Aleo<Network = N>> RegistersTrait<N> for Registers<
+             Operand::Caller => return Ok(Value::Plaintext(Plaintext::from(Literal::Address(self.caller()?)))),
+             // If the operand is the block height, throw an error.
+             Operand::BlockHeight => bail!("Cannot load the block height in a non-finalize context"),
++            // If the operand is the block timestamp, throw an error.
++            Operand::BlockTimestamp => bail!("Cannot load the block timestamp in a non-finalize context"),
+             // If the operand is the network ID, throw an error.
+             Operand::NetworkID => bail!("Cannot load the network ID in a non-finalize context"),
+             // If the operand is the checksum, throw an error.
+diff --git a/synthesizer/process/src/tests/test_credits.rs b/synthesizer/process/src/tests/test_credits.rs
+index addffa482..7c29f6b3b 100644
+--- a/synthesizer/process/src/tests/test_credits.rs
++++ b/synthesizer/process/src/tests/test_credits.rs
+@@ -70,7 +70,7 @@ macro_rules! test_atomic_finalize {
+ 
+ /// Samples a new finalize state.
+ fn sample_finalize_state(block_height: u32) -> FinalizeGlobalState {
+-    FinalizeGlobalState::from(block_height as u64, block_height, [0u8; 32])
++    FinalizeGlobalState::from(block_height as u64, block_height, None, [0u8; 32])
+ }
+ 
+ /// Returns the `value` for the given `key` in the `mapping` for the given `program_id`.
+diff --git a/synthesizer/process/src/tests/test_execute.rs b/synthesizer/process/src/tests/test_execute.rs
+index 5832ecfb7..9b649cfaf 100644
+--- a/synthesizer/process/src/tests/test_execute.rs
++++ b/synthesizer/process/src/tests/test_execute.rs
+@@ -46,7 +46,7 @@ type CurrentAleo = AleoV0;
+ 
+ /// Samples a new finalize state.
+ pub fn sample_finalize_state(block_height: u32) -> FinalizeGlobalState {
+-    FinalizeGlobalState::from(block_height as u64, block_height, [0u8; 32])
++    FinalizeGlobalState::from(block_height as u64, block_height, None, [0u8; 32])
+ }
+ 
+ /// Samples a valid fee for the given process, block store, and finalize store.
+diff --git a/synthesizer/process/src/tests/test_utils.rs b/synthesizer/process/src/tests/test_utils.rs
+index a029cd8e0..18e8a7ddc 100644
+--- a/synthesizer/process/src/tests/test_utils.rs
++++ b/synthesizer/process/src/tests/test_utils.rs
+@@ -64,7 +64,7 @@ pub(super) use test_atomic_finalize;
+ 
+ /// Samples a new finalize state.
+ fn sample_finalize_state(block_height: u32) -> FinalizeGlobalState {
+-    FinalizeGlobalState::from(block_height as u64, block_height, [0u8; 32])
++    FinalizeGlobalState::from(block_height as u64, block_height, None, [0u8; 32])
+ }
+ 
+ /// Returns the `value` for the given `key` in the `mapping` for the given `program_id`.
+diff --git a/synthesizer/program/src/lib.rs b/synthesizer/program/src/lib.rs
+index 9f3bb4fff..46720d7c9 100644
+--- a/synthesizer/program/src/lib.rs
++++ b/synthesizer/program/src/lib.rs
+@@ -967,6 +967,22 @@ impl<N: Network> ProgramCore<N> {
+         function_contains || closure_contains || command_contains || array_size_exceeds
+     }
+ 
++    /// Returns `true` if a program contains any V12 syntax.
++    /// This includes `Operand::BlockTimestamp`.
++    /// This is enforced to be `false` for programs before `ConsensusVersion::V12`.
++    #[inline]
++    pub fn contains_v12_syntax(&self) -> bool {
++        // Check each instruction and output in each function's finalize scope for the use of
++        // `Operand::BlockTimestamp`.
++        cfg_iter!(self.functions()).any(|(_, function)| {
++            function.finalize_logic().is_some_and(|finalize_logic| {
++                cfg_iter!(finalize_logic.commands()).any(|command| {
++                    cfg_iter!(command.operands()).any(|operand| matches!(operand, Operand::BlockTimestamp))
++                })
++            })
++        })
 +    }
 +
-     /// Checks that the block subdag can not be split into multiple valid subdags.
-     fn check_block_subdag_atomicity(&self, block: &Block<N>) -> Result<()> {
-         // Returns `true` if there is a path from the previous certificate to the current certificate.
-diff --git a/ledger/src/lib.rs b/ledger/src/lib.rs
-index 7a2e772d3..dfd783e33 100644
---- a/ledger/src/lib.rs
-+++ b/ledger/src/lib.rs
-@@ -76,7 +76,7 @@ use lru::LruCache;
- #[cfg(not(feature = "locktick"))]
- use parking_lot::{Mutex, RwLock};
- use rand::{prelude::IteratorRandom, rngs::OsRng};
--use std::{borrow::Cow, sync::Arc};
-+use std::{borrow::Cow, collections::HashSet, sync::Arc};
- use time::OffsetDateTime;
+     /// Returns `true` if a program contains any string type.
+     /// Before ConsensusVersion::V12, variable-length string sampling when using them as inputs caused deployment synthesis to be inconsistent and abort with probability 63/64.
+     /// After ConsensusVersion::V12, string types are disallowed.
+diff --git a/synthesizer/program/src/logic/finalize_global_state/mod.rs b/synthesizer/program/src/logic/finalize_global_state/mod.rs
+index c705bcd3e..118e480ef 100644
+--- a/synthesizer/program/src/logic/finalize_global_state/mod.rs
++++ b/synthesizer/program/src/logic/finalize_global_state/mod.rs
+@@ -21,6 +21,8 @@ pub struct FinalizeGlobalState {
+     block_round: u64,
+     /// The block height.
+     block_height: u32,
++    /// The block timestamp.
++    block_timestamp: Option<i64>, // TODO (raychu86): Consider adding the entire Metadata here instead.
+     /// The block-specific random seed.
+     random_seed: [u8; 32],
+ }
+@@ -39,6 +41,7 @@ impl FinalizeGlobalState {
+         Self::new::<N>(
+             block_round,
+             block_height,
++            None,
+             block_cumulative_weight,
+             block_cumulative_proof_target,
+             previous_block_hash,
+@@ -50,18 +53,22 @@ impl FinalizeGlobalState {
+     pub fn new<N: Network>(
+         block_round: u64,
+         block_height: u32,
++        block_timestamp: Option<i64>,
+         block_cumulative_weight: u128,
+         block_cumulative_proof_target: u128,
+         previous_block_hash: N::BlockHash,
+     ) -> Result<Self> {
+-        // Initialize the preimage.
++        // Initialize the preimage, optionally including the block timestamp.
+         let preimage = to_bits_le![
+             block_round,
+             block_height,
+             block_cumulative_weight,
+             block_cumulative_proof_target,
+             (*previous_block_hash); 605
+-        ];
++        ]
++        .into_iter()
++        .chain(block_timestamp.into_iter().flat_map(|ts| to_bits_le![ts]))
++        .collect::<Vec<_>>();
  
- #[cfg(not(feature = "serial"))]
+         // Hash the preimage to get the random seed.
+         let seed = N::hash_bhp768(&preimage)?.to_bytes_le()?;
+@@ -72,13 +79,18 @@ impl FinalizeGlobalState {
+         let mut random_seed = [0u8; 32];
+         random_seed.copy_from_slice(&seed[..32]);
+ 
+-        Ok(Self { block_round, block_height, random_seed })
++        Ok(Self { block_round, block_height, block_timestamp, random_seed })
+     }
+ 
+     /// Initializes a new global state.
+     #[inline]
+-    pub const fn from(block_round: u64, block_height: u32, random_seed: [u8; 32]) -> Self {
+-        Self { block_round, block_height, random_seed }
++    pub const fn from(
++        block_round: u64,
++        block_height: u32,
++        block_timestamp: Option<i64>,
++        random_seed: [u8; 32],
++    ) -> Self {
++        Self { block_round, block_height, block_timestamp, random_seed }
+     }
+ 
+     /// Returns the block round.
+@@ -98,4 +110,10 @@ impl FinalizeGlobalState {
+     pub const fn random_seed(&self) -> &[u8; 32] {
+         &self.random_seed
+     }
++
++    /// Returns the block timestamp.
++    #[inline]
++    pub const fn block_timestamp(&self) -> Option<i64> {
++        self.block_timestamp
++    }
+ }
+diff --git a/synthesizer/program/src/logic/instruction/operand/bytes.rs b/synthesizer/program/src/logic/instruction/operand/bytes.rs
+index 4bf2e68de..15b0f5ff5 100644
+--- a/synthesizer/program/src/logic/instruction/operand/bytes.rs
++++ b/synthesizer/program/src/logic/instruction/operand/bytes.rs
+@@ -52,6 +52,7 @@ impl<N: Network> FromBytes for Operand<N> {
+                 };
+                 Ok(Self::ProgramOwner(program_id))
+             }
++            10 => Ok(Self::BlockTimestamp),
+             variant => Err(error(format!("Failed to deserialize operand variant {variant}"))),
+         }
+     }
+@@ -109,6 +110,7 @@ impl<N: Network> ToBytes for Operand<N> {
+                     }
+                 }
+             }
++            Self::BlockTimestamp => 10u8.write_le(&mut writer),
+         }
+     }
+ }
+diff --git a/synthesizer/program/src/logic/instruction/operand/mod.rs b/synthesizer/program/src/logic/instruction/operand/mod.rs
+index 51420b399..8810c6893 100644
+--- a/synthesizer/program/src/logic/instruction/operand/mod.rs
++++ b/synthesizer/program/src/logic/instruction/operand/mod.rs
+@@ -41,6 +41,9 @@ pub enum Operand<N: Network> {
+     /// The operand is the block height.
+     /// Note: This variant is only accessible in the `finalize` scope.
+     BlockHeight,
++    /// The operand is the block timestamp.
++    /// Note: This variant is only accessible in the `finalize` scope.
++    BlockTimestamp,
+     /// The operand is the network ID.
+     /// Note: This variant is only accessible in the `finalize` scope.
+     NetworkID,
+diff --git a/synthesizer/program/src/logic/instruction/operand/parse.rs b/synthesizer/program/src/logic/instruction/operand/parse.rs
+index f65986eab..149ec7941 100644
+--- a/synthesizer/program/src/logic/instruction/operand/parse.rs
++++ b/synthesizer/program/src/logic/instruction/operand/parse.rs
+@@ -27,6 +27,7 @@ impl<N: Network> Parser for Operand<N> {
+             map(tag("self.signer"), |_| Self::Signer),
+             map(tag("self.caller"), |_| Self::Caller),
+             map(tag("block.height"), |_| Self::BlockHeight),
++            map(tag("block.timestamp"), |_| Self::BlockTimestamp),
+             map(tag("network.id"), |_| Self::NetworkID),
+             // Note that `Operand::Checksum` and `Operand::Edition` must be parsed before `Operand::ProgramID`s, since an edition or checksum may be prefixed with a program ID.
+             map(pair(opt(terminated(ProgramID::parse, tag("/"))), tag("checksum")), |(program_id, _)| {
+@@ -89,6 +90,8 @@ impl<N: Network> Display for Operand<N> {
+             Self::Caller => write!(f, "self.caller"),
+             // Prints the identifier for the block height, i.e. block.height
+             Self::BlockHeight => write!(f, "block.height"),
++            // Prints the identifier for the block timestamp, i.e. block.timestamp
++            Self::BlockTimestamp => write!(f, "block.timestamp"),
+             // Prints the identifier for the network ID, i.e. network.id
+             Self::NetworkID => write!(f, "network.id"),
+             // Prints the optional program ID with the checksum keyword, i.e. `checksum` or `token.aleo/checksum`
+@@ -140,6 +143,9 @@ mod tests {
+         let operand = Operand::<CurrentNetwork>::parse("block.height").unwrap().1;
+         assert_eq!(Operand::BlockHeight, operand);
+ 
++        let operand = Operand::<CurrentNetwork>::parse("block.timestamp").unwrap().1;
++        assert_eq!(Operand::BlockTimestamp, operand);
++
+         let operand = Operand::<CurrentNetwork>::parse("network.id").unwrap().1;
+         assert_eq!(Operand::NetworkID, operand);
+ 
+diff --git a/synthesizer/program/tests/helpers/sample.rs b/synthesizer/program/tests/helpers/sample.rs
+index febf5a479..8366a0b8e 100644
+--- a/synthesizer/program/tests/helpers/sample.rs
++++ b/synthesizer/program/tests/helpers/sample.rs
+@@ -64,7 +64,7 @@ pub fn sample_finalize_registers(
+ ) -> Result<FinalizeRegisters<CurrentNetwork>> {
+     // Initialize the registers.
+     let mut finalize_registers = FinalizeRegisters::<CurrentNetwork>::new(
+-        FinalizeGlobalState::from(1, 1, [0; 32]),
++        FinalizeGlobalState::from(1, 1, None, [0; 32]),
+         <CurrentNetwork as Network>::TransitionID::default(),
+         *function_name,
+         stack.get_finalize_types(function_name)?.clone(),
+diff --git a/synthesizer/program/tests/instruction/ecdsa.rs b/synthesizer/program/tests/instruction/ecdsa.rs
+index 882f4069b..ab83d4a64 100644
+--- a/synthesizer/program/tests/instruction/ecdsa.rs
++++ b/synthesizer/program/tests/instruction/ecdsa.rs
+@@ -176,7 +176,7 @@ pub fn sample_ecdsa_finalize_registers(
+ ) -> Result<FinalizeRegisters<CurrentNetwork>> {
+     // Initialize the registers.
+     let mut finalize_registers = FinalizeRegisters::<CurrentNetwork>::new(
+-        FinalizeGlobalState::from(1, 1, [0; 32]),
++        FinalizeGlobalState::from(1, 1, None, [0; 32]),
+         <CurrentNetwork as Network>::TransitionID::default(),
+         *function_name,
+         stack.get_finalize_types(function_name)?.clone(),
+diff --git a/synthesizer/src/vm/finalize.rs b/synthesizer/src/vm/finalize.rs
+index eee7ed59e..bfba992ed 100644
+--- a/synthesizer/src/vm/finalize.rs
++++ b/synthesizer/src/vm/finalize.rs
+@@ -1531,17 +1531,19 @@ finalize transfer_public:
+         unspent_records: &mut Vec<Record<CurrentNetwork, Ciphertext<CurrentNetwork>>>,
+         rng: &mut R,
+     ) -> Result<Block<CurrentNetwork>> {
++        // Create the finalize state for the next block height.
++        let next_block_height = previous_block.height() + 1;
++        let time_since_last_block = MainnetV0::BLOCK_TIME as i64;
++        let next_block_timestamp = previous_block.timestamp().saturating_add(time_since_last_block);
++        let next_timestamp = (next_block_height
++            >= MainnetV0::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default())
++        .then_some(next_block_timestamp);
++        let finalize_state =
++            FinalizeGlobalState::from(next_block_height as u64, next_block_height, next_timestamp, [0u8; 32]);
++
+         // Speculate on the candidate ratifications, solutions, and transactions.
+-        let time_since_last_block = CurrentNetwork::BLOCK_TIME as i64;
+-        let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm.speculate(
+-            sample_finalize_state(previous_block.height() + 1),
+-            time_since_last_block,
+-            None,
+-            vec![],
+-            &None.into(),
+-            transactions.iter(),
+-            rng,
+-        )?;
++        let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) =
++            vm.speculate(finalize_state, time_since_last_block, None, vec![], &None.into(), transactions.iter(), rng)?;
+ 
+         // Construct the metadata associated with the block.
+         let metadata = Metadata::new(
+@@ -1554,7 +1556,7 @@ finalize transfer_public:
+             CurrentNetwork::GENESIS_PROOF_TARGET,
+             previous_block.last_coinbase_target(),
+             previous_block.last_coinbase_timestamp(),
+-            previous_block.timestamp().saturating_add(time_since_last_block),
++            next_block_timestamp,
+         )?;
+ 
+         // Construct the new block header.
+diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
+index d4024eee8..2cf1acf25 100644
+--- a/synthesizer/src/vm/mod.rs
++++ b/synthesizer/src/vm/mod.rs
+@@ -451,10 +451,14 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+         // Note: This lock must be held for the entire scope of this function.
+         let _block_lock = self.block_lock.lock();
+ 
++        // Determine if the block timestamp should be included.
++        let block_timestamp = (block.height() >= N::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default())
++            .then_some(block.timestamp());
+         // Construct the finalize state.
+         let state = FinalizeGlobalState::new::<N>(
+             block.round(),
+             block.height(),
++            block_timestamp,
+             block.cumulative_weight(),
+             block.cumulative_proof_target(),
+             block.previous_hash(),
+@@ -589,7 +593,7 @@ pub(crate) mod test_helpers {
+ 
+     /// Samples a new finalize state.
+     pub(crate) fn sample_finalize_state(block_height: u32) -> FinalizeGlobalState {
+-        FinalizeGlobalState::from(block_height as u64, block_height, [0u8; 32])
++        FinalizeGlobalState::from(block_height as u64, block_height, None, [0u8; 32])
+     }
+ 
+     pub(crate) fn sample_vm() -> VM<CurrentNetwork, LedgerType> {
+@@ -883,17 +887,19 @@ function compute:
+         let block_hash = vm.block_store().get_block_hash(vm.block_store().max_height().unwrap()).unwrap().unwrap();
+         let previous_block = vm.block_store().get_block(&block_hash).unwrap().unwrap();
+ 
+-        // Construct the new block header.
++        // Create the finalize state for the next block height.
++        let next_block_height = previous_block.height() + 1;
+         let time_since_last_block = MainnetV0::BLOCK_TIME as i64;
+-        let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm.speculate(
+-            sample_finalize_state(vm.block_store().current_block_height() + 1),
+-            time_since_last_block,
+-            None,
+-            vec![],
+-            &None.into(),
+-            transactions.iter(),
+-            rng,
+-        )?;
++        let next_block_timestamp = previous_block.timestamp().saturating_add(time_since_last_block);
++        let next_timestamp = (next_block_height
++            >= MainnetV0::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default())
++        .then_some(next_block_timestamp);
++        let finalize_state =
++            FinalizeGlobalState::from(next_block_height as u64, next_block_height, next_timestamp, [0u8; 32]);
++
++        // Speculate on the ratifications, solutions, and transactions.
++        let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) =
++            vm.speculate(finalize_state, time_since_last_block, None, vec![], &None.into(), transactions.iter(), rng)?;
+ 
+         // Construct the metadata associated with the block.
+         let metadata = Metadata::new(
+@@ -909,6 +915,7 @@ function compute:
+             previous_block.timestamp().saturating_add(time_since_last_block),
+         )?;
+ 
++        // Construct the new block header.
+         let header = Header::from(
+             vm.block_store().current_state_root(),
+             transactions.to_transactions_root().unwrap(),
+diff --git a/synthesizer/src/vm/verify.rs b/synthesizer/src/vm/verify.rs
+index 37e9fec4c..3bda86239 100644
+--- a/synthesizer/src/vm/verify.rs
++++ b/synthesizer/src/vm/verify.rs
+@@ -198,6 +198,10 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                 // If the `CONSENSUS_VERSION` is greater than or equal to `V9`, then verify that:
+                 //   - the program checksum is present in the deployment
+                 //   - the program owner is present in the deployment
++                // If the `CONSENSUS_VERSION` is less than `V11`, ensure that
++                //   - the program does not include V11 syntax
++                // If the `CONSENSUS_VERSION` is less than `V12`, ensure that
++                //   - the program does not include V12 syntax
+                 if consensus_version < ConsensusVersion::V8 {
+                     ensure!(
+                         deployment.edition().is_zero(),
+@@ -238,6 +242,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                         "Invalid deployment transaction '{id}' - program uses syntax that is not allowed before `ConsensusVersion::V11`"
+                     );
+                 }
++                if consensus_version < ConsensusVersion::V12 {
++                    ensure!(
++                        !deployment.program().contains_v12_syntax(),
++                        "Invalid deployment transaction '{id}' - program uses syntax that is not allowed before `ConsensusVersion::V12`"
++                    );
++                }
+                 if consensus_version >= ConsensusVersion::V12 {
+                     ensure!(
+                         !deployment.program().contains_string_type(),
+@@ -1528,6 +1538,108 @@ function compute:
+         // Ensure that the deployment is valid after ConsensusVersion::V11.
+         assert!(vm.check_transaction(&deployment, None, rng).is_ok());
+     }
++
++    #[cfg(feature = "test")]
++    #[test]
++    fn test_block_timestamp_migration() {
++        let rng = &mut TestRng::default();
++
++        // Initialize the VM.
++        let vm = crate::vm::test_helpers::sample_vm();
++        // Initialize the genesis block.
++        let genesis = crate::vm::test_helpers::sample_genesis_block(rng);
++        // Update the VM.
++        vm.add_next_block(&genesis).unwrap();
++
++        // Fetch the private key.
++        let private_key = crate::vm::test_helpers::sample_genesis_private_key(rng);
++
++        // Deploy a test program to the ledger.
++        let program_id = ProgramID::<CurrentNetwork>::from_str("dummy_program.aleo").unwrap();
++        let program = Program::<CurrentNetwork>::from_str(&format!(
++            r"
++    program {program_id};
++    function foo:
++        input r0 as i64.public;
++        async foo r0 into r1;
++        output r1 as {program_id}/foo.future;
++    finalize foo:
++        input r0 as i64.public;
++        gte r0 block.timestamp into r1;
++        assert.eq r1 true;
++
++    constructor:
++        assert.eq edition 0u16;",
++        ))
++        .unwrap();
++
++        // Advance the ledger past ConsensusV9 where the new varuna version and deployment version starts to take place.
++        let transactions: [Transaction<CurrentNetwork>; 0] = [];
++        while vm.block_store().current_block_height() < CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V9).unwrap()
++        {
++            // Call the function
++            let next_block = crate::vm::test_helpers::sample_next_block(&vm, &private_key, &transactions, rng).unwrap();
++            vm.add_next_block(&next_block).unwrap();
++        }
++
++        // Construct the deployment transaction.
++        let deployment = vm.deploy(&private_key, &program, None, 0, None, rng).unwrap();
++
++        // Advance the ledger past ConsensusV12 where the new varuna version starts to take place.
++        let transactions: [Transaction<CurrentNetwork>; 0] = [];
++        while vm.block_store().current_block_height() < CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap()
++        {
++            // Ensure that the deployment is invalid.
++            assert!(vm.check_transaction(&deployment, None, rng).is_err());
++
++            // Call the function
++            let next_block = crate::vm::test_helpers::sample_next_block(&vm, &private_key, &transactions, rng).unwrap();
++            vm.add_next_block(&next_block).unwrap();
++        }
++
++        // Ensure that the deployment is valid after ConsensusVersion::V12.
++        assert!(vm.check_transaction(&deployment, None, rng).is_ok());
++
++        // Deploy the program.
++        let next_block = crate::vm::test_helpers::sample_next_block(&vm, &private_key, &[deployment], rng).unwrap();
++        vm.add_next_block(&next_block).unwrap();
++
++        // Construct the input with the valid timestamp.
++        let future_timestamp = next_block.timestamp() + 100;
++        let inputs = [Value::<CurrentNetwork>::Plaintext(Plaintext::from(Literal::I64(console::types::I64::new(
++            future_timestamp,
++        ))))];
++        // Create the execution transaction.
++        let valid_transaction =
++            vm.execute(&private_key, (&program_id.to_string(), "foo"), inputs.into_iter(), None, 0, None, rng).unwrap();
++        let valid_tx_id = valid_transaction.id();
++
++        // Construct the input with an invalid timestamp.
++        let past_timestamp = next_block.timestamp() - 100;
++        let inputs = [Value::<CurrentNetwork>::Plaintext(Plaintext::from(Literal::I64(console::types::I64::new(
++            past_timestamp,
++        ))))];
++        // Create the execution transaction.
++        let invalid_transaction =
++            vm.execute(&private_key, (&program_id.to_string(), "foo"), inputs.into_iter(), None, 0, None, rng).unwrap();
++        let invalid_tx_id = invalid_transaction.id();
++
++        // Construct a block with both transactions.
++        let next_block = crate::vm::test_helpers::sample_next_block(
++            &vm,
++            &private_key,
++            &[valid_transaction, invalid_transaction],
++            rng,
++        )
++        .unwrap();
++        vm.add_next_block(&next_block).unwrap();
++
++        // Ensure that the valid transaction was accepted and the invalid one was rejected.
++        assert_eq!(next_block.transactions().num_accepted(), 1);
++        assert_eq!(next_block.transactions().num_rejected(), 1);
++        assert!(vm.block_store().get_confirmed_transaction(&valid_tx_id).unwrap().unwrap().is_accepted());
++        assert!(vm.block_store().get_confirmed_transaction(&invalid_tx_id).unwrap().unwrap().is_rejected());
++    }
+ }
+ 
+ #[cfg(feature = "test")]
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out b/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
+index 0207e502a..4bedc326f 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
+@@ -19,13 +19,13 @@ outputs:
+     test_rand.aleo/rand_chacha_check:
+       outputs:
+       - '{"type":"future","id":"746545381627269942056971804265088486926111520161800421538758330814778471010field","value":"{\n  program_id: test_rand.aleo,\n  function_name: rand_chacha_check,\n  arguments: [\n    1field,\n    false\n  ]\n}"}'
+-  speculate: the execution was rejected
++  speculate: the execution was accepted
+   add_next_block: succeeded.
+ - verified: true
+   execute:
+     test_rand.aleo/rand_chacha_check:
+       outputs:
+-      - '{"type":"future","id":"892614972800960795570418664663732095814901536157182856491855556648676441607field","value":"{\n  program_id: test_rand.aleo,\n  function_name: rand_chacha_check,\n  arguments: [\n    2field,\n    true\n  ]\n}"}'
++      - '{"type":"future","id":"7959858885373972058168480751284007882110163109985353663075336223286753118497field","value":"{\n  program_id: test_rand.aleo,\n  function_name: rand_chacha_check,\n  arguments: [\n    4field,\n    true\n  ]\n}"}'
+   speculate: the execution was accepted
+   add_next_block: succeeded.
+ additional:
+diff --git a/synthesizer/tests/test_vm_execute_and_finalize.rs b/synthesizer/tests/test_vm_execute_and_finalize.rs
+index 915c8091c..6657b177f 100644
+--- a/synthesizer/tests/test_vm_execute_and_finalize.rs
++++ b/synthesizer/tests/test_vm_execute_and_finalize.rs
+@@ -100,7 +100,7 @@ fn run_test(test: &ProgramTest) -> serde_yaml::Mapping {
+         let time_since_last_block = CurrentNetwork::BLOCK_TIME as i64;
+         let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm
+             .speculate(
+-                construct_finalize_global_state(&vm),
++                construct_finalize_global_state(&vm, time_since_last_block),
+                 time_since_last_block,
+                 Some(0u64),
+                 vec![],
+@@ -147,7 +147,7 @@ fn run_test(test: &ProgramTest) -> serde_yaml::Mapping {
+         let time_since_last_block = CurrentNetwork::BLOCK_TIME as i64;
+         let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm
+             .speculate(
+-                construct_finalize_global_state(&vm),
++                construct_finalize_global_state(&vm, time_since_last_block),
+                 time_since_last_block,
+                 Some(0u64),
+                 vec![],
+@@ -316,7 +316,7 @@ fn run_test(test: &ProgramTest) -> serde_yaml::Mapping {
+             let time_since_last_block = CurrentNetwork::BLOCK_TIME as i64;
+             let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = match vm
+                 .speculate(
+-                    construct_finalize_global_state(&vm),
++                    construct_finalize_global_state(&vm, time_since_last_block),
+                     time_since_last_block,
+                     Some(0u64),
+                     vec![],
+@@ -414,7 +414,7 @@ fn initialize_vm<R: Rng + CryptoRng>(
+         let time_since_last_block = CurrentNetwork::BLOCK_TIME as i64;
+         let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm
+             .speculate(
+-                construct_finalize_global_state(&vm),
++                construct_finalize_global_state(&vm, time_since_last_block),
+                 time_since_last_block,
+                 Some(0u64),
+                 vec![],
+@@ -492,7 +492,7 @@ fn construct_fee_records<C: ConsensusStorage<CurrentNetwork>, R: Rng + CryptoRng
+         let time_since_last_block = CurrentNetwork::BLOCK_TIME as i64;
+         let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm
+             .speculate(
+-                construct_finalize_global_state(vm),
++                construct_finalize_global_state(vm, time_since_last_block),
+                 time_since_last_block,
+                 Some(0u64),
+                 vec![],
+@@ -599,6 +599,7 @@ fn split<C: ConsensusStorage<CurrentNetwork>, R: Rng + CryptoRng>(
+ // Construct `FinalizeGlobalState` from the current `VM` state.
+ fn construct_finalize_global_state<C: ConsensusStorage<CurrentNetwork>>(
+     vm: &VM<CurrentNetwork, C>,
++    time_since_last_block: i64,
+ ) -> FinalizeGlobalState {
+     // Retrieve the latest block.
+     let block_height = vm.block_store().max_height().unwrap();
+@@ -616,10 +617,17 @@ fn construct_finalize_global_state<C: ConsensusStorage<CurrentNetwork>>(
+     // Compute the next height.
+     let next_height = latest_height.saturating_add(1);
+ 
++    // Determine the block timestamp based on the consensus version.
++    let block_timestamp =
++        match next_height >= CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default() {
++            true => Some(latest_block.timestamp().saturating_add(time_since_last_block)),
++            false => None,
++        };
+     // Construct the finalize state.
+     FinalizeGlobalState::new::<CurrentNetwork>(
+         next_round,
+         next_height,
++        block_timestamp,
+         latest_cumulative_weight,
+         0u128,
+         latest_block.hash(),
+diff --git a/synthesizer/tests/tests/vm/execute_and_finalize/test_rand.aleo b/synthesizer/tests/tests/vm/execute_and_finalize/test_rand.aleo
+index a0b321f79..a7f002ce3 100644
+--- a/synthesizer/tests/tests/vm/execute_and_finalize/test_rand.aleo
++++ b/synthesizer/tests/tests/vm/execute_and_finalize/test_rand.aleo
+@@ -12,7 +12,7 @@ cases:
+     inputs: [1field, false]
+   - program: test_rand.aleo
+     function: rand_chacha_check
+-    inputs: [2field, true]
++    inputs: [4field, true]
+ */
+ 
+ program test_rand.aleo;

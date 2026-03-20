@@ -1,0 +1,3656 @@
+diff --git a/bin/preprod/trigger_snapshot_status_check b/bin/preprod/trigger_snapshot_status_check
+new file mode 100755
+index 00000000000000..6a23525d930ea2
+--- /dev/null
++++ b/bin/preprod/trigger_snapshot_status_check
+@@ -0,0 +1,339 @@
++#!/usr/bin/env python
++
++from sentry.runner import configure
++
++configure()
++
++import logging
++import sys
++from datetime import timedelta
++
++logger = logging.getLogger(__name__)
++
++from sentry.models.commitcomparison import CommitComparison
++from sentry.models.project import Project
++from sentry.preprod.models import (
++    PreprodArtifact,
++    PreprodArtifactMobileAppInfo,
++    PreprodComparisonApproval,
++)
++from sentry.preprod.snapshots.models import PreprodSnapshotComparison, PreprodSnapshotMetrics
++from sentry.preprod.vcs.status_checks.snapshots.tasks import (
++    create_preprod_snapshot_status_check_task,
++)
++
++#################
++# Configuration #
++#################
++ORG_SLUG = "sentry"
++PROJECT_SLUG = "internal"
++REPO_NAME = "EmergeTools/hackernews"
++COMMIT_SHA = "db2b4ae626b458b4be651019f1a7c112406c003e"
++
++# Snapshot build configurations
++BUILD_1 = {
++    "app_id": "com.emerge.hackernews.android",
++    "artifact_type": PreprodArtifact.ArtifactType.AAB,
++    "app_name": "HackerNews Android",
++    "build_version": "1.0.3",
++    "build_number": 42,
++    "state": "compared_with_changes",
++    "create_base": True,
++    # Snapshot comparison results
++    "images_changed": 0,
++    "images_added": 0,
++    "images_removed": 0,
++    "images_unchanged": 24,
++    "image_count": 24,
++}
++
++# Set to None to disable BUILD_2
++BUILD_2 = None
++
++# Available states:
++# - "no_metrics":              Artifact has no snapshot metrics yet (processing)
++# - "metrics_no_comparison":   Artifact has metrics but no comparison yet
++# - "comparison_pending":      Comparison created but still pending
++# - "comparison_processing":   Comparison in progress
++# - "comparison_failed":       Comparison failed
++# - "compared_no_changes":     Comparison complete, all images match
++# - "compared_with_changes":   Comparison complete, some images differ
++
++# USAGE EXAMPLES:
++#
++# 1. All images match (SUCCESS):
++#    BUILD_1 = {..., "state": "compared_no_changes"}
++#    BUILD_2 = {..., "state": "compared_no_changes"}
++#
++# 2. Images changed (FAILURE with Approve button):
++#    BUILD_1 = {..., "state": "compared_with_changes", "images_changed": 3}
++#
++# 3. Still comparing (IN_PROGRESS):
++#    BUILD_1 = {..., "state": "comparison_processing"}
++#
++# 4. Mixed states:
++#    BUILD_1 = {..., "state": "compared_with_changes"}
++#    BUILD_2 = {..., "state": "comparison_pending"}
++#
++# 5. Comparison failure:
++#    BUILD_1 = {..., "state": "comparison_failed"}
++
++
++BASE_COMMIT_SHA = "a1b2c3d4e5f6789012345678901234567890abcd"
++
++
++def cleanup_existing_data(project, commit_comparison):
++    """Remove existing test artifacts for idempotent reruns."""
++    logger.info("\n🧹 Cleaning up existing artifacts for commit %s...", COMMIT_SHA[:8])
++
++    base_commit_comparisons = CommitComparison.objects.filter(
++        head_sha=BASE_COMMIT_SHA,
++        organization_id=project.organization_id,
++    )
++
++    all_commit_comparisons = [commit_comparison] + list(base_commit_comparisons)
++    existing_artifacts = PreprodArtifact.objects.filter(
++        commit_comparison__in=all_commit_comparisons,
++        project__organization_id=project.organization_id,
++    )
++
++    if existing_artifacts.exists():
++        artifact_ids = list(existing_artifacts.values_list("id", flat=True))
++        metrics = PreprodSnapshotMetrics.objects.filter(preprod_artifact_id__in=artifact_ids)
++        metrics_ids = list(metrics.values_list("id", flat=True))
++
++        comparison_count = PreprodSnapshotComparison.objects.filter(
++            head_snapshot_metrics_id__in=metrics_ids
++        ).delete()[0]
++        metrics_count = metrics.delete()[0]
++        approval_count = PreprodComparisonApproval.objects.filter(
++            preprod_artifact_id__in=artifact_ids
++        ).delete()[0]
++        artifact_count = existing_artifacts.delete()[0]
++
++        if base_commit_comparisons.exists():
++            base_count = base_commit_comparisons.delete()[0]
++            logger.info(
++                "  ✓ Deleted %s artifacts, %s metrics, %s comparisons, %s approvals, %s base commits",
++                artifact_count,
++                metrics_count,
++                comparison_count,
++                approval_count,
++                base_count,
++            )
++        else:
++            logger.info(
++                "  ✓ Deleted %s artifacts, %s metrics, %s comparisons, %s approvals",
++                artifact_count,
++                metrics_count,
++                comparison_count,
++                approval_count,
++            )
++    else:
++        logger.info("  ✓ No existing artifacts found (clean slate)")
++
++
++def create_artifact_and_metrics(project, build_config, commit_comparison):
++    """Create a preprod artifact with snapshot metrics."""
++    state = build_config["state"]
++
++    artifact = PreprodArtifact.objects.create(
++        project=project,
++        artifact_type=build_config["artifact_type"],
++        app_id=build_config["app_id"],
++        commit_comparison=commit_comparison,
++        state=PreprodArtifact.ArtifactState.PROCESSED,
++    )
++    PreprodArtifactMobileAppInfo.objects.create(
++        preprod_artifact=artifact,
++        app_name=build_config["app_name"],
++        build_version=build_config["build_version"],
++        build_number=build_config["build_number"],
++    )
++
++    # Backdate to simulate processing time
++    artifact.date_added = artifact.date_added - timedelta(minutes=5)
++    artifact.save(update_fields=["date_added"])
++
++    logger.info("  ✓ Created artifact: %s (ID: %s)", build_config["app_id"], artifact.id)
++
++    if state == "no_metrics":
++        logger.info("  ⏳ No metrics created (simulating upload in progress)")
++        return artifact, None
++
++    metrics = PreprodSnapshotMetrics.objects.create(
++        preprod_artifact=artifact,
++        image_count=build_config.get("image_count", 10),
++    )
++    logger.info("  ✓ Created snapshot metrics: %s (%s images)", metrics.id, metrics.image_count)
++
++    return artifact, metrics
++
++
++def create_base_data(project, build_config, head_commit_comparison):
++    """Create base artifact and metrics for comparison."""
++    base_commit_comparison, _ = CommitComparison.objects.get_or_create(
++        head_repo_name=head_commit_comparison.head_repo_name,
++        head_sha=BASE_COMMIT_SHA,
++        provider=head_commit_comparison.provider,
++        organization_id=head_commit_comparison.organization_id,
++    )
++
++    if not head_commit_comparison.base_sha:
++        head_commit_comparison.base_sha = BASE_COMMIT_SHA
++        head_commit_comparison.save(update_fields=["base_sha"])
++
++    base_artifact = PreprodArtifact.objects.create(
++        project=project,
++        artifact_type=build_config["artifact_type"],
++        app_id=build_config["app_id"],
++        commit_comparison=base_commit_comparison,
++        state=PreprodArtifact.ArtifactState.PROCESSED,
++    )
++    PreprodArtifactMobileAppInfo.objects.create(
++        preprod_artifact=base_artifact,
++        app_name=build_config["app_name"],
++        build_version=build_config["build_version"],
++        build_number=build_config["build_number"] - 1,
++    )
++
++    base_metrics = PreprodSnapshotMetrics.objects.create(
++        preprod_artifact=base_artifact,
++        image_count=build_config.get("image_count", 10),
++    )
++
++    logger.info(
++        "  ✓ Created base artifact: %s (ID: %s) with metrics",
++        build_config["app_id"],
++        base_artifact.id,
++    )
++
++    return base_metrics
++
++
++def create_comparison(build_config, head_metrics, base_metrics):
++    """Create a snapshot comparison based on the configured state."""
++    state = build_config["state"]
++
++    state_map = {
++        "comparison_pending": PreprodSnapshotComparison.State.PENDING,
++        "comparison_processing": PreprodSnapshotComparison.State.PROCESSING,
++        "comparison_failed": PreprodSnapshotComparison.State.FAILED,
++        "compared_no_changes": PreprodSnapshotComparison.State.SUCCESS,
++        "compared_with_changes": PreprodSnapshotComparison.State.SUCCESS,
++    }
++
++    comparison_state = state_map.get(state)
++    if comparison_state is None:
++        return None
++
++    comparison = PreprodSnapshotComparison.objects.create(
++        head_snapshot_metrics=head_metrics,
++        base_snapshot_metrics=base_metrics,
++        state=comparison_state,
++        images_changed=build_config.get("images_changed", 0),
++        images_added=build_config.get("images_added", 0),
++        images_removed=build_config.get("images_removed", 0),
++        images_unchanged=build_config.get("images_unchanged", 0),
++    )
++
++    status_label = {
++        PreprodSnapshotComparison.State.PENDING: "⏳ Pending",
++        PreprodSnapshotComparison.State.PROCESSING: "⏳ Processing",
++        PreprodSnapshotComparison.State.FAILED: "❌ Failed",
++        PreprodSnapshotComparison.State.SUCCESS: "✅ Success",
++    }[comparison_state]
++
++    logger.info("  ✓ Created comparison: %s", status_label)
++    if comparison_state == PreprodSnapshotComparison.State.SUCCESS:
++        logger.info(
++            "    Changed: %s, Added: %s, Removed: %s, Unchanged: %s",
++            comparison.images_changed,
++            comparison.images_added,
++            comparison.images_removed,
++            comparison.images_unchanged,
++        )
++
++    return comparison
++
++
++def main():
++    try:
++        project = Project.objects.get(slug=PROJECT_SLUG, organization__slug=ORG_SLUG)
++        logger.info("Found project: %s (ID: %s)", project.name, project.id)
++
++        commit_comparison, created = CommitComparison.objects.get_or_create(
++            head_repo_name=REPO_NAME,
++            head_sha=COMMIT_SHA,
++            provider="github",
++            organization_id=project.organization.id,
++        )
++        logger.info(
++            "%s commit comparison: %s", "Created" if created else "Found", commit_comparison.id
++        )
++
++        cleanup_existing_data(project, commit_comparison)
++
++        build_configs = [BUILD_1]
++        if BUILD_2 is not None:
++            build_configs.append(BUILD_2)
++
++        logger.info("\n🧪 Running snapshot status check test with %s build(s):", len(build_configs))
++        for i, config in enumerate(build_configs, 1):
++            logger.info(
++                "  📱 BUILD_%s: %s (state: %s, base: %s)",
++                i,
++                config["app_id"],
++                config["state"],
++                config.get("create_base", False),
++            )
++
++        created_artifacts = []
++
++        for build_config in build_configs:
++            logger.info("\n📦 Setting up %s...", build_config["app_id"])
++
++            artifact, head_metrics = create_artifact_and_metrics(
++                project, build_config, commit_comparison
++            )
++            created_artifacts.append(artifact)
++
++            if (
++                head_metrics
++                and build_config.get("create_base")
++                and build_config["state"]
++                not in (
++                    "no_metrics",
++                    "metrics_no_comparison",
++                )
++            ):
++                base_metrics = create_base_data(project, build_config, commit_comparison)
++                create_comparison(build_config, head_metrics, base_metrics)
++
++        logger.info(
++            "\n🚀 Calling create_preprod_snapshot_status_check_task with artifact %s...",
++            created_artifacts[0].id,
++        )
++        result = create_preprod_snapshot_status_check_task(
++            preprod_artifact_id=created_artifacts[0].id
++        )
++        logger.info("Task result: %s", result)
++        logger.info("✅ Snapshot status check function called successfully!")
++
++        logger.info("\n🔍 Check your GitHub status check at:")
++        logger.info("   https://github.com/%s/commit/%s", REPO_NAME, COMMIT_SHA)
++
++        logger.info("\n🔧 Debug: Created %s artifacts:", len(created_artifacts))
++        for artifact in created_artifacts:
++            logger.info("  - %s: ID %s", artifact.app_id, artifact.id)
++
++    except Project.DoesNotExist:
++        logger.exception("❌ Project not found: %s/%s", ORG_SLUG, PROJECT_SLUG)
++        sys.exit(1)
++    except Exception:
++        logger.exception("❌ Error running snapshot status check")
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/sentry/api/endpoints/organization_attribute_mappings.py b/src/sentry/api/endpoints/organization_attribute_mappings.py
+index 19687145b9dc0e..3605d537b4a110 100644
+--- a/src/sentry/api/endpoints/organization_attribute_mappings.py
++++ b/src/sentry/api/endpoints/organization_attribute_mappings.py
+@@ -10,6 +10,7 @@
+ from sentry.models.organization import Organization
+ from sentry.search.eap.occurrences.attributes import OCCURRENCE_ATTRIBUTE_DEFINITIONS
+ from sentry.search.eap.ourlogs.attributes import OURLOG_ATTRIBUTE_DEFINITIONS
++from sentry.search.eap.processing_errors.attributes import PROCESSING_ERROR_ATTRIBUTE_DEFINITIONS
+ from sentry.search.eap.profile_functions.attributes import PROFILE_FUNCTIONS_ATTRIBUTE_DEFINITIONS
+ from sentry.search.eap.spans.attributes import SPAN_ATTRIBUTE_DEFINITIONS
+ from sentry.search.eap.trace_metrics.attributes import TRACE_METRICS_ATTRIBUTE_DEFINITIONS
+@@ -21,6 +22,7 @@
+     "occurrences": OCCURRENCE_ATTRIBUTE_DEFINITIONS,
+     "tracemetrics": TRACE_METRICS_ATTRIBUTE_DEFINITIONS,
+     "uptime_results": UPTIME_ATTRIBUTE_DEFINITIONS,
++    "processing_errors": PROCESSING_ERROR_ATTRIBUTE_DEFINITIONS,
+     "profiles": PROFILE_FUNCTIONS_ATTRIBUTE_DEFINITIONS,
+ }
+ 
+diff --git a/src/sentry/api/endpoints/organization_events.py b/src/sentry/api/endpoints/organization_events.py
+index f272c16caec9fa..70c0365f3f6c4a 100644
+--- a/src/sentry/api/endpoints/organization_events.py
++++ b/src/sentry/api/endpoints/organization_events.py
+@@ -46,6 +46,7 @@
+ from sentry.snuba.metrics.extraction import MetricSpecType
+ from sentry.snuba.ourlogs import OurLogs
+ from sentry.snuba.preprod_size import PreprodSize
++from sentry.snuba.processing_errors_rpc import ProcessingErrors
+ from sentry.snuba.profile_functions import ProfileFunctions
+ from sentry.snuba.referrer import Referrer, is_valid_referrer
+ from sentry.snuba.spans_rpc import Spans
+@@ -538,6 +539,13 @@ def get_rpc_config():
+                         disable_aggregate_extrapolation=disable_aggregate_extrapolation,
+                         extrapolation_mode=extrapolation_mode,
+                     )
++                elif scoped_dataset == ProcessingErrors:
++                    return SearchResolverConfig(
++                        use_aggregate_conditions=use_aggregate_conditions,
++                        auto_fields=True,
++                        disable_aggregate_extrapolation=disable_aggregate_extrapolation,
++                        extrapolation_mode=extrapolation_mode,
++                    )
+                 elif scoped_dataset == PreprodSize:
+                     return PreprodSizeSearchResolverConfig(
+                         use_aggregate_conditions=use_aggregate_conditions,
+diff --git a/src/sentry/api/endpoints/organization_events_stats.py b/src/sentry/api/endpoints/organization_events_stats.py
+index a1c65dd3fde9dc..093459404a153c 100644
+--- a/src/sentry/api/endpoints/organization_events_stats.py
++++ b/src/sentry/api/endpoints/organization_events_stats.py
+@@ -39,6 +39,7 @@
+ from sentry.snuba.metrics.extraction import MetricSpecType
+ from sentry.snuba.ourlogs import OurLogs
+ from sentry.snuba.preprod_size import PreprodSize
++from sentry.snuba.processing_errors_rpc import ProcessingErrors
+ from sentry.snuba.profile_functions import ProfileFunctions
+ from sentry.snuba.query_sources import QuerySource
+ from sentry.snuba.referrer import Referrer, is_valid_referrer
+@@ -185,6 +186,7 @@ def get(self, request: Request, organization: Organization) -> Response:
+                         OurLogs,
+                         ProfileFunctions,
+                         PreprodSize,
++                        ProcessingErrors,
+                         TraceMetrics,
+                         errors,
+                         transactions,
+diff --git a/src/sentry/api/endpoints/organization_trace_item_attributes.py b/src/sentry/api/endpoints/organization_trace_item_attributes.py
+index 8b2b8d805e53d8..f627cf47bc598a 100644
+--- a/src/sentry/api/endpoints/organization_trace_item_attributes.py
++++ b/src/sentry/api/endpoints/organization_trace_item_attributes.py
+@@ -37,6 +37,7 @@
+ from sentry.search.eap.columns import ColumnDefinitions, VirtualColumnDefinition
+ from sentry.search.eap.ourlogs.definitions import OURLOG_DEFINITIONS
+ from sentry.search.eap.preprod_size.definitions import PREPROD_SIZE_DEFINITIONS
++from sentry.search.eap.processing_errors.definitions import PROCESSING_ERROR_DEFINITIONS
+ from sentry.search.eap.resolver import SearchResolver
+ from sentry.search.eap.spans.definitions import SPAN_DEFINITIONS
+ from sentry.search.eap.trace_metrics.definitions import TRACE_METRICS_DEFINITIONS
+@@ -158,6 +159,8 @@ def get_column_definitions(item_type: SupportedTraceItemType) -> ColumnDefinitio
+         return TRACE_METRICS_DEFINITIONS
+     elif item_type == SupportedTraceItemType.PREPROD:
+         return PREPROD_SIZE_DEFINITIONS
++    elif item_type == SupportedTraceItemType.PROCESSING_ERRORS:
++        return PROCESSING_ERROR_DEFINITIONS
+ 
+     raise ValueError(f"Invalid item type: {item_type}")
+ 
+@@ -171,6 +174,8 @@ def resolve_attribute_referrer(item_type: str, attribute_type: str) -> Referrer:
+         return Referrer.API_TRACE_METRICS_TAG_KEYS_RPC
+     elif item_type == SupportedTraceItemType.PREPROD.value:
+         return Referrer.API_PREPROD_TAG_KEYS_RPC
++    elif item_type == SupportedTraceItemType.PROCESSING_ERRORS.value:
++        return Referrer.API_PROCESSING_ERRORS_TAG_KEYS_RPC
+     else:
+         raise ValueError(f"Invalid item type: {item_type}")
+ 
+@@ -184,6 +189,8 @@ def resolve_attribute_values_referrer(item_type: str) -> Referrer:
+         return Referrer.API_TRACE_METRICS_TAG_VALUES_RPC
+     elif item_type == SupportedTraceItemType.PREPROD.value:
+         return Referrer.API_PREPROD_TAG_VALUES_RPC
++    elif item_type == SupportedTraceItemType.PROCESSING_ERRORS.value:
++        return Referrer.API_PROCESSING_ERRORS_TAG_VALUES_RPC
+     else:
+         raise ValueError(f"Invalid item type: {item_type}")
+ 
+diff --git a/src/sentry/api/serializers/models/dashboard.py b/src/sentry/api/serializers/models/dashboard.py
+index 31d29cfb3c13b2..828be3bec5d6b3 100644
+--- a/src/sentry/api/serializers/models/dashboard.py
++++ b/src/sentry/api/serializers/models/dashboard.py
+@@ -669,13 +669,6 @@ def get_attrs(self, item_list, user, **kwargs):
+     def serialize(self, obj, attrs, user, **kwargs) -> DashboardDetailsResponse:
+         page_filters, tag_filters = self.get_filters(obj)
+ 
+-        if "globalFilter" in tag_filters and not features.has(
+-            "organizations:dashboards-global-filters",
+-            organization=obj.organization,
+-            actor=user,
+-        ):
+-            tag_filters["globalFilter"] = []
+-
+         data: DashboardDetailsResponse = {
+             "id": str(obj.id),
+             "title": obj.title,
+diff --git a/src/sentry/api/serializers/rest_framework/dashboard.py b/src/sentry/api/serializers/rest_framework/dashboard.py
+index 41beed08759284..149fe65f4c5dc1 100644
+--- a/src/sentry/api/serializers/rest_framework/dashboard.py
++++ b/src/sentry/api/serializers/rest_framework/dashboard.py
+@@ -726,12 +726,7 @@ def update_dashboard_filters(self, instance, validated_data):
+         page_filter_keys = ["environment", "period", "start", "end", "utc"]
+         dashboard_filter_keys = ["release", "release_id"]
+ 
+-        if features.has(
+-            "organizations:dashboards-global-filters",
+-            organization=self.context["organization"],
+-            actor=self.context["request"].user,
+-        ):
+-            dashboard_filter_keys.append("global_filter")
++        dashboard_filter_keys.append("global_filter")
+ 
+         filters = {}
+ 
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index c69957107ba7ca..65adf98f472181 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -895,6 +895,7 @@ def SOCIAL_AUTH_DEFAULT_USERNAME() -> str:
+     "sentry.preprod.tasks",
+     "sentry.preprod.vcs.pr_comments.tasks",
+     "sentry.preprod.vcs.status_checks.size.tasks",
++    "sentry.preprod.vcs.status_checks.snapshots.tasks",
+     "sentry.profiles.task",
+     "sentry.release_health.tasks",
+     "sentry.relocation.tasks.process",
+diff --git a/src/sentry/features/temporary.py b/src/sentry/features/temporary.py
+index 899b6aad1cf03b..6b1224cff20942 100644
+--- a/src/sentry/features/temporary.py
++++ b/src/sentry/features/temporary.py
+@@ -80,8 +80,6 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     manager.add("organizations:dashboards-categorical-bar-charts", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enables custom editable dashboards
+     manager.add("organizations:dashboards-edit", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True, default=True)
+-    # Enables global filters for dashboards
+-    manager.add("organizations:dashboards-global-filters", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enables favourite and duplicate controls for prebuilt dashboards
+     manager.add("organizations:dashboards-prebuilt-controls", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enables import/export functionality for dashboards
+@@ -96,8 +94,6 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     manager.add("organizations:dashboards-drilldown-flow", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable prebuilt dashboards for insights modules
+     manager.add("organizations:dashboards-prebuilt-insights-dashboards", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+-    # Enable new timeseries visualization for dashboard widgets
+-    manager.add("organizations:dashboards-widget-timeseries-visualization", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Replaces insights ui with prebuilt dashboards
+     manager.add("organizations:insights-prebuilt-dashboards", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable the details widget for dashboards
+diff --git a/src/sentry/metrics/sentry_sdk.py b/src/sentry/metrics/sentry_sdk.py
+index f5056d88607ec6..9ec8662dc388bb 100644
+--- a/src/sentry/metrics/sentry_sdk.py
++++ b/src/sentry/metrics/sentry_sdk.py
+@@ -47,8 +47,9 @@ def incr(
+         if instance:
+             metric_attributes["instance"] = instance
+ 
+-        if sample_rate != 1.0:
+-            metric_attributes["sentry.client_sample_rate"] = sample_rate
++        effective_sample_rate = sample_rate * self._experimental_sample_rate
++        if effective_sample_rate != 1.0:
++            metric_attributes["sentry.client_sample_rate"] = effective_sample_rate
+ 
+         metrics.count(
+             full_key,
+@@ -77,8 +78,9 @@ def timing(
+         if instance:
+             metric_attributes["instance"] = instance
+ 
+-        if sample_rate != 1.0:
+-            metric_attributes["sentry.client_sample_rate"] = sample_rate
++        effective_sample_rate = sample_rate * self._experimental_sample_rate
++        if effective_sample_rate != 1.0:
++            metric_attributes["sentry.client_sample_rate"] = effective_sample_rate
+ 
+         metric_attributes["is_timing"] = True
+ 
+@@ -110,8 +112,9 @@ def gauge(
+         if instance:
+             metric_attributes["instance"] = instance
+ 
+-        if sample_rate != 1.0:
+-            metric_attributes["sentry.client_sample_rate"] = sample_rate
++        effective_sample_rate = sample_rate * self._experimental_sample_rate
++        if effective_sample_rate != 1.0:
++            metric_attributes["sentry.client_sample_rate"] = effective_sample_rate
+ 
+         metrics.gauge(
+             full_key,
+@@ -141,8 +144,9 @@ def distribution(
+         if instance:
+             metric_attributes["instance"] = instance
+ 
+-        if sample_rate != 1.0:
+-            metric_attributes["sentry.client_sample_rate"] = sample_rate
++        effective_sample_rate = sample_rate * self._experimental_sample_rate
++        if effective_sample_rate != 1.0:
++            metric_attributes["sentry.client_sample_rate"] = effective_sample_rate
+ 
+         metrics.distribution(
+             full_key,
+diff --git a/src/sentry/preprod/api/endpoints/preprod_artifact_rerun_status_checks.py b/src/sentry/preprod/api/endpoints/preprod_artifact_rerun_status_checks.py
+index ceb0073c92e488..551d15b44467b4 100644
+--- a/src/sentry/preprod/api/endpoints/preprod_artifact_rerun_status_checks.py
++++ b/src/sentry/preprod/api/endpoints/preprod_artifact_rerun_status_checks.py
+@@ -14,6 +14,9 @@
+ from sentry.preprod.api.bases.preprod_artifact_endpoint import PreprodArtifactEndpoint
+ from sentry.preprod.models import PreprodArtifact
+ from sentry.preprod.vcs.status_checks.size.tasks import create_preprod_status_check_task
++from sentry.preprod.vcs.status_checks.snapshots.tasks import (
++    create_preprod_snapshot_status_check_task,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -59,11 +62,13 @@ def post(
+                 status=400,
+             )
+ 
+-        SUPPORTED_CHECK_TYPES = {"size"}
++        SUPPORTED_CHECK_TYPES = {"size", "snapshots"}
+         supported_types = list({ct for ct in check_types if ct in SUPPORTED_CHECK_TYPES})
+         if not supported_types:
+             return Response(
+-                {"error": "No supported check types provided. Currently only 'size' is supported."},
++                {
++                    "error": "No supported check types provided. Supported types: 'size', 'snapshots'."
++                },
+                 status=400,
+             )
+ 
+@@ -91,6 +96,10 @@ def post(
+                         create_preprod_status_check_task.delay(
+                             preprod_artifact_id=head_artifact.id, caller="rerun_endpoint"
+                         )
++                    case "snapshots":
++                        create_preprod_snapshot_status_check_task.delay(
++                            preprod_artifact_id=head_artifact.id, caller="rerun_endpoint"
++                        )
+                     case _:
+                         continue
+             except Exception:
+diff --git a/src/sentry/preprod/snapshots/tasks.py b/src/sentry/preprod/snapshots/tasks.py
+index e69a498c95dc6b..2f98db5cc20236 100644
+--- a/src/sentry/preprod/snapshots/tasks.py
++++ b/src/sentry/preprod/snapshots/tasks.py
+@@ -18,6 +18,9 @@
+     SnapshotManifest,
+ )
+ from sentry.preprod.snapshots.models import PreprodSnapshotComparison, PreprodSnapshotMetrics
++from sentry.preprod.vcs.status_checks.snapshots.tasks import (
++    create_preprod_snapshot_status_check_task,
++)
+ from sentry.silo.base import SiloMode
+ from sentry.tasks.base import instrumented_task
+ from sentry.taskworker.namespaces import preprod_tasks
+@@ -504,6 +507,13 @@ def compare_snapshots(
+             ]
+         )
+ 
++        create_preprod_snapshot_status_check_task.apply_async(
++            kwargs={
++                "preprod_artifact_id": head_artifact_id,
++                "caller": "compare_completion",
++            },
++        )
++
+         logger.info(
+             "Snapshot comparison complete",
+             extra={
+@@ -536,4 +546,11 @@ def compare_snapshots(
+                     "Failed to save FAILED state for comparison",
+                     extra={"comparison_id": comparison.id},
+                 )
++
++        create_preprod_snapshot_status_check_task.apply_async(
++            kwargs={
++                "preprod_artifact_id": head_artifact_id,
++                "caller": "compare_failure",
++            },
++        )
+         raise
+diff --git a/src/sentry/preprod/vcs/status_checks/size/tasks.py b/src/sentry/preprod/vcs/status_checks/size/tasks.py
+index 4f88aa0c7ebbcc..cefba94354a6dc 100644
+--- a/src/sentry/preprod/vcs/status_checks/size/tasks.py
++++ b/src/sentry/preprod/vcs/status_checks/size/tasks.py
+@@ -208,13 +208,13 @@ def create_preprod_status_check_task(
+     # Get all artifacts for this commit across all projects in the organization
+     all_artifacts = list(preprod_artifact.get_sibling_artifacts_for_commit())
+ 
+-    client, repository = _get_status_check_client(preprod_artifact.project, commit_comparison)
++    client, repository = get_status_check_client(preprod_artifact.project, commit_comparison)
+     if not client or not repository:
+         # logging handled in _get_status_check_client. for now we can be lax about users potentially
+         # not having their repos integrated into Sentry
+         return
+ 
+-    provider = _get_status_check_provider(
++    provider = get_status_check_provider(
+         client,
+         commit_comparison.provider,
+         preprod_artifact.project.organization_id,
+@@ -319,7 +319,7 @@ def create_preprod_status_check_task(
+             target_url=target_url,
+             started_at=preprod_artifact.date_added,
+             completed_at=completed_at,
+-            include_approve_action=bool(triggered_rules),
++            approve_action_identifier=APPROVE_SIZE_ACTION_IDENTIFIER if triggered_rules else None,
+         )
+     except Exception as e:
+         extra: dict[str, Any] = {
+@@ -334,7 +334,7 @@ def create_preprod_status_check_task(
+             "preprod.status_checks.create.failed",
+             extra=extra,
+         )
+-        _update_posted_status_check(preprod_artifact, check_type="size", success=False, error=e)
++        update_posted_status_check(preprod_artifact, check_type="size", success=False, error=e)
+         raise
+ 
+     if check_id is None:
+@@ -347,12 +347,10 @@ def create_preprod_status_check_task(
+                 "error_type": "null_check_id",
+             },
+         )
+-        _update_posted_status_check(preprod_artifact, check_type="size", success=False)
++        update_posted_status_check(preprod_artifact, check_type="size", success=False)
+         return
+ 
+-    _update_posted_status_check(
+-        preprod_artifact, check_type="size", success=True, check_id=check_id
+-    )
++    update_posted_status_check(preprod_artifact, check_type="size", success=True, check_id=check_id)
+ 
+     if triggered_rules:
+         sentry_analytics.record(
+@@ -376,7 +374,7 @@ def create_preprod_status_check_task(
+     )
+ 
+ 
+-def _update_posted_status_check(
++def update_posted_status_check(
+     preprod_artifact: PreprodArtifact,
+     check_type: str,
+     success: bool,
+@@ -809,7 +807,7 @@ def _compute_overall_status(
+         return StatusCheckStatus.IN_PROGRESS, triggered_rules
+ 
+ 
+-def _get_status_check_client(
++def get_status_check_client(
+     project: Project, commit_comparison: CommitComparison
+ ) -> tuple[StatusCheckClient, Repository] | tuple[None, None]:
+     """Get status check client for the project's integration.
+@@ -875,7 +873,7 @@ def _get_status_check_client(
+     return client, repository
+ 
+ 
+-def _get_status_check_provider(
++def get_status_check_provider(
+     client: StatusCheckClient,
+     provider: str | None,
+     organization_id: int,
+@@ -932,7 +930,7 @@ def create_status_check(
+         started_at: datetime,
+         completed_at: datetime | None = None,
+         target_url: str | None = None,
+-        include_approve_action: bool = False,
++        approve_action_identifier: str | None = None,
+     ) -> str | None:
+         """Create a status check using provider-specific format."""
+         raise NotImplementedError
+@@ -952,7 +950,7 @@ def create_status_check(
+         started_at: datetime,
+         completed_at: datetime | None = None,
+         target_url: str | None = None,
+-        include_approve_action: bool = False,
++        approve_action_identifier: str | None = None,
+     ) -> str | None:
+         with self._create_scm_interaction_event().capture() as lifecycle:
+             mapped_status = GITHUB_STATUS_CHECK_STATUS_MAPPING.get(status)
+@@ -1029,12 +1027,12 @@ def create_status_check(
+                     "Omit completed_at entirely instead of setting it to None."
+                 )
+ 
+-            if include_approve_action:
++            if approve_action_identifier:
+                 check_data["actions"] = [
+                     {
+                         "label": "Approve",
+-                        "description": "Approve size changes for this PR",
+-                        "identifier": APPROVE_SIZE_ACTION_IDENTIFIER,
++                        "description": "Approve changes for this PR",
++                        "identifier": approve_action_identifier,
+                     }
+                 ]
+ 
+diff --git a/src/sentry/preprod/vcs/status_checks/snapshots/__init__.py b/src/sentry/preprod/vcs/status_checks/snapshots/__init__.py
+new file mode 100644
+index 00000000000000..e69de29bb2d1d6
+diff --git a/src/sentry/preprod/vcs/status_checks/snapshots/tasks.py b/src/sentry/preprod/vcs/status_checks/snapshots/tasks.py
+new file mode 100644
+index 00000000000000..0cbdae4293d59e
+--- /dev/null
++++ b/src/sentry/preprod/vcs/status_checks/snapshots/tasks.py
+@@ -0,0 +1,298 @@
++from __future__ import annotations
++
++import logging
++from datetime import datetime
++from typing import Any
++
++from sentry.integrations.github.status_check import GitHubCheckStatus
++from sentry.integrations.source_code_management.status_check import StatusCheckStatus
++from sentry.models.commitcomparison import CommitComparison
++from sentry.preprod.models import (
++    PreprodArtifact,
++    PreprodComparisonApproval,
++)
++from sentry.preprod.snapshots.models import PreprodSnapshotComparison, PreprodSnapshotMetrics
++from sentry.preprod.url_utils import get_preprod_artifact_url
++from sentry.preprod.vcs.status_checks.size.tasks import (
++    GITHUB_STATUS_CHECK_STATUS_MAPPING,
++    get_status_check_client,
++    get_status_check_provider,
++    update_posted_status_check,
++)
++from sentry.preprod.vcs.status_checks.snapshots.templates import (
++    format_snapshot_status_check_messages,
++)
++from sentry.shared_integrations.exceptions import ApiError
++from sentry.silo.base import SiloMode
++from sentry.tasks.base import instrumented_task
++from sentry.taskworker.namespaces import preprod_tasks
++
++logger = logging.getLogger(__name__)
++
++# Action identifier for the "Approve" button on snapshot GitHub check runs.
++APPROVE_SNAPSHOT_ACTION_IDENTIFIER = "approve_snapshots"
++
++
++@instrumented_task(
++    name="sentry.preprod.tasks.create_preprod_snapshot_status_check",
++    namespace=preprod_tasks,
++    processing_deadline_duration=30,
++    silo_mode=SiloMode.REGION,
++)
++def create_preprod_snapshot_status_check_task(
++    preprod_artifact_id: int, caller: str | None = None, **kwargs: Any
++) -> None:
++    try:
++        preprod_artifact: PreprodArtifact | None = PreprodArtifact.objects.select_related(
++            "mobile_app_info",
++            "commit_comparison",
++            "project",
++            "project__organization",
++        ).get(id=preprod_artifact_id)
++    except PreprodArtifact.DoesNotExist:
++        logger.exception(
++            "preprod.snapshot_status_checks.create.artifact_not_found",
++            extra={"artifact_id": preprod_artifact_id, "caller": caller},
++        )
++        return
++
++    if not preprod_artifact or not isinstance(preprod_artifact, PreprodArtifact):
++        logger.error(
++            "preprod.snapshot_status_checks.create.artifact_not_found",
++            extra={"artifact_id": preprod_artifact_id, "caller": caller},
++        )
++        return
++
++    logger.info(
++        "preprod.snapshot_status_checks.create.start",
++        extra={"artifact_id": preprod_artifact.id, "caller": caller},
++    )
++
++    if not preprod_artifact.commit_comparison:
++        logger.info(
++            "preprod.snapshot_status_checks.create.no_commit_comparison",
++            extra={"artifact_id": preprod_artifact.id},
++        )
++        return
++
++    commit_comparison: CommitComparison = preprod_artifact.commit_comparison
++    if not commit_comparison.head_sha or not commit_comparison.head_repo_name:
++        logger.error(
++            "preprod.snapshot_status_checks.create.missing_git_info",
++            extra={
++                "artifact_id": preprod_artifact.id,
++                "commit_comparison_id": commit_comparison.id,
++            },
++        )
++        return
++
++    # TODO(EME-911) Wireup enabled options once gating/billing comes into play
++
++    all_artifacts = list(preprod_artifact.get_sibling_artifacts_for_commit())
++
++    client, repository = get_status_check_client(preprod_artifact.project, commit_comparison)
++    if not client or not repository:
++        return
++
++    provider = get_status_check_provider(
++        client,
++        commit_comparison.provider,
++        preprod_artifact.project.organization_id,
++        preprod_artifact.project.organization.slug,
++        repository.integration_id,
++    )
++    if not provider:
++        logger.info(
++            "preprod.snapshot_status_checks.create.not_supported_provider",
++            extra={"provider": commit_comparison.provider},
++        )
++        return
++
++    artifact_ids = [a.id for a in all_artifacts]
++    snapshot_metrics_qs = PreprodSnapshotMetrics.objects.filter(
++        preprod_artifact_id__in=artifact_ids,
++    )
++    snapshot_metrics_map: dict[int, PreprodSnapshotMetrics] = {
++        m.preprod_artifact_id: m for m in snapshot_metrics_qs
++    }
++
++    all_artifacts = [a for a in all_artifacts if a.id in snapshot_metrics_map]
++    if not all_artifacts:
++        logger.info(
++            "preprod.snapshot_status_checks.create.no_snapshot_metrics",
++            extra={"artifact_id": preprod_artifact.id},
++        )
++        return
++
++    metrics_ids = [m.id for m in snapshot_metrics_map.values()]
++    comparisons_qs = PreprodSnapshotComparison.objects.filter(
++        head_snapshot_metrics_id__in=metrics_ids,
++    )
++    comparisons_map: dict[int, PreprodSnapshotComparison] = {
++        c.head_snapshot_metrics_id: c for c in comparisons_qs
++    }
++
++    approvals_map: dict[int, PreprodComparisonApproval] = {}
++    approval_qs = PreprodComparisonApproval.objects.filter(
++        preprod_artifact_id__in=artifact_ids,
++        preprod_feature_type=PreprodComparisonApproval.FeatureType.SNAPSHOTS,
++        approval_status=PreprodComparisonApproval.ApprovalStatus.APPROVED,
++    )
++    for approval in approval_qs:
++        approvals_map[approval.preprod_artifact_id] = approval
++
++    base_artifact_map = PreprodArtifact.get_base_artifacts_for_commit(all_artifacts)
++
++    status = _compute_snapshot_status(
++        all_artifacts, snapshot_metrics_map, comparisons_map, approvals_map
++    )
++
++    completed_at: datetime | None = None
++    if GITHUB_STATUS_CHECK_STATUS_MAPPING[status] == GitHubCheckStatus.COMPLETED:
++        completed_at = preprod_artifact.date_updated
++
++    title, subtitle, summary = format_snapshot_status_check_messages(
++        all_artifacts,
++        snapshot_metrics_map,
++        comparisons_map,
++        status,
++        base_artifact_map,
++    )
++
++    approve_action_identifier: str | None = None
++    if _has_snapshot_changes(all_artifacts, snapshot_metrics_map, comparisons_map):
++        approve_action_identifier = APPROVE_SNAPSHOT_ACTION_IDENTIFIER
++
++    url_artifact = (
++        preprod_artifact
++        if preprod_artifact.id in {a.id for a in all_artifacts}
++        else all_artifacts[0]
++    )
++    target_url = get_preprod_artifact_url(url_artifact, view_type="snapshots")
++
++    try:
++        check_id = provider.create_status_check(
++            repo=commit_comparison.head_repo_name,
++            sha=commit_comparison.head_sha,
++            status=status,
++            title=title,
++            subtitle=subtitle,
++            text=None,
++            summary=summary,
++            external_id=str(preprod_artifact.id),
++            target_url=target_url,
++            started_at=preprod_artifact.date_added,
++            completed_at=completed_at,
++            approve_action_identifier=approve_action_identifier,
++        )
++    except Exception as e:
++        extra: dict[str, Any] = {
++            "artifact_id": preprod_artifact.id,
++            "organization_id": preprod_artifact.project.organization_id,
++            "organization_slug": preprod_artifact.project.organization.slug,
++            "error_type": type(e).__name__,
++        }
++        if isinstance(e, ApiError):
++            extra["status_code"] = e.code
++        logger.exception(
++            "preprod.snapshot_status_checks.create.failed",
++            extra=extra,
++        )
++        update_posted_status_check(preprod_artifact, check_type="snapshots", success=False, error=e)
++        raise
++
++    if check_id is None:
++        logger.error(
++            "preprod.snapshot_status_checks.create.failed",
++            extra={
++                "artifact_id": preprod_artifact.id,
++                "organization_id": preprod_artifact.project.organization_id,
++                "organization_slug": preprod_artifact.project.organization.slug,
++                "error_type": "null_check_id",
++            },
++        )
++        update_posted_status_check(preprod_artifact, check_type="snapshots", success=False)
++        return
++
++    update_posted_status_check(
++        preprod_artifact, check_type="snapshots", success=True, check_id=check_id
++    )
++
++    logger.info(
++        "preprod.snapshot_status_checks.create.success",
++        extra={
++            "artifact_id": preprod_artifact.id,
++            "status": status.value,
++            "check_id": check_id,
++            "organization_id": preprod_artifact.project.organization_id,
++            "organization_slug": preprod_artifact.project.organization.slug,
++        },
++    )
++
++
++def _has_snapshot_changes(
++    artifacts: list[PreprodArtifact],
++    snapshot_metrics_map: dict[int, PreprodSnapshotMetrics],
++    comparisons_map: dict[int, PreprodSnapshotComparison],
++) -> bool:
++    """Check if any artifact has snapshot changes (added/removed/changed)."""
++    for artifact in artifacts:
++        metrics = snapshot_metrics_map.get(artifact.id)
++        if not metrics:
++            continue
++        comparison = comparisons_map.get(metrics.id)
++        if not comparison or comparison.state != PreprodSnapshotComparison.State.SUCCESS:
++            continue
++
++        if (
++            comparison.images_changed > 0
++            or comparison.images_added > 0
++            or comparison.images_removed > 0
++            or comparison.images_renamed > 0
++        ):
++            return True
++    return False
++
++
++def _compute_snapshot_status(
++    artifacts: list[PreprodArtifact],
++    snapshot_metrics_map: dict[int, PreprodSnapshotMetrics],
++    comparisons_map: dict[int, PreprodSnapshotComparison],
++    approvals_map: dict[int, PreprodComparisonApproval],
++) -> StatusCheckStatus:
++    """Compute the overall snapshot status check status.
++
++    - IN_PROGRESS if any comparison is pending/processing
++    - FAILURE if any comparison failed, or if any has changes and not approved
++    - SUCCESS if all comparisons succeeded with no changes, or all approved
++    """
++    has_in_progress = False
++
++    for artifact in artifacts:
++        metrics = snapshot_metrics_map.get(artifact.id)
++        comparison = metrics and comparisons_map.get(metrics.id)
++
++        if not comparison:
++            has_in_progress = True
++            continue
++
++        match comparison.state:
++            case (
++                PreprodSnapshotComparison.State.PENDING | PreprodSnapshotComparison.State.PROCESSING
++            ):
++                has_in_progress = True
++            case PreprodSnapshotComparison.State.FAILED:
++                return StatusCheckStatus.FAILURE
++            case PreprodSnapshotComparison.State.SUCCESS:
++                if (
++                    comparison.images_changed > 0
++                    or comparison.images_added > 0
++                    or comparison.images_removed > 0
++                    or comparison.images_renamed > 0
++                ) and artifact.id not in approvals_map:
++                    return StatusCheckStatus.FAILURE
++
++    if has_in_progress:
++        return StatusCheckStatus.IN_PROGRESS
++
++    return StatusCheckStatus.SUCCESS
+diff --git a/src/sentry/preprod/vcs/status_checks/snapshots/templates.py b/src/sentry/preprod/vcs/status_checks/snapshots/templates.py
+new file mode 100644
+index 00000000000000..61136c7b26de39
+--- /dev/null
++++ b/src/sentry/preprod/vcs/status_checks/snapshots/templates.py
+@@ -0,0 +1,176 @@
++from __future__ import annotations
++
++from django.utils.translation import gettext_lazy as _
++from django.utils.translation import ngettext
++
++from sentry.integrations.source_code_management.status_check import StatusCheckStatus
++from sentry.preprod.models import PreprodArtifact
++from sentry.preprod.snapshots.models import PreprodSnapshotComparison, PreprodSnapshotMetrics
++from sentry.preprod.url_utils import get_preprod_artifact_comparison_url, get_preprod_artifact_url
++
++_SNAPSHOT_TITLE_BASE = _("Snapshot Testing")
++
++
++def format_snapshot_status_check_messages(
++    artifacts: list[PreprodArtifact],
++    snapshot_metrics_map: dict[int, PreprodSnapshotMetrics],
++    comparisons_map: dict[int, PreprodSnapshotComparison],
++    overall_status: StatusCheckStatus,
++    base_artifact_map: dict[int, PreprodArtifact],
++) -> tuple[str, str, str]:
++    if not artifacts:
++        raise ValueError("Cannot format messages for empty artifact list")
++
++    title = _SNAPSHOT_TITLE_BASE
++
++    total_changed = 0
++    total_added = 0
++    total_removed = 0
++    total_renamed = 0
++    total_unchanged = 0
++
++    for artifact in artifacts:
++        metrics = snapshot_metrics_map.get(artifact.id)
++        if not metrics:
++            continue
++
++        comparison = comparisons_map.get(metrics.id)
++        if not comparison:
++            continue
++
++        if comparison.state == PreprodSnapshotComparison.State.FAILED:
++            subtitle = str(_("We had trouble comparing snapshots, our team is investigating."))
++            return str(title), str(subtitle), ""
++
++        if comparison.state == PreprodSnapshotComparison.State.SUCCESS:
++            total_changed += comparison.images_changed
++            total_added += comparison.images_added
++            total_removed += comparison.images_removed
++            total_renamed += comparison.images_renamed
++            total_unchanged += comparison.images_unchanged
++
++    if overall_status == StatusCheckStatus.IN_PROGRESS:
++        subtitle = str(_("Comparing snapshots..."))
++    elif total_changed == 0 and total_added == 0 and total_removed == 0 and total_renamed == 0:
++        subtitle = str(_("No changes detected"))
++    else:
++        parts = []
++        if total_changed > 0:
++            parts.append(
++                ngettext(
++                    "%(count)d modified",
++                    "%(count)d modified",
++                    total_changed,
++                )
++                % {"count": total_changed}
++            )
++        if total_added > 0:
++            parts.append(
++                ngettext(
++                    "%(count)d added",
++                    "%(count)d added",
++                    total_added,
++                )
++                % {"count": total_added}
++            )
++        if total_removed > 0:
++            parts.append(
++                ngettext(
++                    "%(count)d removed",
++                    "%(count)d removed",
++                    total_removed,
++                )
++                % {"count": total_removed}
++            )
++        if total_renamed > 0:
++            parts.append(
++                ngettext(
++                    "%(count)d renamed",
++                    "%(count)d renamed",
++                    total_renamed,
++                )
++                % {"count": total_renamed}
++            )
++        if total_unchanged > 0:
++            parts.append(
++                ngettext(
++                    "%(count)d unchanged",
++                    "%(count)d unchanged",
++                    total_unchanged,
++                )
++                % {"count": total_unchanged}
++            )
++        subtitle = ", ".join(str(p) for p in parts)
++
++    summary = _format_snapshot_summary(
++        artifacts,
++        snapshot_metrics_map,
++        comparisons_map,
++        base_artifact_map,
++    )
++
++    return str(title), str(subtitle), str(summary)
++
++
++def _format_snapshot_summary(
++    artifacts: list[PreprodArtifact],
++    snapshot_metrics_map: dict[int, PreprodSnapshotMetrics],
++    comparisons_map: dict[int, PreprodSnapshotComparison],
++    base_artifact_map: dict[int, PreprodArtifact],
++) -> str:
++    table_rows = []
++
++    for artifact in artifacts:
++        mobile_app_info = getattr(artifact, "mobile_app_info", None)
++        app_name = mobile_app_info.app_name if mobile_app_info else None
++        app_display = app_name or artifact.app_id or str(_("Unknown App"))
++        app_id = artifact.app_id or ""
++
++        metrics = snapshot_metrics_map.get(artifact.id)
++        base_artifact = base_artifact_map.get(artifact.id)
++
++        if base_artifact and metrics:
++            artifact_url = get_preprod_artifact_comparison_url(
++                artifact, base_artifact, comparison_type="snapshots"
++            )
++        else:
++            artifact_url = get_preprod_artifact_url(artifact, view_type="snapshots")
++
++        name_cell = (
++            f"[{app_display}]({artifact_url})<br>`{app_id}`"
++            if app_id
++            else f"[{app_display}]({artifact_url})"
++        )
++
++        if not metrics:
++            table_rows.append(f"| {name_cell} | - | - | - | - | - | ⏳ Processing |")
++            continue
++
++        comparison = comparisons_map.get(metrics.id)
++        if not comparison:
++            table_rows.append(f"| {name_cell} | - | - | - | - | - | ⏳ Processing |")
++            continue
++
++        if comparison.state in (
++            PreprodSnapshotComparison.State.PENDING,
++            PreprodSnapshotComparison.State.PROCESSING,
++        ):
++            table_rows.append(f"| {name_cell} | - | - | - | - | - | ⏳ Comparing |")
++        else:
++            added = comparison.images_added
++            removed = comparison.images_removed
++            modified = comparison.images_changed
++            renamed = comparison.images_renamed
++            unchanged = comparison.images_unchanged
++            has_changes = modified > 0 or added > 0 or removed > 0 or renamed > 0
++            status = "⏳ Needs approval" if has_changes else "✅ Unchanged"
++            table_rows.append(
++                f"| {name_cell} | {added} | {removed} | {modified} | {renamed} | {unchanged} | {status} |"
++            )
++
++    table_header = (
++        "| Name | Added | Removed | Modified | Renamed | Unchanged | Status |\n"
++        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n"
++    )
++
++    return table_header + "\n".join(table_rows)
+diff --git a/src/sentry/preprod/vcs/webhooks/github_check_run.py b/src/sentry/preprod/vcs/webhooks/github_check_run.py
+index 667eb28cdda222..2ce271033837d7 100644
+--- a/src/sentry/preprod/vcs/webhooks/github_check_run.py
++++ b/src/sentry/preprod/vcs/webhooks/github_check_run.py
+@@ -4,7 +4,7 @@
+ from collections.abc import Mapping
+ from datetime import datetime, timezone
+ from enum import StrEnum
+-from typing import Any
++from typing import Any, Literal
+ 
+ from django.db.models import F, Window
+ from django.db.models.functions import RowNumber
+@@ -20,6 +20,10 @@
+     APPROVE_SIZE_ACTION_IDENTIFIER,
+     create_preprod_status_check_task,
+ )
++from sentry.preprod.vcs.status_checks.snapshots.tasks import (
++    APPROVE_SNAPSHOT_ACTION_IDENTIFIER,
++    create_preprod_snapshot_status_check_task,
++)
+ from sentry.utils import metrics
+ 
+ logger = logging.getLogger(__name__)
+@@ -32,6 +36,7 @@ class Log(StrEnum):
+     ARTIFACT_NOT_FOUND = "preprod.webhook.check_run.artifact_not_found"
+     APPROVAL_ALREADY_EXISTS = "preprod.webhook.check_run.approval_already_exists"
+     APPROVALS_CREATED = "preprod.webhook.check_run.approvals_created"
++    UNKNOWN_IDENTIFIER = "preprod.webhook.check_run.unknown_identifier"
+ 
+ 
+ class GitHubCheckRunAction(StrEnum):
+@@ -68,7 +73,7 @@ def handle_preprod_check_run_event(
+     requested_action = event.get("requested_action", {})
+     identifier = requested_action.get("identifier")
+ 
+-    if identifier != APPROVE_SIZE_ACTION_IDENTIFIER:
++    if identifier not in (APPROVE_SIZE_ACTION_IDENTIFIER, APPROVE_SNAPSHOT_ACTION_IDENTIFIER):
+         return
+ 
+     check_run = event.get("check_run", {})
+@@ -119,12 +124,28 @@ def handle_preprod_check_run_event(
+     approvals_created = 0
+     github_user_info = {"github": {"id": sender.get("id"), "login": sender.get("login")}}
+ 
++    # Determine feature type based on the action identifier
++    product_name: Literal["size", "snapshots"]
++    if identifier == APPROVE_SIZE_ACTION_IDENTIFIER:
++        feature_type = PreprodComparisonApproval.FeatureType.SIZE
++        product_name = "size"
++    elif identifier == APPROVE_SNAPSHOT_ACTION_IDENTIFIER:
++        feature_type = PreprodComparisonApproval.FeatureType.SNAPSHOTS
++        product_name = "snapshots"
++    else:
++        logger.warning(
++            Log.UNKNOWN_IDENTIFIER,
++            extra={**extra, "identifier": identifier},
++        )
++        metrics.incr(Log.UNKNOWN_IDENTIFIER)
++        return
++
+     # Single query: get latest approval per artifact using window function
+     sibling_ids = [s.id for s in sibling_artifacts]
+     latest_approvals_qs = (
+         PreprodComparisonApproval.objects.filter(
+             preprod_artifact_id__in=sibling_ids,
+-            preprod_feature_type=PreprodComparisonApproval.FeatureType.SIZE,
++            preprod_feature_type=feature_type,
+         )
+         .annotate(
+             row_num=Window(
+@@ -154,7 +175,7 @@ def handle_preprod_check_run_event(
+ 
+         PreprodComparisonApproval.objects.create(
+             preprod_artifact=sibling,
+-            preprod_feature_type=PreprodComparisonApproval.FeatureType.SIZE,
++            preprod_feature_type=feature_type,
+             approval_status=PreprodComparisonApproval.ApprovalStatus.APPROVED,
+             approved_at=datetime.now(timezone.utc),
+             approved_by_id=None,
+@@ -182,13 +203,23 @@ def handle_preprod_check_run_event(
+                 organization_id=organization.id,
+                 project_id=artifact.project_id,
+                 artifact_id=artifact.id,
+-                product="size",
++                product=product_name,
+             )
+         )
+ 
+-    create_preprod_status_check_task.apply_async(
+-        kwargs={
+-            "preprod_artifact_id": artifact.id,
+-            "caller": "github_approve_webhook",
+-        }
+-    )
++    if identifier == APPROVE_SIZE_ACTION_IDENTIFIER:
++        create_preprod_status_check_task.apply_async(
++            kwargs={
++                "preprod_artifact_id": artifact.id,
++                "caller": "github_approve_webhook",
++            }
++        )
++    elif identifier == APPROVE_SNAPSHOT_ACTION_IDENTIFIER:
++        create_preprod_snapshot_status_check_task.apply_async(
++            kwargs={
++                "preprod_artifact_id": artifact.id,
++                "caller": "github_approve_webhook",
++            }
++        )
++    else:
++        raise ValueError(f"Unknown identifier: {identifier}")
+diff --git a/src/sentry/search/eap/constants.py b/src/sentry/search/eap/constants.py
+index 6d5618c729e5e0..8981deed52e32e 100644
+--- a/src/sentry/search/eap/constants.py
++++ b/src/sentry/search/eap/constants.py
+@@ -19,6 +19,7 @@
+     SupportedTraceItemType.PROFILE_FUNCTIONS: TraceItemType.TRACE_ITEM_TYPE_PROFILE_FUNCTION,
+     SupportedTraceItemType.PREPROD: TraceItemType.TRACE_ITEM_TYPE_PREPROD,
+     SupportedTraceItemType.ATTACHMENTS: TraceItemType.TRACE_ITEM_TYPE_ATTACHMENT,
++    SupportedTraceItemType.PROCESSING_ERRORS: TraceItemType.TRACE_ITEM_TYPE_PROCESSING_ERROR,
+ }
+ 
+ SUPPORTED_STATS_TYPES = {"attributeDistributions"}
+diff --git a/src/sentry/search/eap/processing_errors/__init__.py b/src/sentry/search/eap/processing_errors/__init__.py
+new file mode 100644
+index 00000000000000..e69de29bb2d1d6
+diff --git a/src/sentry/search/eap/processing_errors/aggregates.py b/src/sentry/search/eap/processing_errors/aggregates.py
+new file mode 100644
+index 00000000000000..b8ccd1b2dc4d82
+--- /dev/null
++++ b/src/sentry/search/eap/processing_errors/aggregates.py
+@@ -0,0 +1,37 @@
++from sentry_protos.snuba.v1.trace_item_attribute_pb2 import (
++    AttributeKey,
++    Function,
++)
++
++from sentry.search.eap.aggregate_utils import count_processor
++from sentry.search.eap.columns import (
++    AggregateDefinition,
++    AttributeArgumentDefinition,
++    count_argument_resolver_optimized,
++)
++
++PROCESSING_ERRORS_ALWAYS_PRESENT_ATTRIBUTES = [
++    AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
++]
++
++PROCESSING_ERROR_AGGREGATE_DEFINITIONS = {
++    "count": AggregateDefinition(
++        internal_function=Function.FUNCTION_COUNT,
++        infer_search_type_from_arguments=False,
++        processor=count_processor,
++        default_search_type="integer",
++        arguments=[
++            AttributeArgumentDefinition(
++                attribute_types={
++                    "string",
++                    "number",
++                    "integer",
++                },
++                default_arg="error_type",
++            )
++        ],
++        attribute_resolver=count_argument_resolver_optimized(
++            PROCESSING_ERRORS_ALWAYS_PRESENT_ATTRIBUTES
++        ),
++    ),
++}
+diff --git a/src/sentry/search/eap/processing_errors/attributes.py b/src/sentry/search/eap/processing_errors/attributes.py
+new file mode 100644
+index 00000000000000..511f9e0de49329
+--- /dev/null
++++ b/src/sentry/search/eap/processing_errors/attributes.py
+@@ -0,0 +1,59 @@
++from sentry.search.eap.columns import ResolvedAttribute
++from sentry.search.eap.common_columns import COMMON_COLUMNS
++
++PROCESSING_ERROR_ATTRIBUTE_DEFINITIONS = {
++    column.public_alias: column
++    for column in COMMON_COLUMNS
++    + [
++        ResolvedAttribute(
++            public_alias="id",
++            internal_name="sentry.item_id",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="trace",
++            internal_name="sentry.trace_id",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="event_id",
++            internal_name="event_id",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="error_type",
++            internal_name="error_type",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="symbolicator_type",
++            internal_name="symbolicator_type",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="release",
++            internal_name="release",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="environment",
++            internal_name="environment",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="platform",
++            internal_name="platform",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="sdk_name",
++            internal_name="sdk_name",
++            search_type="string",
++        ),
++        ResolvedAttribute(
++            public_alias="sdk_version",
++            internal_name="sdk_version",
++            search_type="string",
++        ),
++    ]
++}
+diff --git a/src/sentry/search/eap/processing_errors/definitions.py b/src/sentry/search/eap/processing_errors/definitions.py
+new file mode 100644
+index 00000000000000..c7da5e603bf297
+--- /dev/null
++++ b/src/sentry/search/eap/processing_errors/definitions.py
+@@ -0,0 +1,16 @@
++from sentry_protos.snuba.v1.request_common_pb2 import TraceItemType
++
++from sentry.search.eap.columns import ColumnDefinitions
++from sentry.search.eap.processing_errors.aggregates import PROCESSING_ERROR_AGGREGATE_DEFINITIONS
++from sentry.search.eap.processing_errors.attributes import PROCESSING_ERROR_ATTRIBUTE_DEFINITIONS
++
++PROCESSING_ERROR_DEFINITIONS = ColumnDefinitions(
++    aggregates=PROCESSING_ERROR_AGGREGATE_DEFINITIONS,
++    formulas={},
++    columns=PROCESSING_ERROR_ATTRIBUTE_DEFINITIONS,
++    contexts={},
++    trace_item_type=TraceItemType.TRACE_ITEM_TYPE_PROCESSING_ERROR,
++    filter_aliases={},
++    alias_to_column=None,
++    column_to_alias=None,
++)
+diff --git a/src/sentry/search/eap/types.py b/src/sentry/search/eap/types.py
+index 5b0bb150f5e91e..849a3a3348a8b0 100644
+--- a/src/sentry/search/eap/types.py
++++ b/src/sentry/search/eap/types.py
+@@ -61,6 +61,7 @@ class SupportedTraceItemType(str, Enum):
+     PROFILE_FUNCTIONS = "profile_functions"
+     PREPROD = "preprod"
+     ATTACHMENTS = "attachments"
++    PROCESSING_ERRORS = "processing_errors"
+     OCCURRENCES = "occurrences"
+ 
+ 
+diff --git a/src/sentry/snuba/processing_errors_rpc.py b/src/sentry/snuba/processing_errors_rpc.py
+new file mode 100644
+index 00000000000000..8c5e4cbc869c55
+--- /dev/null
++++ b/src/sentry/snuba/processing_errors_rpc.py
+@@ -0,0 +1,52 @@
++import logging
++
++import sentry_sdk
++from sentry_protos.snuba.v1.request_common_pb2 import PageToken
++
++from sentry.search.eap.processing_errors.definitions import PROCESSING_ERROR_DEFINITIONS
++from sentry.search.eap.resolver import SearchResolver
++from sentry.search.eap.types import AdditionalQueries, EAPResponse, SearchResolverConfig
++from sentry.search.events.types import SAMPLING_MODES, SnubaParams
++from sentry.snuba import rpc_dataset_common
++
++logger = logging.getLogger("sentry.snuba.processing_errors_rpc")
++
++
++class ProcessingErrors(rpc_dataset_common.RPCBase):
++    DEFINITIONS = PROCESSING_ERROR_DEFINITIONS
++
++    @classmethod
++    @sentry_sdk.trace
++    def run_table_query(
++        cls,
++        *,
++        params: SnubaParams,
++        query_string: str,
++        selected_columns: list[str],
++        orderby: list[str] | None,
++        offset: int,
++        limit: int,
++        referrer: str,
++        config: SearchResolverConfig,
++        sampling_mode: SAMPLING_MODES | None = None,
++        equations: list[str] | None = None,
++        search_resolver: SearchResolver | None = None,
++        page_token: PageToken | None = None,
++        additional_queries: AdditionalQueries | None = None,
++    ) -> EAPResponse:
++        return cls._run_table_query(
++            rpc_dataset_common.TableQuery(
++                query_string=query_string,
++                selected_columns=selected_columns,
++                equations=equations,
++                orderby=orderby,
++                offset=offset,
++                limit=limit,
++                referrer=referrer,
++                sampling_mode=sampling_mode,
++                resolver=search_resolver or cls.get_resolver(params, config),
++                page_token=page_token,
++                additional_queries=additional_queries,
++            ),
++            params.debug,
++        )
+diff --git a/src/sentry/snuba/referrer.py b/src/sentry/snuba/referrer.py
+index 48736b3530abe6..b5d52e0aad2aa5 100644
+--- a/src/sentry/snuba/referrer.py
++++ b/src/sentry/snuba/referrer.py
+@@ -562,6 +562,8 @@ class Referrer(StrEnum):
+     API_LOGS_TAB_VIEW = "api.logs-tab.view"
+     API_PREPROD_TAG_KEYS_RPC = "api.preprod.tags-keys.rpc"
+     API_PREPROD_TAG_VALUES_RPC = "api.preprod.tags-values.rpc"
++    API_PROCESSING_ERRORS_TAG_KEYS_RPC = "api.processing-errors.tags-keys.rpc"
++    API_PROCESSING_ERRORS_TAG_VALUES_RPC = "api.processing-errors.tags-values.rpc"
+     API_SPANS_TAG_KEYS = "api.spans.tags-keys"
+     API_SPANS_TAG_KEYS_RPC = "api.spans.tags-keys.rpc"
+     API_SPANS_TAG_VALUES = "api.spans.tags-values"
+diff --git a/src/sentry/snuba/utils.py b/src/sentry/snuba/utils.py
+index 8074005007b657..af741c4e11997b 100644
+--- a/src/sentry/snuba/utils.py
++++ b/src/sentry/snuba/utils.py
+@@ -20,6 +20,7 @@
+ from sentry.snuba.occurrences_rpc import Occurrences
+ from sentry.snuba.ourlogs import OurLogs
+ from sentry.snuba.preprod_size import PreprodSize
++from sentry.snuba.processing_errors_rpc import ProcessingErrors
+ from sentry.snuba.profile_functions import ProfileFunctions
+ from sentry.snuba.spans_rpc import Spans
+ from sentry.snuba.trace_metrics import TraceMetrics
+@@ -48,12 +49,14 @@
+     "spansIndexed": spans_indexed,
+     "spansMetrics": spans_metrics,
+     SupportedTraceItemType.TRACEMETRICS.value: TraceMetrics,
++    SupportedTraceItemType.PROCESSING_ERRORS.value: ProcessingErrors,
+     "transactions": transactions,
+ }
+ DEPRECATED_LABELS = {"ourlogs"}
+ RPC_DATASETS = {
+     ProfileFunctions,
+     PreprodSize,
++    ProcessingErrors,
+     Spans,
+     TraceMetrics,
+     Occurrences,
+diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
+index 4cde23fcbd9a90..a3cd81dbc22dcc 100644
+--- a/src/sentry/testutils/cases.py
++++ b/src/sentry/testutils/cases.py
+@@ -4050,7 +4050,7 @@ def create_eap_replay_breadcrumb(
+         **attributes,
+     ):
+         """Create single EAP replay breadcrumb TraceItem."""
+-        from datetime import datetime, timezone
++        from datetime import datetime
+         from uuid import uuid4
+ 
+         from google.protobuf.timestamp_pb2 import Timestamp
+@@ -4060,7 +4060,7 @@ def create_eap_replay_breadcrumb(
+         if organization is None:
+             organization = self.organization
+         if timestamp is None:
+-            timestamp = datetime.now(timezone.utc)
++            timestamp = datetime.now(UTC)
+         if trace_id is None:
+             trace_id = replay_id
+ 
+@@ -4178,19 +4178,12 @@ def create_eap_uptime_result(
+         status_reason_description=None,
+         span_id=None,
+     ):
+-        from datetime import datetime, timedelta, timezone
+-        from uuid import uuid4
+-
+-        from google.protobuf.timestamp_pb2 import Timestamp
+-        from sentry_protos.snuba.v1.request_common_pb2 import TraceItemType
+-        from sentry_protos.snuba.v1.trace_item_pb2 import AnyValue, TraceItem
+-
+         if organization is None:
+             organization = self.organization
+         if project is None:
+             project = self.project
+         if scheduled_check_time is None:
+-            scheduled_check_time = datetime.now(timezone.utc) - timedelta(minutes=1)
++            scheduled_check_time = datetime.now(UTC) - timedelta(minutes=1)
+         if trace_id is None:
+             trace_id = uuid4().hex
+         if guid is None:
+@@ -4291,3 +4284,72 @@ def store_uptime_results(self, uptime_results):
+             # Reverse the ids here since these are stored in little endian in Clickhouse
+             # and end up reversed.
+             result.item_id = result.item_id[::-1]
++
++
++class ProcessingErrorTestCase(BaseTestCase):
++    """Test case for creating and storing EAP processing error items."""
++
++    def create_processing_error(
++        self,
++        *,
++        organization=None,
++        project=None,
++        timestamp=None,
++        trace_id=None,
++        event_id=None,
++        error_type="js_no_source",
++        symbolicator_type=None,
++        release=None,
++        environment=None,
++        platform="javascript",
++        sdk_name=None,
++        sdk_version=None,
++    ):
++        if organization is None:
++            organization = self.organization
++        if project is None:
++            project = self.project
++        if timestamp is None:
++            timestamp = datetime.now(UTC) - timedelta(minutes=1)
++        if trace_id is None:
++            trace_id = uuid4().hex
++        if event_id is None:
++            event_id = uuid4().hex
++
++        attributes_data: dict[str, str | int] = {
++            "event_id": event_id,
++            "error_type": error_type,
++        }
++
++        if symbolicator_type is not None:
++            attributes_data["symbolicator_type"] = symbolicator_type
++        if release is not None:
++            attributes_data["release"] = release
++        if environment is not None:
++            attributes_data["environment"] = environment
++        if platform is not None:
++            attributes_data["platform"] = platform
++        if sdk_name is not None:
++            attributes_data["sdk_name"] = sdk_name
++        if sdk_version is not None:
++            attributes_data["sdk_version"] = sdk_version
++
++        attributes_proto = {}
++        for k, v in attributes_data.items():
++            if v is not None:
++                attributes_proto[k] = scalar_to_any_value(v)
++
++        timestamp_proto = Timestamp()
++        timestamp_proto.FromDatetime(timestamp)
++
++        return TraceItem(
++            organization_id=organization.id,
++            project_id=project.id,
++            item_type=TraceItemType.TRACE_ITEM_TYPE_PROCESSING_ERROR,
++            timestamp=timestamp_proto,
++            trace_id=trace_id,
++            item_id=uuid4().bytes,
++            received=timestamp_proto,
++            retention_days=90,
++            attributes=attributes_proto,
++        )
+diff --git a/static/app/components/assigneeBadge.tsx b/static/app/components/assigneeBadge.tsx
+index 95f01faf0415a6..417bd8f6edd779 100644
+--- a/static/app/components/assigneeBadge.tsx
++++ b/static/app/components/assigneeBadge.tsx
+@@ -18,7 +18,6 @@ type AssigneeBadgeProps = {
+   assignedTo?: Actor | undefined;
+   assignmentReason?: SuggestedOwnerReason;
+   chevronDirection?: 'up' | 'down';
+-  className?: string;
+   isTooltipDisabled?: boolean;
+   loading?: boolean;
+   showLabel?: boolean;
+@@ -33,7 +32,6 @@ export function AssigneeBadge({
+   chevronDirection = 'down',
+   loading = false,
+   isTooltipDisabled,
+-  className,
+ }: AssigneeBadgeProps) {
+   const theme = useTheme();
+   const suggestedReasons: Record<SuggestedOwnerReason, React.ReactNode> = {
+@@ -92,7 +90,7 @@ export function AssigneeBadge({
+   );
+ 
+   return loading ? (
+-    <StyledTag className={className} icon={loadingIcon} variant="muted" />
++    <StyledTag icon={loadingIcon} variant="muted" />
+   ) : assignedTo ? (
+     <Tooltip
+       isHoverable
+@@ -108,11 +106,7 @@ export function AssigneeBadge({
+       }
+       skipWrapper
+     >
+-      <StyledTag
+-        className={className}
+-        icon={makeAssignedIcon(assignedTo)}
+-        variant="muted"
+-      />
++      <StyledTag icon={makeAssignedIcon(assignedTo)} variant="muted" />
+     </Tooltip>
+   ) : (
+     <Tooltip
+@@ -135,7 +129,7 @@ export function AssigneeBadge({
+       }
+       skipWrapper
+     >
+-      <UnassignedTag className={className} icon={unassignedIcon} variant="muted" />
++      <UnassignedTag icon={unassignedIcon} variant="muted" />
+     </Tooltip>
+   );
+ }
+diff --git a/static/app/components/badge/groupPriority.tsx b/static/app/components/badge/groupPriority.tsx
+index 00622e02a288de..b57ce7809be134 100644
+--- a/static/app/components/badge/groupPriority.tsx
++++ b/static/app/components/badge/groupPriority.tsx
+@@ -247,6 +247,19 @@ export function GroupPriorityDropdown({
+   );
+ }
+ 
++const DropdownButton = styled(Button)`
++  font-weight: ${p => p.theme.font.weight.sans.regular};
++  border: none;
++  padding: 0;
++  height: unset;
++  border-radius: 20px;
++  box-shadow: none;
++
++  > span > div {
++    border-radius: 20px;
++  }
++`;
++
+ const StyledTag = styled(Tag)`
+   gap: ${p => p.theme.space['2xs']};
+   position: relative;
+@@ -254,15 +267,6 @@ const StyledTag = styled(Tag)`
+   overflow: hidden;
+ `;
+ 
+-const DropdownButton = styled(Button)`
+-  padding: 0;
+-  border-radius: ${p => p.theme.radius.full};
+-
+-  ${StyledTag} {
+-    border-radius: ${p => p.theme.radius.full};
+-  }
+-`;
+-
+ const InlinePlaceholder = styled(Placeholder)`
+   display: inline-block;
+   vertical-align: middle;
+diff --git a/static/app/components/contentSliderDiff/index.tsx b/static/app/components/contentSliderDiff/index.tsx
+index d0f49a05da38d2..e823dd748f1b6d 100644
+--- a/static/app/components/contentSliderDiff/index.tsx
++++ b/static/app/components/contentSliderDiff/index.tsx
+@@ -1,4 +1,4 @@
+-import {Fragment, useRef, type CSSProperties} from 'react';
++import {useRef, type CSSProperties} from 'react';
+ import styled from '@emotion/styled';
+ 
+ import NegativeSpaceContainer from 'sentry/components/container/negativeSpaceContainer';
+@@ -62,7 +62,9 @@ function Sides({onDragHandleMouseDown, viewDimensions, before, after}: SideProps
+   const dividerElem = useRef<HTMLDivElement>(null);
+   const width = `${viewDimensions.width}px`;
+ 
+-  const {onMouseDown, onDoubleClick} = useResizableDrawer({
++  const containerRef = useRef<HTMLDivElement>(null);
++
++  const {onMouseDown, onDoubleClick, setSize} = useResizableDrawer({
+     direction: 'left',
+     initialSize: viewDimensions.width / 2,
+     min: 0,
+@@ -92,8 +94,19 @@ function Sides({onDragHandleMouseDown, viewDimensions, before, after}: SideProps
+     },
+   });
+ 
++  const handleContainerMouseDown = (event: React.MouseEvent<HTMLElement>) => {
++    if (event.button !== 0 || !containerRef.current) {
++      return;
++    }
++    const rect = containerRef.current.getBoundingClientRect();
++    const relativeX = event.clientX - rect.left;
++    setSize(relativeX, true);
++    onDragHandleMouseDown?.(event);
++    onMouseDown(event);
++  };
++
+   return (
+-    <Fragment>
++    <SidesContainer ref={containerRef} onMouseDown={handleContainerMouseDown}>
+       <Cover style={{width}} data-test-id="after-content">
+         <Placement style={{width}}>
+           <FullHeightContainer>{after}</FullHeightContainer>
+@@ -107,17 +120,13 @@ function Sides({onDragHandleMouseDown, viewDimensions, before, after}: SideProps
+       <DragHandle
+         data-test-id="drag-handle"
+         ref={dividerElem}
+-        onMouseDown={event => {
+-          onDragHandleMouseDown?.(event);
+-          onMouseDown(event);
+-        }}
+         onDoubleClick={onDoubleClick}
+       >
+         <DragIndicator>
+           <IconGrabbable size="sm" />
+         </DragIndicator>
+       </DragHandle>
+-    </Fragment>
++    </SidesContainer>
+   );
+ }
+ 
+@@ -154,6 +163,12 @@ const Positioned = styled('div')`
+   width: 100%;
+ `;
+ 
++const SidesContainer = styled('div')`
++  position: absolute;
++  inset: 0;
++  cursor: ew-resize;
++`;
++
+ const DragIndicator = styled('div')`
+   position: absolute;
+   top: 50%;
+diff --git a/static/app/components/core/button/button.spec.tsx b/static/app/components/core/button/button.spec.tsx
+index 03aa4ec7402ace..fb99d7c1d8c592 100644
+--- a/static/app/components/core/button/button.spec.tsx
++++ b/static/app/components/core/button/button.spec.tsx
+@@ -26,34 +26,6 @@ describe('Button', () => {
+ 
+     expect(spy).not.toHaveBeenCalled();
+   });
+-
+-  it('does not call `onClick` on busy buttons', async () => {
+-    const spy = jest.fn();
+-    render(
+-      <Button onClick={spy} busy>
+-        Click me
+-      </Button>
+-    );
+-    await userEvent.click(screen.getByText('Click me'));
+-
+-    expect(spy).not.toHaveBeenCalled();
+-  });
+-
+-  it('shows spinner when busy', () => {
+-    render(<Button busy>Busy Button</Button>);
+-
+-    const button = screen.getByRole('button', {name: 'Busy Button'});
+-    expect(button).toHaveAttribute('aria-busy', 'true');
+-    expect(screen.getByRole('status', {name: 'Busy'})).not.toHaveStyle({
+-      visibility: 'hidden',
+-    });
+-  });
+-
+-  it('hides spinner when not busy', () => {
+-    render(<Button>Normal Button</Button>);
+-
+-    expect(screen.queryByRole('status', {name: 'Busy'})).not.toBeInTheDocument();
+-  });
+ });
+ 
+ describe('LinkButton', () => {
+diff --git a/static/app/components/core/button/button.tsx b/static/app/components/core/button/button.tsx
+index 4f4183472b59b0..b84cf750c79b20 100644
+--- a/static/app/components/core/button/button.tsx
++++ b/static/app/components/core/button/button.tsx
+@@ -1,7 +1,6 @@
+-import {keyframes} from '@emotion/react';
+ import styled from '@emotion/styled';
+ 
+-import {Flex, Grid} from '@sentry/scraps/layout';
++import {Flex} from '@sentry/scraps/layout';
+ import {Tooltip} from '@sentry/scraps/tooltip';
+ 
+ import {IconDefaultsProvider} from 'sentry/icons/useIconDefaults';
+@@ -30,13 +29,6 @@ export function Button({
+     busy,
+   });
+ 
+-  const iconGap =
+-    props.icon && hasChildren
+-      ? size === 'xs' || size === 'zero'
+-        ? 'sm'
+-        : 'md'
+-      : undefined;
+-
+   return (
+     <Tooltip
+       skipWrapper
+@@ -56,25 +48,30 @@ export function Button({
+         onClick={handleClick}
+         role="button"
+       >
+-        <Grid as="span" align="center" justifyItems="center" minWidth="0" height="100%">
+-          <Flex
+-            as="span"
+-            align="center"
+-            area="1 / 1"
+-            gap={iconGap}
+-            visibility={busy ? 'hidden' : undefined}
+-          >
+-            {props.icon && (
+-              <Flex as="span" align="center" flexShrink={0}>
+-                <IconDefaultsProvider size={BUTTON_ICON_SIZES[size]}>
+-                  {props.icon}
+-                </IconDefaultsProvider>
+-              </Flex>
+-            )}
+-            {props.children}
+-          </Flex>
+-          {busy ? <BusySpinner role="status" aria-label="Busy" /> : null}
+-        </Grid>
++        <Flex
++          as="span"
++          align="center"
++          justify="center"
++          minWidth="0"
++          height="100%"
++          whiteSpace="nowrap"
++        >
++          {props.icon && (
++            <Flex
++              as="span"
++              align="center"
++              flexShrink={0}
++              marginRight={
++                hasChildren ? (size === 'xs' || size === 'zero' ? 'sm' : 'md') : undefined
++              }
++            >
++              <IconDefaultsProvider size={BUTTON_ICON_SIZES[size]}>
++                {props.icon}
++              </IconDefaultsProvider>
++            </Flex>
++          )}
++          {props.children}
++        </Flex>
+       </StyledButton>
+     </Tooltip>
+   );
+@@ -83,24 +80,3 @@ export function Button({
+ const StyledButton = styled('button')<ButtonProps>`
+   ${p => getButtonStyles(p as any)}
+ `;
+-
+-const spin = keyframes`
+-  to {
+-    transform: rotate(360deg);
+-  }
+-`;
+-
+-const BusySpinner = styled('span')`
+-  grid-area: 1 / 1;
+-
+-  &::after {
+-    content: '';
+-    display: block;
+-    width: 1em;
+-    height: 1em;
+-    border-radius: 50%;
+-    border: 2px solid currentColor;
+-    border-top-color: transparent;
+-    animation: ${spin} 0.6s linear infinite;
+-  }
+-`;
+diff --git a/static/app/components/core/button/styles.tsx b/static/app/components/core/button/styles.tsx
+index c1dcaa6b5164a1..51eb2429a7183e 100644
+--- a/static/app/components/core/button/styles.tsx
++++ b/static/app/components/core/button/styles.tsx
+@@ -132,7 +132,11 @@ export function DO_NOT_USE_getButtonStyles(
+       zIndex: 1,
+       position: 'relative',
+ 
++      display: 'inherit',
++      alignItems: 'inherit',
++      justifyContent: 'inherit',
+       flex: '1',
++      gap: 'inherit',
+       overflow: 'hidden',
+ 
+       whiteSpace: 'nowrap',
+diff --git a/static/app/components/core/form/scrapsForm.spec.tsx b/static/app/components/core/form/scrapsForm.spec.tsx
+deleted file mode 100644
+index b130714169e376..00000000000000
+--- a/static/app/components/core/form/scrapsForm.spec.tsx
++++ /dev/null
+@@ -1,65 +0,0 @@
+-import {act, render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+-
+-import {defaultFormOptions, useScrapsForm} from '@sentry/scraps/form';
+-
+-function TestForm({onSubmit}: {onSubmit?: () => Promise<void>}) {
+-  const form = useScrapsForm({
+-    ...defaultFormOptions,
+-    defaultValues: {
+-      name: 'default',
+-    },
+-    onSubmit: onSubmit ? async () => onSubmit() : undefined,
+-  });
+-
+-  return (
+-    <form.AppForm form={form}>
+-      <form.AppField name="name">
+-        {field => (
+-          <input
+-            value={field.state.value}
+-            onChange={e => field.handleChange(e.target.value)}
+-          />
+-        )}
+-      </form.AppField>
+-      <form.SubmitButton>Save</form.SubmitButton>
+-    </form.AppForm>
+-  );
+-}
+-
+-describe('SubmitButton', () => {
+-  it('is not disabled when form has default values', () => {
+-    render(<TestForm />);
+-
+-    expect(screen.getByRole('button', {name: 'Save'})).toBeEnabled();
+-  });
+-
+-  it('is disabled and shows busy state while submitting', async () => {
+-    let resolveSubmit!: () => void;
+-    const submitPromise = () =>
+-      new Promise<void>(resolve => {
+-        resolveSubmit = resolve;
+-      });
+-
+-    render(<TestForm onSubmit={submitPromise} />);
+-
+-    const button = screen.getByRole('button', {name: 'Save'});
+-    await userEvent.click(button);
+-
+-    // Button should be busy and disabled while submitting
+-    await waitFor(() => {
+-      expect(button).toHaveAttribute('aria-busy', 'true');
+-    });
+-    expect(button).toBeDisabled();
+-
+-    // Resolve the submit
+-    act(() => {
+-      resolveSubmit();
+-    });
+-
+-    // Button should no longer be busy
+-    await waitFor(() => {
+-      expect(button).not.toHaveAttribute('aria-busy', 'true');
+-    });
+-    expect(button).toBeEnabled();
+-  });
+-});
+diff --git a/static/app/components/core/form/scrapsForm.tsx b/static/app/components/core/form/scrapsForm.tsx
+index aa0118287302b9..e7a87c6f698406 100644
+--- a/static/app/components/core/form/scrapsForm.tsx
++++ b/static/app/components/core/form/scrapsForm.tsx
+@@ -69,15 +69,14 @@ const {useAppForm} = createFormHook({
+ function SubmitButton(props: ButtonProps) {
+   const form = useFormContext();
+   return (
+-    <form.Subscribe selector={state => state.isSubmitting}>
+-      {isSubmitting => (
++    <form.Subscribe selector={state => state.isSubmitting || state.isDefaultValue}>
++      {isDisabled => (
+         <Button
+           {...props}
+           priority="primary"
+           type="submit"
+           form={form.formId}
+-          busy={isSubmitting}
+-          disabled={isSubmitting || props.disabled}
++          disabled={isDisabled || props.disabled}
+         />
+       )}
+     </form.Subscribe>
+diff --git a/static/app/components/core/layout/container.tsx b/static/app/components/core/layout/container.tsx
+index 8fc5f30f53608f..f90b5690465b31 100644
+--- a/static/app/components/core/layout/container.tsx
++++ b/static/app/components/core/layout/container.tsx
+@@ -84,8 +84,6 @@ interface ContainerLayoutProps {
+   alignSelf?: Responsive<React.CSSProperties['alignSelf']>;
+   justifySelf?: Responsive<React.CSSProperties['justifySelf']>;
+ 
+-  visibility?: Responsive<'visible' | 'hidden' | 'collapse'>;
+-
+   // Text Wrapping
+   whiteSpace?: Responsive<
+     'break-spaces' | 'normal' | 'nowrap' | 'pre' | 'pre-line' | 'pre-wrap'
+@@ -224,7 +222,6 @@ const omitContainerProps = new Set<keyof ContainerLayoutProps | 'as'>([
+   'right',
+   'row',
+   'top',
+-  'visibility',
+   'width',
+   'whiteSpace',
+ ]);
+@@ -312,7 +309,6 @@ export const Container = styled(
+   ${p => rc('border-left', p.borderLeft, p.theme, getBorder)};
+   ${p => rc('border-right', p.borderRight, p.theme, getBorder)};
+ 
+-  ${p => rc('visibility', p.visibility, p.theme)};
+   ${p => rc('white-space', p.whiteSpace, p.theme)};
+ 
+   /**
+diff --git a/static/app/components/group/assigneeSelector.tsx b/static/app/components/group/assigneeSelector.tsx
+index 17cf2f8eb5732f..08693c4850a007 100644
+--- a/static/app/components/group/assigneeSelector.tsx
++++ b/static/app/components/group/assigneeSelector.tsx
+@@ -116,7 +116,7 @@ export function AssigneeSelector({
+           aria-label={t('Modify issue assignee')}
+           size="zero"
+         >
+-          <StyledAssigneeBadge
++          <AssigneeBadge
+             assignedTo={group.assignedTo ?? undefined}
+             assignmentReason={
+               group.owners?.find(owner => {
+@@ -135,11 +135,15 @@ export function AssigneeSelector({
+   );
+ }
+ 
+-const StyledAssigneeBadge = styled(AssigneeBadge)`
+-  border-radius: ${p => p.theme.radius.full};
+-`;
+-
+ const StyledTrigger = styled(OverlayTrigger.Button)`
++  font-weight: ${p => p.theme.font.weight.sans.regular};
++  border: none;
+   padding: 0;
+-  border-radius: ${p => p.theme.radius.full};
++  height: unset;
++  border-radius: 20px;
++  box-shadow: none;
++
++  > span > div {
++    border-radius: 20px;
++  }
+ `;
+diff --git a/static/app/components/group/tagFacets/tagFacetsDistributionMeter.tsx b/static/app/components/group/tagFacets/tagFacetsDistributionMeter.tsx
+index 9b9621db6a0088..b34244496e50f8 100644
+--- a/static/app/components/group/tagFacets/tagFacetsDistributionMeter.tsx
++++ b/static/app/components/group/tagFacets/tagFacetsDistributionMeter.tsx
+@@ -395,7 +395,7 @@ const StyledSummary = styled('summary')`
+ 
+ const StyledButton = styled(Button)`
+   width: 100%;
+-  > span > span {
++  > span {
+     display: block;
+   }
+ `;
+diff --git a/static/app/utils/useResizableDrawer.tsx b/static/app/utils/useResizableDrawer.tsx
+index 75045ac0b72482..8d0421856ca6e6 100644
+--- a/static/app/utils/useResizableDrawer.tsx
++++ b/static/app/utils/useResizableDrawer.tsx
+@@ -72,6 +72,7 @@ export function useResizableDrawer(options: UseResizableDrawerOptions): {
+ 
+   const updateSize = useCallback(
+     (newSize: number, userEvent = false) => {
++      sizeRef.current = newSize;
+       setSize(newSize);
+       options.onResize(newSize, undefined, userEvent);
+       if (options.sizeStorageKey) {
+diff --git a/static/app/views/dashboards/dashboard.spec.tsx b/static/app/views/dashboards/dashboard.spec.tsx
+index 656d324fdc2c80..e86dffd3f009e1 100644
+--- a/static/app/views/dashboards/dashboard.spec.tsx
++++ b/static/app/views/dashboards/dashboard.spec.tsx
+@@ -506,7 +506,6 @@ describe('Dashboards > Dashboard', () => {
+             widgetLimitReached={false}
+             widgetLegendState={widgetLegendState}
+             widgetInterval={widgetInterval}
+-            useTimeseriesVisualization
+           />
+         </MEPSettingProvider>
+       );
+diff --git a/static/app/views/dashboards/dashboard.tsx b/static/app/views/dashboards/dashboard.tsx
+index df0f4b6708961f..75826db8daf719 100644
+--- a/static/app/views/dashboards/dashboard.tsx
++++ b/static/app/views/dashboards/dashboard.tsx
+@@ -89,7 +89,6 @@ type Props = {
+   onEditWidget?: (widget: Widget) => void;
+   onNewWidgetScrollComplete?: () => void;
+   onSetNewWidget?: () => void;
+-  useTimeseriesVisualization?: boolean;
+   widgetInterval?: string;
+ };
+ 
+@@ -114,7 +113,6 @@ function Dashboard({
+   onEditWidget,
+   onNewWidgetScrollComplete,
+   onSetNewWidget,
+-  useTimeseriesVisualization,
+   widgetInterval,
+ }: Props) {
+   const theme = useTheme();
+@@ -441,7 +439,6 @@ function Dashboard({
+               index={String(index)}
+               newlyAddedWidget={newlyAddedWidget}
+               onNewWidgetScrollComplete={onNewWidgetScrollComplete}
+-              useTimeseriesVisualization={useTimeseriesVisualization}
+               widgetInterval={widgetInterval}
+             />
+           </div>
+diff --git a/static/app/views/dashboards/detail.tsx b/static/app/views/dashboards/detail.tsx
+index 3001bb039eb223..4856b8c42d7c37 100644
+--- a/static/app/views/dashboards/detail.tsx
++++ b/static/app/views/dashboards/detail.tsx
+@@ -141,7 +141,6 @@ type Props = {
+   children?: React.ReactNode;
+   onDashboardUpdate?: (updatedDashboard: DashboardDetails) => void;
+   storageNamespace?: string;
+-  useTimeseriesVisualization?: boolean;
+   widgetInterval?: string;
+ };
+ 
+@@ -1042,7 +1041,6 @@ class DashboardDetail extends Component<Props, State> {
+       location,
+       onDashboardUpdate,
+       projects,
+-      useTimeseriesVisualization,
+     } = this.props;
+     const {
+       modifiedDashboard,
+@@ -1242,7 +1240,6 @@ class DashboardDetail extends Component<Props, State> {
+                                 onNewWidgetScrollComplete={
+                                   this.handleScrollToNewWidgetComplete
+                                 }
+-                                useTimeseriesVisualization={useTimeseriesVisualization}
+                                 widgetInterval={this.props.widgetInterval}
+                               />
+                             </WidgetQueryQueueProvider>
+diff --git a/static/app/views/dashboards/filtersBar.spec.tsx b/static/app/views/dashboards/filtersBar.spec.tsx
+index 6417dd80d3e7ff..ce59b9fd0fc870 100644
+--- a/static/app/views/dashboards/filtersBar.spec.tsx
++++ b/static/app/views/dashboards/filtersBar.spec.tsx
+@@ -29,7 +29,7 @@ describe('FiltersBar', () => {
+     mockNetworkRequests();
+ 
+     organization = OrganizationFixture({
+-      features: ['dashboards-basic', 'dashboards-edit', 'dashboards-global-filters'],
++      features: ['dashboards-basic', 'dashboards-edit'],
+     });
+   });
+ 
+diff --git a/static/app/views/dashboards/filtersBar.tsx b/static/app/views/dashboards/filtersBar.tsx
+index 690fa7589cc77a..409dae5226281f 100644
+--- a/static/app/views/dashboards/filtersBar.tsx
++++ b/static/app/views/dashboards/filtersBar.tsx
+@@ -1,4 +1,4 @@
+-import {Fragment, useEffect, useMemo, useState} from 'react';
++import {useEffect, useMemo, useState} from 'react';
+ import styled from '@emotion/styled';
+ import type {Location} from 'history';
+ import {createParser, useQueryState} from 'nuqs';
+@@ -283,52 +283,48 @@ export default function FiltersBar({
+           }}
+           onSortChange={setReleaseSort}
+         />
+-        {organization.features.includes('dashboards-global-filters') && (
+-          <Fragment>
+-            {activeGlobalFilters.map(filter => (
+-              <GenericFilterSelector
+-                disableRemoveFilter={
+-                  isPrebuiltDashboard &&
+-                  prebuiltDashboardFilters.some(
+-                    prebuiltFilter =>
+-                      prebuiltFilter.tag.key === filter.tag.key &&
+-                      prebuiltFilter.dataset === filter.dataset
+-                  )
+-                }
+-                key={filter.tag.key + filter.value}
+-                globalFilter={filter}
+-                searchBarData={getSearchBarData(filter.dataset)}
+-                onUpdateFilter={updatedFilter => {
+-                  updateGlobalFilters(
+-                    activeGlobalFilters.map(f =>
+-                      globalFilterKeysAreEqual(f, updatedFilter) ? updatedFilter : f
+-                    )
+-                  );
+-                }}
+-                onRemoveFilter={removedFilter => {
+-                  updateGlobalFilters(
+-                    activeGlobalFilters.filter(
+-                      f => !globalFilterKeysAreEqual(f, removedFilter)
+-                    )
+-                  );
+-                  trackAnalytics('dashboards2.global_filter.remove', {
+-                    organization,
+-                  });
+-                }}
+-              />
+-            ))}
+-            <AddFilter
+-              globalFilters={activeGlobalFilters}
+-              getSearchBarData={getSearchBarData}
+-              onAddFilter={newFilter => {
+-                updateGlobalFilters([...activeGlobalFilters, newFilter]);
+-                trackAnalytics('dashboards2.global_filter.add', {
+-                  organization,
+-                });
+-              }}
+-            />
+-          </Fragment>
+-        )}
++        {activeGlobalFilters.map(filter => (
++          <GenericFilterSelector
++            disableRemoveFilter={
++              isPrebuiltDashboard &&
++              prebuiltDashboardFilters.some(
++                prebuiltFilter =>
++                  prebuiltFilter.tag.key === filter.tag.key &&
++                  prebuiltFilter.dataset === filter.dataset
++              )
++            }
++            key={filter.tag.key + filter.value}
++            globalFilter={filter}
++            searchBarData={getSearchBarData(filter.dataset)}
++            onUpdateFilter={updatedFilter => {
++              updateGlobalFilters(
++                activeGlobalFilters.map(f =>
++                  globalFilterKeysAreEqual(f, updatedFilter) ? updatedFilter : f
++                )
++              );
++            }}
++            onRemoveFilter={removedFilter => {
++              updateGlobalFilters(
++                activeGlobalFilters.filter(
++                  f => !globalFilterKeysAreEqual(f, removedFilter)
++                )
++              );
++              trackAnalytics('dashboards2.global_filter.remove', {
++                organization,
++              });
++            }}
++          />
++        ))}
++        <AddFilter
++          globalFilters={activeGlobalFilters}
++          getSearchBarData={getSearchBarData}
++          onAddFilter={newFilter => {
++            updateGlobalFilters([...activeGlobalFilters, newFilter]);
++            trackAnalytics('dashboards2.global_filter.add', {
++              organization,
++            });
++          }}
++        />
+         {!hasTemporaryFilters &&
+           hasUnsavedChanges &&
+           !isEditingDashboard &&
+diff --git a/static/app/views/dashboards/prebuiltDashboardRenderer.tsx b/static/app/views/dashboards/prebuiltDashboardRenderer.tsx
+index ae135588e0c6df..c258dc5be46da8 100644
+--- a/static/app/views/dashboards/prebuiltDashboardRenderer.tsx
++++ b/static/app/views/dashboards/prebuiltDashboardRenderer.tsx
+@@ -97,7 +97,6 @@ export function PrebuiltDashboardRenderer({
+         dashboard={dashboard}
+         dashboards={[]}
+         initialState={DashboardState.EMBEDDED}
+-        useTimeseriesVisualization
+         storageNamespace={storageNamespace}
+       />
+     </LoadingContainer>
+diff --git a/static/app/views/dashboards/sortableWidget.tsx b/static/app/views/dashboards/sortableWidget.tsx
+index b85001aa30904f..9ce59e027c8920 100644
+--- a/static/app/views/dashboards/sortableWidget.tsx
++++ b/static/app/views/dashboards/sortableWidget.tsx
+@@ -49,7 +49,6 @@ type Props = {
+   isPreview?: boolean;
+   newlyAddedWidget?: Widget;
+   onNewWidgetScrollComplete?: () => void;
+-  useTimeseriesVisualization?: boolean;
+   widgetInterval?: string;
+   windowWidth?: number;
+ };
+@@ -79,7 +78,6 @@ function SortableWidget(props: Props) {
+     dashboardCreator,
+     newlyAddedWidget,
+     onNewWidgetScrollComplete,
+-    useTimeseriesVisualization,
+     isPrebuiltDashboard = false,
+   } = props;
+ 
+@@ -155,7 +153,6 @@ function SortableWidget(props: Props) {
+         : (widget.limit ?? TABLE_ITEM_LIMIT),
+     onWidgetTableSort,
+     onWidgetTableResizeColumn,
+-    useTimeseriesVisualization,
+     widgetInterval: props.widgetInterval,
+   };
+ 
+diff --git a/static/app/views/dashboards/utils/useTimeseriesVisualizationEnabled.tsx b/static/app/views/dashboards/utils/useTimeseriesVisualizationEnabled.tsx
+deleted file mode 100644
+index 02905273231509..00000000000000
+--- a/static/app/views/dashboards/utils/useTimeseriesVisualizationEnabled.tsx
++++ /dev/null
+@@ -1,6 +0,0 @@
+-import useOrganization from 'sentry/utils/useOrganization';
+-
+-export const useTimeseriesVisualizationEnabled = () => {
+-  const organization = useOrganization();
+-  return organization.features.includes('dashboards-widget-timeseries-visualization');
+-};
+diff --git a/static/app/views/dashboards/view.tsx b/static/app/views/dashboards/view.tsx
+index b9ff2eb0f0ff29..84862ae395b6dd 100644
+--- a/static/app/views/dashboards/view.tsx
++++ b/static/app/views/dashboards/view.tsx
+@@ -15,7 +15,6 @@ import {useLocation} from 'sentry/utils/useLocation';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {useParams} from 'sentry/utils/useParams';
+ import {DashboardState, type DashboardDetails} from 'sentry/views/dashboards/types';
+-import {useTimeseriesVisualizationEnabled} from 'sentry/views/dashboards/utils/useTimeseriesVisualizationEnabled';
+ 
+ import DashboardDetail from './detail';
+ import OrgDashboards from './orgDashboards';
+@@ -34,8 +33,6 @@ export default function ViewEditDashboard() {
+     }
+   }, [api, orgSlug, dashboardId]);
+ 
+-  const useTimeseriesVisualization = useTimeseriesVisualizationEnabled();
+-
+   // Get optimistic dashboard from location.state if available (e.g., after adding a widget)
+   const optimisticDashboard = (location.state as {dashboard?: DashboardDetails} | null)
+     ?.dashboard;
+@@ -54,7 +51,6 @@ export default function ViewEditDashboard() {
+                 dashboard={dashboard}
+                 dashboards={dashboards}
+                 onDashboardUpdate={onDashboardUpdate}
+-                useTimeseriesVisualization={useTimeseriesVisualization}
+               />
+             </ErrorBoundary>
+           ) : (
+diff --git a/static/app/views/dashboards/widgetBuilder/components/widgetPreview.tsx b/static/app/views/dashboards/widgetBuilder/components/widgetPreview.tsx
+index d5a94f45cf54a8..0acf443011864e 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/widgetPreview.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/widgetPreview.tsx
+@@ -14,7 +14,6 @@ import {
+   type DashboardFilters,
+ } from 'sentry/views/dashboards/types';
+ import {usesTimeSeriesData} from 'sentry/views/dashboards/utils';
+-import {widgetCanUseTimeSeriesVisualization} from 'sentry/views/dashboards/utils/widgetCanUseTimeSeriesVisualization';
+ import {useWidgetBuilderContext} from 'sentry/views/dashboards/widgetBuilder/contexts/widgetBuilderContext';
+ import {BuilderStateAction} from 'sentry/views/dashboards/widgetBuilder/hooks/useWidgetBuilderState';
+ import {convertBuilderStateToWidget} from 'sentry/views/dashboards/widgetBuilder/utils/convertBuilderStateToWidget';
+@@ -93,8 +92,6 @@ function WidgetPreview({
+     setTableWidths(widths);
+   }
+ 
+-  const useTimeseriesVisualization = widgetCanUseTimeSeriesVisualization(widget);
+-
+   return (
+     <WidgetCard
+       disableFullscreen
+@@ -144,7 +141,6 @@ function WidgetPreview({
+       onWidgetTableSort={handleWidgetTableSort}
+       onWidgetTableResizeColumn={handleWidgetTableResizeColumn}
+       disableTableActions
+-      useTimeseriesVisualization={useTimeseriesVisualization}
+     />
+   );
+ }
+diff --git a/static/app/views/dashboards/widgetCard/index.tsx b/static/app/views/dashboards/widgetCard/index.tsx
+index e07977617c3b5c..fe3b328b640829 100644
+--- a/static/app/views/dashboards/widgetCard/index.tsx
++++ b/static/app/views/dashboards/widgetCard/index.tsx
+@@ -118,7 +118,6 @@ type Props = WithRouterProps & {
+   showLoadingText?: boolean;
+   showStoredAlert?: boolean;
+   tableItemLimit?: number;
+-  useTimeseriesVisualization?: boolean;
+   widgetInterval?: string;
+   windowWidth?: number;
+ };
+@@ -186,7 +185,6 @@ function WidgetCard(props: Props) {
+     onWidgetTableSort,
+     onWidgetTableResizeColumn,
+     disableTableActions,
+-    useTimeseriesVisualization,
+     widgetInterval,
+   } = props;
+ 
+@@ -299,7 +297,7 @@ function WidgetCard(props: Props) {
+     : undefined;
+ 
+   const canUseTimeseriesVisualization = widgetCanUseTimeSeriesVisualization(widget);
+-  if (canUseTimeseriesVisualization && useTimeseriesVisualization) {
++  if (canUseTimeseriesVisualization) {
+     return (
+       <ErrorBoundary
+         customComponent={() => <ErrorCard>{t('Error loading widget data')}</ErrorCard>}
+diff --git a/tests/sentry/api/endpoints/test_organization_attribute_mappings.py b/tests/sentry/api/endpoints/test_organization_attribute_mappings.py
+index 109e1da40e1424..49075faec47223 100644
+--- a/tests/sentry/api/endpoints/test_organization_attribute_mappings.py
++++ b/tests/sentry/api/endpoints/test_organization_attribute_mappings.py
+@@ -29,6 +29,7 @@ def test_get_all_mappings(self):
+             "occurrences",
+             "tracemetrics",
+             "uptime_results",
++            "processing_errors",
+             "profiles",
+         }
+         assert types_present == expected_types
+diff --git a/tests/sentry/metrics/test_sentry_sdk.py b/tests/sentry/metrics/test_sentry_sdk.py
+index 7f11ae412a2059..a087501d3fbb9e 100644
+--- a/tests/sentry/metrics/test_sentry_sdk.py
++++ b/tests/sentry/metrics/test_sentry_sdk.py
+@@ -163,3 +163,19 @@ def test_timing_with_sample_rate(self, mock_distribution, backend):
+             unit="millisecond",
+             attributes={"x": "y", "sentry.client_sample_rate": 0.75, "is_timing": True},
+         )
++
++    @mock.patch("sentry_sdk.metrics.count")
++    def test_incr_effective_sample_rate_includes_experimental(self, mock_count):
++        backend = SentrySDKMetricsBackend(prefix="test.", experimental_sample_rate=0.5)
++        with (
++            mock.patch.object(backend, "_should_sample_experimental", return_value=True),
++            mock.patch.object(backend, "_should_sample", return_value=True),
++        ):
++            backend.incr("foo", tags={"x": "y"}, amount=2, sample_rate=0.5)
++
++        mock_count.assert_called_once_with(
++            "test.foo",
++            2,
++            unit=None,
++            attributes={"x": "y", "sentry.client_sample_rate": 0.25},
++        )
+diff --git a/tests/sentry/preprod/vcs/status_checks/size/test_status_checks_tasks.py b/tests/sentry/preprod/vcs/status_checks/size/test_status_checks_tasks.py
+index 061610a01e454c..a377b4ed435b40 100644
+--- a/tests/sentry/preprod/vcs/status_checks/size/test_status_checks_tasks.py
++++ b/tests/sentry/preprod/vcs/status_checks/size/test_status_checks_tasks.py
+@@ -89,11 +89,11 @@ def _create_working_status_check_setup(self, preprod_artifact):
+         mock_provider.create_status_check.return_value = "check_12345"
+ 
+         patcher_client = patch(
+-            "sentry.preprod.vcs.status_checks.size.tasks._get_status_check_client",
++            "sentry.preprod.vcs.status_checks.size.tasks.get_status_check_client",
+             return_value=(mock_client, repository),
+         )
+         patcher_provider = patch(
+-            "sentry.preprod.vcs.status_checks.size.tasks._get_status_check_provider",
++            "sentry.preprod.vcs.status_checks.size.tasks.get_status_check_provider",
+             return_value=mock_provider,
+         )
+ 
+@@ -105,11 +105,11 @@ def _create_no_api_calls_setup(self):
+         mock_provider = Mock()
+ 
+         patcher_client = patch(
+-            "sentry.preprod.vcs.status_checks.size.tasks._get_status_check_client",
++            "sentry.preprod.vcs.status_checks.size.tasks.get_status_check_client",
+             return_value=(mock_client, None),
+         )
+         patcher_provider = patch(
+-            "sentry.preprod.vcs.status_checks.size.tasks._get_status_check_provider",
++            "sentry.preprod.vcs.status_checks.size.tasks.get_status_check_provider",
+             return_value=mock_provider,
+         )
+ 
+diff --git a/tests/sentry/preprod/vcs/status_checks/snapshots/__init__.py b/tests/sentry/preprod/vcs/status_checks/snapshots/__init__.py
+new file mode 100644
+index 00000000000000..e69de29bb2d1d6
+diff --git a/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py b/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
+new file mode 100644
+index 00000000000000..c595c83bb77b13
+--- /dev/null
++++ b/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
+@@ -0,0 +1,657 @@
++from __future__ import annotations
++
++import pytest
++
++from sentry.integrations.source_code_management.status_check import StatusCheckStatus
++from sentry.models.commitcomparison import CommitComparison
++from sentry.preprod.models import PreprodArtifact
++from sentry.preprod.snapshots.models import PreprodSnapshotComparison, PreprodSnapshotMetrics
++from sentry.preprod.vcs.status_checks.snapshots.templates import (
++    format_snapshot_status_check_messages,
++)
++from sentry.testutils.cases import TestCase
++from sentry.testutils.silo import region_silo_test
++
++
++class SnapshotStatusCheckTestBase(TestCase):
++    def setUp(self):
++        super().setUp()
++        self.organization = self.create_organization(owner=self.user)
++        self.team = self.create_team(organization=self.organization)
++        self.project = self.create_project(
++            teams=[self.team], organization=self.organization, name="test_project"
++        )
++
++    def _create_artifact_with_metrics(
++        self,
++        app_id: str = "com.example.app",
++        app_name: str | None = None,
++        build_version: str = "1.0.0",
++        build_number: int = 1,
++        image_count: int = 10,
++        state: int = PreprodArtifact.ArtifactState.PROCESSED,
++        commit_comparison: CommitComparison | None = None,
++    ) -> tuple[PreprodArtifact, PreprodSnapshotMetrics]:
++        artifact = self.create_preprod_artifact(
++            project=self.project,
++            state=state,
++            app_id=app_id,
++            app_name=app_name,
++            build_version=build_version,
++            build_number=build_number,
++            commit_comparison=commit_comparison,
++        )
++        metrics = PreprodSnapshotMetrics.objects.create(
++            preprod_artifact=artifact,
++            image_count=image_count,
++        )
++        return artifact, metrics
++
++    def _create_comparison(
++        self,
++        head_metrics: PreprodSnapshotMetrics,
++        base_metrics: PreprodSnapshotMetrics,
++        state: int = PreprodSnapshotComparison.State.SUCCESS,
++        images_changed: int = 0,
++        images_added: int = 0,
++        images_removed: int = 0,
++        images_renamed: int = 0,
++        images_unchanged: int = 10,
++    ) -> PreprodSnapshotComparison:
++        return PreprodSnapshotComparison.objects.create(
++            head_snapshot_metrics=head_metrics,
++            base_snapshot_metrics=base_metrics,
++            state=state,
++            images_changed=images_changed,
++            images_added=images_added,
++            images_removed=images_removed,
++            images_renamed=images_renamed,
++            images_unchanged=images_unchanged,
++        )
++
++
++@region_silo_test
++class SnapshotEmptyArtifactsTest(SnapshotStatusCheckTestBase):
++    def test_empty_artifacts_raises_error(self):
++        with pytest.raises(ValueError, match="Cannot format messages for empty artifact list"):
++            format_snapshot_status_check_messages([], {}, {}, StatusCheckStatus.SUCCESS, {})
++
++
++@region_silo_test
++class SnapshotProcessingStateFormattingTest(SnapshotStatusCheckTestBase):
++    def test_artifact_without_metrics_shows_processing(self):
++        artifact = self.create_preprod_artifact(
++            project=self.project,
++            state=PreprodArtifact.ArtifactState.PROCESSED,
++            app_id="com.example.app",
++            build_version="1.0.0",
++            build_number=1,
++        )
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [artifact], {}, {}, StatusCheckStatus.IN_PROGRESS, {}
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "Comparing snapshots..."
++        assert "Processing" in summary
++        assert "com.example.app" in summary
++
++    def test_artifact_with_metrics_but_no_comparison_shows_processing(self):
++        artifact, metrics = self._create_artifact_with_metrics()
++
++        snapshot_metrics_map = {artifact.id: metrics}
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [artifact], snapshot_metrics_map, {}, StatusCheckStatus.IN_PROGRESS, {}
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "Comparing snapshots..."
++        assert "Processing" in summary
++
++    def test_comparison_in_pending_state_shows_comparing(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics(app_id="com.example.head")
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics, base_metrics, state=PreprodSnapshotComparison.State.PENDING
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.IN_PROGRESS,
++            {},
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "Comparing snapshots..."
++        assert "Comparing" in summary
++
++    def test_comparison_in_processing_state_shows_comparing(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics(app_id="com.example.head")
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics, base_metrics, state=PreprodSnapshotComparison.State.PROCESSING
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, subtitle, _ = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.IN_PROGRESS,
++            {},
++        )
++
++        assert subtitle == "Comparing snapshots..."
++
++
++@region_silo_test
++class SnapshotSuccessStateFormattingTest(SnapshotStatusCheckTestBase):
++    def test_all_images_match_shows_success(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.app", app_name="My App"
++        )
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_changed=0,
++            images_added=0,
++            images_removed=0,
++            images_unchanged=10,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            {},
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "No changes detected"
++        assert "✅ Unchanged" in summary
++        assert "My App" in summary
++
++    def test_app_id_shown_in_name_cell(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.noname"
++        )
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(head_metrics, base_metrics)
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, _, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            {},
++        )
++
++        assert "`com.example.noname`" in summary
++
++    def test_multiple_artifacts_all_match(self):
++        artifacts = []
++        snapshot_metrics_map = {}
++        comparisons_map = {}
++
++        for i in range(3):
++            head_artifact, head_metrics = self._create_artifact_with_metrics(
++                app_id=f"com.example.app{i}", build_number=i + 1
++            )
++            base_artifact, base_metrics = self._create_artifact_with_metrics(
++                app_id=f"com.example.base{i}", build_number=i + 10
++            )
++            comparison = self._create_comparison(head_metrics, base_metrics)
++
++            artifacts.append(head_artifact)
++            snapshot_metrics_map[head_artifact.id] = head_metrics
++            comparisons_map[head_metrics.id] = comparison
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            artifacts,
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            {},
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "No changes detected"
++        for i in range(3):
++            assert f"com.example.app{i}" in summary
++
++
++@region_silo_test
++class SnapshotChangesFormattingTest(SnapshotStatusCheckTestBase):
++    def test_images_changed_shows_failure_subtitle(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_changed=3,
++            images_added=0,
++            images_removed=0,
++            images_unchanged=7,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "3 modified, 7 unchanged"
++        assert "⏳ Needs approval" in summary
++
++    def test_single_image_changed(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_changed=1,
++            images_unchanged=9,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, subtitle, _ = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert subtitle == "1 modified, 9 unchanged"
++
++    def test_images_added_and_removed(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_changed=0,
++            images_added=2,
++            images_removed=1,
++            images_unchanged=8,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, subtitle, _ = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert subtitle == "2 added, 1 removed, 8 unchanged"
++
++    def test_images_renamed(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_renamed=4,
++            images_unchanged=6,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, subtitle, _ = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert subtitle == "4 renamed, 6 unchanged"
++
++    def test_all_change_types_combined(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_changed=3,
++            images_added=1,
++            images_removed=2,
++            images_renamed=1,
++            images_unchanged=5,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, subtitle, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert subtitle == "3 modified, 1 added, 2 removed, 1 renamed, 5 unchanged"
++        assert "⏳ Needs approval" in summary
++
++
++@region_silo_test
++class SnapshotFailureStateFormattingTest(SnapshotStatusCheckTestBase):
++    def test_failed_comparison_returns_error_message(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            state=PreprodSnapshotComparison.State.FAILED,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "We had trouble comparing snapshots, our team is investigating."
++        assert summary == ""
++
++    def test_failed_comparison_early_returns_ignoring_other_artifacts(self):
++        # First artifact has a failed comparison
++        head1, head1_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.failed", build_number=1
++        )
++        base1, base1_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.base1", build_number=10
++        )
++        comparison1 = self._create_comparison(
++            head1_metrics, base1_metrics, state=PreprodSnapshotComparison.State.FAILED
++        )
++
++        # Second artifact has changes
++        head2, head2_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.changed", build_number=2
++        )
++        base2, base2_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.base2", build_number=11
++        )
++        comparison2 = self._create_comparison(
++            head2_metrics, base2_metrics, images_changed=5, images_unchanged=5
++        )
++
++        snapshot_metrics_map = {
++            head1.id: head1_metrics,
++            head2.id: head2_metrics,
++        }
++        comparisons_map = {
++            head1_metrics.id: comparison1,
++            head2_metrics.id: comparison2,
++        }
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [head1, head2],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert subtitle == "We had trouble comparing snapshots, our team is investigating."
++        assert summary == ""
++
++
++@region_silo_test
++class SnapshotMixedStateFormattingTest(SnapshotStatusCheckTestBase):
++    def test_mixed_success_and_processing(self):
++        head1, head1_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.done", build_number=1
++        )
++        base1, base1_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.base1", build_number=10
++        )
++        comparison1 = self._create_comparison(head1_metrics, base1_metrics, images_unchanged=5)
++
++        # Processing comparison
++        head2, head2_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.pending", build_number=2
++        )
++        base2, base2_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.base2", build_number=11
++        )
++        comparison2 = self._create_comparison(
++            head2_metrics, base2_metrics, state=PreprodSnapshotComparison.State.PROCESSING
++        )
++
++        snapshot_metrics_map = {
++            head1.id: head1_metrics,
++            head2.id: head2_metrics,
++        }
++        comparisons_map = {
++            head1_metrics.id: comparison1,
++            head2_metrics.id: comparison2,
++        }
++
++        _, subtitle, summary = format_snapshot_status_check_messages(
++            [head1, head2],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.IN_PROGRESS,
++            {},
++        )
++
++        assert subtitle == "Comparing snapshots..."
++        assert "✅ Unchanged" in summary
++        assert "Comparing" in summary
++
++
++@region_silo_test
++class SnapshotSummaryFormattingTest(SnapshotStatusCheckTestBase):
++    def test_summary_table_has_correct_headers(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++        comparison = self._create_comparison(head_metrics, base_metrics)
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, _, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            {},
++        )
++
++        assert "| Name | Added | Removed | Modified | Renamed | Unchanged | Status |" in summary
++        assert "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |" in summary
++
++    def test_summary_has_no_settings_link(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++        comparison = self._create_comparison(head_metrics, base_metrics)
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, _, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            {},
++        )
++
++        assert "Configure" not in summary
++        assert "settings" not in summary
++
++    def test_summary_uses_comparison_url_when_base_artifact_exists(self):
++        head_commit_comparison = CommitComparison.objects.create(
++            head_repo_name="test/repo",
++            head_sha="head_sha_123",
++            base_sha="base_sha_456",
++            provider="github",
++            organization_id=self.organization.id,
++        )
++
++        head_artifact, head_metrics = self._create_artifact_with_metrics(
++            commit_comparison=head_commit_comparison,
++        )
++        base_artifact, base_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.base",
++        )
++        comparison = self._create_comparison(head_metrics, base_metrics)
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++        base_artifact_map = {head_artifact.id: base_artifact}
++
++        _, _, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            base_artifact_map,
++        )
++
++        expected_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/compare/{head_artifact.id}/{base_artifact.id}"
++        assert expected_url in summary
++
++    def test_summary_uses_artifact_url_when_no_base(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics()
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++        comparison = self._create_comparison(head_metrics, base_metrics)
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        _, _, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            {},
++        )
++
++        expected_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/{head_artifact.id}"
++        assert expected_url in summary
++
++    def test_full_success_summary_format(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.app", app_name="My App"
++        )
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_changed=0,
++            images_added=0,
++            images_removed=0,
++            images_renamed=0,
++            images_unchanged=15,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        artifact_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/{head_artifact.id}"
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.SUCCESS,
++            {},
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "No changes detected"
++
++        expected = (
++            "| Name | Added | Removed | Modified | Renamed | Unchanged | Status |\n"
++            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n"
++            f"| [My App]({artifact_url})<br>`com.example.app` | 0 | 0 | 0 | 0 | 15 | ✅ Unchanged |"
++        )
++        assert summary == expected
++
++    def test_full_failure_summary_format(self):
++        head_artifact, head_metrics = self._create_artifact_with_metrics(
++            app_id="com.example.app", app_name="My App"
++        )
++        base_artifact, base_metrics = self._create_artifact_with_metrics(app_id="com.example.base")
++        comparison = self._create_comparison(
++            head_metrics,
++            base_metrics,
++            images_changed=3,
++            images_added=1,
++            images_removed=2,
++            images_renamed=1,
++            images_unchanged=4,
++        )
++
++        snapshot_metrics_map = {head_artifact.id: head_metrics}
++        comparisons_map = {head_metrics.id: comparison}
++
++        artifact_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/{head_artifact.id}"
++
++        title, subtitle, summary = format_snapshot_status_check_messages(
++            [head_artifact],
++            snapshot_metrics_map,
++            comparisons_map,
++            StatusCheckStatus.FAILURE,
++            {},
++        )
++
++        assert title == "Snapshot Testing"
++        assert subtitle == "3 modified, 1 added, 2 removed, 1 renamed, 4 unchanged"
++
++        expected = (
++            "| Name | Added | Removed | Modified | Renamed | Unchanged | Status |\n"
++            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n"
++            f"| [My App]({artifact_url})<br>`com.example.app` | 1 | 2 | 3 | 1 | 4 | ⏳ Needs approval |"
++        )
++        assert summary == expected
+diff --git a/tests/sentry/search/eap/test_processing_errors.py b/tests/sentry/search/eap/test_processing_errors.py
+new file mode 100644
+index 00000000000000..50b2a20ec87620
+--- /dev/null
++++ b/tests/sentry/search/eap/test_processing_errors.py
+@@ -0,0 +1,139 @@
++from unittest import TestCase
++
++from sentry_protos.snuba.v1.trace_item_attribute_pb2 import (
++    AttributeKey,
++    AttributeValue,
++    StrArray,
++)
++from sentry_protos.snuba.v1.trace_item_filter_pb2 import (
++    AndFilter,
++    ComparisonFilter,
++    OrFilter,
++    TraceItemFilter,
++)
++
++from sentry.search.eap.processing_errors.definitions import PROCESSING_ERROR_DEFINITIONS
++from sentry.search.eap.resolver import SearchResolver
++from sentry.search.eap.types import SearchResolverConfig
++from sentry.search.events.types import SnubaParams
++
++
++class SearchResolverQueryTest(TestCase):
++    def setUp(self) -> None:
++        self.resolver = SearchResolver(
++            params=SnubaParams(),
++            config=SearchResolverConfig(),
++            definitions=PROCESSING_ERROR_DEFINITIONS,
++        )
++
++    def test_simple_query(self) -> None:
++        where, having, _ = self.resolver.resolve_query("error_type:js_no_source")
++        assert where == TraceItemFilter(
++            comparison_filter=ComparisonFilter(
++                key=AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
++                op=ComparisonFilter.OP_EQUALS,
++                value=AttributeValue(val_str="js_no_source"),
++            )
++        )
++        assert having is None
++
++    def test_negation(self) -> None:
++        where, having, _ = self.resolver.resolve_query("!error_type:js_no_source")
++        assert where == TraceItemFilter(
++            comparison_filter=ComparisonFilter(
++                key=AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
++                op=ComparisonFilter.OP_NOT_EQUALS,
++                value=AttributeValue(val_str="js_no_source"),
++            )
++        )
++        assert having is None
++
++    def test_in_filter(self) -> None:
++        where, having, _ = self.resolver.resolve_query(
++            "error_type:[js_no_source,js_invalid_source,js_scraping_disabled]"
++        )
++        assert where == TraceItemFilter(
++            comparison_filter=ComparisonFilter(
++                key=AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
++                op=ComparisonFilter.OP_IN,
++                value=AttributeValue(
++                    val_str_array=StrArray(
++                        values=["js_no_source", "js_invalid_source", "js_scraping_disabled"]
++                    )
++                ),
++            )
++        )
++        assert having is None
++
++    def test_symbolicator_type_filter(self) -> None:
++        where, having, _ = self.resolver.resolve_query("symbolicator_type:missing_sourcemap")
++        assert where == TraceItemFilter(
++            comparison_filter=ComparisonFilter(
++                key=AttributeKey(name="symbolicator_type", type=AttributeKey.Type.TYPE_STRING),
++                op=ComparisonFilter.OP_EQUALS,
++                value=AttributeValue(val_str="missing_sourcemap"),
++            )
++        )
++        assert having is None
++
++    def test_query_with_and(self) -> None:
++        where, having, _ = self.resolver.resolve_query(
++            "error_type:js_no_source platform:javascript"
++        )
++        assert where == TraceItemFilter(
++            and_filter=AndFilter(
++                filters=[
++                    TraceItemFilter(
++                        comparison_filter=ComparisonFilter(
++                            key=AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
++                            op=ComparisonFilter.OP_EQUALS,
++                            value=AttributeValue(val_str="js_no_source"),
++                        )
++                    ),
++                    TraceItemFilter(
++                        comparison_filter=ComparisonFilter(
++                            key=AttributeKey(name="platform", type=AttributeKey.Type.TYPE_STRING),
++                            op=ComparisonFilter.OP_EQUALS,
++                            value=AttributeValue(val_str="javascript"),
++                        )
++                    ),
++                ]
++            )
++        )
++        assert having is None
++
++    def test_query_with_or(self) -> None:
++        where, having, _ = self.resolver.resolve_query(
++            "error_type:js_no_source or error_type:js_invalid_source"
++        )
++        assert where == TraceItemFilter(
++            or_filter=OrFilter(
++                filters=[
++                    TraceItemFilter(
++                        comparison_filter=ComparisonFilter(
++                            key=AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
++                            op=ComparisonFilter.OP_EQUALS,
++                            value=AttributeValue(val_str="js_no_source"),
++                        )
++                    ),
++                    TraceItemFilter(
++                        comparison_filter=ComparisonFilter(
++                            key=AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
++                            op=ComparisonFilter.OP_EQUALS,
++                            value=AttributeValue(val_str="js_invalid_source"),
++                        )
++                    ),
++                ]
++            )
++        )
++        assert having is None
++
++    def test_empty_query(self) -> None:
++        where, having, _ = self.resolver.resolve_query("")
++        assert where is None
++        assert having is None
++
++    def test_none_query(self) -> None:
++        where, having, _ = self.resolver.resolve_query(None)
++        assert where is None
++        assert having is None
+diff --git a/tests/snuba/api/endpoints/test_organization_events.py b/tests/snuba/api/endpoints/test_organization_events.py
+index e3893827631a2d..98e8316f1903a5 100644
+--- a/tests/snuba/api/endpoints/test_organization_events.py
++++ b/tests/snuba/api/endpoints/test_organization_events.py
+@@ -32,6 +32,7 @@
+     APITransactionTestCase,
+     OurLogTestCase,
+     PerformanceIssueTestCase,
++    ProcessingErrorTestCase,
+     ProfileFunctionsTestCase,
+     ProfilesSnubaTestCase,
+     SnubaTestCase,
+@@ -57,6 +58,7 @@ class OrganizationEventsEndpointTestBase(
+     SnubaTestCase,
+     SpanTestCase,
+     OurLogTestCase,
++    ProcessingErrorTestCase,
+     TraceMetricsTestCase,
+     ProfileFunctionsTestCase,
+ ):
+diff --git a/tests/snuba/api/endpoints/test_organization_events_stats_processing_errors.py b/tests/snuba/api/endpoints/test_organization_events_stats_processing_errors.py
+new file mode 100644
+index 00000000000000..e2cacbd2f1bec0
+--- /dev/null
++++ b/tests/snuba/api/endpoints/test_organization_events_stats_processing_errors.py
+@@ -0,0 +1,184 @@
++from datetime import timedelta
++
++from django.urls import reverse
++
++from sentry.testutils.helpers.datetime import before_now
++from tests.snuba.api.endpoints.test_organization_events import OrganizationEventsEndpointTestBase
++
++
++class OrganizationEventsStatsProcessingErrorsEndpointTest(OrganizationEventsEndpointTestBase):
++    endpoint = "sentry-api-0-organization-events-stats"
++
++    def setUp(self) -> None:
++        super().setUp()
++        self.login_as(user=self.user)
++        self.start = self.day_ago = before_now(days=1).replace(
++            hour=10, minute=0, second=0, microsecond=0
++        )
++        self.end = self.start + timedelta(hours=6)
++
++        self.url = reverse(
++            self.endpoint,
++            kwargs={"organization_id_or_slug": self.project.organization.slug},
++        )
++
++    def _do_request(self, data, url=None, features=None):
++        if features is None:
++            features = {}
++        features.update(self.features)
++        with self.feature(features):
++            return self.client.get(self.url if url is None else url, data=data, format="json")
++
++    def test_count(self) -> None:
++        event_counts = [6, 0, 6, 3, 0, 3]
++        items = []
++        for hour, count in enumerate(event_counts):
++            items.extend(
++                [
++                    self.create_processing_error(
++                        error_type="js_no_source",
++                        timestamp=self.start + timedelta(hours=hour, minutes=minute),
++                    )
++                    for minute in range(count)
++                ],
++            )
++        self.store_eap_items(items)
++
++        response = self._do_request(
++            data={
++                "start": self.start,
++                "end": self.end,
++                "interval": "1h",
++                "yAxis": "count()",
++                "project": self.project.id,
++                "dataset": "processing_errors",
++            },
++        )
++        assert response.status_code == 200, response.content
++        assert [attrs for time, attrs in response.data["data"]] == [
++            [{"count": count}] for count in event_counts
++        ]
++
++    def test_zerofill(self) -> None:
++        response = self._do_request(
++            data={
++                "start": self.start,
++                "end": self.end,
++                "interval": "1h",
++                "yAxis": "count()",
++                "project": self.project.id,
++                "dataset": "processing_errors",
++            },
++        )
++        assert response.status_code == 200, response.content
++        assert [attrs for time, attrs in response.data["data"]] == [[{"count": 0}]] * 7
++
++    def test_top_events_group_by_error_type(self) -> None:
++        event_counts = [6, 0, 6, 3, 0, 3]
++        items = []
++        for hour, count in enumerate(event_counts):
++            items.extend(
++                [
++                    self.create_processing_error(
++                        error_type="js_no_source",
++                        timestamp=self.start + timedelta(hours=hour, minutes=minute),
++                    )
++                    for minute in range(count)
++                ],
++            )
++            items.extend(
++                [
++                    self.create_processing_error(
++                        error_type="js_invalid_source",
++                        timestamp=self.start + timedelta(hours=hour, minutes=minute),
++                    )
++                    for minute in range(count)
++                ],
++            )
++        items.append(
++            self.create_processing_error(
++                error_type="js_scraping_disabled",
++                timestamp=self.start + timedelta(hours=1),
++            )
++        )
++        self.store_eap_items(items)
++
++        response = self._do_request(
++            data={
++                "start": self.day_ago,
++                "end": self.day_ago + timedelta(hours=6),
++                "interval": "1h",
++                "yAxis": "count()",
++                "field": ["error_type", "count()"],
++                "orderby": ["-count"],
++                "project": self.project.id,
++                "dataset": "processing_errors",
++                "excludeOther": 0,
++                "topEvents": 2,
++            },
++        )
++        assert response.status_code == 200, response.content
++        assert "Other" in response.data
++        assert "js_no_source" in response.data
++        assert "js_invalid_source" in response.data
++
++        for key in ["js_no_source", "js_invalid_source"]:
++            rows = response.data[key]["data"][0:6]
++            for expected, result in zip(event_counts, rows):
++                assert result[1][0]["count"] == expected, key
++
++            assert response.data[key]["meta"]["dataset"] == "processing_errors"
++
++        rows = response.data["Other"]["data"][0:6]
++        for expected, result in zip([0, 1, 0, 0, 0, 0], rows):
++            assert result[1][0]["count"] == expected, "Other"
++
++    def test_filter_by_error_type(self) -> None:
++        items = [
++            self.create_processing_error(
++                error_type="js_no_source",
++                timestamp=self.start + timedelta(hours=1),
++            ),
++            self.create_processing_error(
++                error_type="js_invalid_source",
++                timestamp=self.start + timedelta(hours=1),
++            ),
++            self.create_processing_error(
++                error_type="js_no_source",
++                timestamp=self.start + timedelta(hours=2),
++            ),
++        ]
++        self.store_eap_items(items)
++
++        response = self._do_request(
++            data={
++                "start": self.start,
++                "end": self.end,
++                "interval": "1h",
++                "yAxis": "count()",
++                "project": self.project.id,
++                "dataset": "processing_errors",
++                "query": "error_type:js_no_source",
++            },
++        )
++        assert response.status_code == 200, response.content
++        data = [attrs for time, attrs in response.data["data"]]
++        assert data[0] == [{"count": 0}]
++        assert data[1] == [{"count": 1}]
++        assert data[2] == [{"count": 1}]
++
++    def test_top_events_with_no_data(self) -> None:
++        response = self._do_request(
++            data={
++                "start": self.day_ago,
++                "end": self.day_ago + timedelta(minutes=6),
++                "interval": "1m",
++                "yAxis": "count()",
++                "field": ["error_type", "count()"],
++                "orderby": ["-count"],
++                "dataset": "processing_errors",
++                "excludeOther": 0,
++                "topEvents": 2,
++            },
++        )
++        assert response.status_code == 200, response.content

@@ -1,13 +1,370 @@
-diff --git a/frontend/discourse/app/components/reviewable-claimed-topic.gjs b/frontend/discourse/app/components/reviewable-claimed-topic.gjs
-index 81e9055b15..64d5ee6003 100644
---- a/frontend/discourse/app/components/reviewable-claimed-topic.gjs
-+++ b/frontend/discourse/app/components/reviewable-claimed-topic.gjs
-@@ -15,7 +15,7 @@ export default class ReviewableClaimedTopic extends Component {
-   }
+diff --git a/.github/workflows/linting.yml b/.github/workflows/linting.yml
+index 1db38db67568e..54bca5fcbf799 100644
+--- a/.github/workflows/linting.yml
++++ b/.github/workflows/linting.yml
+@@ -72,7 +72,7 @@ jobs:
  
-   get isRefresh() {
--    return this.siteSettings.reviewable_ui_refresh;
-+    return this.currentUser?.use_reviewable_ui_refresh;
-   }
+       - name: ESLint
+         if: ${{ !cancelled() }}
+-        run: pnpm lint:js
++        run: pnpm lint:js --max-warnings 0
+ 
+       - name: Types
+         if: ${{ !cancelled() }}
+diff --git a/frontend/discourse/admin/components/upsert-category/general.gjs b/frontend/discourse/admin/components/upsert-category/general.gjs
+index b2df01bf2ff66..7103d309369ee 100644
+--- a/frontend/discourse/admin/components/upsert-category/general.gjs
++++ b/frontend/discourse/admin/components/upsert-category/general.gjs
+@@ -91,6 +91,10 @@ export default class UpsertCategoryGeneral extends Component {
+ 
+     const parentId = this.args.transientData.parent_category_id;
+     const parentCategory = Category.findById(parentId);
++    if (!parentCategory?.permissions) {
++      return groups;
++    }
++
+     const parentGroupIds = new Set(
+       parentCategory.permissions.map((p) => p.group_id)
+     );
+@@ -100,7 +104,17 @@ export default class UpsertCategoryGeneral extends Component {
  
    @action
+   onChangeAccessGroups(groupIds) {
++    const existingPermissions = this.permissions || [];
++
+     const newPermissions = groupIds.map((groupId) => {
++      const existingPermission = existingPermissions.find(
++        (p) => p.group_id === groupId
++      );
++
++      if (existingPermission) {
++        return existingPermission;
++      }
++
+       return {
+         group_id: groupId,
+         group_name: this.site.groupsById[groupId]?.name,
+diff --git a/plugins/chat/assets/javascripts/discourse/lib/chat-channel-subscription-manager.js b/plugins/chat/assets/javascripts/discourse/lib/chat-channel-subscription-manager.js
+index 87446ecccfa08..11c7e2f2e87c8 100644
+--- a/plugins/chat/assets/javascripts/discourse/lib/chat-channel-subscription-manager.js
++++ b/plugins/chat/assets/javascripts/discourse/lib/chat-channel-subscription-manager.js
+@@ -184,7 +184,11 @@ export default class ChatChannelSubscriptionManager {
+       return;
+     }
+ 
+-    if (this.currentUser.staff || this.currentUser.id === targetMsg.user.id) {
++    if (
++      this.currentUser.staff ||
++      this.channel.canModerate ||
++      this.currentUser.id === targetMsg.user.id
++    ) {
+       targetMsg.deletedAt = data.deleted_at;
+       targetMsg.deletedById = data.deleted_by_id;
+       targetMsg.expanded = false;
+diff --git a/plugins/chat/assets/javascripts/discourse/lib/chat-channel-thread-subscription-manager.js b/plugins/chat/assets/javascripts/discourse/lib/chat-channel-thread-subscription-manager.js
+index f4b771dcbaa5e..68d73efdb069a 100644
+--- a/plugins/chat/assets/javascripts/discourse/lib/chat-channel-thread-subscription-manager.js
++++ b/plugins/chat/assets/javascripts/discourse/lib/chat-channel-thread-subscription-manager.js
+@@ -168,7 +168,11 @@ export default class ChatChannelThreadSubscriptionManager {
+       return;
+     }
+ 
+-    if (this.currentUser.staff || this.currentUser.id === targetMsg.user.id) {
++    if (
++      this.currentUser.staff ||
++      this.thread.channel.canModerate ||
++      this.currentUser.id === targetMsg.user.id
++    ) {
+       targetMsg.deletedAt = data.deleted_at;
+       targetMsg.deletedById = data.deleted_by_id;
+       targetMsg.expanded = false;
+diff --git a/plugins/chat/assets/javascripts/discourse/lib/chat-message-interactor.js b/plugins/chat/assets/javascripts/discourse/lib/chat-message-interactor.js
+index 04cbcb3128ef3..1841b8fb53710 100644
+--- a/plugins/chat/assets/javascripts/discourse/lib/chat-message-interactor.js
++++ b/plugins/chat/assets/javascripts/discourse/lib/chat-message-interactor.js
+@@ -126,6 +126,7 @@ export default class ChatMessageInteractor {
+     return (
+       this.message?.deletedAt &&
+       (this.currentUser.staff ||
++        this.message?.channel?.canModerate ||
+         (this.message?.user?.id === this.currentUser.id &&
+           this.message?.deletedById === this.currentUser.id)) &&
+       this.message.channel?.canModifyMessages?.(this.currentUser)
+diff --git a/plugins/chat/lib/chat/guardian_extensions.rb b/plugins/chat/lib/chat/guardian_extensions.rb
+index fd8dda4d28d98..b20235293c88a 100644
+--- a/plugins/chat/lib/chat/guardian_extensions.rb
++++ b/plugins/chat/lib/chat/guardian_extensions.rb
+@@ -246,7 +246,7 @@ def can_restore_chat?(message, chatable)
+       if message.user_id == current_user.id
+         case chatable
+         when Category
+-          return message.deleted_by_id == current_user.id || can_see_category?(chatable)
++          return message.deleted_by_id == current_user.id || can_moderate_chat?(chatable)
+         when Chat::DirectMessage
+           return message.deleted_by_id == current_user.id || is_staff?
+         end
+diff --git a/plugins/chat/spec/lib/chat/guardian_extensions_spec.rb b/plugins/chat/spec/lib/chat/guardian_extensions_spec.rb
+index 55d95a8f8aa68..2e15758dca0b8 100644
+--- a/plugins/chat/spec/lib/chat/guardian_extensions_spec.rb
++++ b/plugins/chat/spec/lib/chat/guardian_extensions_spec.rb
+@@ -565,10 +565,16 @@
+ 
+       context "when user is owner of the message" do
+         context "when chatable is a category" do
+-          it "allows to restore if owner can see category" do
++          it "allows owner to restore when deleted by owner" do
++            message.trash!(guardian.user)
+             expect(guardian.can_restore_chat?(message, chatable)).to eq(true)
+           end
+ 
++          it "disallows owner to restore when deleted by staff" do
++            message.trash!(staff_guardian.user)
++            expect(guardian.can_restore_chat?(message, chatable)).to eq(false)
++          end
++
+           context "when category is restricted" do
+             fab!(:chatable) { Fabricate(:category, read_restricted: true) }
+ 
+diff --git a/plugins/chat/spec/requests/chat/api/messages_controller_spec.rb b/plugins/chat/spec/requests/chat/api/messages_controller_spec.rb
+index e4f6d0b18f4a1..400f4381920aa 100644
+--- a/plugins/chat/spec/requests/chat/api/messages_controller_spec.rb
++++ b/plugins/chat/spec/requests/chat/api/messages_controller_spec.rb
+@@ -186,6 +186,17 @@
+       fab!(:chat_channel) { Fabricate(:category_channel, chatable: category) }
+ 
+       it_behaves_like "chat_message_restoration"
++
++      it "doesn't allow a regular user to restore their own message deleted by staff" do
++        message = Fabricate(:chat_message, chat_channel: chat_channel, user: current_user)
++        message.trash!(admin)
++
++        sign_in(current_user)
++
++        put "/chat/api/channels/#{chat_channel.id}/messages/#{message.id}/restore.json"
++        expect(response.status).to eq(403)
++        expect(message.reload.deleted_at).not_to be_nil
++      end
+     end
+ 
+     describe "for dm channel" do
+diff --git a/plugins/chat/spec/services/chat/restore_message_spec.rb b/plugins/chat/spec/services/chat/restore_message_spec.rb
+index aa5ac89911799..96f3644e620df 100644
+--- a/plugins/chat/spec/services/chat/restore_message_spec.rb
++++ b/plugins/chat/spec/services/chat/restore_message_spec.rb
+@@ -6,7 +6,7 @@
+   fab!(:message) { Fabricate(:chat_message, user: current_user) }
+ 
+   before do
+-    message.trash!
++    message.trash!(current_user)
+     message.chat_channel.update!(
+       last_message_id: message.chat_channel.latest_not_deleted_message_id,
+     )
+diff --git a/plugins/chat/spec/system/thread_list/full_page_spec.rb b/plugins/chat/spec/system/thread_list/full_page_spec.rb
+index b83231d74c2bd..6fb9289f1504c 100644
+--- a/plugins/chat/spec/system/thread_list/full_page_spec.rb
++++ b/plugins/chat/spec/system/thread_list/full_page_spec.rb
+@@ -185,7 +185,7 @@
+       end
+ 
+       it "shows the thread in the list when another user restores the original message" do
+-        trash_message!(thread_1.original_message)
++        trash_message!(thread_1.original_message, user: other_user)
+         chat_page.visit_threads_list(channel)
+ 
+         expect(thread_list_page).to have_no_thread(thread_1)
+diff --git a/plugins/chat/test/javascripts/unit/lib/chat-message-interactor-test.js b/plugins/chat/test/javascripts/unit/lib/chat-message-interactor-test.js
+index bfaff333d7e95..ea4e6d3c3f179 100644
+--- a/plugins/chat/test/javascripts/unit/lib/chat-message-interactor-test.js
++++ b/plugins/chat/test/javascripts/unit/lib/chat-message-interactor-test.js
+@@ -12,8 +12,9 @@ module("Discourse Chat | Unit | chat-message-interactor", function (hooks) {
+   setupTest(hooks);
+ 
+   hooks.beforeEach(function () {
+-    logIn(getOwner(this));
+-    const message = new ChatFabricators(getOwner(this)).message();
++    this.currentUser = logIn(getOwner(this));
++    this.chatFabricators = new ChatFabricators(getOwner(this));
++    const message = this.chatFabricators.message();
+     this.messageInteractor = new ChatMessageInteractor(getOwner(this), message);
+     this.emojiStore = getOwner(this).lookup("service:emoji-store");
+     this.siteSettings = getOwner(this).lookup("service:site-settings");
+@@ -134,4 +135,49 @@ module("Discourse Chat | Unit | chat-message-interactor", function (hooks) {
+       ["+1", "butterfly", "heart"]
+     );
+   });
++
++  test("canRestoreMessage allows moderators to restore deleted messages", function (assert) {
++    updateCurrentUser({ admin: false, moderator: false, staff: false });
++
++    const otherUser = this.chatFabricators.coreFabricators.user();
++    const channel = this.chatFabricators.channel({
++      meta: { can_moderate: true },
++    });
++    const message = this.chatFabricators.message({
++      channel,
++      user: otherUser,
++      deleted_at: new Date(),
++      deleted_by_id: otherUser.id,
++    });
++
++    const interactor = new ChatMessageInteractor(getOwner(this), message);
++
++    assert.true(interactor.canRestoreMessage);
++    assert.true(
++      interactor.secondaryActions.some(({ id }) => id === "restore"),
++      "restore action is visible to moderators"
++    );
++  });
++
++  test("canRestoreMessage disallows regular users from restoring moderator-deleted messages", function (assert) {
++    updateCurrentUser({ admin: false, moderator: false, staff: false });
++
++    const channel = this.chatFabricators.channel({
++      meta: { can_moderate: false },
++    });
++    const message = this.chatFabricators.message({
++      channel,
++      user: this.currentUser,
++      deleted_at: new Date(),
++      deleted_by_id: this.currentUser.id + 1,
++    });
++
++    const interactor = new ChatMessageInteractor(getOwner(this), message);
++
++    assert.false(interactor.canRestoreMessage);
++    assert.false(
++      interactor.secondaryActions.some(({ id }) => id === "restore"),
++      "restore action stays hidden for non-moderators"
++    );
++  });
+ });
+diff --git a/plugins/chat/test/javascripts/unit/lib/chat-subscription-manager-test.js b/plugins/chat/test/javascripts/unit/lib/chat-subscription-manager-test.js
+index 0a9517528c0b9..45b5d36ab05b9 100644
+--- a/plugins/chat/test/javascripts/unit/lib/chat-subscription-manager-test.js
++++ b/plugins/chat/test/javascripts/unit/lib/chat-subscription-manager-test.js
+@@ -118,6 +118,61 @@ module(
+         "/uploads/short-url/server-thread"
+       );
+     });
++
++    test("channel manager keeps deleted messages visible for category moderators", function (assert) {
++      const channel = this.fabricators.channel({
++        id: 13,
++        meta: { can_moderate: true },
++      });
++      const message = this.fabricators.message({
++        id: 201,
++        channel,
++        user: { id: 2, username: "other_user" },
++      });
++      channel.messagesManager.addMessages([message]);
++
++      const manager = new ChatChannelSubscriptionManager(this, channel);
++      manager.currentUser = { id: 1, staff: false };
++
++      manager.handleDeleteMessage({
++        deleted_id: message.id,
++        deleted_at: "2026-03-11T10:00:00.000Z",
++        deleted_by_id: 1,
++      });
++
++      assert.strictEqual(channel.messagesManager.messages.length, 1);
++      assert.strictEqual(message.deletedById, 1);
++      assert.strictEqual(message.deletedAt, "2026-03-11T10:00:00.000Z");
++      assert.false(message.expanded);
++    });
++
++    test("thread manager keeps deleted messages visible for category moderators", function (assert) {
++      const channel = this.fabricators.channel({
++        id: 14,
++        meta: { can_moderate: true },
++      });
++      const thread = this.fabricators.thread({ id: 223, channel });
++      const message = this.fabricators.message({
++        id: 202,
++        channel,
++        user: { id: 2, username: "other_user" },
++      });
++      thread.messagesManager.addMessages([message]);
++
++      const manager = new ChatChannelThreadSubscriptionManager(this, thread);
++      manager.currentUser = { id: 1, staff: false };
++
++      manager.handleDeleteMessage({
++        deleted_id: message.id,
++        deleted_at: "2026-03-11T10:00:00.000Z",
++        deleted_by_id: 1,
++      });
++
++      assert.strictEqual(thread.messagesManager.messages.length, 1);
++      assert.strictEqual(message.deletedById, 1);
++      assert.strictEqual(message.deletedAt, "2026-03-11T10:00:00.000Z");
++      assert.false(message.expanded);
++    });
+   }
+ );
+ 
+diff --git a/spec/system/simplified_category_creation_spec.rb b/spec/system/simplified_category_creation_spec.rb
+index 8540bbbe9b226..cc0a52aeb5a71 100644
+--- a/spec/system/simplified_category_creation_spec.rb
++++ b/spec/system/simplified_category_creation_spec.rb
+@@ -107,6 +107,36 @@
+       expect(page).to have_css(".edit-category-settings")
+     end
+ 
++    it "preserves permission types when adding a new access group on general tab" do
++      group2 = Fabricate(:group)
++
++      category_page.visit_new_category
++      category_type_card.find_type_card("discussion").click
++
++      form.field("name").fill_in("Permission Test")
++      form.choose_conditional("group_restricted")
++
++      group_chooser = PageObjects::Components::SelectKit.new(".group-chooser")
++      group_chooser.expand
++      group_chooser.select_row_by_value(group.id)
++      group_chooser.collapse
++
++      category_page.toggle_advanced_settings
++      find(".edit-category-security a").click
++      category_permission_row.toggle_group_permission(group.name, "reply")
++
++      find(".edit-category-general a").click
++      group_chooser.expand
++      group_chooser.select_row_by_value(group2.id)
++      group_chooser.collapse
++
++      find(".edit-category-security a").click
++
++      expect(page).to have_no_css(
++        "#{category_permission_row.group_permission_row_selector(group.name)} .reply-granted",
++      )
++    end
++
+     it "automatically switches to private when selecting a restricted parent" do
+       restricted_parent =
+         Fabricate(:category, name: "Restricted Parent", permissions: { group.name => :full })
+@@ -120,6 +150,21 @@
+ 
+       expect(page).to have_css(".group-chooser")
+     end
++
++    it "shows inherited groups when selecting a restricted parent" do
++      restricted_parent =
++        Fabricate(:category, name: "Restricted Parent", permissions: { group.name => :full })
++
++      category_page.visit_new_category
++      category_type_card.find_type_card("discussion").click
++
++      parent_chooser = PageObjects::Components::SelectKit.new(".category-chooser")
++      parent_chooser.expand
++      parent_chooser.select_row_by_value(restricted_parent.id)
++
++      group_chooser = PageObjects::Components::SelectKit.new(".group-chooser")
++      expect(group_chooser).to have_selected_name(group.name)
++    end
+   end
+ 
+   describe "Security Tab" do

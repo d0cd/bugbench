@@ -1,0 +1,1399 @@
+diff --git a/src/sentry/api/bases/rule.py b/src/sentry/api/bases/rule.py
+index 6d26ba66a8a4f7..da3f59f885467c 100644
+--- a/src/sentry/api/bases/rule.py
++++ b/src/sentry/api/bases/rule.py
+@@ -2,10 +2,15 @@
+ 
+ from rest_framework.request import Request
+ 
++from sentry import features
+ from sentry.api.api_owners import ApiOwner
+ from sentry.api.bases import ProjectAlertRulePermission, ProjectEndpoint
+ from sentry.api.exceptions import ResourceDoesNotExist
++from sentry.constants import ObjectStatus
++from sentry.incidents.endpoints.serializers.utils import get_object_id_from_fake_id
+ from sentry.models.rule import Rule
++from sentry.workflow_engine.models.alertrule_workflow import AlertRuleWorkflow
++from sentry.workflow_engine.models.workflow import Workflow
+ from sentry.workflow_engine.utils.legacy_metric_tracking import report_used_legacy_models
+ 
+ 
+@@ -34,3 +39,42 @@ def convert_args(
+             raise ResourceDoesNotExist
+ 
+         return args, kwargs
++
++
++class WorkflowEngineRuleEndpoint(RuleEndpoint):
++    def convert_args(
++        self, request: Request, rule_id: str, *args: Any, **kwargs: Any
++    ) -> tuple[Any, Any]:
++        args, kwargs = super(RuleEndpoint, self).convert_args(request, *args, **kwargs)
++        project = kwargs["project"]
++
++        if not rule_id.isdigit():
++            raise ResourceDoesNotExist
++
++        if features.has("organizations:workflow-engine-rule-serializers", project.organization):
++            try:
++                arw = AlertRuleWorkflow.objects.get(
++                    rule_id=rule_id, workflow__organization=project.organization
++                )
++                kwargs["rule"] = arw.workflow
++            except AlertRuleWorkflow.DoesNotExist:
++                # XXX: this means the workflow was single written and has no ARW or related Rule object
++                try:
++                    workflow_id = get_object_id_from_fake_id(int(rule_id))
++                    kwargs["rule"] = Workflow.objects.get(
++                        id=workflow_id,
++                        organization=project.organization,
++                        status=ObjectStatus.ACTIVE,
++                    )
++                except (AlertRuleWorkflow.DoesNotExist, Workflow.DoesNotExist):
++                    raise ResourceDoesNotExist
++
++            return args, kwargs
++
++        report_used_legacy_models()
++        try:
++            kwargs["rule"] = Rule.objects.get(project=project, id=rule_id)
++        except Rule.DoesNotExist:
++            raise ResourceDoesNotExist
++
++        return args, kwargs
+diff --git a/src/sentry/api/endpoints/project_rule_details.py b/src/sentry/api/endpoints/project_rule_details.py
+index 5e8ed9f86d600b..2f5905fea52d02 100644
+--- a/src/sentry/api/endpoints/project_rule_details.py
++++ b/src/sentry/api/endpoints/project_rule_details.py
+@@ -9,7 +9,7 @@
+ from rest_framework.request import Request
+ from rest_framework.response import Response
+ 
+-from sentry import analytics, audit_log
++from sentry import analytics, audit_log, features
+ from sentry.analytics.events.rule_disable_opt_out import (
+     RuleDisableOptOutEdit,
+     RuleDisableOptOutExplicit,
+@@ -17,11 +17,11 @@
+ from sentry.analytics.events.rule_reenable import RuleReenableEdit
+ from sentry.api.api_publish_status import ApiPublishStatus
+ from sentry.api.base import region_silo_endpoint
+-from sentry.api.bases.rule import RuleEndpoint
++from sentry.api.bases.rule import WorkflowEngineRuleEndpoint
+ from sentry.api.endpoints.project_rules import find_duplicate_rule
+ from sentry.api.fields.actor import OwnerActorField
+ from sentry.api.serializers import serialize
+-from sentry.api.serializers.models.rule import RuleSerializer
++from sentry.api.serializers.models.rule import RuleSerializer, WorkflowEngineRuleSerializer
+ from sentry.api.serializers.rest_framework.rule import RuleNodeField
+ from sentry.api.serializers.rest_framework.rule import RuleSerializer as DrfRuleSerializer
+ from sentry.apidocs.constants import (
+@@ -38,12 +38,14 @@
+ from sentry.integrations.jira_server.actions.create_ticket import JiraServerCreateTicketAction
+ from sentry.integrations.slack.tasks.find_channel_id_for_rule import find_channel_id_for_rule
+ from sentry.integrations.slack.utils.rule_status import RedisRuleStatus
++from sentry.models.project import Project
+ from sentry.models.rule import NeglectedRule, Rule, RuleActivity, RuleActivityType
+ from sentry.projects.project_rules.updater import ProjectRuleUpdater
+ from sentry.rules.actions import trigger_sentry_app_action_creators_for_issues
+ from sentry.sentry_apps.utils.errors import SentryAppBaseError
+ from sentry.signals import alert_rule_edited
+ from sentry.types.actor import Actor
++from sentry.workflow_engine.models.workflow import Workflow
+ from sentry.workflow_engine.utils.legacy_metric_tracking import (
+     report_used_legacy_models,
+     track_alert_endpoint_execution,
+@@ -99,7 +101,7 @@ class ProjectRuleDetailsPutSerializer(serializers.Serializer):
+ 
+ @extend_schema(tags=["Alerts"])
+ @region_silo_endpoint
+-class ProjectRuleDetailsEndpoint(RuleEndpoint):
++class ProjectRuleDetailsEndpoint(WorkflowEngineRuleEndpoint):
+     publish_status = {
+         "DELETE": ApiPublishStatus.PUBLIC,
+         "GET": ApiPublishStatus.PUBLIC,
+@@ -122,7 +124,7 @@ class ProjectRuleDetailsEndpoint(RuleEndpoint):
+         examples=IssueAlertExamples.GET_PROJECT_RULE,
+     )
+     @track_alert_endpoint_execution("GET", "sentry-api-0-project-rule-details")
+-    def get(self, request: Request, project, rule) -> Response:
++    def get(self, request: Request, project: Project, rule: Rule | Workflow) -> Response:
+         """
+         ## Deprecated
+         🚧 Use [Fetch an Alert](/api/monitors/fetch-an-alert) instead.
+@@ -135,13 +137,23 @@ def get(self, request: Request, project, rule) -> Response:
+         - Filters - help control noise by triggering an alert only if the issue matches the specified criteria.
+         - Actions - specify what should happen when the trigger conditions are met and the filters match.
+         """
+-        # Serialize Rule object
+-        rule_serializer = RuleSerializer(
+-            expand=request.GET.getlist("expand", []),
+-            prepare_component_fields=True,
+-            project_slug=project.slug,
+-        )
+-        serialized_rule = serialize(rule, request.user, rule_serializer)
++        if features.has("organizations:workflow-engine-rule-serializers", project.organization):
++            workflow_engine_rule_serializer = WorkflowEngineRuleSerializer(
++                expand=request.GET.getlist("expand", []),
++                prepare_component_fields=True,
++                project_slug=project.slug,
++            )
++            # XXX: Note 'rule' here is actually a workflow object
++            serialized_rule = serialize(rule, request.user, workflow_engine_rule_serializer)
++        else:
++            # Serialize Rule object
++            rule_serializer = RuleSerializer(
++                expand=request.GET.getlist("expand", []),
++                prepare_component_fields=True,
++                project_slug=project.slug,
++            )
++            serialized_rule = serialize(rule, request.user, rule_serializer)
++
+         # Prepare Rule Actions that are SentryApp components using the meta fields
+         for action in serialized_rule.get("actions", []):
+             # TODO(nisanthan): This is a temporary fix. We need to save both the label and value of
+@@ -174,7 +186,7 @@ def get(self, request: Request, project, rule) -> Response:
+         examples=IssueAlertExamples.UPDATE_PROJECT_RULE,
+     )
+     @track_alert_endpoint_execution("PUT", "sentry-api-0-project-rule-details")
+-    def put(self, request: Request, project, rule) -> Response:
++    def put(self, request: Request, project: Project, rule: Rule | Workflow) -> Response:
+         """
+         ## Deprecated
+         🚧 Use [Update an Alert by ID](/api/monitors/update-an-alert-by-id) instead.
+@@ -188,6 +200,16 @@ def put(self, request: Request, project, rule) -> Response:
+         - Filters - help control noise by triggering an alert only if the issue matches the specified criteria.
+         - Actions - specify what should happen when the trigger conditions are met and the filters match.
+         """
++        if isinstance(rule, Workflow):
++            return Response(
++                {
++                    "rule": [
++                        "Passing a workflow through this endpoint is not yet supported",
++                    ]
++                },
++                status=status.HTTP_400_BAD_REQUEST,
++            )
++
+         rule_data_before = dict(rule.data)
+         if rule.environment_id:
+             rule_data_before["environment_id"] = rule.environment_id
+@@ -383,7 +405,7 @@ def put(self, request: Request, project, rule) -> Response:
+         },
+     )
+     @track_alert_endpoint_execution("DELETE", "sentry-api-0-project-rule-details")
+-    def delete(self, request: Request, project, rule) -> Response:
++    def delete(self, request: Request, project: Project, rule: Rule | Workflow) -> Response:
+         """
+         ## Deprecated
+          🚧 Use [Delete an Alert](/api/monitors/delete-an-alert) instead.
+@@ -396,6 +418,16 @@ def delete(self, request: Request, project, rule) -> Response:
+          - Filters: help control noise by triggering an alert only if the issue matches the specified criteria.
+          - Actions: specify what should happen when the trigger conditions are met and the filters match.
+         """
++        if isinstance(rule, Workflow):
++            return Response(
++                {
++                    "rule": [
++                        "Passing a workflow through this endpoint is not yet supported",
++                    ]
++                },
++                status=status.HTTP_400_BAD_REQUEST,
++            )
++
+         report_used_legacy_models()
+         with transaction.atomic(router.db_for_write(Rule)):
+             rule.update(status=ObjectStatus.PENDING_DELETION)
+diff --git a/src/sentry/api/serializers/models/rule.py b/src/sentry/api/serializers/models/rule.py
+index f01c585f368f77..0ce209f914480a 100644
+--- a/src/sentry/api/serializers/models/rule.py
++++ b/src/sentry/api/serializers/models/rule.py
+@@ -449,6 +449,7 @@ def _fetch_workflow_last_triggered(self, item_list: Sequence[Workflow]) -> dict[
+         return {wf_id: date for wf_id, date in results.items() if date is not None}
+ 
+     def get_attrs(self, item_list: Sequence[Workflow], user, **kwargs):
++        from sentry.incidents.endpoints.serializers.utils import get_fake_id_from_object_id
+         from sentry.notifications.notification_action.registry import issue_alert_handler_registry
+ 
+         # Bulk fetch users that created workflows
+@@ -477,7 +478,9 @@ def get_attrs(self, item_list: Sequence[Workflow], user, **kwargs):
+ 
+             result[workflow]["environment"] = workflow.environment
+             result[workflow]["projects"] = list(workflow_to_projects[workflow])
+-            result[workflow]["rule_id"] = workflow_rule_ids[workflow.id]
++            result[workflow]["rule_id"] = workflow_rule_ids.get(
++                workflow.id, get_fake_id_from_object_id(workflow.id)
++            )
+ 
+             result[workflow]["action_match"] = (
+                 workflow.when_condition_group.logic_type if workflow.when_condition_group else None
+@@ -521,7 +524,6 @@ def get_attrs(self, item_list: Sequence[Workflow], user, **kwargs):
+             conditions, filters = self._generate_rule_conditions_filters(
+                 workflow, result[workflow]["projects"][0], workflow_dcg
+             )
+-
+             result[workflow]["conditions"] = conditions
+             result[workflow]["filters"] = filters
+ 
+diff --git a/src/sentry/feedback/endpoints/error_page_embed.py b/src/sentry/feedback/endpoints/error_page_embed.py
+index c468be956b5fe5..73ab0d1844d864 100644
+--- a/src/sentry/feedback/endpoints/error_page_embed.py
++++ b/src/sentry/feedback/endpoints/error_page_embed.py
+@@ -19,7 +19,7 @@
+ from sentry.models.userreport import UserReport
+ from sentry.services import eventstore
+ from sentry.signals import user_feedback_received
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_locality
+ from sentry.utils import json
+ from sentry.utils.db import atomic_transaction
+ from sentry.utils.http import is_valid_origin, origin_from_request
+@@ -219,8 +219,7 @@ def dispatch(self, request: HttpRequest) -> HttpResponse:
+         elif request.method == "POST":
+             return self._smart_response(request, {"errors": dict(form.errors)}, status=400)
+ 
+-        region = get_local_region()
+-        endpoint = region.to_url(request.get_full_path())
++        endpoint = get_local_locality().to_url(request.get_full_path())
+         show_branding = (
+             ProjectOption.objects.get_value(
+                 project=key.project, key="feedback:branding", default="1"
+diff --git a/src/sentry/grouping/parameterization.py b/src/sentry/grouping/parameterization.py
+index 70b5fd64cb62b3..7f2d2922f1e2d9 100644
+--- a/src/sentry/grouping/parameterization.py
++++ b/src/sentry/grouping/parameterization.py
+@@ -116,8 +116,21 @@ def _get_pattern(self, raw_pattern: str) -> str:
+             # JavaScript
+             ((?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{2}\s\d{4}\s\d{2}:\d{2}:\d{2}\sGMT[+-]\d{4}(?:\s\([^)]+\))?)
+             |
+-            # Datetime:
+-            (\d{4}-?[01]\d-?[0-3]\d\s[0-2]\d:[0-5]\d:[0-5]\d)(\.\d+)?
++            # Datetime with timezone offset (Z=UTC):
++            # (Note: These come before plain datetimes so the offset is seen as part of the time and
++            # not a separate int value.)
++            (
++                (\d{4}-?[01]\d-?[0-3]\d[\sT][0-2]\d:?[0-5]\d:?[0-5]\d\.\d+([+-][0-2]\d:?[0-5]\d|Z))| # decimal seconds
++                (\d{4}-?[01]\d-?[0-3]\d[\sT][0-2]\d:?[0-5]\d:?[0-5]\d([+-][0-2]\d:?[0-5]\d|Z))| # seconds
++                (\d{4}-?[01]\d-?[0-3]\d[\sT][0-2]\d:?[0-5]\d([+-][0-2]\d:?[0-5]\d|Z)) # no seconds
++            )
++            |
++            # Datetime
++            (
++                (\d{4}-?[01]\d-?[0-3]\d[\sT][0-2]\d:?[0-5]\d:?[0-5]\d\.\d+)| # decimal seconds
++                (\d{4}-?[01]\d-?[0-3]\d[\sT][0-2]\d:?[0-5]\d:?[0-5]\d)| # seconds
++                (\d{4}-?[01]\d-?[0-3]\d[\sT][0-2]\d:?[0-5]\d) # no seconds
++            )
+             |
+             # Kitchen
+             ([1-9]\d?:\d{2}(:\d{2})?(?: [aApP][Mm])?)
+@@ -129,11 +142,6 @@ def _get_pattern(self, raw_pattern: str) -> str:
+             ([0-2]\d:[0-5]\d:[0-5]\d)
+             |
+             # Old Date Formats, TODO: possibly safe to remove?
+-            (
+-                (\d{4}-[01]\d-[0-3]\dT[0-2]\d:[0-5]\d:[0-5]\d\.\d+([+-][0-2]\d:[0-5]\d|Z))|
+-                (\d{4}-[01]\d-[0-3]\dT[0-2]\d:[0-5]\d:[0-5]\d([+-][0-2]\d:[0-5]\d|Z))|
+-                (\d{4}-[01]\d-[0-3]\dT[0-2]\d:[0-5]\d([+-][0-2]\d:[0-5]\d|Z))
+-            ) |
+             (
+                 \b(?:(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+)?
+                 (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+
+@@ -180,13 +188,15 @@ def _get_pattern(self, raw_pattern: str) -> str:
+             # then the <int> pattern would already have caught it. Given that we're here, it didn't,
+             # so the only thing we need the lookahead to guard against is it being all letters.
+             #
+-            # Each regex consists of two parts:
+-            # (?=.*[0-9])             The aforementioned lookahead - at least one `0-9` is present
+-            # [0-9a-f/A-F]{8 | 16,64}   8 or 16-128 hex characters
+-            (\b(?=.*[0-9])[0-9a-f]{8}\b) |
+-            (\b(?=.*[0-9])[0-9a-f]{16,128}\b) |
+-            (\b(?=.*[0-9])[0-9A-F]{8}\b) |
+-            (\b(?=.*[0-9])[0-9A-F]{16,128}\b)
++            # Each regex consists of two parts, the lookahead and the hex characters themselves. For
++            # example, for the lowercase 8-character pattern we have:
++            #     (?=[a-f]*[0-9])     The lookahead - there must be a digit, which may or may not be
++            #                         preceded by some number of hex letters
++            #     [0-9a-f]{8}         The matcher itself - 8 hex characters
++            (\b(?=[a-f]*[0-9])[0-9a-f]{8}\b) |
++            (\b(?=[a-f]*[0-9])[0-9a-f]{16,128}\b) |
++            (\b(?=[A-F]*[0-9])[0-9A-F]{8}\b) |
++            (\b(?=[A-F]*[0-9])[0-9A-F]{16,128}\b)
+         """,
+     ),
+     ParameterizationRegex(name="float", raw_pattern=r"""-\d+\.\d+\b | \b\d+\.\d+\b"""),
+diff --git a/src/sentry/models/avatars/base.py b/src/sentry/models/avatars/base.py
+index a457ed1998bdb1..203d0d60bcc99a 100644
+--- a/src/sentry/models/avatars/base.py
++++ b/src/sentry/models/avatars/base.py
+@@ -16,7 +16,7 @@
+ from sentry.models.files.control_file import ControlFile
+ from sentry.models.files.file import File
+ from sentry.silo.base import SiloMode
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_locality
+ from sentry.utils.cache import cache
+ from sentry.utils.db import atomic_transaction
+ 
+@@ -122,7 +122,7 @@ def absolute_url(self) -> str:
+         url_base = options.get("system.url-prefix")
+         silo_limit = getattr(cls._meta, "silo_limit", None)
+         if silo_limit is not None and SiloMode.REGION in silo_limit.modes:
+-            url_base = get_local_region().to_url("")
++            url_base = get_local_locality().to_url("")
+ 
+         return urljoin(url_base, f"/{self.url_path}/{self.ident}/")
+ 
+diff --git a/src/sentry/releases/endpoints/project_releases_token.py b/src/sentry/releases/endpoints/project_releases_token.py
+index 2fe9af624ce199..aaefc73a943a25 100644
+--- a/src/sentry/releases/endpoints/project_releases_token.py
++++ b/src/sentry/releases/endpoints/project_releases_token.py
+@@ -10,12 +10,11 @@
+ from sentry.api.base import region_silo_endpoint
+ from sentry.api.bases.project import ProjectEndpoint, StrictProjectPermission
+ from sentry.models.options.project_option import ProjectOption
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_locality
+ 
+ 
+ def _get_webhook_url(project, plugin_id, token):
+-    region = get_local_region()
+-    return region.to_url(
++    return get_local_locality().to_url(
+         reverse(
+             "sentry-release-hook",
+             kwargs={
+diff --git a/src/sentry/seer/explorer/explorer_service_map_utils.py b/src/sentry/seer/explorer/explorer_service_map_utils.py
+index d511d1496bfd6c..91635ed43360fc 100644
+--- a/src/sentry/seer/explorer/explorer_service_map_utils.py
++++ b/src/sentry/seer/explorer/explorer_service_map_utils.py
+@@ -140,16 +140,17 @@ def _process_rows(rows: list[dict]) -> None:
+         span.set_data("batch_count", math.ceil(len(unique_parent_span_ids) / batch_size))
+         for i in range(0, len(unique_parent_span_ids), batch_size):
+             batch = unique_parent_span_ids[i : i + batch_size]
+-            span_id_filters = " OR ".join([f'id:"{sid}"' for sid in batch])
++            span_ids = ",".join(batch)
+             parent_result = Spans.run_table_query(
+                 params=snuba_params,
+-                query_string=span_id_filters,
++                query_string=f"id:[{span_ids}]",
+                 selected_columns=["id", "project.id", "project.slug", "timestamp"],
+                 orderby=["-timestamp"],
+                 offset=0,
+                 limit=len(batch),
+                 referrer=Referrer.SEER_EXPLORER_SERVICE_MAP.value,
+                 config=SearchResolverConfig(),
++                sampling_mode="HIGHEST_ACCURACY",
+             )
+ 
+             for parent_row in parent_result.get("data", []):
+diff --git a/src/sentry/testutils/region.py b/src/sentry/testutils/region.py
+index 091d6d92cc8d92..5ddc77afa693c7 100644
+--- a/src/sentry/testutils/region.py
++++ b/src/sentry/testutils/region.py
+@@ -66,7 +66,7 @@ def swap_to_default_region(self) -> Generator[None]:
+     def swap_to_region_by_name(self, region_name: str) -> Generator[None]:
+         """Swap to the specified region when entering region mode."""
+ 
+-        region = self.get_by_name(region_name)
++        region = self.get_cell_by_name(region_name)
+         if region is None:
+             raise Exception("specified swap region not found")
+         with override_settings(SENTRY_REGION=region.name):
+@@ -88,7 +88,7 @@ def localities(self) -> frozenset[Locality]:
+             for r in self._tmp_state.regions
+         )
+ 
+-    def get_by_name(self, region_name: str) -> Region | None:
++    def get_cell_by_name(self, region_name: str) -> Region | None:
+         match = (r for r in self._tmp_state.regions if r.name == region_name)
+         try:
+             return next(match)
+@@ -96,7 +96,7 @@ def get_by_name(self, region_name: str) -> Region | None:
+             return None
+ 
+     def get_locality_by_name(self, locality_name: str) -> Locality | None:
+-        region = self.get_by_name(locality_name)
++        region = self.get_cell_by_name(locality_name)
+         if region is None:
+             return None
+         return Locality(
+@@ -107,7 +107,7 @@ def get_locality_by_name(self, locality_name: str) -> Locality | None:
+         )
+ 
+     def get_locality_for_cell(self, cell_name: str) -> Locality | None:
+-        region = self.get_by_name(cell_name)
++        region = self.get_cell_by_name(cell_name)
+         if region is None:
+             return None
+         return Locality(
+@@ -118,7 +118,7 @@ def get_locality_for_cell(self, cell_name: str) -> Locality | None:
+         )
+ 
+     def get_cells_for_locality(self, locality_name: str) -> Iterable[Region]:
+-        region = self.get_by_name(locality_name)
++        region = self.get_cell_by_name(locality_name)
+         if region is None:
+             return ()
+         return (region,)
+diff --git a/src/sentry/types/region.py b/src/sentry/types/region.py
+index f7e40af11deff5..d20bbd8a3c1662 100644
+--- a/src/sentry/types/region.py
++++ b/src/sentry/types/region.py
+@@ -40,6 +40,11 @@ class Locality:
+     """Whether the locality is visible in API responses."""
+ 
+     def to_url(self, path: str) -> str:
++        """Resolve a path into a customer facing URL on this locality.
++
++        In monolith mode, there is likely only the historical simulated locality.
++        The public URL of the simulated locality is the same as the application base URL.
++        """
+         from sentry.api.utils import generate_region_url
+ 
+         if SiloMode.get_current_mode() == SiloMode.MONOLITH:
+@@ -101,22 +106,6 @@ def validate(self) -> None:
+ 
+         REGION_ID.validate(self.snowflake_id)
+ 
+-    def to_url(self, path: str) -> str:
+-        """Resolve a path into a customer facing URL on this region's silo.
+-
+-        In monolith mode, there is likely only the historical simulated
+-        region. The public URL of the simulated region is the same
+-        as the application base URL.
+-        """
+-        from sentry.api.utils import generate_region_url
+-
+-        if SiloMode.get_current_mode() == SiloMode.MONOLITH:
+-            base_url = options.get("system.url-prefix")
+-        else:
+-            base_url = generate_region_url(self.name)
+-
+-        return urljoin(base_url, path)
+-
+     def is_historic_monolith_region(self) -> bool:
+         """Check whether this is a historic monolith region.
+ 
+@@ -154,10 +143,10 @@ class RegionDirectory:
+ 
+     def __init__(
+         self,
+-        regions: Collection[Region],
++        cells: Collection[Region],
+         localities: Collection[Locality],
+     ) -> None:
+-        self._cells = frozenset(regions)
++        self._cells = frozenset(cells)
+         self._by_name = {r.name: r for r in self._cells}
+         self._localities = frozenset(localities)
+         self._localities_by_name = {loc.name: loc for loc in self._localities}
+@@ -171,18 +160,22 @@ def regions(self) -> frozenset[Region]:
+     def localities(self) -> frozenset[Locality]:
+         return self._localities
+ 
+-    def get_by_name(self, region_name: str) -> Region | None:
++    def get_cell_by_name(self, region_name: str) -> Region | None:
+         return self._by_name.get(region_name)
+ 
+     def get_locality_by_name(self, locality_name: str) -> Locality | None:
+         return self._localities_by_name.get(locality_name)
+ 
+-    def get_regions(self, category: RegionCategory | None = None) -> Iterable[Region]:
++    def get_cells(self, category: RegionCategory | None = None) -> Iterable[Region]:
+         return (r for r in self.regions if (category is None or r.category == category))
+ 
+-    def get_region_names(self, category: RegionCategory | None = None) -> Iterable[str]:
++    def get_cell_names(self, category: RegionCategory | None = None) -> Iterable[str]:
+         return (r.name for r in self.regions if (category is None or r.category == category))
+ 
++    def get_region_names(self, category: RegionCategory | None = None) -> Iterable[str]:
++        """Deprecated. Use get_cell_names."""
++        return self.get_cell_names(category)
++
+     def get_locality_for_cell(self, cell_name: str) -> Locality | None:
+         return self._cell_to_locality.get(cell_name)
+ 
+@@ -328,11 +321,11 @@ def get_global_directory() -> RegionDirectory:
+ def get_cell_by_name(name: str) -> Region:
+     """Look up a cell by name."""
+     global_regions = get_global_directory()
+-    region = global_regions.get_by_name(name)
++    region = global_regions.get_cell_by_name(name)
+     if region is not None:
+         return region
+     else:
+-        region_names = list(global_regions.get_region_names(RegionCategory.MULTI_TENANT))
++        region_names = list(global_regions.get_cell_names(RegionCategory.MULTI_TENANT))
+         raise RegionResolutionError(
+             f"No cell with name: {name!r} "
+             f"(expected one of {region_names!r} or a single-tenant name)"
+@@ -358,7 +351,7 @@ def get_region_by_name(name: str) -> Region:
+ 
+ 
+ def is_region_name(name: str) -> bool:
+-    return get_global_directory().get_by_name(name) is not None
++    return get_global_directory().get_cell_by_name(name) is not None
+ 
+ 
+ def subdomain_is_region(request: HttpRequest) -> bool:
+@@ -388,6 +381,15 @@ def get_region_for_organization(organization_id_or_slug: str) -> Region:
+     return get_region_by_name(name=mapping.region_name)
+ 
+ 
++def get_local_locality() -> Locality:
++    """Get the locality for the cell this server instance is running in."""
++    cell = get_local_region()
++    locality = get_global_directory().get_locality_for_cell(cell.name)
++    if locality is None:
++        raise RegionResolutionError(f"No locality found for cell {cell.name!r}")
++    return locality
++
++
+ def get_local_region() -> Region:
+     """Get the region in which this server instance is running.
+ 
+@@ -469,15 +471,20 @@ def find_regions_for_sentry_app(sentry_app: SentryApp) -> set[str]:
+     return {r[0] for r in regions}
+ 
+ 
++def find_all_cell_names() -> Iterable[str]:
++    return get_global_directory().get_cell_names()
++
++
+ def find_all_region_names() -> Iterable[str]:
+-    return get_global_directory().get_region_names()
++    """Deprecated. Use find_all_cell_names."""
++    return find_all_cell_names()
+ 
+ 
+ def find_all_multitenant_region_names() -> list[str]:
+     """
+     Return all visible multi_tenant regions.
+     """
+-    regions = get_global_directory().get_regions(RegionCategory.MULTI_TENANT)
++    regions = get_global_directory().get_cells(RegionCategory.MULTI_TENANT)
+     return list([r.name for r in regions if r.visible])
+ 
+ 
+@@ -490,7 +497,3 @@ def find_all_multitenant_locality_names() -> list[str]:
+         for loc in get_global_directory().localities
+         if loc.category == RegionCategory.MULTI_TENANT and loc.visible
+     ]
+-
+-
+-def find_all_region_addresses() -> Iterable[str]:
+-    return (r.address for r in get_global_directory().regions)
+diff --git a/src/sentry/utils/linksign.py b/src/sentry/utils/linksign.py
+index 4c6709b05b925d..68029384a42aef 100644
+--- a/src/sentry/utils/linksign.py
++++ b/src/sentry/utils/linksign.py
+@@ -10,7 +10,7 @@
+ 
+ from sentry import features, options
+ from sentry.models.organization import Organization
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_locality
+ from sentry.users.services.user.model import RpcUser
+ from sentry.users.services.user.service import user_service
+ from sentry.utils.numbers import base36_decode, base36_encode
+@@ -36,8 +36,7 @@ def generate_signed_link(
+     path = reverse(viewname, args=args, kwargs=kwargs)
+     item = "{}|{}|{}".format(options.get("system.url-prefix"), path, base36_encode(user_id))
+     signature = ":".join(get_signer().sign(item).rsplit(":", 2)[1:])
+-    region = get_local_region()
+-    signed_link = f"{region.to_url(path)}?_={base36_encode(user_id)}:{signature}"
++    signed_link = f"{get_local_locality().to_url(path)}?_={base36_encode(user_id)}:{signature}"
+     if referrer:
+         signed_link = signed_link + "&" + urlencode({"referrer": referrer})
+     return signed_link
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts b/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
+index c9dbaa048a2ee0..f0e187e0c92af6 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
+@@ -1,10 +1,114 @@
++import {t} from 'sentry/locale';
++import {DisplayType, WidgetType, type Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+ import {DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/caches/settings';
++import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
++import {SpanFields} from 'sentry/views/insights/types';
++
++const BASE_CONDITION = `${SpanFields.SPAN_OP}:[cache.get,cache.get_item]`;
++
++const FIRST_ROW_WIDGETS = spaceWidgetsEquallyOnRow(
++  [
++    {
++      id: 'cache-hits-widget',
++      title: t('Miss Rate'),
++      displayType: DisplayType.LINE,
++      widgetType: WidgetType.SPANS,
++      interval: '5m',
++      queries: [
++        {
++          name: '',
++          aggregates: [
++            `equation|count_if(${SpanFields.CACHE_HIT},equals,false) / count(${SpanFields.SPAN_DURATION})`,
++          ],
++          columns: [],
++          fields: [
++            `equation|count_if(${SpanFields.CACHE_HIT},equals,false) / count(${SpanFields.SPAN_DURATION})`,
++          ],
++          conditions: BASE_CONDITION,
++          orderby: `equation|count_if(${SpanFields.CACHE_HIT},equals,false) / count(${SpanFields.SPAN_DURATION})`,
++          fieldMeta: [{valueType: 'percentage', valueUnit: null}],
++        },
++      ],
++    },
++    {
++      id: 'throughput-widget',
++      title: t('Throughput'),
++      displayType: DisplayType.LINE,
++      widgetType: WidgetType.SPANS,
++      interval: '5m',
++      queries: [
++        {
++          name: '',
++          aggregates: ['epm()'],
++          columns: [],
++          fields: ['epm()'],
++          conditions: BASE_CONDITION,
++          orderby: 'epm()',
++        },
++      ],
++    },
++  ],
++  0
++);
++
++const TRANSACTION_TABLE: Widget = {
++  id: 'transaction-table',
++  title: t('Transactions'),
++  displayType: DisplayType.TABLE,
++  widgetType: WidgetType.SPANS,
++  interval: '5m',
++  queries: [
++    {
++      name: '',
++      fields: [
++        SpanFields.TRANSACTION,
++        SpanFields.PROJECT,
++        `avg(${SpanFields.CACHE_ITEM_SIZE})`,
++        'epm()',
++        `equation|count_if(${SpanFields.CACHE_HIT},equals,false) / count(${SpanFields.SPAN_DURATION})`,
++        `sum(${SpanFields.SPAN_DURATION})`,
++      ],
++      aggregates: [
++        `avg(${SpanFields.CACHE_ITEM_SIZE})`,
++        'epm()',
++        `equation|count_if(${SpanFields.CACHE_HIT},equals,false) / count(${SpanFields.SPAN_DURATION})`,
++        `sum(${SpanFields.SPAN_DURATION})`,
++      ],
++      columns: [SpanFields.TRANSACTION, SpanFields.PROJECT],
++      fieldAliases: [
++        t('Transaction'),
++        t('Project'),
++        t('Avg Value Size'),
++        t('Requests Per Minute'),
++        t('Miss Rate'),
++        t('Time Spent'),
++      ],
++      fieldMeta: [
++        null,
++        null,
++        null,
++        null,
++        {valueType: 'percentage', valueUnit: null},
++        null,
++      ],
++      conditions: BASE_CONDITION,
++      orderby: `-sum(${SpanFields.SPAN_DURATION})`,
++    },
++  ],
++  layout: {
++    x: 0,
++    y: 3,
++    w: 6,
++    h: 6,
++    minH: 6,
++  },
++};
+ 
+ export const CACHES_PREBUILT_CONFIG: PrebuiltDashboard = {
+   dateCreated: '',
+   projects: [],
+   title: DASHBOARD_TITLE,
+   filters: {},
+-  widgets: [],
++  widgets: [...FIRST_ROW_WIDGETS, TRANSACTION_TABLE],
+ };
+diff --git a/static/app/views/insights/cache/utils/useHasPlatformizedCaches.tsx b/static/app/views/insights/cache/utils/useHasPlatformizedCaches.tsx
+new file mode 100644
+index 00000000000000..09cf91a4220b2e
+--- /dev/null
++++ b/static/app/views/insights/cache/utils/useHasPlatformizedCaches.tsx
+@@ -0,0 +1,12 @@
++import {useLocation} from 'sentry/utils/useLocation';
++import useOrganization from 'sentry/utils/useOrganization';
++
++export function useHasPlatformizedCaches() {
++  const organization = useOrganization();
++  const location = useLocation();
++
++  return (
++    organization.features.includes('insights-cache-dashboard-migration') ||
++    location.query.usePlatformizedView === '1'
++  );
++}
+diff --git a/static/app/views/insights/cache/views/cacheLandingPage.tsx b/static/app/views/insights/cache/views/cacheLandingPage.tsx
+index bee7879946f369..d2441c9c44d3e0 100644
+--- a/static/app/views/insights/cache/views/cacheLandingPage.tsx
++++ b/static/app/views/insights/cache/views/cacheLandingPage.tsx
+@@ -15,6 +15,8 @@ import {
+ } from 'sentry/views/insights/cache/components/tables/transactionsTable';
+ import {Referrer} from 'sentry/views/insights/cache/referrers';
+ import {BASE_FILTERS} from 'sentry/views/insights/cache/settings';
++import {useHasPlatformizedCaches} from 'sentry/views/insights/cache/utils/useHasPlatformizedCaches';
++import {PlatformizedCachesOverview} from 'sentry/views/insights/cache/views/platformizedOverview';
+ import {ModuleFeature} from 'sentry/views/insights/common/components/moduleFeature';
+ import * as ModuleLayout from 'sentry/views/insights/common/components/moduleLayout';
+ import {ModulePageFilterBar} from 'sentry/views/insights/common/components/modulePageFilterBar';
+@@ -137,10 +139,15 @@ export function CacheLandingPage() {
+ }
+ 
+ function PageWithProviders() {
++  const hasPlatformizedCaches = useHasPlatformizedCaches();
+   const maxPickableDays = useMaxPickableDays({
+     dataCategories: [DataCategory.SPANS],
+   });
+ 
++  if (hasPlatformizedCaches) {
++    return <PlatformizedCachesOverview />;
++  }
++
+   return (
+     <ModulePageProviders
+       moduleName="cache"
+diff --git a/static/app/views/insights/cache/views/platformizedOverview.tsx b/static/app/views/insights/cache/views/platformizedOverview.tsx
+new file mode 100644
+index 00000000000000..df8ad2ac37bb98
+--- /dev/null
++++ b/static/app/views/insights/cache/views/platformizedOverview.tsx
+@@ -0,0 +1,20 @@
++import {DataCategory} from 'sentry/types/core';
++import {useMaxPickableDays} from 'sentry/utils/useMaxPickableDays';
++import {PrebuiltDashboardRenderer} from 'sentry/views/dashboards/prebuiltDashboardRenderer';
++import {PrebuiltDashboardId} from 'sentry/views/dashboards/utils/prebuiltConfigs';
++import {ModulePageProviders} from 'sentry/views/insights/common/components/modulePageProviders';
++
++export function PlatformizedCachesOverview() {
++  const maxPickableDays = useMaxPickableDays({
++    dataCategories: [DataCategory.SPANS],
++  });
++
++  return (
++    <ModulePageProviders
++      moduleName="cache"
++      maxPickableDays={maxPickableDays.maxPickableDays}
++    >
++      <PrebuiltDashboardRenderer prebuiltId={PrebuiltDashboardId.BACKEND_CACHES} />
++    </ModulePageProviders>
++  );
++}
+diff --git a/static/app/views/seerExplorer/blockComponents.tsx b/static/app/views/seerExplorer/blockComponents.tsx
+index 41e9ec250dc8bc..add7de51e93825 100644
+--- a/static/app/views/seerExplorer/blockComponents.tsx
++++ b/static/app/views/seerExplorer/blockComponents.tsx
+@@ -298,7 +298,7 @@ function BlockComponent({
+           block_message: block.message.content.slice(0, 100),
+           langfuse_url: getLangfuseUrl(runId),
+           explorer_url: getExplorerUrl(runId),
+-          conversations_url: getConversationsUrl(organization.slug, runId),
++          conversations_url: getConversationsUrl('sentry', runId),
+         });
+         setFeedbackSubmitted(true); // disable button for rest of the session
+       }
+diff --git a/static/app/views/seerExplorer/explorerMenu.tsx b/static/app/views/seerExplorer/explorerMenu.tsx
+index c0e17102fdbfaf..0769e60d30c360 100644
+--- a/static/app/views/seerExplorer/explorerMenu.tsx
++++ b/static/app/views/seerExplorer/explorerMenu.tsx
+@@ -10,6 +10,15 @@ import {isSeerExplorerEnabled} from 'sentry/views/seerExplorer/utils';
+ 
+ type MenuMode = 'slash-commands-keyboard' | 'session-history' | 'pr-widget' | 'hidden';
+ 
++interface SlashCommandHandlers {
++  onConversations: () => void;
++  onFeedback: (() => void) | undefined;
++  onLangfuse: () => void;
++  onMaxSize: () => void;
++  onMedSize: () => void;
++  onNew: () => void;
++}
++
+ interface ExplorerMenuProps {
+   clearInput: () => void;
+   focusInput: () => void;
+@@ -17,14 +26,7 @@ interface ExplorerMenuProps {
+   onChangeSession: (runId: number) => void;
+   panelSize: 'max' | 'med';
+   panelVisible: boolean;
+-  slashCommandHandlers: {
+-    onFeedback: (() => void) | undefined;
+-    onLangfuse: () => void;
+-    onMaxSize: () => void;
+-    onMedSize: () => void;
+-    onNew: () => void;
+-    onSentryTrace: () => void;
+-  };
++  slashCommandHandlers: SlashCommandHandlers;
+   textAreaRef: React.RefObject<HTMLTextAreaElement | null>;
+   inputAnchorRef?: React.RefObject<HTMLElement | null>;
+   menuAnchorRef?: React.RefObject<HTMLElement | null>;
+@@ -348,15 +350,8 @@ function useSlashCommands({
+   onNew,
+   onFeedback,
+   onLangfuse,
+-  onSentryTrace,
+-}: {
+-  onFeedback: (() => void) | undefined;
+-  onLangfuse: () => void;
+-  onMaxSize: () => void;
+-  onMedSize: () => void;
+-  onNew: () => void;
+-  onSentryTrace: () => void;
+-}): MenuItemProps[] {
++  onConversations,
++}: SlashCommandHandlers): MenuItemProps[] {
+   const isSentryEmployee = useIsSentryEmployee();
+ 
+   return useMemo(
+@@ -404,15 +399,23 @@ function useSlashCommands({
+               handler: onLangfuse,
+             },
+             {
+-              title: '/sentry-conversation',
+-              key: '/sentry-conversation',
+-              description: 'Open Sentry AI trace (conversation view)',
+-              handler: onSentryTrace,
++              title: '/conversations',
++              key: '/conversations',
++              description: 'Open Sentry AI trace (conversations view)',
++              handler: onConversations,
+             },
+           ]
+         : []),
+     ],
+-    [onNew, onMaxSize, onMedSize, onFeedback, onLangfuse, onSentryTrace, isSentryEmployee]
++    [
++      onNew,
++      onMaxSize,
++      onMedSize,
++      onFeedback,
++      onLangfuse,
++      onConversations,
++      isSentryEmployee,
++    ]
+   );
+ }
+ 
+diff --git a/static/app/views/seerExplorer/explorerPanel.tsx b/static/app/views/seerExplorer/explorerPanel.tsx
+index 9b639fe0b95e52..3034b79141cf85 100644
+--- a/static/app/views/seerExplorer/explorerPanel.tsx
++++ b/static/app/views/seerExplorer/explorerPanel.tsx
+@@ -328,10 +328,7 @@ function ExplorerPanel() {
+   }, [setFocusedBlockIndex, textareaRef, setIsMinimized]);
+ 
+   const langfuseUrl = runId ? getLangfuseUrl(runId) : undefined;
+-  const conversationsUrl =
+-    runId && organization?.slug
+-      ? getConversationsUrl(organization.slug, runId)
+-      : undefined;
++  const conversationsUrl = runId ? getConversationsUrl('sentry', runId) : undefined;
+ 
+   const handleOpenLangfuse = useCallback(() => {
+     // Command handler. Disabled in slash command menu for non-employees
+@@ -340,7 +337,7 @@ function ExplorerPanel() {
+     }
+   }, [langfuseUrl]);
+ 
+-  const handleOpenSentryTrace = useCallback(() => {
++  const handleOpenConversations = useCallback(() => {
+     // Command handler. Disabled in slash command menu for non-employees
+     if (conversationsUrl) {
+       window.open(conversationsUrl, '_blank');
+@@ -381,7 +378,7 @@ function ExplorerPanel() {
+         onNew: startNewSession,
+         onFeedback: openFeedbackForm ? handleFeedback : undefined,
+         onLangfuse: handleOpenLangfuse,
+-        onSentryTrace: handleOpenSentryTrace,
++        onConversations: handleOpenConversations,
+       },
+       onChangeSession: switchToRun,
+       menuAnchorRef: sessionHistoryButtonRef,
+diff --git a/tests/sentry/api/endpoints/test_project_rule_details.py b/tests/sentry/api/endpoints/test_project_rule_details.py
+index 6578cec66a6184..e27cd4badf02be 100644
+--- a/tests/sentry/api/endpoints/test_project_rule_details.py
++++ b/tests/sentry/api/endpoints/test_project_rule_details.py
+@@ -16,6 +16,7 @@
+ from sentry.analytics.events.rule_reenable import RuleReenableEdit
+ from sentry.constants import ObjectStatus
+ from sentry.deletions.tasks.scheduled import run_scheduled_deletions
++from sentry.incidents.endpoints.serializers.utils import get_fake_id_from_object_id
+ from sentry.integrations.slack.utils.channel import strip_channel_name
+ from sentry.models.environment import Environment
+ from sentry.models.rule import NeglectedRule, Rule, RuleActivity, RuleActivityType
+@@ -24,16 +25,17 @@
+ from sentry.sentry_apps.utils.errors import SentryAppErrorType
+ from sentry.silo.base import SiloMode
+ from sentry.testutils.cases import APITestCase
+-from sentry.testutils.helpers import install_slack
++from sentry.testutils.helpers import install_slack, with_feature
+ from sentry.testutils.helpers.analytics import assert_any_analytics_event
+ from sentry.testutils.helpers.datetime import freeze_time
+ from sentry.testutils.silo import assume_test_silo_mode
+ from sentry.types.actor import Actor
+ from sentry.workflow_engine.models import AlertRuleWorkflow
+-from sentry.workflow_engine.models.data_condition import DataCondition
++from sentry.workflow_engine.models.data_condition import Condition, DataCondition
+ from sentry.workflow_engine.models.data_condition_group import DataConditionGroup
+ from sentry.workflow_engine.models.workflow import Workflow
+ from sentry.workflow_engine.models.workflow_data_condition_group import WorkflowDataConditionGroup
++from tests.sentry.workflow_engine.test_base import BaseWorkflowTest
+ 
+ 
+ def assert_rule_from_payload(rule: Rule, payload: Mapping[str, Any]) -> None:
+@@ -92,7 +94,7 @@ def assert_rule_from_payload(rule: Rule, payload: Mapping[str, Any]) -> None:
+     assert RuleActivity.objects.filter(rule=rule, type=RuleActivityType.UPDATED.value).exists()
+ 
+ 
+-class ProjectRuleDetailsBaseTestCase(APITestCase):
++class ProjectRuleDetailsBaseTestCase(APITestCase, BaseWorkflowTest):
+     endpoint = "sentry-api-0-project-rule-details"
+ 
+     def setUp(self) -> None:
+@@ -134,6 +136,34 @@ def setUp(self) -> None:
+                 "id": "sentry.rules.conditions.first_seen_event.FirstSeenEventCondition",
+             }
+         ]
++        # create single written workflow
++        self.detector = self.create_detector()
++        self.workflow_triggers = self.create_data_condition_group()
++        self.workflow = self.create_workflow(
++            when_condition_group=self.workflow_triggers,
++            organization=self.detector.project.organization,
++        )
++        self.detector_workflow = self.create_detector_workflow(
++            detector=self.detector, workflow=self.workflow
++        )
++        self.create_data_condition(  # trigger condition
++            condition_group=self.workflow_triggers,
++            type=Condition.EVENT_FREQUENCY_COUNT,
++            comparison={"interval": "1d", "value": 100},
++            condition_result=True,
++        )
++        self.workflow_filters = self.create_data_condition_group()
++        self.workflow_dcg = self.create_workflow_data_condition_group(
++            workflow=self.workflow, condition_group=self.workflow_filters
++        )
++        self.create_data_condition(  # filter condition
++            condition_group=self.workflow_filters,
++            type=Condition.EVENT_ATTRIBUTE,
++            comparison={"attribute": "platform", "match": "eq", "value": "python"},
++            condition_result=True,
++        )
++        self.action_group, self.action = self.create_workflow_action(self.workflow)
++        self.fake_workflow_id = get_fake_id_from_object_id(self.workflow.id)
+ 
+ 
+ class ProjectRuleDetailsTest(ProjectRuleDetailsBaseTestCase):
+@@ -145,6 +175,25 @@ def test_simple(self) -> None:
+         assert response.data["environment"] is None
+         assert response.data["conditions"][0]["name"]
+ 
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    def test_workflow_engine_serializer_dual_written_rule(self) -> None:
++        response = self.get_success_response(
++            self.organization.slug, self.project.slug, self.rule.id, status_code=200
++        )
++        assert response.data["id"] == str(self.rule.id)
++        assert response.data["environment"] is None
++        assert response.data["conditions"][0]["name"]
++
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    def test_workflow_engine_serializer_single_written_rule(self) -> None:
++        response = self.get_success_response(
++            self.organization.slug, self.project.slug, self.fake_workflow_id, status_code=200
++        )
++        assert response.data["id"] == str(self.fake_workflow_id)
++        assert response.data["environment"] is None
++        assert response.data["conditions"][0]["name"]
++        assert response.data["filters"][0]["name"]
++
+     def test_non_existing_rule(self) -> None:
+         self.get_error_response(self.organization.slug, self.project.slug, 12345, status_code=404)
+ 
+@@ -612,6 +661,12 @@ def test_simple(self, send_robust: MagicMock) -> None:
+         assert_rule_from_payload(self.rule, payload)
+         assert send_robust.called
+ 
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    def test_workflow_passed(self) -> None:
++        self.get_error_response(
++            self.organization.slug, self.project.slug, self.fake_workflow_id, status_code=400
++        )
++
+     def test_no_owner(self) -> None:
+         conditions = [
+             {
+@@ -1585,6 +1640,12 @@ def test_simple(self) -> None:
+             id=self.rule.id, project=self.project, status=ObjectStatus.PENDING_DELETION
+         ).exists()
+ 
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    def test_workflow_passed(self) -> None:
++        self.get_error_response(
++            self.organization.slug, self.project.slug, self.fake_workflow_id, status_code=400
++        )
++
+     def test_dual_delete_workflow_engine(self) -> None:
+         rule = self.create_project_rule(
+             self.project,
+diff --git a/tests/sentry/core/endpoints/test_organization_region.py b/tests/sentry/core/endpoints/test_organization_region.py
+index c4fd75bd9cbccc..719c99a6c963de 100644
+--- a/tests/sentry/core/endpoints/test_organization_region.py
++++ b/tests/sentry/core/endpoints/test_organization_region.py
+@@ -2,7 +2,7 @@
+ from sentry.models.organizationmember import OrganizationMember
+ from sentry.testutils.cases import APITestCase
+ from sentry.testutils.silo import assume_test_silo_mode_of, control_silo_test, create_test_regions
+-from sentry.types.region import Region, get_region_by_name
++from sentry.types.region import Region, get_global_directory, get_region_by_name
+ from sentry.utils.security.orgauthtoken_token import generate_token, hash_token
+ 
+ 
+@@ -27,7 +27,9 @@ def create_internal_integration_for_org(self, org, user, scopes: list[str]):
+         return (internal_integration, integration_token)
+ 
+     def create_auth_token_for_org(self, org: Organization, region: Region, scopes: list[str]):
+-        org_auth_token_str = generate_token(org.slug, region.to_url(""))
++        locality = get_global_directory().get_locality_for_cell(region.name)
++        assert locality is not None
++        org_auth_token_str = generate_token(org.slug, locality.to_url(""))
+         self.create_org_auth_token(
+             organization_id=org.id,
+             scope_list=scopes,
+@@ -51,8 +53,9 @@ def test_org_member_has_access(self) -> None:
+         response = self.get_response(self.org.slug)
+ 
+         assert response.status_code == 200
+-        us_region = get_region_by_name("us")
+-        assert response.data == {"url": us_region.to_url(""), "name": us_region.name}
++        us_locality = get_global_directory().get_locality_for_cell("us")
++        assert us_locality is not None
++        assert response.data == {"url": us_locality.to_url(""), "name": us_locality.name}
+ 
+     def test_non_org_member_has_no_access(self) -> None:
+         non_member_user = self.create_user()
+@@ -67,8 +70,9 @@ def test_org_auth_token_access_with_org_read(self) -> None:
+         )
+         response = self.send_get_request_with_auth(self.org.slug, org_auth_token_str)
+ 
+-        us_region = get_region_by_name("us")
+-        assert response.data == {"url": us_region.to_url(""), "name": us_region.name}
++        us_locality = get_global_directory().get_locality_for_cell("us")
++        assert us_locality is not None
++        assert response.data == {"url": us_locality.to_url(""), "name": us_locality.name}
+         assert response.status_code == 200
+ 
+     def test_org_auth_token_access_with_incorrect_scopes(self) -> None:
+@@ -99,8 +103,9 @@ def test_integration_token_access(self) -> None:
+         response = self.send_get_request_with_auth(self.org.slug, token.token)
+ 
+         assert response.status_code == 200
+-        us_region = get_region_by_name("us")
+-        assert response.data == {"name": us_region.name, "url": us_region.to_url("")}
++        us_locality = get_global_directory().get_locality_for_cell("us")
++        assert us_locality is not None
++        assert response.data == {"name": us_locality.name, "url": us_locality.to_url("")}
+ 
+     def test_integration_token_with_invalid_scopes(self) -> None:
+         integration, token = self.create_internal_integration_for_org(self.org, self.org_owner, [])
+@@ -127,8 +132,9 @@ def test_user_auth_token_for_owner(self) -> None:
+         response = self.send_get_request_with_auth(self.org.slug, user_auth_token.token)
+ 
+         assert response.status_code == 200
+-        us_region = get_region_by_name("us")
+-        assert response.data == {"url": us_region.to_url(""), "name": us_region.name}
++        us_locality = get_global_directory().get_locality_for_cell("us")
++        assert us_locality is not None
++        assert response.data == {"url": us_locality.to_url(""), "name": us_locality.name}
+ 
+     def test_user_auth_token_for_member(self) -> None:
+         org_user = self.create_user()
+@@ -141,8 +147,9 @@ def test_user_auth_token_for_member(self) -> None:
+         response = self.send_get_request_with_auth(self.org.slug, user_auth_token.token)
+ 
+         assert response.status_code == 200
+-        us_region = get_region_by_name("us")
+-        assert response.data == {"url": us_region.to_url(""), "name": us_region.name}
++        us_locality = get_global_directory().get_locality_for_cell("us")
++        assert us_locality is not None
++        assert response.data == {"url": us_locality.to_url(""), "name": us_locality.name}
+ 
+     def test_user_auth_token_for_non_member(self) -> None:
+         user_auth_token = self.create_user_auth_token(
+diff --git a/tests/sentry/feedback/endpoints/test_error_page_embed.py b/tests/sentry/feedback/endpoints/test_error_page_embed.py
+index 6a4f3e64f94809..988a8b2dfb4f85 100644
+--- a/tests/sentry/feedback/endpoints/test_error_page_embed.py
++++ b/tests/sentry/feedback/endpoints/test_error_page_embed.py
+@@ -9,7 +9,7 @@
+ from sentry.models.userreport import UserReport
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.helpers.datetime import before_now
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_locality
+ 
+ 
+ class ErrorPageEmbedTest(TestCase):
+@@ -83,8 +83,7 @@ def test_endpoint_reflects_region_url(self) -> None:
+         assert resp["Access-Control-Allow-Origin"] == "*"
+         self.assertTemplateUsed(resp, "sentry/error-page-embed.html")
+ 
+-        region = get_local_region()
+-        region_url = region.to_url(self.path_with_qs)
++        region_url = get_local_locality().to_url(self.path_with_qs)
+         body = resp.content.decode("utf8")
+         assert f'endpoint = /**/"{region_url}";/**/' in body
+ 
+diff --git a/tests/sentry/grouping/test_parameterization.py b/tests/sentry/grouping/test_parameterization.py
+index 360862c8d48a15..054f4c6365ebb2 100644
+--- a/tests/sentry/grouping/test_parameterization.py
++++ b/tests/sentry/grouping/test_parameterization.py
+@@ -63,9 +63,17 @@ def experimental_parameterizer() -> Parameterizer:
+     ("date - plain", "2006-01-02", "<date>"),
+     ("date - long", "Jan 18, 2019", "<date>"),
+     ("date - datetime space-separated", "2006-01-02 15:04:05", "<date>"),
++    ("date - datetime space-separated UTC", "2006-01-02 15:04:05Z", "<date>"),
++    ("date - datetime space-separated w offset", "2006-01-02 15:04:05+01:00", "<date>"),
+     ("date - datetime T-separated", "2006-01-02T15:04:05", "<date>"),
+     ("date - datetime T-separated UTC", "2006-01-02T15:04:05Z", "<date>"),
+     ("date - datetime T-separated w offset", "2006-01-02T15:04:05+01:00", "<date>"),
++    ("date - datetime compressed space-separated", "20060102 150405", "<date>"),
++    ("date - datetime compressed space-separated UTC", "20060102 150405Z", "<date>"),
++    ("date - datetime compressed space-separated w offset", "20060102 150405+0100", "<date>"),
++    ("date - datetime compressed T-separated", "20060102T150405", "<date>"),
++    ("date - datetime compressed T-separated UTC", "20060102T150405Z", "<date>"),
++    ("date - datetime compressed T-separated w offset", "20060102T150405+0100", "<date>"),
+     ("date - kitchen", "3:04PM", "<date>"),
+     ("date - time", "15:04:05", "<date>"),
+     ("date - basic", "Mon Jan 02, 1999", "<date>"),
+@@ -119,6 +127,8 @@ def experimental_parameterizer() -> Parameterizer:
+     ("hex without prefix - uppercase, 128 digits", "B0" * 64, "<hex>"),
+     ("hex without prefix - lowercase, no numbers", "deadbeef", "deadbeef"),
+     ("hex without prefix - uppercase, no numbers", "DEADBEEF", "DEADBEEF"),
++    ("hex without prefix - lowercase, no numbers until later", "deadbeef 123", "deadbeef <int>"),
++    ("hex without prefix - uppercase, no numbers until later", "DEADBEEF 123", "DEADBEEF <int>"),
+     ("hex without prefix - no letters, < 8 digits", "1234567", "<int>"),
+     ("hex without prefix - no letters, 8+ digits", "12345678", "<hex>"),
+     ("git sha - all letters", "commit deadbeef", "commit deadbeef"),
+@@ -200,72 +210,12 @@ def test_experimental_parameterization(
+ # parameterization. (Remember to remove the last item in each tuple for the cases you fix.)
+ incorrect_cases = [
+     # ("name", "input", "desired", "actual")
+-    (
+-        "date - datetime space-separated UTC",
+-        "2006-01-02 15:04:05Z",
+-        "<date>",
+-        "<date>Z",
+-    ),
+-    (
+-        "date - datetime space-separated w offset",
+-        "2006-01-02 15:04:05+01:00",
+-        "<date>",
+-        "<date>+<int>:<int>",
+-    ),
+-    (
+-        "date - datetime compressed space-separated",
+-        "20060102 150405",
+-        "<date>",
+-        "<hex> <int>",
+-    ),
+-    (
+-        "date - datetime compressed space-separated UTC",
+-        "20060102 150405Z",
+-        "<date>",
+-        "<hex> 150405Z",
+-    ),
+-    (
+-        "date - datetime compressed space-separated w offset",
+-        "20060102 150405+0100",
+-        "<date>",
+-        "<hex> <int>+<int>",
+-    ),
+-    (
+-        "date - datetime compressed T-separated",
+-        "20060102T150405",
+-        "<date>",
+-        "20060102T150405",
+-    ),
+-    (
+-        "date - datetime compressed T-separated UTC",
+-        "20060102T150405Z",
+-        "<date>",
+-        "20060102T150405Z",
+-    ),
+-    (
+-        "date - datetime compressed T-separated w offset",
+-        "20060102T150405+0100",
+-        "<date>",
+-        "20060102T150405+<int>",
+-    ),
+     (
+         "git sha",
+         "commit a93c7d2",
+         "commit <git_sha>",
+         "commit a93c7d2",
+     ),
+-    (
+-        "hex without prefix - lowercase, no numbers until later",
+-        "deadbeef 123",
+-        "deadbeef <int>",
+-        "<hex> <int>",
+-    ),
+-    (
+-        "hex without prefix - uppercase, no numbers until later",
+-        "DEADBEEF 123",
+-        "DEADBEEF <int>",
+-        "<hex> <int>",
+-    ),
+     (
+         "int - number in word",
+         "Encoding: utf-8",
+diff --git a/tests/sentry/middleware/integrations/parsers/test_jira.py b/tests/sentry/middleware/integrations/parsers/test_jira.py
+index 93b1f5a7794134..9f507c05a913b1 100644
+--- a/tests/sentry/middleware/integrations/parsers/test_jira.py
++++ b/tests/sentry/middleware/integrations/parsers/test_jira.py
+@@ -16,10 +16,12 @@
+ from sentry.testutils.outbox import assert_no_webhook_payloads, assert_webhook_payloads_for_mailbox
+ from sentry.testutils.region import override_regions
+ from sentry.testutils.silo import control_silo_test
+-from sentry.types.region import Region, RegionCategory
++from sentry.types.region import Locality, Region, RegionCategory
+ 
+ region = Region("us", 1, "http://us.testserver", RegionCategory.MULTI_TENANT)
+ eu_region = Region("eu", 2, "http://eu.testserver", RegionCategory.MULTI_TENANT)
++locality = Locality("us", frozenset(["us"]), RegionCategory.MULTI_TENANT)
++eu_locality = Locality("eu", frozenset(["eu"]), RegionCategory.MULTI_TENANT)
+ 
+ region_config = (region, eu_region)
+ 
+@@ -79,7 +81,7 @@ def test_get_response_routing_to_control(self) -> None:
+     def test_get_response_routing_to_region_sync(self) -> None:
+         responses.add(
+             responses.POST,
+-            region.to_url("/extensions/jira/issue/LR-123/"),
++            locality.to_url("/extensions/jira/issue/LR-123/"),
+             body="region response",
+             status=200,
+         )
+@@ -101,7 +103,7 @@ def test_get_response_routing_to_region_sync(self) -> None:
+     def test_get_response_routing_to_region_sync_retry_errors(self) -> None:
+         responses.add(
+             responses.POST,
+-            region.to_url("/extensions/jira/issue/LR-123/"),
++            locality.to_url("/extensions/jira/issue/LR-123/"),
+             body="region response",
+             status=503,
+         )
+@@ -188,7 +190,7 @@ def test_get_response_invalid_path(self) -> None:
+     def test_get_response_multiple_regions(self) -> None:
+         responses.add(
+             responses.POST,
+-            eu_region.to_url("/extensions/jira/issue/LR-123/"),
++            eu_locality.to_url("/extensions/jira/issue/LR-123/"),
+             body="region response",
+             status=200,
+         )
+diff --git a/tests/sentry/releases/endpoints/test_project_releases_token.py b/tests/sentry/releases/endpoints/test_project_releases_token.py
+index 09bf15d2034fc6..53679e30dfb134 100644
+--- a/tests/sentry/releases/endpoints/test_project_releases_token.py
++++ b/tests/sentry/releases/endpoints/test_project_releases_token.py
+@@ -2,7 +2,7 @@
+ 
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import APITestCase
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_locality
+ 
+ 
+ class ReleaseTokenGetTest(APITestCase):
+@@ -62,8 +62,7 @@ def test_generate_region_webhookurl(self) -> None:
+         response = self.client.get(url)
+         assert response.status_code == 200, response.content
+ 
+-        region = get_local_region()
+-        assert response.data["webhookUrl"].startswith(region.to_url("/"))
++        assert response.data["webhookUrl"].startswith(get_local_locality().to_url("/"))
+ 
+     def test_regenerates_token(self) -> None:
+         project = self.create_project(name="foo")
+diff --git a/tests/sentry/types/test_region.py b/tests/sentry/types/test_region.py
+index 264213dc1bc724..6320f1e60d6c34 100644
+--- a/tests/sentry/types/test_region.py
++++ b/tests/sentry/types/test_region.py
+@@ -14,6 +14,7 @@
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.region import get_test_env_directory
+ from sentry.types.region import (
++    Locality,
+     Region,
+     RegionCategory,
+     RegionConfigurationError,
+@@ -78,7 +79,7 @@ def test_region_config_parsing_in_monolith(self) -> None:
+         with override_settings(SENTRY_MONOLITH_REGION="us"):
+             directory = load_from_config(self._INPUTS, [])
+         assert directory.regions == frozenset(self._EXPECTED_OUTPUTS)
+-        assert directory.get_by_name("nowhere") is None
++        assert directory.get_cell_by_name("nowhere") is None
+ 
+         with self._in_global_state(directory):
+             assert get_region_by_name("eu") == self._EXPECTED_OUTPUTS[1]
+@@ -140,14 +141,14 @@ def test_validate_region(self) -> None:
+         for region in self._EXPECTED_OUTPUTS:
+             region.validate()
+ 
+-    def test_region_to_url(self) -> None:
+-        region = Region("us", 1, "http://192.168.1.99", RegionCategory.MULTI_TENANT)
++    def test_locality_to_url(self) -> None:
++        locality = Locality("us", frozenset(["us"]), RegionCategory.MULTI_TENANT)
+         with override_settings(SILO_MODE=SiloMode.REGION, SENTRY_REGION="us"):
+-            assert region.to_url("/avatar/abcdef/") == "http://us.testserver/avatar/abcdef/"
++            assert locality.to_url("/avatar/abcdef/") == "http://us.testserver/avatar/abcdef/"
+         with override_settings(SILO_MODE=SiloMode.CONTROL, SENTRY_REGION=""):
+-            assert region.to_url("/avatar/abcdef/") == "http://us.testserver/avatar/abcdef/"
++            assert locality.to_url("/avatar/abcdef/") == "http://us.testserver/avatar/abcdef/"
+         with override_settings(SILO_MODE=SiloMode.MONOLITH, SENTRY_REGION=""):
+-            assert region.to_url("/avatar/abcdef/") == "http://testserver/avatar/abcdef/"
++            assert locality.to_url("/avatar/abcdef/") == "http://testserver/avatar/abcdef/"
+ 
+     @patch("sentry.types.region.sentry_sdk")
+     def test_invalid_config(self, sentry_sdk_mock: MagicMock) -> None:
+diff --git a/tests/sentry/utils/test_linksign.py b/tests/sentry/utils/test_linksign.py
+index c0b97cf06b2c56..76be8cd4195e72 100644
+--- a/tests/sentry/utils/test_linksign.py
++++ b/tests/sentry/utils/test_linksign.py
+@@ -5,13 +5,13 @@
+ 
+ from sentry.silo.base import SiloMode
+ from sentry.testutils.cases import TestCase
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_locality
+ from sentry.utils import linksign
+ 
+ 
+ class LinkSignTestCase(TestCase):
+     def test_link_signing(self) -> None:
+-        base_url = get_local_region().to_url("/")
++        base_url = get_local_locality().to_url("/")
+         assert base_url.startswith("http://")
+ 
+         url = linksign.generate_signed_link(self.user.id, "sentry")

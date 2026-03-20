@@ -1,0 +1,509 @@
+diff --git a/src/sentry/preprod/build_distribution_utils.py b/src/sentry/preprod/build_distribution_utils.py
+index a9e116b1a1d5b4..6db66ad394a7f2 100644
+--- a/src/sentry/preprod/build_distribution_utils.py
++++ b/src/sentry/preprod/build_distribution_utils.py
+@@ -84,6 +84,8 @@ def is_installable_artifact(artifact: PreprodArtifact) -> bool:
+         extras = artifact.extras or {}
+         if extras.get("is_code_signature_valid") is not True:
+             return False
++        if extras.get("codesigning_type") == "app-store":
++            return False
+     return True
+ 
+ 
+diff --git a/src/sentry/search/eap/spans/formulas.py b/src/sentry/search/eap/spans/formulas.py
+index 82daa59cc88975..b90fef5d198030 100644
+--- a/src/sentry/search/eap/spans/formulas.py
++++ b/src/sentry/search/eap/spans/formulas.py
+@@ -228,28 +228,35 @@ def failure_rate(_: ResolvedArguments, settings: ResolverSettings) -> Column.Bin
+ 
+     return Column.BinaryFormula(
+         left=Column(
+-            conditional_aggregation=AttributeConditionalAggregation(
+-                aggregate=Function.FUNCTION_COUNT,
+-                key=AttributeKey(
+-                    name="sentry.status",
+-                    type=AttributeKey.TYPE_STRING,
+-                ),
+-                filter=TraceItemFilter(
+-                    comparison_filter=ComparisonFilter(
++            formula=Column.BinaryFormula(
++                default_value_double=0.0,
++                left=Column(
++                    conditional_aggregation=AttributeConditionalAggregation(
++                        aggregate=Function.FUNCTION_COUNT,
+                         key=AttributeKey(
+                             name="sentry.status",
+                             type=AttributeKey.TYPE_STRING,
+                         ),
+-                        op=ComparisonFilter.OP_NOT_IN,
+-                        value=AttributeValue(
+-                            val_str_array=StrArray(
+-                                values=["ok", "cancelled", "unknown"],
+-                            ),
++                        filter=TraceItemFilter(
++                            comparison_filter=ComparisonFilter(
++                                key=AttributeKey(
++                                    name="sentry.status",
++                                    type=AttributeKey.TYPE_STRING,
++                                ),
++                                op=ComparisonFilter.OP_NOT_IN,
++                                value=AttributeValue(
++                                    val_str_array=StrArray(
++                                        values=["ok", "cancelled", "unknown"],
++                                    ),
++                                ),
++                            )
+                         ),
+-                    )
++                        extrapolation_mode=extrapolation_mode,
++                    ),
+                 ),
+-                extrapolation_mode=extrapolation_mode,
+-            ),
++                op=Column.BinaryFormula.OP_MULTIPLY,
++                right=Column(literal=LiteralValue(val_double=1.0)),
++            )
+         ),
+         op=Column.BinaryFormula.OP_DIVIDE,
+         right=get_total_span_count(settings),
+@@ -755,6 +762,7 @@ def failure_count(_: ResolvedArguments, settings: ResolverSettings) -> Column.Bi
+     extrapolation_mode = settings["extrapolation_mode"]
+ 
+     return Column.BinaryFormula(
++        default_value_double=0.0,
+         left=Column(
+             conditional_aggregation=AttributeConditionalAggregation(
+                 aggregate=Function.FUNCTION_COUNT,
+diff --git a/src/sentry/tasks/autofix.py b/src/sentry/tasks/autofix.py
+index 2c77d415cdfbae..5cce4bd27be850 100644
+--- a/src/sentry/tasks/autofix.py
++++ b/src/sentry/tasks/autofix.py
+@@ -32,6 +32,15 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _get_group_or_log(group_id: int, task_name: str) -> Group | None:
++    """Fetch a Group by ID, returning None and logging a warning if it no longer exists."""
++    try:
++        return Group.objects.get(id=group_id)
++    except Group.DoesNotExist:
++        logger.warning("%s.group_not_found", task_name, extra={"group_id": group_id})
++        return None
++
++
+ @instrumented_task(
+     name="sentry.tasks.autofix.check_autofix_status",
+     namespace=issues_tasks,
+@@ -63,7 +72,9 @@ def generate_summary_and_run_automation(group_id: int, **kwargs) -> None:
+     trigger_path = kwargs.get("trigger_path", "unknown")
+     sentry_sdk.set_tag("trigger_path", trigger_path)
+ 
+-    group = Group.objects.get(id=group_id)
++    group = _get_group_or_log(group_id, "generate_summary_and_run_automation")
++    if group is None:
++        return
+     organization = group.project.organization
+ 
+     task_state = current_task()
+@@ -99,7 +110,9 @@ def generate_issue_summary_only(group_id: int) -> None:
+         get_issue_summary,
+     )
+ 
+-    group = Group.objects.get(id=group_id)
++    group = _get_group_or_log(group_id, "generate_issue_summary_only")
++    if group is None:
++        return
+     organization = group.project.organization
+ 
+     task_state = current_task()
+@@ -139,7 +152,9 @@ def run_automation_only_task(group_id: int) -> None:
+ 
+     from sentry.seer.autofix.issue_summary import run_automation
+ 
+-    group = Group.objects.get(id=group_id)
++    group = _get_group_or_log(group_id, "run_automation_only_task")
++    if group is None:
++        return
+     organization = group.project.organization
+ 
+     task_state = current_task()
+diff --git a/src/sentry/templates/sentry/oauth-authorize.html b/src/sentry/templates/sentry/oauth-authorize.html
+index 9d5de3c4eaf9a3..880fe90cde4438 100644
+--- a/src/sentry/templates/sentry/oauth-authorize.html
++++ b/src/sentry/templates/sentry/oauth-authorize.html
+@@ -2,6 +2,7 @@
+ 
+ {% load crispy_forms_tags %}
+ {% load i18n %}
++{% load sentry_assets %}
+ {% load sentry_avatars %}
+ 
+ {% block title %}{% trans "Authorize Application" %} | {{ block.super }}{% endblock %}
+@@ -55,8 +56,27 @@
+     </div>
+ 
+     <div class="auth-footer">
+-      <button type="submit" class="btn btn-primary" name="op" value="approve">{% trans "Approve" %}</button>
++      <button type="submit" class="btn btn-primary" name="op" value="approve" disabled>{% trans "Approve" %}</button>
+       <button type="submit" class="btn btn-danger" name="op" value="deny">{% trans "Deny" %}</button>
+     </div>
+   </form>
++  {% script %}
++  <script>
++    (function () {
++      var btn = document.querySelector('[name="op"][value="approve"]');
++      function onFirstInteraction() {
++        document.removeEventListener('pointermove', onFirstInteraction);
++        document.removeEventListener('pointerdown', onFirstInteraction);
++        document.removeEventListener('keydown', onFirstInteraction);
++        setTimeout(function () {
++          btn.disabled = false;
++        }, 1000);
++      }
++
++      document.addEventListener('pointermove', onFirstInteraction);
++      document.addEventListener('pointerdown', onFirstInteraction);
++      document.addEventListener('keydown', onFirstInteraction);
++    })();
++  </script>
++  {% endscript %}
+ {% endblock %}
+diff --git a/src/sentry/utils/avatar.py b/src/sentry/utils/avatar.py
+index 07bbc627c6289f..809bbe37c92b23 100644
+--- a/src/sentry/utils/avatar.py
++++ b/src/sentry/utils/avatar.py
+@@ -152,6 +152,8 @@ def is_black_alpha_only(data: IO[bytes]) -> bool:
+     result = False
+     with Image.open(data) as image:
+         if image.mode == "RGBA":
+-            result = not any(p[:3] != (0, 0, 0) for p in list(image.getdata()))
++            # tobytes() returns raw RGBA bytes (4 bytes per pixel)
++            raw = image.tobytes()
++            result = not any(raw[i : i + 3] != b"\x00\x00\x00" for i in range(0, len(raw), 4))
+     data.seek(0)
+     return result
+diff --git a/static/app/views/dashboards/globalFilter/filterSelector.spec.tsx b/static/app/views/dashboards/globalFilter/filterSelector.spec.tsx
+index 5277aa8366386c..7d89ead3901cfb 100644
+--- a/static/app/views/dashboards/globalFilter/filterSelector.spec.tsx
++++ b/static/app/views/dashboards/globalFilter/filterSelector.spec.tsx
+@@ -4,6 +4,7 @@ import {FieldKind} from 'sentry/utils/fields';
+ import type {SearchBarData} from 'sentry/views/dashboards/datasetConfig/base';
+ import FilterSelector from 'sentry/views/dashboards/globalFilter/filterSelector';
+ import {WidgetType, type GlobalFilter} from 'sentry/views/dashboards/types';
++import {SpanFields} from 'sentry/views/insights/types';
+ 
+ describe('FilterSelector', () => {
+   const mockOnUpdateFilter = jest.fn();
+@@ -107,4 +108,41 @@ describe('FilterSelector', () => {
+ 
+     expect(mockOnRemoveFilter).toHaveBeenCalledWith(mockGlobalFilter);
+   });
++
++  it('translates subregion codes to human-readable names for spans dataset', async () => {
++    const subregionFilter: GlobalFilter = {
++      dataset: WidgetType.SPANS,
++      tag: {
++        key: SpanFields.USER_GEO_SUBREGION,
++        name: 'User Geo Subregion',
++        kind: FieldKind.FIELD,
++      },
++      value: '',
++    };
++
++    const subregionSearchBarData: SearchBarData = {
++      getFilterKeySections: () => [],
++      getFilterKeys: () => ({}),
++      getTagValues: () => Promise.resolve(['21', '154']),
++    };
++
++    render(
++      <FilterSelector
++        globalFilter={subregionFilter}
++        searchBarData={subregionSearchBarData}
++        onUpdateFilter={mockOnUpdateFilter}
++        onRemoveFilter={mockOnRemoveFilter}
++      />
++    );
++
++    const button = screen.getByRole('button', {
++      name: SpanFields.USER_GEO_SUBREGION + ' :',
++    });
++    await userEvent.click(button);
++
++    expect(screen.getByRole('row', {name: 'North America'})).toBeInTheDocument();
++    expect(screen.getByRole('row', {name: 'Northern Europe'})).toBeInTheDocument();
++    expect(screen.queryByRole('row', {name: '21'})).not.toBeInTheDocument();
++    expect(screen.queryByRole('row', {name: '154'})).not.toBeInTheDocument();
++  });
+ });
+diff --git a/static/app/views/dashboards/globalFilter/filterSelector.tsx b/static/app/views/dashboards/globalFilter/filterSelector.tsx
+index 7b61e167415171..68755e0c776a87 100644
+--- a/static/app/views/dashboards/globalFilter/filterSelector.tsx
++++ b/static/app/views/dashboards/globalFilter/filterSelector.tsx
+@@ -305,7 +305,7 @@ function FilterSelector({
+ 
+   const stagedSelect = useStagedCompactSelect({
+     value: activeFilterValues,
+-    options,
++    options: translatedOptions,
+     onChange: handleChange,
+     onStagedValueChange: setStagedFilterValues,
+     multiple: true,
+diff --git a/tests/sentry/discover/test_compare_tables.py b/tests/sentry/discover/test_compare_tables.py
+index 7e97c70e07ae17..a4d85db853ab62 100644
+--- a/tests/sentry/discover/test_compare_tables.py
++++ b/tests/sentry/discover/test_compare_tables.py
+@@ -88,16 +88,6 @@ def setUp(self) -> None:
+             widget_type=DashboardWidgetTypes.TRANSACTION_LIKE,
+         )
+ 
+-        self.empty_field_widget_query = DashboardWidgetQuery.objects.create(
+-            widget=self.empty_field_widget,
+-            name="Test Empty Field Widget Query",
+-            order=2,
+-            conditions="",
+-            aggregates=["failure_rate()", "count()"],
+-            columns=["failure_rate()", "count()", "http.status_code"],
+-            fields=["failure_rate()", "count()", "http.status_code"],
+-        )
+-
+         self.non_existent_field_widget = DashboardWidget.objects.create(
+             dashboard=self.dashboard,
+             title="Test Non Existent Field Widget",
+@@ -282,18 +272,6 @@ def test_compare_successful_tables(self) -> None:
+         assert comparison_result["passed"]
+         assert comparison_result["mismatches"] == []
+ 
+-    def test_compare_empty_field_tables(self) -> None:
+-        # testing with failure_rate() field, which is not supported in EAP
+-        comparison_result = compare_tables_for_dashboard_widget_queries(
+-            self.empty_field_widget_query
+-        )
+-        assert comparison_result["passed"] is False
+-        assert comparison_result["reason"] == CompareTableResult.FIELD_NOT_FOUND
+-        assert (
+-            comparison_result["mismatches"] is not None
+-            and "failure_rate()" in comparison_result["mismatches"]
+-        )
+-
+     def test_compare_non_existent_field_tables(self) -> None:
+         comparison_result = compare_tables_for_dashboard_widget_queries(
+             self.non_existent_field_widget_query
+diff --git a/tests/sentry/preprod/test_build_distribution_utils.py b/tests/sentry/preprod/test_build_distribution_utils.py
+new file mode 100644
+index 00000000000000..bdaa6bf5bddb06
+--- /dev/null
++++ b/tests/sentry/preprod/test_build_distribution_utils.py
+@@ -0,0 +1,65 @@
++from sentry.preprod.build_distribution_utils import is_installable_artifact
++from sentry.preprod.models import (
++    PreprodArtifact,
++    PreprodArtifactMobileAppInfo,
++    PreprodBuildConfiguration,
++)
++from sentry.testutils.cases import TestCase
++from sentry.testutils.silo import region_silo_test
++
++
++@region_silo_test
++class IsInstallableArtifactTest(TestCase):
++    def _create_artifact(
++        self,
++        artifact_type=PreprodArtifact.ArtifactType.XCARCHIVE,
++        installable_app_file_id=1,
++        build_number="456",
++        extras=None,
++    ) -> PreprodArtifact:
++        build_config = PreprodBuildConfiguration.objects.create(
++            project=self.project, name="Release"
++        )
++        artifact = PreprodArtifact.objects.create(
++            project=self.project,
++            state=PreprodArtifact.ArtifactState.PROCESSED,
++            artifact_type=artifact_type,
++            app_id="com.example.app",
++            build_configuration=build_config,
++            installable_app_file_id=installable_app_file_id,
++            extras=extras,
++        )
++        PreprodArtifactMobileAppInfo.objects.create(
++            preprod_artifact=artifact,
++            app_name="TestApp",
++            build_version="1.0.0",
++            build_number=build_number,
++        )
++        return PreprodArtifact.objects.select_related("mobile_app_info").get(id=artifact.id)
++
++    def test_xcarchive_with_valid_signature_is_installable(self):
++        artifact = self._create_artifact(extras={"is_code_signature_valid": True})
++        assert is_installable_artifact(artifact) is True
++
++    def test_xcarchive_without_valid_signature_is_not_installable(self):
++        artifact = self._create_artifact(extras={"is_code_signature_valid": False})
++        assert is_installable_artifact(artifact) is False
++
++    def test_xcarchive_with_app_store_codesigning_is_not_installable(self):
++        artifact = self._create_artifact(
++            extras={"is_code_signature_valid": True, "codesigning_type": "app-store"}
++        )
++        assert is_installable_artifact(artifact) is False
++
++    def test_xcarchive_without_installable_app_file_is_not_installable(self):
++        artifact = self._create_artifact(
++            installable_app_file_id=None, extras={"is_code_signature_valid": True}
++        )
++        assert is_installable_artifact(artifact) is False
++
++    def test_aab_is_installable(self):
++        artifact = self._create_artifact(
++            artifact_type=PreprodArtifact.ArtifactType.AAB,
++            extras=None,
++        )
++        assert is_installable_artifact(artifact) is True
+diff --git a/tests/sentry/preprod/vcs/pr_comments/test_tasks.py b/tests/sentry/preprod/vcs/pr_comments/test_tasks.py
+index 17777a3fcaeeff..20cacb555b6955 100644
+--- a/tests/sentry/preprod/vcs/pr_comments/test_tasks.py
++++ b/tests/sentry/preprod/vcs/pr_comments/test_tasks.py
+@@ -536,3 +536,17 @@ def test_skips_xcarchive_without_valid_code_signature(self):
+             create_preprod_pr_comment_task(artifact.id)
+ 
+         # No comment posted — task returns early because artifact is not installable
++
++    @patch("sentry.preprod.vcs.pr_comments.tasks.get_commit_context_client")
++    def test_skips_xcarchive_with_app_store_codesigning(self, mock_get_client):
++        mock_client = Mock()
++        mock_get_client.return_value = mock_client
++        artifact = self._create_artifact(
++            extras={"is_code_signature_valid": True, "codesigning_type": "app-store"}
++        )
++
++        with self.feature(self._pr_comment_feature):
++            create_preprod_pr_comment_task(artifact.id)
++
++        mock_client.create_comment.assert_not_called()
++        mock_client.update_comment.assert_not_called()
+diff --git a/tests/sentry/utils/test_avatar.py b/tests/sentry/utils/test_avatar.py
+new file mode 100644
+index 00000000000000..cf8b42dac738f6
+--- /dev/null
++++ b/tests/sentry/utils/test_avatar.py
+@@ -0,0 +1,46 @@
++from __future__ import annotations
++
++import io
++
++from PIL import Image
++
++from sentry.utils.avatar import is_black_alpha_only
++
++
++def _make_image(pixels: list[tuple[int, int, int, int]], mode: str = "RGBA") -> io.BytesIO:
++    img = Image.new(mode, (len(pixels), 1))
++    img.putdata(pixels)  # type: ignore[arg-type]
++    buf = io.BytesIO()
++    img.save(buf, format="PNG")
++    buf.seek(0)
++    return buf
++
++
++class TestIsBlackAlphaOnly:
++    def test_all_black_opaque(self):
++        buf = _make_image([(0, 0, 0, 255), (0, 0, 0, 255)])
++        assert is_black_alpha_only(buf) is True
++
++    def test_all_black_transparent(self):
++        buf = _make_image([(0, 0, 0, 0), (0, 0, 0, 128)])
++        assert is_black_alpha_only(buf) is True
++
++    def test_one_non_black_pixel(self):
++        buf = _make_image([(0, 0, 0, 255), (1, 0, 0, 255)])
++        assert is_black_alpha_only(buf) is False
++
++    def test_colored_pixel(self):
++        buf = _make_image([(255, 0, 0, 255)])
++        assert is_black_alpha_only(buf) is False
++
++    def test_non_rgba_mode_returns_false(self):
++        img = Image.new("RGB", (2, 1), color=(0, 0, 0))
++        buf = io.BytesIO()
++        img.save(buf, format="PNG")
++        buf.seek(0)
++        assert is_black_alpha_only(buf) is False
++
++    def test_resets_file_position(self):
++        buf = _make_image([(0, 0, 0, 255)])
++        is_black_alpha_only(buf)
++        assert buf.tell() == 0
+diff --git a/tests/snuba/api/endpoints/test_organization_events_span_indexed.py b/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
+index 97c8cf9561eb11..72c0f0ef85369f 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
++++ b/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
+@@ -7286,3 +7286,39 @@ def test_has_in_filter(self) -> None:
+         assert app_start_row["os.name"] == "iOS"
+ 
+         assert meta["dataset"] == "spans"
++
++    def test_failure_count_and_rate_none(self):
++        response = self.do_request(
++            {
++                "field": ["failure_rate()", "failure_count()", "count()"],
++                "project": self.project.id,
++                "dataset": "spans",
++            }
++        )
++        assert response.status_code == 200, response.content
++        assert response.data["data"] == [
++            {
++                "failure_rate()": None,
++                "failure_count()": 0,
++                "count()": 0,
++            }
++        ]
++
++    def test_failure_count_and_rate_zero(self):
++        self.store_spans([self.create_span({"description": "foo"}, start_ts=self.ten_mins_ago)])
++
++        response = self.do_request(
++            {
++                "field": ["failure_rate()", "failure_count()", "count()"],
++                "project": self.project.id,
++                "dataset": "spans",
++            }
++        )
++        assert response.status_code == 200, response.content
++        assert response.data["data"] == [
++            {
++                "failure_rate()": 0,
++                "failure_count()": 0,
++                "count()": 1,
++            }
++        ]
+diff --git a/uv.lock b/uv.lock
+index 9b6857ef71357d..f2813e39963bac 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1502,16 +1502,15 @@ wheels = [
+ 
+ [[package]]
+ name = "pillow"
+-version = "11.0.0"
++version = "12.1.1"
+ source = { registry = "https://pypi.devinfra.sentry.io/simple" }
+ wheels = [
+-    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-11.0.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:bcd1fb5bb7b07f64c15618c89efcc2cfa3e95f0e3bcdbaf4642509de1942a699" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-11.0.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:0e038b0745997c7dcaae350d35859c9715c71e92ffb7e0f4a8e8a16732150f38" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-11.0.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:61b887f9ddba63ddf62fd02a3ba7add935d053b6dd7d58998c630e6dbade8527" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-11.0.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:c6a660307ca9d4867caa8d9ca2c2658ab685de83792d1876274991adec7b93fa" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-11.0.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:d06fe46339c3b524dc482c6d2c92cd0c5bd50b62184198b2859960a07c6d178c" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-11.0.0-cp314-cp314-manylinux_2_31_aarch64.whl", hash = "sha256:a93098a41e8e4715e137e2696ed5d3f8b9085d9882165a758bc76dfb16f1045f" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-11.0.0-cp314-cp314-manylinux_2_31_x86_64.whl", hash = "sha256:682e113ebeb97bf34cd49578fa35ec9b499a4bd230e2398f3f41069ef56fd904" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-12.1.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:8b7e5304e34942bf62e15184219a7b5ad4ff7f3bb5cca4d984f37df1a0e1aee2" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-12.1.1-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5a8eb7ed8d4198bccbd07058416eeec51686b498e784eda166395a23eb99138e" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-12.1.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:47b94983da0c642de92ced1702c5b6c292a84bd3a8e1d1702ff923f183594717" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-12.1.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:f7ed2c6543bad5a7d5530eb9e78c53132f93dfa44a28492db88b41cdab885202" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-12.1.1-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b574c51cf7d5d62e9be37ba446224b59a2da26dc4c1bb2ecbe936a4fb1a7cb7f" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/pillow-12.1.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a37691702ed687799de29a518d63d4682d9016932db66d4e90c345831b02fb4e" },
+ ]
+ 
+ [[package]]

@@ -1,30 +1,233 @@
-diff --git a/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb b/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb
-index 3b36d4d518..3025e26030 100644
---- a/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb
-+++ b/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb
-@@ -20,6 +20,8 @@ module DiscourseSubscriptions
-         sig_header = request.env["HTTP_STRIPE_SIGNATURE"]
-         webhook_secret = SiteSetting.discourse_subscriptions_webhook_secret
+diff --git a/lib/onebox/engine/image_onebox.rb b/lib/onebox/engine/image_onebox.rb
+index 28d446ca5ff55..b0246aa7c0e71 100644
+--- a/lib/onebox/engine/image_onebox.rb
++++ b/lib/onebox/engine/image_onebox.rb
+@@ -13,12 +13,8 @@ def always_https?
+       end
  
-+        return head :forbidden if webhook_secret.blank?
+       def to_html
+-        # Fix Dropbox image links
+-        if @url[%r{^https://www.dropbox.com/s/}]
+-          @url.sub!("https://www.dropbox.com", "https://dl.dropboxusercontent.com")
+-        end
+-
+-        escaped_url = ::Onebox::Helpers.normalize_url_for_output(@url)
++        url = ::Onebox::Helpers.normalize_dropbox_url(@url)
++        escaped_url = ::Onebox::Helpers.normalize_url_for_output(url)
+         <<-HTML
+           <a href="#{escaped_url}" target="_blank" rel="noopener" class="onebox">
+             <img src="#{escaped_url}">
+diff --git a/lib/onebox/engine/video_onebox.rb b/lib/onebox/engine/video_onebox.rb
+index 3c810d7556c36..d4edd2627c182 100644
+--- a/lib/onebox/engine/video_onebox.rb
++++ b/lib/onebox/engine/video_onebox.rb
+@@ -12,17 +12,13 @@ def always_https?
+       end
+ 
+       def to_html
+-        # Fix Dropbox image links
+-        if @url[%r{^https://www.dropbox.com/s/}]
+-          @url.sub!("https://www.dropbox.com", "https://dl.dropboxusercontent.com")
+-        end
+-
+-        escaped_url = ::Onebox::Helpers.normalize_url_for_output(@url)
++        url = ::Onebox::Helpers.normalize_dropbox_url(@url)
++        escaped_url = ::Onebox::Helpers.normalize_url_for_output(url)
+         <<-HTML
+           <div class="onebox video-onebox">
+             <video width='100%' height='100%' controls #{@options[:disable_media_download_controls] ? 'controlslist="nodownload"' : ""}>
+               <source src='#{escaped_url}'>
+-              <a href='#{escaped_url}'>#{@url}</a>
++              <a href='#{escaped_url}'>#{url}</a>
+             </video>
+           </div>
+         HTML
+diff --git a/lib/onebox/helpers.rb b/lib/onebox/helpers.rb
+index 7c57c0411e8c3..034d7fc9cbcb2 100644
+--- a/lib/onebox/helpers.rb
++++ b/lib/onebox/helpers.rb
+@@ -286,5 +286,20 @@ def self.map_placeholder_html
+     def self.generic_placeholder_html
+       "<div class='onebox-placeholder-container'><span class='placeholder-icon generic'></span></div>"
+     end
 +
-         event = ::Stripe::Webhook.construct_event(payload, sig_header, webhook_secret)
-       rescue JSON::ParserError => e
-         return render_json_error e.message
-diff --git a/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb b/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb
-index 93b42df096..da21da58e4 100644
---- a/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb
-+++ b/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb
-@@ -6,6 +6,12 @@ RSpec.describe DiscourseSubscriptions::HooksController do
-     SiteSetting.discourse_subscriptions_enabled = true
++    def self.normalize_dropbox_url(url)
++      return url unless url.start_with?("https://www.dropbox.com/")
++
++      uri = URI.parse(url)
++      uri.host = "dl.dropboxusercontent.com"
++
++      if url.include?("/scl/")
++        params = URI.decode_www_form(uri.query.to_s).to_h
++        params["raw"] = "1"
++        uri.query = URI.encode_www_form(params)
++      end
++
++      uri.to_s
++    end
    end
+ end
+diff --git a/plugins/discourse-ai/app/jobs/scheduled/topic_localization_backfill.rb b/plugins/discourse-ai/app/jobs/scheduled/topic_localization_backfill.rb
+index 7b1501837a2d8..11a04cdb487d5 100644
+--- a/plugins/discourse-ai/app/jobs/scheduled/topic_localization_backfill.rb
++++ b/plugins/discourse-ai/app/jobs/scheduled/topic_localization_backfill.rb
+@@ -21,6 +21,8 @@ def execute(args)
+       end
  
-+  it "rejects webhooks when webhook secret is blank" do
-+    SiteSetting.discourse_subscriptions_webhook_secret = ""
-+    post "/s/hooks.json", params: "{}", headers: { HTTP_STRIPE_SIGNATURE: "t=1,v1=abc" }
-+    expect(response.status).to eq 403
+       limit = SiteSetting.ai_translation_backfill_hourly_rate / (60 / 5) # this job runs in 5-minute intervals
++      return if limit == 0
++
+       Jobs.enqueue(:localize_topics, limit:)
+     end
+ 
+diff --git a/plugins/discourse-ai/spec/jobs/scheduled/topic_localization_backfill_spec.rb b/plugins/discourse-ai/spec/jobs/scheduled/topic_localization_backfill_spec.rb
+new file mode 100644
+index 0000000000000..42ca7d2cea80d
+--- /dev/null
++++ b/plugins/discourse-ai/spec/jobs/scheduled/topic_localization_backfill_spec.rb
+@@ -0,0 +1,43 @@
++# frozen_string_literal: true
++
++describe Jobs::TopicLocalizationBackfill do
++  before do
++    enable_current_plugin
++    assign_fake_provider_to(:ai_default_llm_model)
++    SiteSetting.ai_translation_backfill_hourly_rate = 100
++    SiteSetting.content_localization_supported_locales = "en"
++    SiteSetting.ai_translation_enabled = true
 +  end
 +
-   it "constructs a webhook event" do
-     payload = "we-want-a-shrubbery"
-     headers = { HTTP_STRIPE_SIGNATURE: "stripe-webhook-signature" }
++  it "does not enqueue topic translation when translator disabled" do
++    SiteSetting.discourse_ai_enabled = false
++
++    expect_not_enqueued_with(job: :localize_topics) { described_class.new.execute({}) }
++  end
++
++  it "does not enqueue topic translation when ai_translation_enabled disabled" do
++    SiteSetting.ai_translation_enabled = false
++
++    expect_not_enqueued_with(job: :localize_topics) { described_class.new.execute({}) }
++  end
++
++  it "does not enqueue topic translation if backfill languages are not set" do
++    SiteSetting.content_localization_supported_locales = ""
++
++    expect_not_enqueued_with(job: :localize_topics) { described_class.new.execute({}) }
++  end
++
++  it "does not enqueue topic translation if backfill limit is set to 0" do
++    SiteSetting.ai_translation_backfill_hourly_rate = 0
++
++    expect_not_enqueued_with(job: :localize_topics) { described_class.new.execute({}) }
++  end
++
++  it "enqueues topic translation with correct limit" do
++    SiteSetting.ai_translation_backfill_hourly_rate = 100
++
++    described_class.new.execute({})
++
++    expect_job_enqueued(job: :localize_topics, args: { limit: 8 })
++  end
++end
+diff --git a/spec/lib/onebox/engine/image_onebox_spec.rb b/spec/lib/onebox/engine/image_onebox_spec.rb
+index 0b77ca280e03d..46befddc432cb 100644
+--- a/spec/lib/onebox/engine/image_onebox_spec.rb
++++ b/spec/lib/onebox/engine/image_onebox_spec.rb
+@@ -76,4 +76,12 @@
+       Onebox.preview("http://www.discourse.org/images/logo", { content_type: "image/png" }).to_s,
+     ).to match(/<img/)
+   end
++
++  context "with Dropbox URL" do
++    let(:html) { Onebox.preview("https://www.dropbox.com/scl/fi/abc123/image.png?rlkey=xyz").to_s }
++
++    it "transforms to direct download link" do
++      expect(html).to include("dl.dropboxusercontent.com")
++    end
++  end
+ end
+diff --git a/spec/lib/onebox/engine/video_onebox_spec.rb b/spec/lib/onebox/engine/video_onebox_spec.rb
+index 69bcb5e670cd9..3dea8b75c792b 100644
+--- a/spec/lib/onebox/engine/video_onebox_spec.rb
++++ b/spec/lib/onebox/engine/video_onebox_spec.rb
+@@ -49,4 +49,12 @@
+       ).to_s,
+     ).to include("controlslist=\"nodownload\"")
+   end
++
++  context "with Dropbox URL" do
++    let(:html) { Onebox.preview("https://www.dropbox.com/scl/fi/abc123/video.mp4?rlkey=xyz").to_s }
++
++    it "transforms to direct download link" do
++      expect(html).to include("dl.dropboxusercontent.com")
++    end
++  end
+ end
+diff --git a/spec/lib/onebox/helpers_spec.rb b/spec/lib/onebox/helpers_spec.rb
+index 762071abb5f6d..fa29daaa5132f 100644
+--- a/spec/lib/onebox/helpers_spec.rb
++++ b/spec/lib/onebox/helpers_spec.rb
+@@ -414,4 +414,48 @@
+       expect(described_class.uri_encode(url)).to eq(url)
+     end
+   end
++
++  describe ".normalize_dropbox_url" do
++    subject(:result) { described_class.normalize_dropbox_url(url) }
++
++    context "with non-Dropbox URL" do
++      let(:url) { "https://example.com/video.mp4" }
++
++      it "returns unchanged" do
++        expect(result).to eq(url)
++      end
++    end
++
++    context "with old /s/ format" do
++      let(:url) { "https://www.dropbox.com/s/abc123/file.mp4" }
++
++      it "converts to direct download domain" do
++        expect(result).to eq("https://dl.dropboxusercontent.com/s/abc123/file.mp4")
++      end
++    end
++
++    context "with new /scl/ format" do
++      let(:url) { "https://www.dropbox.com/scl/fi/abc123/file.mp4?rlkey=xyz789&st=test" }
++
++      it "converts to direct download domain" do
++        expect(result).to include("dl.dropboxusercontent.com")
++      end
++
++      it "adds raw=1 for direct file access" do
++        expect(result).to include("raw=1")
++      end
++
++      it "preserves authentication parameters" do
++        expect(result).to include("rlkey=xyz789", "st=test")
++      end
++    end
++
++    context "with /scl/ format without query string" do
++      let(:url) { "https://www.dropbox.com/scl/fi/abc123/file.mp4" }
++
++      it "adds raw=1 for direct file access" do
++        expect(result).to include("raw=1")
++      end
++    end
++  end
+ end
+diff --git a/themes/horizon/scss/high-context-cards.scss b/themes/horizon/scss/high-context-cards.scss
+index 50ab6ca18a70f..b85150a67b298 100644
+--- a/themes/horizon/scss/high-context-cards.scss
++++ b/themes/horizon/scss/high-context-cards.scss
+@@ -186,6 +186,10 @@ $padding-pills-small: var(--space-half) var(--space-2);
+     a {
+       color: var(--primary);
+       word-break: break-word;
++
++      > * {
++        pointer-events: none;
++      }
+     }
+ 
+     .topic-status.--pinned,

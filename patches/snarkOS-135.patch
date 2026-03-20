@@ -1,19 +1,84 @@
-diff --git a/src/network/server.rs b/src/network/server.rs
-index 31d62ae2a..35d382120 100644
---- a/src/network/server.rs
-+++ b/src/network/server.rs
-@@ -297,12 +297,13 @@ impl<N: Network, E: Environment> Server<N, E> {
-             loop {
-                 info!(
-                     r"
+diff --git a/node/tcp/src/helpers/connections.rs b/node/tcp/src/helpers/connections.rs
+index 88b07e303..1b42635ac 100644
+--- a/node/tcp/src/helpers/connections.rs
++++ b/node/tcp/src/helpers/connections.rs
+@@ -15,7 +15,7 @@
+ 
+ //! Objects associated with connection handling.
+ 
+-use std::{collections::HashMap, net::SocketAddr, ops::Not};
++use std::{collections::HashMap, net::SocketAddr, ops::Not, sync::atomic::AtomicBool};
+ 
+ #[cfg(feature = "locktick")]
+ use locktick::parking_lot::RwLock;
+@@ -33,7 +33,7 @@ use crate::protocols::{Handshake, Reading, Writing};
+ 
+ /// A map of all currently connected addresses to their associated connection.
+ #[derive(Default)]
+-pub(crate) struct Connections(RwLock<HashMap<SocketAddr, Connection>>);
++pub(crate) struct Connections(pub(crate) RwLock<HashMap<SocketAddr, Connection>>);
+ 
+ impl Connections {
+     /// Adds the given connection to the list of active connections.
+@@ -85,6 +85,8 @@ pub struct Connection {
+     pub(crate) writer: Option<Box<dyn AW>>,
+     /// Used to notify the [`Reading`] protocol that the connection is fully ready.
+     pub(crate) readiness_notifier: Option<oneshot::Sender<()>>,
++    /// Prevents the OnDisconnect hook from being triggered multiple times.
++    pub(crate) disconnecting: AtomicBool,
+     /// Handles to tasks spawned for the connection.
+     pub(crate) tasks: Vec<JoinHandle<()>>,
+ }
+@@ -98,6 +100,7 @@ impl Connection {
+             reader: None,
+             writer: None,
+             readiness_notifier: None,
++            disconnecting: Default::default(),
+             side,
+             tasks: Default::default(),
+         }
+diff --git a/node/tcp/src/protocols/reading.rs b/node/tcp/src/protocols/reading.rs
+index a71db8609..8e9ef1688 100644
+--- a/node/tcp/src/protocols/reading.rs
++++ b/node/tcp/src/protocols/reading.rs
+@@ -175,6 +175,9 @@ impl<R: Reading> ReadingInternal for R {
+                         if let Err(e) = inbound_message_sender.try_send(msg) {
+                             error!(parent: node.span(), "can't process a message from {addr}: {e}");
+                             node.stats().register_failure();
++                            if matches!(e, mpsc::error::TrySendError::Closed(_)) {
++                                break;
++                            }
+                         }
+                         #[cfg(feature = "metrics")]
+                         metrics::increment_gauge(metrics::tcp::TCP_TASKS, 1f64);
+diff --git a/node/tcp/src/tcp.rs b/node/tcp/src/tcp.rs
+index d34f256fc..90a46c561 100644
+--- a/node/tcp/src/tcp.rs
++++ b/node/tcp/src/tcp.rs
+@@ -302,12 +302,21 @@ impl Tcp {
+     ///
+     /// Returns true if the we were connected to the given address.
+     pub async fn disconnect(&self, addr: SocketAddr) -> bool {
+-        if let Some(handler) = self.protocols.disconnect.get() {
+-            if self.is_connected(addr) {
+-                let (sender, receiver) = oneshot::channel();
+-                handler.trigger((addr, sender));
+-                let _ = receiver.await; // can't really fail
++        // claim the disconnect to avoid duplicate executions, or return early if already claimed
++        if let Some(conn) = self.connections.0.read().get(&addr) {
++            if conn.disconnecting.swap(true, Relaxed) {
++                // valid connection, but someone else is already disconnecting it
++                return false;
+             }
++        } else {
++            // not connected
++            return false;
++        };
 +
- ===========================================================================================================
-                                   Aleo Testnet2 - Incentivization Period
- ===========================================================================================================
++        if let Some(handler) = self.protocols.disconnect.get() {
++            let (sender, receiver) = oneshot::channel();
++            handler.trigger((addr, sender));
++            let _ = receiver.await; // can't really fail
+         }
  
-     In preparation for the incentivization period, testnet2 will automatically reset within 48 hours.
--    Please ensure your Aleo node is runnning either the `run-client.sh` or `run-miner.sh` script,
-+    Please ensure your Aleo node is running either the `run-client.sh` or `run-miner.sh` script,
-     in order to automatically upgrade to the incentivized testnet.
- 
- ===========================================================================================================
+         let conn = self.connections.remove(addr);

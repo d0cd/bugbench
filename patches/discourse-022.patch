@@ -1,194 +1,364 @@
-diff --git a/plugins/discourse-ai/app/controllers/discourse_ai/translation/translation_controller.rb b/plugins/discourse-ai/app/controllers/discourse_ai/translation/translation_controller.rb
-index 2abbd1349f..99294241bc 100644
---- a/plugins/discourse-ai/app/controllers/discourse_ai/translation/translation_controller.rb
-+++ b/plugins/discourse-ai/app/controllers/discourse_ai/translation/translation_controller.rb
-@@ -90,10 +90,10 @@ module DiscourseAi
-         # 2. Need translation to other supported locales (excluding their own locale)
-         # 3. Don't have PostLocalization records for those target locales yet
-         # 4. Are not deleted and have content
--        topic
--          .posts
--          .secured(guardian)
--          .where("user_id > 0")
-+        posts = topic.posts.secured(guardian)
-+        posts =
-+          posts.where("posts.user_id > 0") unless SiteSetting.ai_translation_include_bot_content
-+        posts
-           .where.not(raw: "")
-           .where(deleted_at: nil)
-           .where.not(locale: nil)
-diff --git a/plugins/discourse-ai/app/jobs/regular/detect_translate_post.rb b/plugins/discourse-ai/app/jobs/regular/detect_translate_post.rb
-index bfd34b200b..b6d6942a24 100644
---- a/plugins/discourse-ai/app/jobs/regular/detect_translate_post.rb
-+++ b/plugins/discourse-ai/app/jobs/regular/detect_translate_post.rb
-@@ -17,13 +17,14 @@ module Jobs
-       end
+diff --git a/plugins/discourse-ai/config/eval-llms.yml b/plugins/discourse-ai/config/eval-llms.yml
+index d279009e69093..6d417585e9228 100644
+--- a/plugins/discourse-ai/config/eval-llms.yml
++++ b/plugins/discourse-ai/config/eval-llms.yml
+@@ -56,9 +56,9 @@ llms:
+       enable_reasoning: true
+       reasoning_tokens: 1024
  
-       post = Post.find_by(id: args[:post_id])
--      return if post.blank? || post.raw.blank? || post.deleted_at.present? || post.user_id <= 0
-+      return if post.blank? || post.raw.blank? || post.deleted_at.present?
-+
-+      force = args[:force] || false
-+      return if post.user_id <= 0 && !force && !SiteSetting.ai_translation_include_bot_content
+-  claude-4.5-sonnet:
+-    display_name: Claude 4.5 Sonnet
+-    name: claude-sonnet-4-5
++  claude-4.6-sonnet:
++    display_name: Claude 4.6 Sonnet
++    name: claude-sonnet-4-6
+     tokenizer: DiscourseAi::Tokenizer::AnthropicTokenizer
+     api_key_env: ANTHROPIC_API_KEY
+     provider: anthropic
+@@ -66,9 +66,9 @@ llms:
+     max_prompt_tokens: 200000
+     vision_enabled: true
  
-       topic = post.topic
-       return if topic.blank?
+-  claude-4.5-sonnet-thinking:
+-    display_name: Claude 4.5 Sonnet
+-    name: claude-sonnet-4-5
++  claude-4.6-sonnet-thinking:
++    display_name: Claude 4.6 Sonnet
++    name: claude-sonnet-4-6
+     tokenizer: DiscourseAi::Tokenizer::AnthropicTokenizer
+     api_key_env: ANTHROPIC_API_KEY
+     provider: anthropic
+diff --git a/plugins/discourse-ai/config/locales/client.en.yml b/plugins/discourse-ai/config/locales/client.en.yml
+index b83e8e037f7ec..a557e673f03eb 100644
+--- a/plugins/discourse-ai/config/locales/client.en.yml
++++ b/plugins/discourse-ai/config/locales/client.en.yml
+@@ -774,8 +774,8 @@ en:
  
--      force = args[:force] || false
+         model_description:
+           none: "General settings that work for most language models"
+-          anthropic-claude-opus-4-5: "Anthropic's most intelligent model"
+-          anthropic-claude-sonnet-4-5: "Optimal balance of speed and cost"
++          anthropic-claude-opus-4-6: "Anthropic's most intelligent model"
++          anthropic-claude-sonnet-4-6: "Optimal balance of speed and cost"
+           anthropic-claude-haiku-4-5: "Fast and cost-effective"
+           google-gemini-3-pro: "Google's most intelligent model"
+           google-gemini-3-flash: "Fast and cost-efficient with multimodal reasoning"
+@@ -785,8 +785,8 @@ en:
+           open_router-deepseek-deepseek-v3-2: "DeepSeek's latest high-performance model"
+           open_router-moonshotai-kimi-k2-5: "Moonshot's multimodal model with vision capabilities"
+           open_router-x-ai-grok-4-fast: "xAI's flagship model with vision"
+-          open_router-minimax-minimax-m2-1: "MiniMax's multimodal model with large context"
+-          open_router-z-ai-glm-4-7: "Z-AI's multimodal model with vision"
++          open_router-minimax-minimax-m2-5: "MiniMax's multimodal model with large context"
++          open_router-z-ai-glm-5: "Z-AI's multimodal model with vision"
+           open_router-arcee-ai-trinity-large-preview-free: "Free open-source model from Arcee AI"
+ 
+         preseeded_model_description: "Pre-configured open-source model utilizing %{model}"
+@@ -861,7 +861,7 @@ en:
+           prompt_caching_never: "Never - Do not use prompt caching"
+           prompt_caching_tool_results: "Tool Results - Cache when tool results are present (recommended)"
+           prompt_caching_always: "Always - Always use prompt caching"
+-          effort: "Effort level (Claude Opus 4.5 only)"
++          effort: "Effort level"
+ 
+       related_topics:
+         title: "Related topics"
+diff --git a/plugins/discourse-ai/lib/completions/endpoints/anthropic.rb b/plugins/discourse-ai/lib/completions/endpoints/anthropic.rb
+index 1267ddbb5c245..30836d5bd8559 100644
+--- a/plugins/discourse-ai/lib/completions/endpoints/anthropic.rb
++++ b/plugins/discourse-ai/lib/completions/endpoints/anthropic.rb
+@@ -62,7 +62,7 @@ def default_options(dialect)
+           options[:stop_sequences] = ["</function_calls>"] if !dialect.native_tool_support? &&
+             dialect.prompt.has_tools?
+ 
+-          # effort parameter for Claude Opus 4.5
++          # effort parameter
+           effort = llm_model.lookup_custom_param("effort")
+           options[:output_config] = { effort: effort } if %w[low medium high].include?(effort)
+ 
+@@ -154,25 +154,9 @@ def prepare_request(payload)
+             "content-type" => "application/json",
+           }
+ 
+-          headers.merge!(combined_anthropic_beta_headers)
 -
-       if force
-         # no restrictions
-       elsif SiteSetting.ai_translation_backfill_limit_to_public_content
-diff --git a/plugins/discourse-ai/app/jobs/regular/detect_translate_topic.rb b/plugins/discourse-ai/app/jobs/regular/detect_translate_topic.rb
-index 5e661ebc92..29d246adf1 100644
---- a/plugins/discourse-ai/app/jobs/regular/detect_translate_topic.rb
-+++ b/plugins/discourse-ai/app/jobs/regular/detect_translate_topic.rb
-@@ -17,11 +17,10 @@ module Jobs
-       end
- 
-       topic = Topic.find_by(id: args[:topic_id])
--      if topic.blank? || topic.title.blank? || topic.deleted_at.present? || topic.user_id <= 0
--        return
--      end
-+      return if topic.blank? || topic.title.blank? || topic.deleted_at.present?
- 
-       force = args[:force] || false
-+      return if topic.user_id <= 0 && !force && !SiteSetting.ai_translation_include_bot_content
- 
-       if force
-         # no restrictions
-diff --git a/plugins/discourse-ai/assets/javascripts/discourse/lib/ai-feature-setting-groups.js b/plugins/discourse-ai/assets/javascripts/discourse/lib/ai-feature-setting-groups.js
-index 3231701952..e1fa4073a5 100644
---- a/plugins/discourse-ai/assets/javascripts/discourse/lib/ai-feature-setting-groups.js
-+++ b/plugins/discourse-ai/assets/javascripts/discourse/lib/ai-feature-setting-groups.js
-@@ -167,6 +167,7 @@ export const AI_FEATURE_SETTING_GROUPS = {
-       settings: [
-         "ai_translation_backfill_hourly_rate",
-         "ai_translation_backfill_limit_to_public_content",
-+        "ai_translation_include_bot_content",
-         "ai_translation_max_post_length",
-         "ai_translation_backfill_max_age_days",
-         "ai_translation_max_tokens_multiplier",
-diff --git a/plugins/discourse-ai/spec/jobs/regular/detect_translate_post_spec.rb b/plugins/discourse-ai/spec/jobs/regular/detect_translate_post_spec.rb
-index 6950581305..cfca233dfc 100644
---- a/plugins/discourse-ai/spec/jobs/regular/detect_translate_post_spec.rb
-+++ b/plugins/discourse-ai/spec/jobs/regular/detect_translate_post_spec.rb
-@@ -59,7 +59,7 @@ describe Jobs::DetectTranslatePost do
-     job.execute({ post_id: post.id })
-   end
- 
--  it "skips bot posts" do
-+  it "skips bot posts by default" do
-     post.update!(user: Discourse.system_user)
-     DiscourseAi::Translation::PostLocaleDetector.expects(:detect_locale).never
-     DiscourseAi::Translation::PostLocalizer.expects(:localize).never
-@@ -67,6 +67,21 @@ describe Jobs::DetectTranslatePost do
-     job.execute({ post_id: post.id })
-   end
- 
-+  it "translates bot posts when force is true" do
-+    post.update!(user: Discourse.system_user)
-+    DiscourseAi::Translation::PostLocaleDetector.expects(:detect_locale).once
-+
-+    job.execute({ post_id: post.id, force: true })
-+  end
-+
-+  it "translates bot posts when ai_translation_include_bot_content is true" do
-+    SiteSetting.ai_translation_include_bot_content = true
-+    post.update!(user: Discourse.system_user)
-+    DiscourseAi::Translation::PostLocaleDetector.expects(:detect_locale).once
-+
-+    job.execute({ post_id: post.id })
-+  end
-+
-   it "skips locale detection when no target languages are configured" do
-     SiteSetting.content_localization_supported_locales = ""
-     DiscourseAi::Translation::PostLocaleDetector.expects(:detect_locale).never
-diff --git a/plugins/discourse-ai/spec/jobs/regular/detect_translate_topic_spec.rb b/plugins/discourse-ai/spec/jobs/regular/detect_translate_topic_spec.rb
-index 54fd274520..55995ecd95 100644
---- a/plugins/discourse-ai/spec/jobs/regular/detect_translate_topic_spec.rb
-+++ b/plugins/discourse-ai/spec/jobs/regular/detect_translate_topic_spec.rb
-@@ -55,13 +55,28 @@ describe Jobs::DetectTranslateTopic do
-     job.execute({ topic_id: topic.id })
-   end
- 
--  it "skips bot topics" do
-+  it "skips bot topics by default" do
-     topic.update!(user: Discourse.system_user)
-     DiscourseAi::Translation::TopicLocalizer.expects(:localize).never
- 
-     job.execute({ topic_id: topic.id })
-   end
- 
-+  it "translates bot topics when force is true" do
-+    topic.update!(user: Discourse.system_user)
-+    DiscourseAi::Translation::TopicLocaleDetector.expects(:detect_locale).once
-+
-+    job.execute({ topic_id: topic.id, force: true })
-+  end
-+
-+  it "translates bot topics when ai_translation_include_bot_content is true" do
-+    SiteSetting.ai_translation_include_bot_content = true
-+    topic.update!(user: Discourse.system_user)
-+    DiscourseAi::Translation::TopicLocaleDetector.expects(:detect_locale).once
-+
-+    job.execute({ topic_id: topic.id })
-+  end
-+
-   it "does not get locale or translate when no target languages are configured" do
-     SiteSetting.content_localization_supported_locales = ""
-     DiscourseAi::Translation::TopicLocaleDetector.expects(:detect_locale).never
-diff --git a/plugins/discourse-ai/spec/requests/translation/translation_controller_spec.rb b/plugins/discourse-ai/spec/requests/translation/translation_controller_spec.rb
-index 5aa1df1e8d..0c94bd98d7 100644
---- a/plugins/discourse-ai/spec/requests/translation/translation_controller_spec.rb
-+++ b/plugins/discourse-ai/spec/requests/translation/translation_controller_spec.rb
-@@ -270,6 +270,49 @@ describe DiscourseAi::Translation::TranslationController do
+           Net::HTTP::Post.new(model_uri, headers).tap { |r| r.body = payload }
          end
-       end
  
-+      it "excludes bot posts by default" do
-+        bot_post = Fabricate(:post, topic: topic, user: Discourse.system_user, locale: "en")
-+        post1.update!(locale: "en")
-+        SiteSetting.content_localization_supported_locales = "en|es"
-+
-+        expect_enqueued_with(
-+          job: Jobs::DetectTranslatePost,
-+          args: {
-+            post_id: post1.id,
-+            force: true,
-+          },
-+        ) { post "/discourse-ai/translate/topics/#{topic.id}" }
-+
-+        expect(response.status).to eq(200)
-+        expect(response.parsed_body["scheduled_posts"]).to eq(1)
-+      end
-+
-+      it "includes bot posts when ai_translation_include_bot_content is true" do
-+        SiteSetting.ai_translation_include_bot_content = true
-+        bot_post = Fabricate(:post, topic: topic, user: Discourse.system_user, locale: "en")
-+        post1.update!(locale: "en")
-+        SiteSetting.content_localization_supported_locales = "en|es"
-+
-+        expect_enqueued_with(
-+          job: Jobs::DetectTranslatePost,
-+          args: {
-+            post_id: post1.id,
-+            force: true,
-+          },
-+        ) do
-+          expect_enqueued_with(
-+            job: Jobs::DetectTranslatePost,
-+            args: {
-+              post_id: bot_post.id,
-+              force: true,
-+            },
-+          ) { post "/discourse-ai/translate/topics/#{topic.id}" }
-+        end
-+
-+        expect(response.status).to eq(200)
-+        expect(response.parsed_body["scheduled_posts"]).to eq(2)
-+      end
-+
-       it "ignores posts that already have translations" do
-         post1.update!(locale: "en")
-         post2.update!(locale: "en")
+-        def combined_anthropic_beta_headers
+-          beta_features = []
+-
+-          caching_mode = llm_model.lookup_custom_param("prompt_caching") || "never"
+-          beta_features << "prompt-caching-2024-07-31" if caching_mode != "never"
+-
+-          effort = llm_model.lookup_custom_param("effort")
+-          beta_features << "effort-2025-11-24" if %w[low medium high].include?(effort)
+-
+-          return {} if beta_features.empty?
+-
+-          { "anthropic-beta" => beta_features.join(",") }
+-        end
+-
+         def decode_chunk(partial_data)
+           @decoder ||= JsonStreamDecoder.new
+           (@decoder << partial_data)
+diff --git a/plugins/discourse-ai/lib/completions/endpoints/anthropic_prompt_cache.rb b/plugins/discourse-ai/lib/completions/endpoints/anthropic_prompt_cache.rb
+index 82d9544015962..929eacfe45676 100644
+--- a/plugins/discourse-ai/lib/completions/endpoints/anthropic_prompt_cache.rb
++++ b/plugins/discourse-ai/lib/completions/endpoints/anthropic_prompt_cache.rb
+@@ -49,13 +49,6 @@ def apply_anthropic_cache_control!(payload, prompt)
+             end
+           end
+         end
+-
+-        def anthropic_cache_headers
+-          caching_mode = llm_model.lookup_custom_param("prompt_caching") || "never"
+-          return {} if caching_mode == "never"
+-
+-          { "anthropic-beta" => "prompt-caching-2024-07-31" }
+-        end
+       end
+     end
+   end
+diff --git a/plugins/discourse-ai/lib/completions/endpoints/aws_bedrock.rb b/plugins/discourse-ai/lib/completions/endpoints/aws_bedrock.rb
+index 2993aefaa521e..d8e217514da40 100644
+--- a/plugins/discourse-ai/lib/completions/endpoints/aws_bedrock.rb
++++ b/plugins/discourse-ai/lib/completions/endpoints/aws_bedrock.rb
+@@ -43,18 +43,9 @@ def default_options(dialect)
+               end
+               result[:max_tokens] = max_tokens
+ 
+-              # effort parameter for Claude Opus 4.5
++              # effort parameter
+               effort = llm_model.lookup_custom_param("effort")
+-              if %w[low medium high].include?(effort)
+-                result[:output_config] = { effort: effort }
+-                result[:anthropic_beta] = ["effort-2025-11-24"]
+-              end
+-
+-              caching_mode = llm_model.lookup_custom_param("prompt_caching") || "never"
+-              if caching_mode != "never"
+-                result[:anthropic_beta] ||= []
+-                result[:anthropic_beta] << "prompt-caching-2024-07-31"
+-              end
++              result[:output_config] = { effort: effort } if %w[low medium high].include?(effort)
+ 
+               result
+             else
+@@ -106,6 +97,14 @@ def bedrock_model_id
+             "anthropic.claude-opus-4-20250514-v1:0"
+           when "claude-sonnet-4", "claude-sonnet-4-20250514"
+             "anthropic.claude-sonnet-4-20250514-v1:0"
++          when "claude-opus-4-5"
++            "anthropic.claude-opus-4-5-20250918-v1:0"
++          when "claude-sonnet-4-5"
++            "anthropic.claude-sonnet-4-5-20250514-v1:0"
++          when "claude-opus-4-6"
++            "anthropic.claude-opus-4-6-v1"
++          when "claude-sonnet-4-6"
++            "anthropic.claude-sonnet-4-6-v1"
+           else
+             llm_model.name
+           end
+diff --git a/plugins/discourse-ai/lib/completions/llm_presets.rb b/plugins/discourse-ai/lib/completions/llm_presets.rb
+index f25271ef89c64..a0d998ad7c436 100644
+--- a/plugins/discourse-ai/lib/completions/llm_presets.rb
++++ b/plugins/discourse-ai/lib/completions/llm_presets.rb
+@@ -33,10 +33,10 @@ def anthropic_preset
+             id: "anthropic",
+             models: [
+               model(
+-                name: "claude-opus-4-5",
++                name: "claude-opus-4-6",
+                 tokens: 200_000,
+-                display_name: "Claude Opus 4.5",
+-                max_output_tokens: 64_000,
++                display_name: "Claude Opus 4.6",
++                max_output_tokens: 128_000,
+                 input_cost: 5.0,
+                 cached_input_cost: 0.50,
+                 cache_write_cost: 6.25,
+@@ -44,9 +44,9 @@ def anthropic_preset
+                 vision_enabled: true,
+               ),
+               model(
+-                name: "claude-sonnet-4-5",
++                name: "claude-sonnet-4-6",
+                 tokens: 200_000,
+-                display_name: "Claude Sonnet 4.5",
++                display_name: "Claude Sonnet 4.6",
+                 max_output_tokens: 64_000,
+                 input_cost: 3.0,
+                 cached_input_cost: 0.30,
+@@ -162,11 +162,11 @@ def open_router_preset
+               ),
+               model(
+                 name: "moonshotai/kimi-k2.5",
+-                tokens: 128_000,
++                tokens: 262_144,
+                 display_name: "Moonshot Kimi K2.5",
+-                max_output_tokens: 32_000,
+-                input_cost: 0.50,
+-                output_cost: 2.0,
++                max_output_tokens: 262_144,
++                input_cost: 0.60,
++                output_cost: 3.0,
+                 vision_enabled: true,
+               ),
+               model(
+@@ -179,21 +179,21 @@ def open_router_preset
+                 vision_enabled: true,
+               ),
+               model(
+-                name: "minimax/minimax-m2.1",
+-                tokens: 256_000,
+-                display_name: "MiniMax M2.1",
+-                max_output_tokens: 32_000,
+-                input_cost: 0.40,
+-                output_cost: 1.60,
++                name: "minimax/minimax-m2.5",
++                tokens: 196_608,
++                display_name: "MiniMax M2.5",
++                max_output_tokens: 65_536,
++                input_cost: 0.30,
++                output_cost: 1.20,
+                 vision_enabled: true,
+               ),
+               model(
+-                name: "z-ai/glm-4.7",
+-                tokens: 128_000,
+-                display_name: "Z-AI GLM-4.7",
+-                max_output_tokens: 32_000,
++                name: "z-ai/glm-5",
++                tokens: 204_800,
++                display_name: "Z-AI GLM-5",
++                max_output_tokens: 131_072,
+                 input_cost: 0.30,
+-                output_cost: 1.20,
++                output_cost: 2.55,
+                 vision_enabled: true,
+               ),
+               model(
+diff --git a/plugins/discourse-ai/spec/lib/completions/endpoints/anthropic_spec.rb b/plugins/discourse-ai/spec/lib/completions/endpoints/anthropic_spec.rb
+index 2f1d2a2c5dacb..80b36c3c9ab83 100644
+--- a/plugins/discourse-ai/spec/lib/completions/endpoints/anthropic_spec.rb
++++ b/plugins/discourse-ai/spec/lib/completions/endpoints/anthropic_spec.rb
+@@ -586,7 +586,6 @@ def build_pdf_upload
+         "Content-Type" => "application/json",
+         "X-Api-Key" => "123",
+         "Anthropic-Version" => "2023-06-01",
+-        "Anthropic-Beta" => "prompt-caching-2024-07-31",
+       },
+     ).to_return(status: 200, body: body)
+ 
+@@ -709,7 +708,6 @@ def build_pdf_upload
+         "Content-Type" => "application/json",
+         "X-Api-Key" => "123",
+         "Anthropic-Version" => "2023-06-01",
+-        "Anthropic-Beta" => "prompt-caching-2024-07-31",
+       },
+     ).to_return(status: 200, body: body)
+ 
+@@ -1297,7 +1295,7 @@ def build_pdf_upload
+   end
+ 
+   describe "effort parameter" do
+-    it "includes effort in output_config and beta header when set to low, medium, or high" do
++    it "includes effort in output_config when set to low, medium, or high" do
+       model.update!(provider_params: { effort: "high" })
+ 
+       parsed_body = nil
+@@ -1311,7 +1309,6 @@ def build_pdf_upload
+           "Content-Type" => "application/json",
+           "X-Api-Key" => "123",
+           "Anthropic-Version" => "2023-06-01",
+-          "Anthropic-Beta" => "effort-2025-11-24",
+         },
+       ).to_return(
+         status: 200,
+@@ -1332,7 +1329,7 @@ def build_pdf_upload
+       expect(parsed_body.dig(:output_config, :effort)).to eq("high")
+     end
+ 
+-    it "combines effort and caching beta headers when both are configured" do
++    it "includes effort in output_config when both effort and caching are configured" do
+       model.update!(provider_params: { effort: "medium", prompt_caching: "always" })
+ 
+       parsed_body = nil
+@@ -1346,7 +1343,6 @@ def build_pdf_upload
+           "Content-Type" => "application/json",
+           "X-Api-Key" => "123",
+           "Anthropic-Version" => "2023-06-01",
+-          "Anthropic-Beta" => "prompt-caching-2024-07-31,effort-2025-11-24",
+         },
+       ).to_return(
+         status: 200,
+@@ -1367,7 +1363,7 @@ def build_pdf_upload
+       expect(parsed_body.dig(:output_config, :effort)).to eq("medium")
+     end
+ 
+-    it "omits effort and beta header when set to default" do
++    it "omits effort when set to default" do
+       model.update!(provider_params: { effort: "default" })
+ 
+       parsed_body = nil
+@@ -1401,7 +1397,7 @@ def build_pdf_upload
+       expect(parsed_body).not_to have_key(:output_config)
+     end
+ 
+-    it "omits effort and beta header when not configured" do
++    it "omits effort when not configured" do
+       parsed_body = nil
+       stub_request(:post, url).with(
+         body:
+diff --git a/plugins/discourse-ai/spec/lib/completions/endpoints/aws_bedrock_spec.rb b/plugins/discourse-ai/spec/lib/completions/endpoints/aws_bedrock_spec.rb
+index 272e3d85db057..a62d3ccf5940b 100644
+--- a/plugins/discourse-ai/spec/lib/completions/endpoints/aws_bedrock_spec.rb
++++ b/plugins/discourse-ai/spec/lib/completions/endpoints/aws_bedrock_spec.rb
+@@ -1129,7 +1129,7 @@ def encode_message(message)
+   end
+ 
+   describe "effort parameter" do
+-    it "includes effort in output_config and anthropic_beta when set to low, medium, or high" do
++    it "includes effort in output_config when set to low, medium, or high" do
+       model.update!(
+         provider_params: {
+           access_key_id: "123",
+@@ -1163,10 +1163,10 @@ def encode_message(message)
+ 
+       request_body = JSON.parse(request.body)
+       expect(request_body.dig("output_config", "effort")).to eq("medium")
+-      expect(request_body["anthropic_beta"]).to eq(["effort-2025-11-24"])
++      expect(request_body).not_to have_key("anthropic_beta")
+     end
+ 
+-    it "omits effort and anthropic_beta when set to default" do
++    it "omits effort when set to default" do
+       model.update!(
+         provider_params: {
+           access_key_id: "123",
+diff --git a/plugins/discourse-ai/spec/system/llms/ai_llm_spec.rb b/plugins/discourse-ai/spec/system/llms/ai_llm_spec.rb
+index ca4b068134e0b..32becef9ec98c 100644
+--- a/plugins/discourse-ai/spec/system/llms/ai_llm_spec.rb
++++ b/plugins/discourse-ai/spec/system/llms/ai_llm_spec.rb
+@@ -16,7 +16,7 @@
+   it "correctly sets defaults" do
+     visit "/admin/plugins/discourse-ai/ai-llms"
+ 
+-    find("[data-llm-id='anthropic-claude-opus-4-5'] button").click()
++    find("[data-llm-id='anthropic-claude-opus-4-6'] button").click()
+ 
+     secret_selector = PageObjects::Components::SelectKit.new(".ai-secret-selector__dropdown")
+     secret_selector.expand
+@@ -32,9 +32,9 @@
+     expect(llm.api_key).to eq("abcd")
+ 
+     preset = DiscourseAi::Completions::Llm.presets.find { |p| p[:id] == "anthropic" }
+-    model_preset = preset[:models].find { |m| m[:name] == "claude-opus-4-5" }
++    model_preset = preset[:models].find { |m| m[:name] == "claude-opus-4-6" }
+ 
+-    expect(llm.name).to eq("claude-opus-4-5")
++    expect(llm.name).to eq("claude-opus-4-6")
+     expect(llm.url).to eq(preset[:endpoint])
+     expect(llm.tokenizer).to eq(preset[:tokenizer].to_s)
+     expect(llm.max_prompt_tokens.to_i).to eq(model_preset[:tokens])

@@ -1,251 +1,549 @@
-diff --git a/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java b/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
-index a0ce080bfe..0f3c4ab2c6 100644
---- a/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
-+++ b/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
-@@ -160,10 +160,10 @@ public class DatabaseOptions {
-         private static final Map<Option<?>, Consumer<OptionBuilder<?>>> DATASOURCES_OVERRIDES_OPTIONS = Map.of(
-                 DatabaseOptions.DB, builder -> builder
-                         .defaultValue(Optional.empty()) // no default value for DB kind for datasources
--                        .connectedOptions(
--                                getDatasourceOption(DatabaseOptions.DB_URL).orElseThrow(),
--                                TransactionOptions.TRANSACTION_XA_ENABLED_DATASOURCE
--                        )
-+                        .connectedOptions(TransactionOptions.TRANSACTION_XA_ENABLED_DATASOURCE,
-+                                getDatasourceOption(DB_POOL_MAX_SIZE).orElseThrow(),
-+                                getDatasourceOption(DB_SQL_JPA_DEBUG).orElseThrow(),
-+                                getDatasourceOption(DB_SQL_LOG_SLOW_QUERIES).orElseThrow())
-         );
- 
-         private static final Map<String, Option<?>> cachedDatasourceOptions = new HashMap<>();
-diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java
-index c86b0c2faf..0b7092fdcd 100644
---- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java
-+++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java
-@@ -16,7 +16,9 @@
-  */
- package org.keycloak.quarkus.runtime.configuration;
- 
-+import java.util.ArrayList;
- import java.util.Iterator;
-+import java.util.List;
- import java.util.Objects;
- import java.util.Optional;
- import java.util.Set;
-@@ -26,6 +28,7 @@ import java.util.stream.StreamSupport;
- import jakarta.annotation.Priority;
- 
- import org.keycloak.config.OptionCategory;
-+import org.keycloak.quarkus.runtime.Environment;
- import org.keycloak.quarkus.runtime.configuration.mappers.PropertyMapper;
- import org.keycloak.quarkus.runtime.configuration.mappers.PropertyMappers;
- import org.keycloak.quarkus.runtime.configuration.mappers.WildcardPropertyMapper;
-@@ -95,7 +98,7 @@ public class PropertyMappingInterceptor implements ConfigSourceInterceptor {
-         // come from kc.log - but via a map from, not to.
-         // so we'd need additional logic like the getWildcardMappedFrom case for that
- 
--        boolean filterRuntime = isRebuild();
-+        boolean filterRuntime = isRebuild() || Boolean.getBoolean(Environment.KC_TEST_REBUILD);
- 
-         var baseStream = StreamSupport.stream(iterable.spliterator(), false).flatMap(name -> {
-             final PropertyMapper<?> mapper = PropertyMappers.getMapper(name);
-@@ -116,41 +119,73 @@ public class PropertyMappingInterceptor implements ConfigSourceInterceptor {
- 
-             allMappers.remove(mapper);
- 
-+            List<String> wildcardsMappedFrom = getWildcardsMappedFrom(context, name, mapper);
-+
-             if (mapper.hasWildcard()) {
-+                var wildcardMapper = (WildcardPropertyMapper<?>) mapper;
-+
-+                var wildcardValue = wildcardMapper.extractWildcardValue(name).orElseThrow();
-+
-                 // non-wildcard connected options should be already advertised by the logic in iterateNames()
-                 if (mapper.hasConnectedOptions()) {
--                    var wildcardMapper = (WildcardPropertyMapper<?>) mapper;
--                    var wildcardValue = wildcardMapper.extractWildcardValue(name).orElseThrow();
-                     var connectedTo = wildcardMapper.getConnectedOptions(wildcardValue).stream()
-                             .map(option -> Optional.ofNullable(PropertyMappers.getMapper(NS_KEYCLOAK_PREFIX + option)).orElseThrow(() -> new IllegalArgumentException("Cannot find connected options")))
-                             .map(m -> m.hasWildcard() ? ((WildcardPropertyMapper<?>) m).getTo(wildcardValue) : m.getTo());
- 
--                    return Stream.concat(toDistinctStream(name, wildcardMapper.getTo(wildcardValue)), connectedTo);
--                }
--            } else {
--                // this is not a wildcard value, but may map to wildcards
--                // the current example is something like log-level=wildcardCat1:level,wildcardCat2:level
--                var wildCard = PropertyMappers.getWildcardMappedFrom(mapper.getOption());
--                if (wildCard != null) {
--                    ConfigValue value = context.proceed(name);
--                    if (value != null && value.getValue() != null) {
--                        return Stream.concat(Stream.of(name), wildCard.getToFromWildcardTransformer(value.getValue()));
--                    }
-+                    return Stream.concat(toDistinctStream(name, wildcardMapper.getTo(wildcardValue)), Stream.concat(connectedTo, wildcardsMappedFrom.stream()));
-                 }
-             }
- 
--            // there is a corner case here: -1 for the reload period has no 'to' value.
--            // if that becomes an issue we could use more metadata to perform a full mapping
--            return toDistinctStream(name, mappedMapper.getTo());
-+            // there are corner cases here: -1 for the reload period has no 'to' value.
-+            // if that becomes an issue we could use more metadata or perform a full mapping
-+            return Stream.concat(toDistinctStream(name, mappedMapper.getTo()), wildcardsMappedFrom.stream());
-         });
- 
--        // include anything remaining that has a default value
--        var defaultStream = allMappers.stream()
--                .filter(m -> m.getDefaultValue().isPresent() && !m.hasWildcard()
--                        && m.getCategory() != OptionCategory.CONFIG) // advertising the keystore type causes the keystore to be used early
--                .flatMap(m -> toDistinctStream(m.getTo()));
-+        // include anything remaining that has a value
-+        var inferredValueStream = allMappers.stream()
-+                .filter(m -> m.getCategory() != OptionCategory.CONFIG // advertising the keystore type causes the keystore to be used early
-+                        && hasValue(m, allMappers))
-+                .map(m -> m.getTo());
-+
-+        return IteratorUtils.chainedIterator(baseStream.iterator(), inferredValueStream.iterator());
-+    }
-+
-+    private List<String> getWildcardsMappedFrom(ConfigSourceInterceptorContext context, String name,
-+            final PropertyMapper<?> mapper) {
-+        var wildCards = PropertyMappers.getWildcardsMappedFrom(mapper.getOption());
-+        if (wildCards.isEmpty()) {
-+            return List.of();
-+        }
-+        List<String> mappedFromWildCardKeys = new ArrayList<>();
-+        ConfigValue value = context.proceed(name);
-+        if (value != null && value.getValue() != null) {
-+            for (WildcardPropertyMapper<?> wildCard : wildCards) {
-+                if (mapper.hasWildcard()) {
-+                    var wildcardMapper = (WildcardPropertyMapper<?>) mapper;
-+                    var wildcardValue = wildcardMapper.extractWildcardValue(name).orElseThrow();
-+                    // TODO could check recursively backwards
-+                    mappedFromWildCardKeys.add(wildCard.getTo(wildcardValue));
-+                } else {
-+                    // this is not a wildcard value, but may map to wildcards
-+                    // the current example is something like log-level=wildcardCat1:level,wildcardCat2:level
-+                    wildCard.getToFromWildcardTransformer(value.getValue()).forEach(mappedFromWildCardKeys::add);
-+                }
-+            }
-+        }
-+        return mappedFromWildCardKeys;
-+    }
-+
-+    private boolean hasValue(PropertyMapper<?> m, Set<PropertyMapper<?>> mappersWithNoValue) {
-+        if (m.hasWildcard()) {
-+            return false;
-+        }
-+
-+        if (m.getDefaultValue().isPresent() || !mappersWithNoValue.contains(m)) {
-+            return true;
-+        }
- 
--        return IteratorUtils.chainedIterator(baseStream.iterator(), defaultStream.iterator());
-+        return Optional.ofNullable(m.getMapFrom()).map(from -> PropertyMappers.getMapper(NS_KEYCLOAK_PREFIX + from))
-+                .filter(fm -> hasValue(fm, mappersWithNoValue)).isPresent();
+diff --git a/core/src/main/java/org/keycloak/representations/info/SystemInfoRepresentation.java b/core/src/main/java/org/keycloak/representations/info/SystemInfoRepresentation.java
+index 094834389161..23eb5ae176d7 100755
+--- a/core/src/main/java/org/keycloak/representations/info/SystemInfoRepresentation.java
++++ b/core/src/main/java/org/keycloak/representations/info/SystemInfoRepresentation.java
+@@ -26,7 +26,7 @@ public class SystemInfoRepresentation {
+     private String version;
+     private String serverTime;
+     private String uptime;
+-    private long uptimeMillis;
++    private Long uptimeMillis;
+     private String javaVersion;
+     private String javaVendor;
+     private String javaVm;
+@@ -91,11 +91,11 @@ public void setUptime(String uptime) {
+         this.uptime = uptime;
      }
  
-     private static Stream<String> toDistinctStream(String... values) {
-diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
-index 6b7ba9cda4..ac51f82efc 100644
---- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
-+++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
-@@ -276,7 +276,12 @@ public final class DatabasePropertyMappers implements PropertyMapperGrouping {
-                     customTransformer.accept(created);
-                 }
- 
--                datasourceMappers.add(created.build());
-+                PropertyMapper<?> mapper = created.build();
-+                if (mapper.getMapFrom() == null && mapper.getDefaultValue().isPresent() && !getDatasourceOption(DB)
-+                        .orElseThrow().getConnectedOptions().contains(mapper.getOption().getKey())) {
-+                    throw new AssertionError("Mapper should be connected to the primary to be discovered");
-+                }
-+                datasourceMappers.add(mapper);
-             }
- 
-             datasourceMappers.addAll(mappers);
-diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java
-index eb6dc730b1..54b95d3fe5 100644
---- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java
-+++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java
-@@ -694,7 +694,7 @@ public class PropertyMapper<T> {
-         return !option.getConnectedOptions().isEmpty();
+-    public long getUptimeMillis() {
++    public Long getUptimeMillis() {
+         return uptimeMillis;
      }
  
--    String getMapFrom() {
-+    public String getMapFrom() {
-         return mapFrom;
+-    public void setUptimeMillis(long uptimeMillis) {
++    public void setUptimeMillis(Long uptimeMillis) {
+         this.uptimeMillis = uptimeMillis;
      }
  
-diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers.java
-index e4bf980b48..b9a62efffd 100644
---- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers.java
-+++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers.java
-@@ -195,8 +195,12 @@ public final class PropertyMappers {
-         return MAPPERS.getWildcardMappers();
-     }
+diff --git a/docs/documentation/upgrading/topics/changes/changes-26_5_4.adoc b/docs/documentation/upgrading/topics/changes/changes-26_5_4.adoc
+index 92fef83359a1..ca595af97099 100644
+--- a/docs/documentation/upgrading/topics/changes/changes-26_5_4.adoc
++++ b/docs/documentation/upgrading/topics/changes/changes-26_5_4.adoc
+@@ -10,3 +10,15 @@ Now {project_name}, when acting as a SAML Service Provider (SP) in identity brok
+ To prepare for the upgrade, verify that the Identity Provider or adapter configurations allow for a sufficient clock skew for the time attributes.
  
--    public static WildcardPropertyMapper<?> getWildcardMappedFrom(Option<?> from) {
--        return MAPPERS.wildcardConfig.wildcardMapFrom.get(from.getKey());
-+    public static List<WildcardPropertyMapper<?>> getWildcardsMappedFrom(Option<?> from) {
-+        var result = MAPPERS.wildcardConfig.wildcardMapFrom.get(from.getKey());
-+        if (result == null) {
-+            return List.of();
-+        }
-+        return result;
-     }
+ If you see any issue after the upgrade related to this element, please configure the external IdP to set the correct values for the subject confirmation element.
++
++== Notable changes
++
++Notable changes may include internal behavior changes that prevent common misconfigurations, bugs that are fixed, or changes to simplify running {project_name}.
++It also lists significant changes to internal APIs.
++
++=== More changes for the `server-info` system information
++
++In version 26.4.0, the `server-info` endpoint changed to just return the system information for administrators in the admin realm. Nevertheless, the version property was detected to be needed by some products that interact with {project_name}. Now that property is included for administrators in the realm with permission `manage-realm`.
++
++The workaround of the `view-system` permission is more restricted too. It can only be assigned by administrators in the master realm using link:{adminguide_link}#_fine_grained_permissions[FGAP]. This permission will be deleted in a future version.
++
+diff --git a/docs/documentation/upgrading/topics/changes/changes.adoc b/docs/documentation/upgrading/topics/changes/changes.adoc
+index 093e5ff26307..eca96a546701 100644
+--- a/docs/documentation/upgrading/topics/changes/changes.adoc
++++ b/docs/documentation/upgrading/topics/changes/changes.adoc
+@@ -1,6 +1,10 @@
+ [[migration-changes]]
+ == Migration Changes
  
-     public static boolean isSupported(PropertyMapper<?> mapper) {
-@@ -372,11 +376,11 @@ public final class PropertyMappers {
-      */
-     private static class WildcardMappersConfig {
-         private final Set<WildcardPropertyMapper<?>> wildcardMappers = new HashSet<>();
--        private final Map<String, WildcardPropertyMapper<?>> wildcardMapFrom = new HashMap<>();
-+        private final MultivaluedHashMap<String, WildcardPropertyMapper<?>> wildcardMapFrom = new MultivaluedHashMap<>();
++=== Migrating to 26.5.4
++
++include::changes-26_5_4.adoc[leveloffset=2]
++
+ === Migrating to 26.5.2
  
-         public void addMapper(WildcardPropertyMapper<?> mapper) {
-             if (mapper.getMapFrom() != null) {
--                wildcardMapFrom.put(mapper.getMapFrom(), mapper);
-+                wildcardMapFrom.add(mapper.getMapFrom(), mapper);
-             }
-             wildcardMappers.add(mapper);
-         }
-diff --git a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java
-index 12bd599dce..939f381209 100644
---- a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java
-+++ b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java
-@@ -3,6 +3,7 @@ package org.keycloak.quarkus.runtime.configuration;
- import java.util.List;
- import java.util.Map;
- import java.util.stream.Collectors;
-+import java.util.stream.Stream;
- import java.util.stream.StreamSupport;
+ include::changes-26_5_2.adoc[leveloffset=2]
+@@ -9,10 +13,6 @@ include::changes-26_5_2.adoc[leveloffset=2]
  
- import org.keycloak.quarkus.runtime.Environment;
-@@ -498,7 +499,12 @@ public class DatasourcesConfigurationTest extends AbstractConfigurationTest {
-                 "kc.db-kind-user-store",
-                 "quarkus.datasource.\"user-store\".db-kind",
-                 "quarkus.datasource.\"user-store\".jdbc.url",
--                "quarkus.datasource.\"user-store\".jdbc.transactions"
-+                "quarkus.datasource.\"user-store\".jdbc.transactions",
-+                "quarkus.datasource.\"user-store\".jdbc.max-size",
-+                "quarkus.datasource.\"user-store\".jdbc.driver",
-+                "quarkus.datasource.jdbc.min-size",
-+                "quarkus.datasource.jdbc.driver",
-+                "quarkus.datasource.jdbc.url"
-         ));
+ include::changes-26_5_1.adoc[leveloffset=2]
  
-         // verify the db-kind is there only once
-@@ -507,11 +513,8 @@ public class DatasourcesConfigurationTest extends AbstractConfigurationTest {
-                 .count();
-         assertThat(quarkusDbKindCount, is(1L));
+-=== Migrating to 26.5.4
+-
+-include::changes-26_5_4.adoc[leveloffset=2]
+-
+ === Migrating to 26.5.0
  
--        assertThat(propertyNames, not(hasItems(
--                "kc.db-dialect-user-store",
--                "quarkus.datasource.\"user-store\".username",
--                "quarkus.datasource.\"user-store\".password",
--                "quarkus.datasource.\"user-store\".jdbc.driver"
--        )));
-+        Stream.of("quarkus.datasource.\"user-store\".username"
-+                , "quarkus.datasource.\"user-store\".password")
-+                .forEach(n -> assertThat(propertyNames, not(hasItem(n))));
+ include::changes-26_5_0.adoc[leveloffset=2]
+diff --git a/server-spi-private/src/main/java/org/keycloak/models/AdminRoles.java b/server-spi-private/src/main/java/org/keycloak/models/AdminRoles.java
+index b4c63686bbd9..1daf51724b76 100755
+--- a/server-spi-private/src/main/java/org/keycloak/models/AdminRoles.java
++++ b/server-spi-private/src/main/java/org/keycloak/models/AdminRoles.java
+@@ -69,5 +69,6 @@ public class AdminRoles {
+         ALL_ROLES.add(ADMIN);
+         ALL_ROLES.add(CREATE_REALM);
+         ALL_ROLES.add(REALM_ADMIN);
++        ALL_ROLES.add(VIEW_SYSTEM);
      }
  }
+diff --git a/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java b/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java
+index 446630ca9a8a..85d4a4488d0b 100755
+--- a/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java
++++ b/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java
+@@ -17,7 +17,6 @@
+ package org.keycloak.services.managers;
+ 
+ import java.util.List;
+-import java.util.regex.Pattern;
+ 
+ import jakarta.ws.rs.NotAuthorizedException;
+ import jakarta.ws.rs.core.HttpHeaders;
+@@ -41,8 +40,6 @@ public class AppAuthManager extends AuthenticationManager {
+ 
+     public static final String BEARER = "Bearer";
+ 
+-    private static final Pattern WHITESPACES = Pattern.compile("\\s+");
+-
+     @Override
+     public AuthResult authenticateIdentityCookie(KeycloakSession session, RealmModel realm) {
+         AuthResult authResult = super.authenticateIdentityCookie(session, realm);
+@@ -64,26 +61,28 @@ private static AuthHeader extractTokenStringFromAuthHeader(String authHeader) {
+             return null;
+         }
+ 
+-        String[] split = WHITESPACES.split(authHeader.trim());
+-        if (split.length != 2){
++        int indexOfSpace = authHeader.indexOf(' ');
++
++        if (indexOfSpace <= 0) {
+             return null;
+         }
+ 
+-        String typeString = split[0];
++        String typeString = authHeader.substring(0, indexOfSpace);
++        String tokenString = authHeader.substring(indexOfSpace + 1);
+ 
++        boolean isBearerHeader = typeString.equalsIgnoreCase(BEARER);
+         if (!Profile.isFeatureEnabled(Profile.Feature.DPOP)) {
+-            if (!typeString.equalsIgnoreCase(BEARER)) {
++            if (!isBearerHeader) {
+                 return null;
+             }
+         } else {
+             // "Bearer" is case-insensitive for historical reasons. "DPoP" is case-sensitive to follow the spec.
+-            if (!typeString.equalsIgnoreCase(BEARER) && !typeString.equals(TokenUtil.TOKEN_TYPE_DPOP)){
++            if (!isBearerHeader && !typeString.equals(TokenUtil.TOKEN_TYPE_DPOP)) {
+                 return null;
+             }
+         }
+ 
+-        String tokenString = split[1];
+-        if (ObjectUtil.isBlank(tokenString)) {
++        if (ObjectUtil.isBlank(tokenString) || tokenString.contains(" ")) {
+             return null;
+         }
+ 
+diff --git a/services/src/main/java/org/keycloak/services/resources/admin/fgap/RolePermissionsV2.java b/services/src/main/java/org/keycloak/services/resources/admin/fgap/RolePermissionsV2.java
+index 234138a3375a..dc0b9a4eb900 100644
+--- a/services/src/main/java/org/keycloak/services/resources/admin/fgap/RolePermissionsV2.java
++++ b/services/src/main/java/org/keycloak/services/resources/admin/fgap/RolePermissionsV2.java
+@@ -69,6 +69,9 @@ private boolean isRealmAdmin() {
+     @Override
+     public boolean canMapRole(RoleModel role) {
+         if (isRealmAdminRole(role)) {
++            if (AdminRoles.VIEW_SYSTEM.equals(role.getName()) && !root.isAdmin(getMasterRealm())) {
++                return false;
++            }
+             if (realm.isAdminPermissionsEnabled()) {
+                 // only server or realm admins can map roles if FGAP is enabled
+                 return isRealmAdmin();
+@@ -94,6 +97,9 @@ public boolean canMapRole(RoleModel role) {
+     @Override
+     public boolean canMapComposite(RoleModel role) {
+         if (isRealmAdminRole(role)) {
++            if (AdminRoles.VIEW_SYSTEM.equals(role.getName()) && !root.isAdmin(getMasterRealm())) {
++                return false;
++            }
+             if (realm.isAdminPermissionsEnabled()) {
+                 // only server or realm admins can map roles if FGAP is enabled
+                 return isRealmAdmin();
+diff --git a/services/src/main/java/org/keycloak/services/resources/admin/info/ServerInfoAdminResource.java b/services/src/main/java/org/keycloak/services/resources/admin/info/ServerInfoAdminResource.java
+index 1ccfc3aee598..22276b187011 100755
+--- a/services/src/main/java/org/keycloak/services/resources/admin/info/ServerInfoAdminResource.java
++++ b/services/src/main/java/org/keycloak/services/resources/admin/info/ServerInfoAdminResource.java
+@@ -84,6 +84,7 @@
+ import org.keycloak.services.managers.RealmManager;
+ import org.keycloak.services.resources.KeycloakOpenAPI;
+ import org.keycloak.services.resources.admin.AdminAuth;
++import org.keycloak.services.resources.admin.fgap.AdminPermissionEvaluator;
+ import org.keycloak.services.resources.admin.fgap.AdminPermissions;
+ import org.keycloak.theme.Theme;
+ 
+@@ -121,12 +122,17 @@ public ServerInfoAdminResource(KeycloakSession session, AdminAuth auth) {
+     public ServerInfoRepresentation getInfo() {
+         ServerInfoRepresentation info = new ServerInfoRepresentation();
+         RealmModel userRealm = session.getContext().getRealm();
+-        if (RealmManager.isAdministrationRealm(userRealm)
+-                || AdminPermissions.evaluator(session, userRealm, auth).hasOneAdminRole(AdminRoles.VIEW_SYSTEM)) {
++        AdminPermissionEvaluator adminEvaluator = AdminPermissions.evaluator(session, userRealm, auth);
++        if (RealmManager.isAdministrationRealm(userRealm) || adminEvaluator.hasOneAdminRole(AdminRoles.VIEW_SYSTEM)) {
+             // system information is only for admins in the administration realm or fallback view-system role
+             info.setSystemInfo(SystemInfoRepresentation.create(session.getKeycloakSessionFactory().getServerStartupTimestamp(), Version.VERSION));
+             info.setCpuInfo(CpuInfoRepresentation.create());
+             info.setMemoryInfo(MemoryInfoRepresentation.create());
++        } else if (adminEvaluator.realm().canManageRealm()) {
++            // If the user can manage his own realm just add the version information
++            SystemInfoRepresentation systemInfo = new SystemInfoRepresentation();
++            systemInfo.setVersion(Version.VERSION);
++            info.setSystemInfo(systemInfo);
+         }
+         info.setProfileInfo(createProfileInfo());
+         info.setFeatures(createFeatureRepresentations());
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/AppAuthManagerTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/AppAuthManagerTest.java
+new file mode 100644
+index 000000000000..94fe4a5b453f
+--- /dev/null
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/AppAuthManagerTest.java
+@@ -0,0 +1,129 @@
++package org.keycloak.tests.admin;
++
++import java.io.IOException;
++
++import jakarta.ws.rs.core.Response;
++
++import org.keycloak.models.AdminRoles;
++import org.keycloak.models.Constants;
++import org.keycloak.testframework.annotations.InjectHttpClient;
++import org.keycloak.testframework.annotations.InjectKeycloakUrls;
++import org.keycloak.testframework.annotations.InjectRealm;
++import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
++import org.keycloak.testframework.oauth.OAuthClient;
++import org.keycloak.testframework.oauth.annotations.InjectOAuthClient;
++import org.keycloak.testframework.realm.ManagedRealm;
++import org.keycloak.testframework.realm.RealmConfig;
++import org.keycloak.testframework.realm.RealmConfigBuilder;
++import org.keycloak.testframework.server.KeycloakUrls;
++import org.keycloak.testsuite.util.oauth.AccessTokenResponse;
++
++import org.apache.http.client.methods.CloseableHttpResponse;
++import org.apache.http.client.methods.HttpGet;
++import org.apache.http.impl.client.CloseableHttpClient;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.Test;
++
++/**
++ *
++ * @author rmartinc
++ */
++@KeycloakIntegrationTest
++public class AppAuthManagerTest {
++
++    @InjectRealm(config = TestRealmConfig.class)
++    ManagedRealm realm;
++
++    @InjectOAuthClient
++    OAuthClient  oAuthClient;
++
++    @InjectKeycloakUrls
++    KeycloakUrls keycloakUrls;
++
++    @InjectHttpClient
++    CloseableHttpClient client;
++
++    @Test
++    public void testSuccess() throws IOException {
++        test("Bearer ", true);
++    }
++
++    @Test
++    public void testFailure_BearerLowerCase() throws IOException {
++        test("bearer ", true);
++    }
++
++    @Test
++    public void testFailure_BearerUpperCase() throws IOException {
++        test("BEARER ", true);
++    }
++
++    @Test
++    public void testFailure_BearerDiffCase() throws IOException {
++        test("BeArEr ", true);
++    }
++
++    @Test
++    public void testFailure_TwoSpaces() throws IOException {
++        test("Bearer  ", false);
++    }
++
++    @Test
++    public void testFailure_MultiSpaces() throws IOException {
++        test("Bearer     ", false);
++    }
++
++    @Test
++    public void testFailure_TabSymbol() throws IOException {
++        test("Bearer\t", false);
++    }
++
++    private void test(String authPrefix, boolean success) throws IOException {
++        AccessTokenResponse response = accessToken(oAuthClient, Constants.ADMIN_CLI_CLIENT_ID, "secret", "test-admin", "password");
++        Assertions.assertNotNull(response.getAccessToken());
++        try (CloseableHttpResponse res = getHttpJsonResponse(whoAmiUrl(), authPrefix, response.getAccessToken())) {
++            Assertions.assertEquals(
++                    success ? Response.Status.OK.getStatusCode() : Response.Status.UNAUTHORIZED.getStatusCode(),
++                    res.getStatusLine().getStatusCode());
++        }
++        oAuthClient.doLogout(response.getRefreshToken());
++    }
++
++    private AccessTokenResponse accessToken(OAuthClient oAuth, String clientId, String clientSecret, String username, String password) {
++        return oAuth.client(clientId, clientSecret).doPasswordGrantRequest(username, password);
++    }
++
++    private CloseableHttpResponse getHttpJsonResponse(String url, String authPrefix, String accessToken) throws IOException{
++        HttpGet httpGet = new HttpGet(url);
++        httpGet.addHeader("Accept", "application/json");
++        httpGet.addHeader("Authorization", authPrefix + accessToken);
++        return client.execute(httpGet);
++    }
++
++    private String whoAmiUrl() {
++        return new StringBuilder()
++                .append(keycloakUrls.getBaseUrl())
++                .append("/admin/default/console/whoami")
++                .toString();
++    }
++
++    private static class TestRealmConfig implements RealmConfig {
++
++        @Override
++        public RealmConfigBuilder configure(RealmConfigBuilder realm) {
++            realm.internationalizationEnabled(false);
++            realm.addUser("test-admin")
++                    .password("password")
++                    .name("Test", "Admin")
++                    .email("locale-off@email.org")
++                    .emailVerified(true)
++                    .clientRoles(Constants.REALM_MANAGEMENT_CLIENT_ID, AdminRoles.REALM_ADMIN);
++            realm.addClient(Constants.ADMIN_CLI_CLIENT_ID)
++                    .name(Constants.ADMIN_CLI_CLIENT_ID)
++                    .secret("secret")
++                    .attribute(Constants.SECURITY_ADMIN_CONSOLE_ATTR, "true")
++                    .directAccessGrantsEnabled(true);
++            return realm;
++        }
++    }
++}
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/PermissionsTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/PermissionsTest.java
+index 53b3f12eeafa..680102860b03 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/admin/PermissionsTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/PermissionsTest.java
+@@ -17,18 +17,13 @@
+ 
+ package org.keycloak.tests.admin;
+ 
+-import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+-import jakarta.ws.rs.ForbiddenException;
+ import jakarta.ws.rs.core.Response;
+ 
+-import org.keycloak.admin.client.Keycloak;
+-import org.keycloak.admin.client.resource.ClientResource;
+ import org.keycloak.admin.client.resource.RealmResource;
+-import org.keycloak.admin.client.resource.UserResource;
+ import org.keycloak.models.AdminRoles;
+ import org.keycloak.models.Constants;
+ import org.keycloak.models.UserModel;
+@@ -47,7 +42,6 @@
+ import org.keycloak.representations.idm.RealmEventsConfigRepresentation;
+ import org.keycloak.representations.idm.RoleRepresentation;
+ import org.keycloak.representations.idm.UserRepresentation;
+-import org.keycloak.representations.info.ServerInfoRepresentation;
+ import org.keycloak.services.resources.admin.AdminAuth.Resource;
+ import org.keycloak.testframework.annotations.InjectRealm;
+ import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
+@@ -62,7 +56,6 @@
+ 
+ import org.hamcrest.Matchers;
+ import org.jgroups.util.UUID;
+-import org.junit.Assert;
+ import org.junit.jupiter.api.Test;
+ 
+ import static org.hamcrest.MatcherAssert.assertThat;
+@@ -556,51 +549,6 @@ public void localizations() {
+         invoke(realm -> realm.localization().deleteRealmLocalizationTexts("en"), clients.get("REALM2"), false);
+     }
+ 
+-    @Test
+-    public void testServerInfo() throws Exception {
+-        // user in master with no permission => forbidden
+-        Assert.assertThrows(ForbiddenException.class, () -> clients.get("master-none").serverInfo().getInfo());
+-        // user in master with any permission can see the system info
+-        ServerInfoRepresentation serverInfo = clients.get("master-view-realm").serverInfo().getInfo();
+-        Assert.assertNotNull(serverInfo.getSystemInfo());
+-        Assert.assertNotNull(serverInfo.getCpuInfo());
+-        Assert.assertNotNull(serverInfo.getMemoryInfo());
+-
+-        // user in test realm with no permission => forbidden
+-        Assert.assertThrows(ForbiddenException.class, () -> clients.get("none").serverInfo().getInfo());
+-        // user in test realm with any permission cannot see the system info
+-        serverInfo = clients.get("view-realm").serverInfo().getInfo();
+-        Assert.assertNull(serverInfo.getSystemInfo());
+-        Assert.assertNull(serverInfo.getCpuInfo());
+-        Assert.assertNull(serverInfo.getMemoryInfo());
+-        serverInfo = clients.get("manage-users").serverInfo().getInfo();
+-        Assert.assertNull(serverInfo.getSystemInfo());
+-        Assert.assertNull(serverInfo.getCpuInfo());
+-        Assert.assertNull(serverInfo.getMemoryInfo());
+-
+-        // assign the view-system permission to a test realm user and check the fallback works
+-        ClientRepresentation realmMgtRep = adminClient.realm(REALM_NAME).clients().findByClientId(Constants.REALM_MANAGEMENT_CLIENT_ID).get(0);
+-        ClientResource realmMgtRes = adminClient.realm(REALM_NAME).clients().get(realmMgtRep.getId());
+-        RoleRepresentation viewSystem = new RoleRepresentation();
+-        viewSystem.setName(AdminRoles.VIEW_SYSTEM);
+-        realmMgtRes.roles().create(viewSystem);
+-        viewSystem = realmMgtRes.roles().get(AdminRoles.VIEW_SYSTEM).toRepresentation();
+-        UserRepresentation userRep = adminClient.realm(REALM_NAME).users().search("view-realm", Boolean.TRUE).get(0);
+-        UserResource userRes = adminClient.realm(REALM_NAME).users().get(userRep.getId());
+-        userRes.roles().clientLevel(realmMgtRep.getId()).add(Collections.singletonList(viewSystem));
+-        try (Keycloak keycloak = adminClientFactory.create().realm(REALM_NAME)
+-                .username(userRep.getUsername()).password("password").clientId("test-client")
+-                .build()) {
+-            serverInfo = keycloak.serverInfo().getInfo();
+-            Assert.assertNotNull(serverInfo.getSystemInfo());
+-            Assert.assertNotNull(serverInfo.getCpuInfo());
+-            Assert.assertNotNull(serverInfo.getMemoryInfo());
+-        } finally {
+-            userRes.roles().clientLevel(realmMgtRep.getId()).remove(Collections.singletonList(viewSystem));
+-            realmMgtRes.roles().get(AdminRoles.VIEW_SYSTEM).remove();
+-        }
+-    }
+-
+     private void verifyAnyAdminRoleReqired(Invocation invocation) {
+         invoke(invocation, clients.get("view-realm"), true);
+         invoke(invocation, clients.get("manage-realm"), true);
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/ServerInfoPermissionsTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/ServerInfoPermissionsTest.java
+new file mode 100644
+index 000000000000..1b0e7dfad359
+--- /dev/null
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/ServerInfoPermissionsTest.java
+@@ -0,0 +1,120 @@
++/*
++ * Copyright 2026 Red Hat, Inc. and/or its affiliates
++ * and other contributors as indicated by the @author tags.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.keycloak.tests.admin;
++
++import java.util.Collections;
++
++import jakarta.ws.rs.ForbiddenException;
++
++import org.keycloak.admin.client.Keycloak;
++import org.keycloak.admin.client.resource.ClientResource;
++import org.keycloak.admin.client.resource.UserResource;
++import org.keycloak.models.AdminRoles;
++import org.keycloak.models.Constants;
++import org.keycloak.representations.idm.ClientRepresentation;
++import org.keycloak.representations.idm.RoleRepresentation;
++import org.keycloak.representations.idm.UserRepresentation;
++import org.keycloak.representations.info.ServerInfoRepresentation;
++import org.keycloak.testframework.annotations.InjectRealm;
++import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
++import org.keycloak.testframework.realm.ManagedRealm;
++import org.keycloak.testframework.realm.RealmConfigBuilder;
++
++import org.junit.Assert;
++import org.junit.jupiter.api.Test;
++
++/**
++ *
++ * @author rmartinc
++ */
++@KeycloakIntegrationTest
++public class ServerInfoPermissionsTest extends AbstractPermissionsTest {
++
++    @InjectRealm(config = PermissionsTestRealm.class, ref = "realm1")
++    ManagedRealm managedRealm1;
++
++    @Test
++    public void testServerInfo() throws Exception {
++        // user in master with no permission => forbidden
++        Assert.assertThrows(ForbiddenException.class, () -> clients.get("master-none").serverInfo().getInfo());
++        // user in master with any permission can see the system info
++        ServerInfoRepresentation serverInfo = clients.get("master-view-realm").serverInfo().getInfo();
++        Assert.assertNotNull(serverInfo.getSystemInfo());
++        Assert.assertNotNull(serverInfo.getSystemInfo().getJavaVersion());
++        Assert.assertNotNull(serverInfo.getCpuInfo());
++        Assert.assertNotNull(serverInfo.getMemoryInfo());
++
++        // user in test realm with no permission => forbidden
++        Assert.assertThrows(ForbiddenException.class, () -> clients.get("none").serverInfo().getInfo());
++        // user in test realm with any permission cannot see the system info
++        serverInfo = clients.get("view-realm").serverInfo().getInfo();
++        Assert.assertNull(serverInfo.getSystemInfo());
++        Assert.assertNull(serverInfo.getCpuInfo());
++        Assert.assertNull(serverInfo.getMemoryInfo());
++        serverInfo = clients.get("manage-users").serverInfo().getInfo();
++        Assert.assertNull(serverInfo.getSystemInfo());
++        Assert.assertNull(serverInfo.getCpuInfo());
++        Assert.assertNull(serverInfo.getMemoryInfo());
++        // user with manage realm can only see the version
++        serverInfo = clients.get("manage-realm").serverInfo().getInfo();
++        Assert.assertNotNull(serverInfo.getSystemInfo());
++        Assert.assertNotNull(serverInfo.getSystemInfo().getVersion());
++        Assert.assertNull(serverInfo.getSystemInfo().getJavaVersion());
++        Assert.assertNull(serverInfo.getSystemInfo().getOsName());
++        Assert.assertNull(serverInfo.getSystemInfo().getServerTime());
++        Assert.assertNull(serverInfo.getCpuInfo());
++        Assert.assertNull(serverInfo.getMemoryInfo());
++
++        // assign the view-system permission to a test realm user and check the fallback works
++        ClientRepresentation realmMgtRep = adminClient.realm(REALM_NAME).clients().findByClientId(Constants.REALM_MANAGEMENT_CLIENT_ID).get(0);
++        ClientResource realmMgtRes = adminClient.realm(REALM_NAME).clients().get(realmMgtRep.getId());
++        RoleRepresentation createViewSystem = new RoleRepresentation();
++        createViewSystem.setName(AdminRoles.VIEW_SYSTEM);
++        realmMgtRes.roles().create(createViewSystem);
++        final RoleRepresentation viewSystem = realmMgtRes.roles().get(AdminRoles.VIEW_SYSTEM).toRepresentation();
++        UserRepresentation userRep = adminClient.realm(REALM_NAME).users().search("view-realm", Boolean.TRUE).get(0);
++        // view-system cannot be assigned by admin in the permissions realm
++        Assert.assertThrows(ForbiddenException.class, () -> clients.get("realm-admin")
++                .realm(REALM_NAME).users().get(userRep.getId()).roles().clientLevel(realmMgtRep.getId())
++                .add(Collections.singletonList(viewSystem)));
++        // view-system can be assigned by a master realm-admin using FGAP
++        UserResource userRes = adminClient.realm(REALM_NAME).users().get(userRep.getId());
++        userRes.roles().clientLevel(realmMgtRep.getId())
++                .add(Collections.singletonList(viewSystem));
++        try (Keycloak keycloak = adminClientFactory.create().realm(REALM_NAME)
++                .username(userRep.getUsername()).password("password").clientId("test-client")
++                .build()) {
++            serverInfo = keycloak.serverInfo().getInfo();
++            Assert.assertNotNull(serverInfo.getSystemInfo());
++            Assert.assertNotNull(serverInfo.getSystemInfo().getJavaVersion());
++            Assert.assertNotNull(serverInfo.getCpuInfo());
++            Assert.assertNotNull(serverInfo.getMemoryInfo());
++        } finally {
++            userRes.roles().clientLevel(realmMgtRep.getId()).remove(Collections.singletonList(viewSystem));
++            realmMgtRes.roles().get(AdminRoles.VIEW_SYSTEM).remove();
++        }
++    }
++
++    protected static class PermissionsTestRealm extends PermissionsTestRealmConfig1 {
++
++        @Override
++        public RealmConfigBuilder configure(RealmConfigBuilder realm) {
++            // configure with permissions enable to test view-system assignment
++            return super.configure(realm).adminPermissionsEnabled(true);
++        }
++    }
++}

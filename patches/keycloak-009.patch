@@ -1,21 +1,963 @@
-diff --git a/.github/workflows/js-ci.yml b/.github/workflows/js-ci.yml
-index 4cc0e1d23d..cd75943d07 100644
---- a/.github/workflows/js-ci.yml
-+++ b/.github/workflows/js-ci.yml
-@@ -190,7 +190,7 @@ jobs:
-     needs:
-       - conditional
-       - build-keycloak
--    if: needs.conditional.outputs.js-ci == 'true'
-+    if: needs.conditional.outputs.js-ci == 'true' && github.repository == 'keycloak/keycloak'
-     runs-on: ubuntu-latest
-     env:
-       WORKSPACE: admin-ui
-@@ -243,6 +243,7 @@ jobs:
-           CYPRESS_BASE_URL: http://localhost:8080/admin/
-           CYPRESS_KEYCLOAK_SERVER: http://localhost:8080
-           CYPRESS_RECORD_KEY: b8f1d15e-eab8-4ee7-8e44-c6d7cd8fc0eb
-+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+diff --git a/docs/guides/server/reverseproxy.adoc b/docs/guides/server/reverseproxy.adoc
+index a667d3a8cc2a..350d775ae333 100644
+--- a/docs/guides/server/reverseproxy.adoc
++++ b/docs/guides/server/reverseproxy.adoc
+@@ -394,24 +394,15 @@ Calculation:
  
-       - name: Upload server logs
-         uses: actions/upload-artifact@v3
+ For production with TLS passthrough:
+ 
+-[source,bash]
+-----
+ <@kc.start parameters="--shutdown-delay=30s --shutdown-timeout=1s"/>
+-----
+ 
+ For load balancers that poll readiness:
+ 
+-[source,bash]
+-----
+ <@kc.start parameters="--shutdown-delay=16s --shutdown-timeout=1s"/>
+-----
+ 
+ For test environments:
+ 
+-[source,bash]
+-----
+ <@kc.start parameters="--shutdown-delay=0s --shutdown-timeout=500ms"/>
+-----
+ 
+ [NOTE]
+ ====
+diff --git a/pom.xml b/pom.xml
+index 4d78b0ceb97f..7afa22a7b906 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -46,8 +46,8 @@
+ 
+         <asciidoctor.plugin.version>1.5.8</asciidoctor.plugin.version>
+ 
+-        <quarkus.version>3.32.2</quarkus.version>
+-        <quarkus.build.version>3.32.2</quarkus.build.version>
++        <quarkus.version>3.32.3</quarkus.version>
++        <quarkus.build.version>3.32.3</quarkus.build.version>
+         <jboss-logging-annotations.version>3.0.4.Final</jboss-logging-annotations.version> <!-- keep in sync with the version used by quarkus -->
+ 
+         <project.build-time>${timestamp}</project.build-time>
+diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java
+index 76dd34e39271..185707811166 100644
+--- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java
++++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor.java
+@@ -19,7 +19,6 @@
+ import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.stream.Stream;
+@@ -92,14 +91,17 @@ public static void enable() {
+     public Iterator<String> iterateNames(ConfigSourceInterceptorContext context) {
+         Iterable<String> iterable = context::iterateNames;
+ 
+-        final Set<PropertyMapper<?>> allMappers = PropertyMappers.getMappers();
+-
+-        //TODO: this is still not a complete list - things like quarkus.log.console.enabled
+-        // come from kc.log - but via a map from, not to.
+-        // so we'd need additional logic like the getWildcardMappedFrom case for that
++        final Set<PropertyMapper<?>> mappersWithoutValues = PropertyMappers.getMappers();
+ 
+         boolean filterRuntime = isRebuild() || Boolean.getBoolean(Environment.KC_TEST_REBUILD);
+ 
++        // this will return different iterations when our configuration is initialized vs not.
++        // when the configuration is not initialized, we only need to worry about providing
++        // bootsrapping level options, so we can make simplistic assumptions about the presence of values
++
++        // we also only do first level discovery - for example if an inferred value exists, we are not
++        // checking to see if it has wildcard or connected options
++
+         var baseStream = StreamSupport.stream(iterable.spliterator(), false).flatMap(name -> {
+             final PropertyMapper<?> mapper = PropertyMappers.getMapper(name);
+ 
+@@ -112,14 +114,20 @@ public Iterator<String> iterateNames(ConfigSourceInterceptorContext context) {
+ 
+             final PropertyMapper<?> mappedMapper = mapper.forKey(name);
+ 
++            mappersWithoutValues.remove(mapper);
++
+             // only include additional mappings if we're on the from side of the mapping as the mapping may not be bi-directional
+             if (!name.equals(mappedMapper.getFrom())) {
+                 return Stream.of(name);
+             }
+ 
+-            allMappers.remove(mapper);
++            List<String> allNames = new ArrayList<String>();
++            allNames.add(name);
++            if (!name.equals(mappedMapper.getTo()) && hasValue(mappedMapper.getTo(), context)) {
++                allNames.add(mappedMapper.getTo());
++            }
+ 
+-            List<String> wildcardsMappedFrom = getWildcardsMappedFrom(context, name, mapper);
++            appendWildcardsMappedFrom(context, name, mapper, allNames);
+ 
+             if (mapper.hasWildcard()) {
+                 var wildcardMapper = (WildcardPropertyMapper<?>) mapper;
+@@ -127,68 +135,74 @@ public Iterator<String> iterateNames(ConfigSourceInterceptorContext context) {
+                 var wildcardValue = wildcardMapper.extractWildcardValue(name).orElseThrow();
+ 
+                 if (mapper.hasConnectedOptions()) {
+-                    var connectedTo = wildcardMapper.getConnectedOptions(wildcardValue).stream()
++                    wildcardMapper.getConnectedOptions(wildcardValue).stream()
+                             .map(option -> Optional.ofNullable(PropertyMappers.getMapper(NS_KEYCLOAK_PREFIX + option)).orElseThrow(() -> new IllegalArgumentException("Cannot find connected options")))
+                             .map(m -> m.hasWildcard() ? ((WildcardPropertyMapper<?>) m).getTo(wildcardValue) : m.getTo())
+-                            .filter(key -> hasValue(key, context));
+-                    String to = wildcardMapper.getTo(wildcardValue);
+-                    return Stream.concat(toDistinctStream(name, !Configuration.isInitialized() || hasValue(to, context) ? to : null), Stream.concat(connectedTo, wildcardsMappedFrom.stream()));
++                            .filter(key -> hasValue(key, context)).forEach(allNames::add);
+                 }
+             }
+ 
+-            return Stream.concat(toDistinctStream(name,
+-                    !Configuration.isInitialized() || hasValue(mappedMapper.getTo(), context) ? mappedMapper.getTo() : null),
+-                    wildcardsMappedFrom.stream());
++            return allNames.stream();
+         });
+ 
+-        // include anything remaining that has a value - we only care about the to (typically quarkus) values
+-        var inferredValueStream = allMappers.stream()
+-                .filter(m -> m.getCategory() != OptionCategory.CONFIG // advertising the keystore type causes the keystore to be used early
+-                        && !m.hasWildcard()
+-                        && hasValue(m.getTo(), context))
++        // include anything remaining that has a value - we currently only care about the to (typically quarkus) values
++        var inferredValueStream = mappersWithoutValues.stream()
++                .filter(m -> hasInferredValue(m, context))
+                 .map(m -> m.getTo());
+ 
+         return IteratorUtils.chainedIterator(baseStream.iterator(), inferredValueStream.iterator());
+     }
+ 
+-    private List<String> getWildcardsMappedFrom(ConfigSourceInterceptorContext context, String name,
+-            final PropertyMapper<?> mapper) {
++    private void appendWildcardsMappedFrom(ConfigSourceInterceptorContext context, String name,
++            final PropertyMapper<?> mapper, List<String> names) {
+         var wildCards = PropertyMappers.getWildcardsMappedFrom(mapper.getOption());
+         if (wildCards.isEmpty()) {
+-            return List.of();
++            return;
+         }
+-        List<String> mappedFromWildCardKeys = new ArrayList<>();
+         ConfigValue value = context.proceed(name);
+-        if (value != null && value.getValue() != null) {
+-            for (WildcardPropertyMapper<?> wildCard : wildCards) {
+-                if (mapper.hasWildcard()) {
+-                    var wildcardMapper = (WildcardPropertyMapper<?>) mapper;
+-                    var wildcardValue = wildcardMapper.extractWildcardValue(name).orElseThrow();
+-                    // TODO could check recursively backwards
+-                    mappedFromWildCardKeys.add(wildCard.getTo(wildcardValue));
+-                } else {
+-                    // this is not a wildcard value, but may map to wildcards
+-                    // the current example is something like log-level=wildcardCat1:level,wildcardCat2:level
+-                    wildCard.getToFromWildcardTransformer(value.getValue()).forEach(mappedFromWildCardKeys::add);
+-                }
+-            }
++        if (value == null || value.getValue() == null) {
++            return;
++        }
++        if (mapper.hasWildcard()) {
++            var wildcardMapper = (WildcardPropertyMapper<?>) mapper;
++            var wildcardValue = wildcardMapper.extractWildcardValue(name).orElseThrow();
++            wildCards.stream().map(w -> w.getTo(wildcardValue)).filter(to -> hasValue(to, context)).forEach(names::add);
++        } else {
++            // this is not a wildcard value, but may map to wildcards
++            // the current example is something like log-level=wildcardCat1:level,wildcardCat2:level
++            wildCards.stream().flatMap(w -> w.getToFromWildcardTransformer(value.getValue())).forEach(names::add);
++        }
++    }
++
++    private boolean hasInferredValue(PropertyMapper<?> m, ConfigSourceInterceptorContext context) {
++        if (m.getCategory() == OptionCategory.CONFIG // advertising the keystore type causes the keystore to be used early
++                || m.hasWildcard()
++                || (m.getDefaultValue().isEmpty() && m.getMapFrom() == null)
++                || m.getTo().startsWith(NS_KEYCLOAK_PREFIX)) {
++            return false;
+         }
+-        return mappedFromWildCardKeys;
++
++        if (m.getMapper() == null && m.getDefaultValue().isPresent() && m.getMapFrom() == null) {
++            return true; // the default will be used "as-is"
++        }
++
++        if (Configuration.isInitialized()) {
++            return hasValue(m.getTo(), context);
++        }
++
++        return m.getDefaultValue().isPresent(); // just make a simplistic assumption prior to init
+     }
+ 
+     private boolean hasValue(String key, ConfigSourceInterceptorContext context) {
+         try {
+-            return Configuration.isInitialized()
+-                    && Optional.ofNullable(context.restart(key)).map(ConfigValue::getValue).isPresent();
++            return !Configuration.isInitialized()
++                    || key.startsWith(NS_KEYCLOAK_PREFIX) // once we remove Scope.getPropertyNames, this check can be inverted like in hasInferredValue
++                    || Optional.ofNullable(context.restart(key)).map(ConfigValue::getValue).isPresent();
+         } catch (Exception e) {
+             return false; // corner case - validation or other failure, we won't report it as having a value
+         }
+     }
+ 
+-    private static Stream<String> toDistinctStream(String... values) {
+-        return Stream.of(values).filter(Objects::nonNull).distinct();
+-    }
+-
+     @Override
+     public ConfigValue getValue(ConfigSourceInterceptorContext context, String name) {
+         if (Boolean.TRUE.equals(disable.get())) {
+diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
+index b22c452601fa..bc0decd77b29 100644
+--- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
++++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
+@@ -336,8 +336,14 @@ static List<PropertyMapper<?>> appendDatasourceMappers(List<PropertyMapper<?>> m
+                     customTransformer.accept(created);
+                 }
+ 
++                Option<String> primaryOption = getDatasourceOption(DB).orElseThrow();
++
+                 PropertyMapper<?> mapper = created.build();
+-                getDatasourceOption(DB).orElseThrow().getConnectedOptions().add(mapper.getOption().getKey());
++                // if we're not the DB option, nor mapped directly from the DB option, then
++                // it's considered "connected" for the purposes of discovery
++                if (parentOption != DB && !primaryOption.getKey().equals(mapper.getMapFrom())) {
++                    primaryOption.getConnectedOptions().add(mapper.getOption().getKey());
++                }
+                 datasourceMappers.add(mapper);
+             }
+ 
+diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java
+index 54b95d3fe57c..380f8c6342e2 100644
+--- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java
++++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper.java
+@@ -264,7 +264,7 @@ ValueMapper getParentMapper() {
+         return parentMapper;
+     }
+ 
+-    ValueMapper getMapper() {
++    public ValueMapper getMapper() {
+         return mapper;
+     }
+ 
+diff --git a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java
+index 939f38120957..1c651e01d5d5 100644
+--- a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java
++++ b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/DatasourcesConfigurationTest.java
+@@ -19,7 +19,6 @@
+ import org.postgresql.xa.PGXADataSource;
+ 
+ import static org.hamcrest.CoreMatchers.hasItem;
+-import static org.hamcrest.CoreMatchers.hasItems;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.CoreMatchers.not;
+ import static org.hamcrest.MatcherAssert.assertThat;
+@@ -495,8 +494,7 @@ public void propagatedPropertyNames() {
+                 .stream(config.getPropertyNames().spliterator(), false)
+                 .collect(Collectors.toList());
+ 
+-        assertThat(propertyNames, hasItems(
+-                "kc.db-kind-user-store",
++        List<String> expectedNames = List.of("kc.db-kind-user-store",
+                 "quarkus.datasource.\"user-store\".db-kind",
+                 "quarkus.datasource.\"user-store\".jdbc.url",
+                 "quarkus.datasource.\"user-store\".jdbc.transactions",
+@@ -504,14 +502,9 @@ public void propagatedPropertyNames() {
+                 "quarkus.datasource.\"user-store\".jdbc.driver",
+                 "quarkus.datasource.jdbc.min-size",
+                 "quarkus.datasource.jdbc.driver",
+-                "quarkus.datasource.jdbc.url"
+-        ));
++                "quarkus.datasource.jdbc.url");
+ 
+-        // verify the db-kind is there only once
+-        long quarkusDbKindCount = propertyNames.stream()
+-                .filter("quarkus.datasource.\"user-store\".jdbc.url"::equals)
+-                .count();
+-        assertThat(quarkusDbKindCount, is(1L));
++        expectedNames.forEach(n -> assertThat(propertyNames, hasItem(n)));
+ 
+         Stream.of("quarkus.datasource.\"user-store\".username"
+                 , "quarkus.datasource.\"user-store\".password")
+diff --git a/services/src/main/java/org/keycloak/protocol/oauth2/OAuth2WellKnownProviderFactory.java b/services/src/main/java/org/keycloak/protocol/oauth2/OAuth2WellKnownProviderFactory.java
+index 0b11b236e4be..e72dbee2ec9a 100644
+--- a/services/src/main/java/org/keycloak/protocol/oauth2/OAuth2WellKnownProviderFactory.java
++++ b/services/src/main/java/org/keycloak/protocol/oauth2/OAuth2WellKnownProviderFactory.java
+@@ -30,4 +30,9 @@ public class OAuth2WellKnownProviderFactory extends OIDCWellKnownProviderFactory
+     public String getId() {
+         return PROVIDER_ID;
+     }
++
++    @Override
++    public boolean isAvailableViaServerMetadata() {
++        return true;
++    }
+ }
+diff --git a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProvider.java b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProvider.java
+index b7a6d692819b..de7b75e07c10 100644
+--- a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProvider.java
++++ b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProvider.java
+@@ -91,7 +91,7 @@ private void addDeprecationHeadersIfOldRoute() {
+         }
+ 
+         var base = session.getContext().getUri().getBaseUriBuilder();
+-        var successor = ServerMetadataResource.wellKnownOAuthProviderUrl(base)
++        var successor = ServerMetadataResource.wellKnownProviderUrl(base)
+                 .build(JWTVCIssuerWellKnownProviderFactory.PROVIDER_ID, realm.getName());
+ 
+         HttpResponse httpResponse = session.getContext().getHttpResponse();
+diff --git a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProviderFactory.java b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProviderFactory.java
+index 5dd6b88c213a..421b7998c349 100644
+--- a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProviderFactory.java
++++ b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/JWTVCIssuerWellKnownProviderFactory.java
+@@ -58,4 +58,9 @@ public void close() {
+     public String getId() {
+         return PROVIDER_ID;
+     }
+-}
+\ No newline at end of file
++
++    @Override
++    public boolean isAvailableViaServerMetadata() {
++        return true;
++    }
++}
+diff --git a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProvider.java b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProvider.java
+index b19b01521fcd..2fb0158f17a7 100644
+--- a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProvider.java
++++ b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProvider.java
+@@ -571,7 +571,7 @@ private void addDeprecationHeadersIfOldRoute(KeycloakSession session) {
+ 
+         UriBuilder base = session.getContext().getUri().getBaseUriBuilder();
+         String logKey = session.getContext().getRealm().getName();
+-        URI successor = ServerMetadataResource.wellKnownOAuthProviderUrl(base)
++        URI successor = ServerMetadataResource.wellKnownProviderUrl(base)
+                 .build(WELL_KNOWN_OPENID_CREDENTIAL_ISSUER, logKey);
+ 
+         HttpResponse httpResponse = session.getContext().getHttpResponse();
+diff --git a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProviderFactory.java b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProviderFactory.java
+index b209c3ca34b7..cd2862c8b7c4 100644
+--- a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProviderFactory.java
++++ b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerWellKnownProviderFactory.java
+@@ -60,4 +60,9 @@ public void close() {
+     public String getId() {
+         return PROVIDER_ID;
+     }
++
++    @Override
++    public boolean isAvailableViaServerMetadata() {
++        return true;
++    }
+ }
+diff --git a/services/src/main/java/org/keycloak/services/resources/RealmsResource.java b/services/src/main/java/org/keycloak/services/resources/RealmsResource.java
+index bfc0136e94c9..8d6966e9bbe8 100755
+--- a/services/src/main/java/org/keycloak/services/resources/RealmsResource.java
++++ b/services/src/main/java/org/keycloak/services/resources/RealmsResource.java
+@@ -17,7 +17,6 @@
+ package org.keycloak.services.resources;
+ 
+ import java.net.URI;
+-import java.util.Comparator;
+ 
+ import jakarta.ws.rs.GET;
+ import jakarta.ws.rs.NotFoundException;
+@@ -53,6 +52,7 @@
+ import org.keycloak.services.resources.account.AccountLoader;
+ import org.keycloak.services.util.CacheControlUtil;
+ import org.keycloak.services.util.ResolveRelative;
++import org.keycloak.services.util.WellKnownProviderUtil;
+ import org.keycloak.utils.ProfileHelper;
+ import org.keycloak.wellknown.WellKnownProvider;
+ import org.keycloak.wellknown.WellKnownProviderFactory;
+@@ -230,20 +230,17 @@ public Response getVersionPreflight(final @PathParam("realm") String name,
+     @GET
+     @Path("{realm}/.well-known/{alias}")
+     @Produces({MediaType.APPLICATION_JSON, APPLICATION_JWT})
+-    public Response getWellKnown(final @PathParam("realm") String name,
++    public Response getWellKnown(final @PathParam("realm") String realm,
+                                  final @PathParam("alias") String alias) {
+-        return getWellKnownResponse(session, name, alias, logger);
++        return getWellKnownResponse(session, realm, alias, logger);
+     }
+ 
+-    public static Response getWellKnownResponse(KeycloakSession session, String name, String alias, Logger logger) throws NotFoundException {
+-        resolveRealmAndUpdateSession(session, name);
++    public static Response getWellKnownResponse(KeycloakSession session, String realm, String alias, Logger logger) throws NotFoundException {
++        resolveRealmAndUpdateSession(session, realm);
+         checkSsl(session, session.getContext().getRealm());
+ 
+-        WellKnownProviderFactory wellKnownProviderFactoryFound = session.getKeycloakSessionFactory().getProviderFactoriesStream(WellKnownProvider.class)
+-                .map(providerFactory -> (WellKnownProviderFactory) providerFactory)
+-                .filter(wellKnownProviderFactory -> alias.equals(wellKnownProviderFactory.getAlias()))
+-                .sorted(Comparator.comparingInt(WellKnownProviderFactory::getPriority))
+-                .findFirst().orElseThrow(NotFoundException::new);
++        WellKnownProviderFactory wellKnownProviderFactoryFound = WellKnownProviderUtil.resolveFromAlias(session.getKeycloakSessionFactory(), alias)
++                .orElseThrow(NotFoundException::new);
+ 
+         logger.tracef("Use provider with ID '%s' for well-known alias '%s'", wellKnownProviderFactoryFound.getId(), alias);
+ 
+diff --git a/services/src/main/java/org/keycloak/services/resources/ServerMetadataResource.java b/services/src/main/java/org/keycloak/services/resources/ServerMetadataResource.java
+index b86c48bdd4f7..91c8eda921f3 100644
+--- a/services/src/main/java/org/keycloak/services/resources/ServerMetadataResource.java
++++ b/services/src/main/java/org/keycloak/services/resources/ServerMetadataResource.java
+@@ -29,16 +29,12 @@
+ import jakarta.ws.rs.ext.Provider;
+ 
+ import org.keycloak.models.KeycloakSession;
+-import org.keycloak.protocol.oauth2.OAuth2WellKnownProviderFactory;
+-import org.keycloak.protocol.oid4vc.issuance.JWTVCIssuerWellKnownProviderFactory;
+-import org.keycloak.protocol.oid4vc.issuance.OID4VCIssuerWellKnownProviderFactory;
+ import org.keycloak.services.cors.Cors;
++import org.keycloak.services.util.WellKnownProviderUtil;
++import org.keycloak.wellknown.WellKnownProviderFactory;
+ 
+ import org.jboss.logging.Logger;
+ 
+-import static org.keycloak.utils.MediaType.APPLICATION_JWT;
+-
+-
+ @Provider
+ @Path("/.well-known")
+ public class ServerMetadataResource {
+@@ -51,30 +47,48 @@ public class ServerMetadataResource {
+     @OPTIONS
+     @Path("{provider}/realms/{realm}")
+     @Produces(MediaType.APPLICATION_JSON)
+-    public Response getOAuth2AuthorizationServerWellKnownVersionPreflight(final @PathParam("provider") String providerName,
+-                                                                          final @PathParam("realm") String name) {
+-        if (!isValidProvider(providerName)) throw new NotFoundException();
++    public Response getWellKnownPreflight(final @PathParam("provider") String alias,
++                                          final @PathParam("realm") String realm) {
++        if (!isValidProvider(alias)) {
++            throw new NotFoundException();
++        }
+         return Cors.builder().allowedMethods("GET").preflight().auth().add(Response.ok());
+     }
+ 
+     @GET
+     @Path("{provider}/realms/{realm}")
+-    @Produces({MediaType.APPLICATION_JSON, APPLICATION_JWT})
+-    public Response getOAuth2AuthorizationServerWellKnown(final @PathParam("provider") String providerName,
+-                                                          final @PathParam("realm") String name) {
+-        if (!isValidProvider(providerName)) throw new NotFoundException();
+-        return RealmsResource.getWellKnownResponse(session, name, providerName, logger);
++    @Produces({MediaType.APPLICATION_JSON, org.keycloak.utils.MediaType.APPLICATION_JWT})
++    public Response getWellKnown(final @PathParam("provider") String alias,
++                                 final @PathParam("realm") String realm) {
++        if (!isValidProvider(alias)) {
++            throw new NotFoundException();
++        }
++        return RealmsResource.getWellKnownResponse(session, realm, alias, logger);
+     }
+ 
++    /**
++     * @Deprecated use {@link #wellKnownProviderUrl(UriBuilder)} instead.
++     * @return the updated UriBuilder instance.
++     */
++    @Deprecated
+     public static UriBuilder wellKnownOAuthProviderUrl(UriBuilder builder) {
++        return wellKnownProviderUrl(builder);
++    }
++
++    /**
++     * Constructs the URI path for the well-known provider URL based on the provided UriBuilder.
++     *
++     * @param builder the base UriBuilder instance to which the well-known provider path will be appended.
++     *                It must not be null.
++     * @return the updated UriBuilder instance with the well-known provider path appended.
++     */
++    public static UriBuilder wellKnownProviderUrl(UriBuilder builder) {
+         return builder.path(ServerMetadataResource.class).path("{provider}/realms/{realm}");
+     }
+ 
+-    private boolean isValidProvider(String providerName) {
+-        // you can add codes here considering the current status of the implementation (preview, experimental).
+-        if (OAuth2WellKnownProviderFactory.PROVIDER_ID.equals(providerName)) return true;
+-        if (OID4VCIssuerWellKnownProviderFactory.PROVIDER_ID.equals(providerName)) return true;
+-        if (JWTVCIssuerWellKnownProviderFactory.PROVIDER_ID.equals(providerName)) return true;
+-        return false;
++    private boolean isValidProvider(String alias) {
++        return WellKnownProviderUtil.resolveFromAlias(session.getKeycloakSessionFactory(), alias)
++                .map(WellKnownProviderFactory::isAvailableViaServerMetadata)
++                .orElse(false);
+     }
+ }
+diff --git a/services/src/main/java/org/keycloak/services/util/WellKnownProviderUtil.java b/services/src/main/java/org/keycloak/services/util/WellKnownProviderUtil.java
+new file mode 100644
+index 000000000000..94b71bbadad1
+--- /dev/null
++++ b/services/src/main/java/org/keycloak/services/util/WellKnownProviderUtil.java
+@@ -0,0 +1,42 @@
++package org.keycloak.services.util;
++
++import java.util.Comparator;
++import java.util.Optional;
++
++import org.keycloak.models.KeycloakSessionFactory;
++import org.keycloak.wellknown.WellKnownProvider;
++import org.keycloak.wellknown.WellKnownProviderFactory;
++
++/**
++ * Utility class for resolving {@link WellKnownProviderFactory} instances based on their alias.
++ * This class provides methods to interact with the available provider factories within the context
++ * of a {@link KeycloakSessionFactory}.
++ *
++ * This is a utility class and is not intended to be instantiated.
++ */
++public class WellKnownProviderUtil {
++
++    private WellKnownProviderUtil() {
++        // Utility class
++    }
++
++    /**
++     * Resolves a {@link WellKnownProviderFactory} from the specified alias.
++     * If multiple factories share the same alias, the one with the lowest priority is selected.
++     *
++     * @param sessionFactory the {@link KeycloakSessionFactory} to retrieve provider factories from
++     * @param alias the alias of the desired {@link WellKnownProviderFactory}; if null, an empty {@link Optional} is returned
++     * @return an {@link Optional} containing the resolved {@link WellKnownProviderFactory}, or empty if no matching factory is found
++     */
++    public static Optional<WellKnownProviderFactory> resolveFromAlias(KeycloakSessionFactory sessionFactory, String alias) {
++
++        if (alias == null) {
++            return Optional.empty();
++        }
++
++        return sessionFactory.getProviderFactoriesStream(WellKnownProvider.class)
++                .map(providerFactory -> (WellKnownProviderFactory) providerFactory)
++                .filter(wellKnownProviderFactory -> alias.equals(wellKnownProviderFactory.getAlias()))
++                .min(Comparator.comparingInt(WellKnownProviderFactory::getPriority));
++    }
++}
+diff --git a/services/src/main/java/org/keycloak/wellknown/WellKnownProviderFactory.java b/services/src/main/java/org/keycloak/wellknown/WellKnownProviderFactory.java
+index 22f84fa00681..59a50ee2f8c2 100755
+--- a/services/src/main/java/org/keycloak/wellknown/WellKnownProviderFactory.java
++++ b/services/src/main/java/org/keycloak/wellknown/WellKnownProviderFactory.java
+@@ -44,4 +44,17 @@ default String getAlias() {
+     default int getPriority() {
+         return 1;
+     }
++
++    /**
++     * Controls if the {@link WellKnownProvider} is available via server metadata endpoint.
++     * If this method returns true, then the provider will be available under {@code /.well-known/{alias}/realms/{realm}},
++     * where {@code {alias}} is the well-known alias returned by {@link #getAlias()}.
++     *
++     * Default implementation returns false.
++     *
++     * @return true if this provider may be exposed via ServerMetadataResource
++     */
++    default boolean isAvailableViaServerMetadata() {
++        return false;
++    }
+ }
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/events/AbstractEvents.java b/test-framework/core/src/main/java/org/keycloak/testframework/events/AbstractEvents.java
+index 2d741ab4af41..3dcb45885b02 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/events/AbstractEvents.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/events/AbstractEvents.java
+@@ -58,6 +58,7 @@ public R poll() {
+                     .stream().filter(e -> !processedEvents.contains(getEventId(e)))
+                     .forEach(e -> {
+                         Assertions.assertEquals(realm.getId(), getRealmId(e));
++                        Assertions.assertTrue(getTime(e) > 0);
+                         processedEvents.add(getEventId(e));
+                         this.events.add(e);
+                     });
+@@ -125,6 +126,8 @@ void testStarted() {
+ 
+     protected abstract String getRealmId(R representation);
+ 
++    protected abstract long getTime(R representation);
++
+     protected abstract void clearServerEvents();
+ 
+     protected abstract Logger getLogger();
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/events/AdminEvents.java b/test-framework/core/src/main/java/org/keycloak/testframework/events/AdminEvents.java
+index 3b59a1b8dcf2..2d8eceffa54c 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/events/AdminEvents.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/events/AdminEvents.java
+@@ -33,6 +33,11 @@ protected String getRealmId(AdminEventRepresentation rep) {
+         return rep.getRealmId();
+     }
+ 
++    @Override
++    protected long getTime(AdminEventRepresentation rep) {
++        return rep.getTime();
++    }
++
+     @Override
+     protected void clearServerEvents() {
+         realm.admin().clearAdminEvents();
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/events/EventAssertion.java b/test-framework/core/src/main/java/org/keycloak/testframework/events/EventAssertion.java
+index 21e342627260..b7a12de5332a 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/events/EventAssertion.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/events/EventAssertion.java
+@@ -8,6 +8,8 @@
+ import org.hamcrest.Matchers;
+ import org.junit.jupiter.api.Assertions;
+ 
++import static org.hamcrest.Matchers.is;
++
+ /**
+  * Helper to assert login events
+  */
+@@ -15,6 +17,10 @@ public class EventAssertion {
+ 
+     private final EventRepresentation event;
+ 
++    private static final String DEFAULT_IP_ADDRESS = "127.0.0.1";
++    private static final String DEFAULT_IP_ADDRESS_V6 = "0:0:0:0:0:0:0:1";
++    private static final String DEFAULT_IP_ADDRESS_V6_SHORT = "::1";
++
+     protected EventAssertion(EventRepresentation event) {
+         Assertions.assertNotNull(event, "Event was null");
+         Assertions.assertNotNull(event.getId(), "Event id was null");
+@@ -84,6 +90,17 @@ public EventAssertion isCodeId() {
+         return this;
+     }
+ 
++    /**
++     * Assert the event has an ipAddress set
++     * @return
++     */
++    public EventAssertion hasIpAddress() {
++        Assertions.assertNotNull(event.getIpAddress());
++        Assertions.assertFalse(event.getIpAddress().isEmpty());
++        MatcherAssert.assertThat(event.getIpAddress(), Matchers.anyOf(is(DEFAULT_IP_ADDRESS), is(DEFAULT_IP_ADDRESS_V6), is(DEFAULT_IP_ADDRESS_V6_SHORT)));
++        return this;
++    }
++
+     /**
+      * Assert the clientId for the event
+      *
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/events/EventMatchers.java b/test-framework/core/src/main/java/org/keycloak/testframework/events/EventMatchers.java
+index 13498d86357c..72e1b2d99295 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/events/EventMatchers.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/events/EventMatchers.java
+@@ -13,6 +13,9 @@
+  */
+ public class EventMatchers {
+ 
++    private EventMatchers() {
++    }
++
+     /**
+      * Check if value is a UUID
+      * @return
+@@ -57,9 +60,6 @@ public void describeTo(Description description) {
+         };
+     }
+ 
+-    private EventMatchers() {
+-    }
+-
+     private static class UUIDMatcher extends TypeSafeMatcher<String> {
+ 
+         @Override
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/events/Events.java b/test-framework/core/src/main/java/org/keycloak/testframework/events/Events.java
+index b8e9aae16023..39f87511e223 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/events/Events.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/events/Events.java
+@@ -30,6 +30,11 @@ protected String getRealmId(EventRepresentation rep) {
+         return rep.getRealmId();
+     }
+ 
++    @Override
++    protected long getTime(EventRepresentation rep) {
++        return rep.getTime();
++    }
++
+     @Override
+     protected void clearServerEvents() {
+         realm.admin().clearEvents();
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/ConsentsTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/ConsentsTest.java
+index d0ba035541e5..a208fecb3c2f 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/admin/ConsentsTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/ConsentsTest.java
+@@ -41,7 +41,7 @@
+ import org.keycloak.testframework.annotations.InjectRealm;
+ import org.keycloak.testframework.annotations.InjectUser;
+ import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
+-import org.keycloak.testframework.events.EventMatchers;
++import org.keycloak.testframework.events.EventAssertion;
+ import org.keycloak.testframework.events.Events;
+ import org.keycloak.testframework.injection.LifeCycle;
+ import org.keycloak.testframework.oauth.OAuthClient;
+@@ -64,7 +64,6 @@
+ import org.keycloak.testsuite.util.oauth.AccessTokenResponse;
+ import org.keycloak.testsuite.util.oauth.AuthorizationEndpointResponse;
+ 
+-import org.hamcrest.MatcherAssert;
+ import org.jboss.logging.Logger;
+ import org.junit.jupiter.api.Assertions;
+ import org.junit.jupiter.api.Test;
+@@ -299,17 +298,12 @@ public void clientConsentRequiredAfterLogin() {
+         assertTrue(driver.page().getPageSource().contains("Happy days"), "Test user should be successfully logged in.");
+ 
+         EventRepresentation loginEvent = userRealmEvents.poll();
+-        Assertions.assertNotNull(loginEvent);
+-        Assertions.assertEquals(userFromUserRealm.getId(), loginEvent.getUserId());
+-        Assertions.assertEquals(EventType.LOGIN.toString(), loginEvent.getType());
+-        loginEvent.getDetails().forEach((key, value) -> {
+-            switch (key) {
+-                case Details.CODE_ID -> MatcherAssert.assertThat(value, EventMatchers.isCodeId());
+-                case Details.USERNAME -> Assertions.assertEquals(userFromUserRealm.getUsername(), value);
+-                case Details.CONSENT -> Assertions.assertEquals(Details.CONSENT_VALUE_NO_CONSENT_REQUIRED, value);
+-                case Details.REDIRECT_URI -> Assertions.assertEquals("http://127.0.0.1:8500/callback/oauth", value);
+-            }
+-        });
++        EventAssertion.assertSuccess(loginEvent).type(EventType.LOGIN)
++                .userId(userFromUserRealm.getId())
++                .isCodeId()
++                .details(Details.USERNAME, userFromUserRealm.getUsername())
++                .details(Details.CONSENT, Details.CONSENT_VALUE_NO_CONSENT_REQUIRED)
++                .details(Details.REDIRECT_URI, "http://127.0.0.1:8500/callback/oauth");
+ 
+         userRealm.updateWithCleanup(r -> r.enabledEventTypes("REFRESH_TOKEN_ERROR"));
+         String sessionId = loginEvent.getSessionId();
+@@ -327,13 +321,13 @@ public void clientConsentRequiredAfterLogin() {
+             Assertions.assertEquals(OAuthErrorException.INVALID_SCOPE, refreshTokenResponse.getError());
+             Assertions.assertEquals("Client no longer has requested consent from user", refreshTokenResponse.getErrorDescription());
+ 
+-            EventRepresentation refreshEvent = userRealmEvents.poll();
+-            Assertions.assertNotNull(refreshEvent);
+-            Assertions.assertNull(refreshEvent.getUserId());
+-            Assertions.assertEquals(EventType.REFRESH_TOKEN_ERROR.toString(), refreshEvent.getType());
+             Assertions.assertNull(refreshTokenResponse.getRefreshToken());
+-            Assertions.assertEquals(sessionId, refreshEvent.getSessionId());
+-            Assertions.assertEquals(Errors.INVALID_TOKEN, refreshEvent.getError());
++
++            EventRepresentation refreshEvent = userRealmEvents.poll();
++            EventAssertion.assertError(refreshEvent).type(EventType.REFRESH_TOKEN_ERROR)
++                    .userId(null)
++                    .sessionId(sessionId)
++                    .error(Errors.INVALID_TOKEN);
+         } finally {
+             clientRepresentation.setConsentRequired(false);
+             userRealm.admin().clients().get(clientRepresentation.getId()).update(clientRepresentation);
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/ImpersonationTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/ImpersonationTest.java
+index e83a4adb6b4d..3ecbb8608e77 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/admin/ImpersonationTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/ImpersonationTest.java
+@@ -56,7 +56,7 @@
+ import org.keycloak.testframework.annotations.InjectRealm;
+ import org.keycloak.testframework.annotations.InjectUser;
+ import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
+-import org.keycloak.testframework.events.EventMatchers;
++import org.keycloak.testframework.events.EventAssertion;
+ import org.keycloak.testframework.events.Events;
+ import org.keycloak.testframework.oauth.OAuthClient;
+ import org.keycloak.testframework.oauth.TestApp;
+@@ -307,11 +307,12 @@ private Set<Cookie> impersonate(Keycloak adminClient, String admin, String admin
+             Assertions.assertTrue(resBody.contains("redirect"));
+ 
+             EventRepresentation event = events.poll();
+-            Assertions.assertEquals(event.getType(), EventType.IMPERSONATE.toString());
+-            MatcherAssert.assertThat(event.getSessionId(), EventMatchers.isSessionId());
+-            Assertions.assertEquals(event.getUserId(), managedUser.getId());
+-            Assertions.assertTrue(event.getDetails().values().stream().anyMatch(f -> f.equals(admin)));
+-            Assertions.assertTrue(event.getDetails().values().stream().anyMatch(f -> f.equals(adminRealm)));
++            EventAssertion.assertSuccess(event)
++                    .type(EventType.IMPERSONATE)
++                    .sessionId(event.getSessionId())
++                    .userId(managedUser.getId())
++                    .details("impersonator", admin)
++                    .details("impersonator_realm", adminRealm);
+ 
+             String testRealm = managedRealm.getName();
+             // Fetch user session notes
+@@ -389,8 +390,7 @@ private Keycloak login(String username, String realm) {
+         // - since for master testing event listener is not installed
+         if (!realm.equals("master")) {
+             EventRepresentation e = events.poll();
+-            Assertions.assertEquals(EventType.LOGIN.toString(), e.getType(), "Event type");
+-            Assertions.assertEquals(clientId, e.getClientId(), "Client ID");
++            EventAssertion.assertSuccess(e).type(EventType.LOGIN).clientId(e.getClientId());
+         }
+         return client;
+     }
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/event/LoginEventsTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/event/LoginEventsTest.java
+index 80cb5d6aefc9..1c5242a45a29 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/admin/event/LoginEventsTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/event/LoginEventsTest.java
+@@ -21,15 +21,15 @@
+ import java.time.LocalDate;
+ import java.time.ZoneOffset;
+ import java.util.List;
+-import java.util.Map;
+ 
++import org.keycloak.events.Details;
+ import org.keycloak.events.Event;
+ import org.keycloak.events.EventStoreProvider;
+ import org.keycloak.events.EventType;
+ import org.keycloak.representations.idm.EventRepresentation;
+ import org.keycloak.testframework.annotations.InjectRealm;
+ import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
+-import org.keycloak.testframework.events.EventMatchers;
++import org.keycloak.testframework.events.EventAssertion;
+ import org.keycloak.testframework.oauth.OAuthClient;
+ import org.keycloak.testframework.oauth.annotations.InjectOAuthClient;
+ import org.keycloak.testframework.realm.ManagedRealm;
+@@ -44,7 +44,6 @@
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ 
+-import static org.hamcrest.MatcherAssert.assertThat;
+ 
+ /**
+  * Test getting and filtering login-related events.
+@@ -94,22 +93,17 @@ public void eventAttributesTest() {
+         badLogin();
+         List<EventRepresentation> events = events();
+         Assertions.assertEquals(1, events.size());
+-        EventRepresentation event = events.get(0);
+-        assertThat(event.getId(), EventMatchers.isUUID());
+-        Assertions.assertTrue(event.getTime() > 0);
+-        Assertions.assertNotNull(event.getIpAddress());
+-        Assertions.assertEquals("LOGIN_ERROR", event.getType());
+-        Assertions.assertEquals(managedRealm.getId(), event.getRealmId());
+-        Assertions.assertNull(event.getUserId()); // no user for bad login
+-        Assertions.assertNull(event.getSessionId()); // no session for bad login
+-        Assertions.assertEquals("user_not_found", event.getError());
+-
+-        Map<String, String> details = event.getDetails();
+-        Assertions.assertEquals("openid-connect", details.get("auth_method"));
+-        Assertions.assertEquals("code", details.get("auth_type"));
+-        Assertions.assertNotNull(details.get("redirect_uri"));
+-        Assertions.assertNotNull(details.get("code_id"));
+-        Assertions.assertEquals("bad", details.get("username"));
++        EventAssertion.assertError(events.get(0))
++                .type(EventType.LOGIN_ERROR).isCodeId()
++                .error("user_not_found")
++                .userId(null)
++                .sessionId(null)
++                .isCodeId()
++                .hasIpAddress()
++                .details(Details.AUTH_METHOD, "openid-connect")
++                .details(Details.AUTH_TYPE, "code")
++                .details(Details.USERNAME, "bad")
++                .details(Details.REDIRECT_URI, "http://127.0.0.1:8500/callback/oauth");
+     }
+ 
+     @Test
+diff --git a/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/FederatedClientAuthConflictsTest.java b/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/FederatedClientAuthConflictsTest.java
+index 41eadfad7bf3..4c52aca86f99 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/FederatedClientAuthConflictsTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/FederatedClientAuthConflictsTest.java
+@@ -6,6 +6,7 @@
+ import org.keycloak.broker.oidc.OIDCIdentityProviderConfig;
+ import org.keycloak.broker.oidc.OIDCIdentityProviderFactory;
+ import org.keycloak.common.util.Time;
++import org.keycloak.events.EventType;
+ import org.keycloak.models.IdentityProviderModel;
+ import org.keycloak.representations.JsonWebToken;
+ import org.keycloak.representations.idm.ClientRepresentation;
+@@ -13,6 +14,7 @@
+ import org.keycloak.testframework.annotations.InjectEvents;
+ import org.keycloak.testframework.annotations.InjectRealm;
+ import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
++import org.keycloak.testframework.events.EventAssertion;
+ import org.keycloak.testframework.events.Events;
+ import org.keycloak.testframework.injection.LifeCycle;
+ import org.keycloak.testframework.oauth.OAuthClient;
+@@ -65,7 +67,8 @@ public void testChangedIssuer() {
+         // Should fail as there are two IdPs with the same issuer URL
+         AccessTokenResponse response = oAuthClient.clientCredentialsGrantRequest().clientJwt(createDefaultToken("external1", "http://127.0.0.1:8500")).send();
+         Assertions.assertTrue(response.isSuccess());
+-        Assertions.assertEquals("myclient", events.poll().getClientId());
++
++        EventAssertion.assertSuccess(events.poll()).type(EventType.CLIENT_LOGIN).clientId("myclient");
+ 
+         IdentityProviderRepresentation idp2 = createIdp("idp2", "http://127.0.0.1:8500", false);
+ 
+@@ -89,7 +92,8 @@ public void testChangedIssuer() {
+         events.clear();
+         response = oAuthClient.clientCredentialsGrantRequest().clientJwt(createDefaultToken("external1", "http://127.0.0.1:8500")).send();
+         Assertions.assertTrue(response.isSuccess());
+-        Assertions.assertEquals("myclient", events.poll().getClientId());
++
++        EventAssertion.assertSuccess(events.poll()).type(EventType.CLIENT_LOGIN).clientId("myclient");
+     }
+ 
+     @Test
+@@ -102,11 +106,13 @@ public void testDuplicatedClientExternalId() {
+ 
+         AccessTokenResponse response = oAuthClient.clientCredentialsGrantRequest().clientJwt(createDefaultToken("external1", "http://127.0.0.1:8500/one")).send();
+         Assertions.assertTrue(response.isSuccess());
+-        Assertions.assertEquals("myclient1", events.poll().getClientId());
++
++        EventAssertion.assertSuccess(events.poll()).type(EventType.CLIENT_LOGIN).clientId("myclient1");
+ 
+         response = oAuthClient.clientCredentialsGrantRequest().clientJwt(createDefaultToken("external1", "http://127.0.0.1:8500/two")).send();
+         Assertions.assertTrue(response.isSuccess());
+-        Assertions.assertEquals("myclient2", events.poll().getClientId());
++
++        EventAssertion.assertSuccess(events.poll()).type(EventType.CLIENT_LOGIN).clientId("myclient2");
+     }
+ 
+     private String createDefaultToken(String externalClientId, String issuer) {
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RFC8414CompliantOAuth2WellKnownProviderTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RFC8414CompliantOAuth2WellKnownProviderTest.java
+index 64881a1f472e..cf715a5b25b5 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RFC8414CompliantOAuth2WellKnownProviderTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RFC8414CompliantOAuth2WellKnownProviderTest.java
+@@ -32,7 +32,7 @@ protected String getWellKnownProviderId() {
+     }
+ 
+     protected URI getOIDCDiscoveryUri(UriBuilder builder) {
+-        return ServerMetadataResource.wellKnownOAuthProviderUrl(builder).build(this.getWellKnownProviderId(), "test");
++        return ServerMetadataResource.wellKnownProviderUrl(builder).build(this.getWellKnownProviderId(), "test");
+     }
+ 
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/OIDCWellKnownProviderTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/OIDCWellKnownProviderTest.java
+index 74d015c96e10..2838662ddddf 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/OIDCWellKnownProviderTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/OIDCWellKnownProviderTest.java
+@@ -17,7 +17,20 @@
+ 
+ package org.keycloak.testsuite.oidc;
+ 
++import java.net.URI;
++
++import jakarta.ws.rs.client.Client;
++import jakarta.ws.rs.core.Response;
++import jakarta.ws.rs.core.UriBuilder;
++
+ import org.keycloak.protocol.oidc.OIDCWellKnownProviderFactory;
++import org.keycloak.services.resources.ServerMetadataResource;
++import org.keycloak.testsuite.util.AdminClientUtil;
++import org.keycloak.testsuite.util.oauth.OAuthClient;
++
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
+ 
+ /**
+  * @author <a href="mailto:mposolda@redhat.com">Marek Posolda</a>
+@@ -28,4 +41,21 @@ protected String getWellKnownProviderId() {
+         return OIDCWellKnownProviderFactory.PROVIDER_ID;
+     }
+ 
++    /**
++     * Ensures that the OpenID Connect configuration is not exposed by default via the server metadata
++     * root endpoint. This test verifies that accessing the `.well-known/openid-configuration`
++     * endpoint results in an HTTP 404 response, indicating the resource is not available.
++     */
++    @Test
++    public void openIdConfigurationShouldNotBeExposedViaServerMetadataRoot() {
++
++        UriBuilder builder = UriBuilder.fromUri(OAuthClient.AUTH_SERVER_ROOT);
++        URI serverMetadataWellKnownUri = ServerMetadataResource.wellKnownProviderUrl(builder).build(getWellKnownProviderId(), "test");
++
++        try (Client client = AdminClientUtil.createResteasyClient()) {
++            try (Response response = client.target(serverMetadataWellKnownUri).request().get()) {
++                assertEquals(404, response.getStatus());
++            }
++        }
++    }
+ }

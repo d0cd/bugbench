@@ -1,0 +1,1290 @@
+diff --git a/src/sentry/api/bases/organization.py b/src/sentry/api/bases/organization.py
+index 5cd5c832021407..2eb871a405b60d 100644
+--- a/src/sentry/api/bases/organization.py
++++ b/src/sentry/api/bases/organization.py
+@@ -34,7 +34,12 @@
+     RpcUserOrganizationContext,
+     organization_service,
+ )
+-from sentry.types.region import subdomain_is_region
++
++# TODO(cells): Temporarily imported for getsentry tests
++from sentry.types.region import (
++    subdomain_is_locality,
++    subdomain_is_region,  # noqa
++)
+ from sentry.utils import auth
+ from sentry.utils.hashlib import hash_values
+ from sentry.utils.numbers import format_grouped_length
+@@ -275,7 +280,7 @@ def convert_args(
+         if not organization_id_or_slug:
+             raise ResourceDoesNotExist
+ 
+-        if not subdomain_is_region(request):
++        if not subdomain_is_locality(request):
+             subdomain = getattr(request, "subdomain", None)
+             if subdomain is not None and subdomain != organization_id_or_slug:
+                 raise ResourceDoesNotExist
+@@ -612,7 +617,7 @@ def convert_args(
+         if not organization_id_or_slug:
+             raise ResourceDoesNotExist
+ 
+-        if not subdomain_is_region(request):
++        if not subdomain_is_locality(request):
+             subdomain = getattr(request, "subdomain", None)
+             if subdomain is not None and subdomain != organization_id_or_slug:
+                 raise ResourceDoesNotExist
+diff --git a/src/sentry/integrations/claude_code/integration.py b/src/sentry/integrations/claude_code/integration.py
+index 454841aa519855..c0311fc7a0c427 100644
+--- a/src/sentry/integrations/claude_code/integration.py
++++ b/src/sentry/integrations/claude_code/integration.py
+@@ -76,6 +76,8 @@ class ClaudeCodeIntegrationMetadata(BaseModel):
+     domain_name: Literal["anthropic.com"] = "anthropic.com"
+     environment_id: str | None = None
+     workspace_name: str | None = None
++    agent_id: str | None = None
++    agent_version: str | None = None
+ 
+ 
+ metadata = IntegrationMetadata(
+@@ -335,31 +337,35 @@ def get_client(self) -> Any:
+             api_key=metadata.api_key,
+             environment_id=metadata.environment_id,
+             workspace_name=metadata.workspace_name,
++            agent_id=metadata.agent_id,
++            agent_version=metadata.agent_version,
+         )
+ 
+     def launch(self, request: CodingAgentLaunchRequest) -> CodingAgentState:
+-        """Launch coding agent and persist the resolved environment ID."""
++        """Launch coding agent and persist resolved environment/agent IDs."""
+         webhook_url = self.get_webhook_url()
+         client = self.get_client()
+ 
+         state = client.launch(webhook_url=webhook_url, request=request)
+         state.integration_id = self.model.id
+ 
+-        if client.environment_id and client.environment_id != self.environment_id:
+-            self.update_environment_id(client.environment_id)
++        metadata = self._get_metadata()
++        metadata_changed = False
++
++        if client.environment_id and client.environment_id != metadata.environment_id:
++            metadata.environment_id = client.environment_id
++            metadata_changed = True
++
++        if client.agent_id and client.agent_id != metadata.agent_id:
++            metadata.agent_id = client.agent_id
++            metadata.agent_version = client.agent_version
++            metadata_changed = True
++
++        if metadata_changed:
++            self._persist_metadata(metadata)
+ 
+         return state
+ 
+     @property
+     def api_key(self) -> str:
+         return self._get_metadata().api_key
+-
+-    @property
+-    def environment_id(self) -> str | None:
+-        return self._get_metadata().environment_id
+-
+-    def update_environment_id(self, environment_id: str) -> None:
+-        """Update the stored environment ID for this integration."""
+-        metadata = self._get_metadata()
+-        metadata.environment_id = environment_id
+-        self._persist_metadata(metadata)
+diff --git a/src/sentry/integrations/claude_code/utils.py b/src/sentry/integrations/claude_code/utils.py
+index 998df1bad4e195..17583bdae0e87e 100644
+--- a/src/sentry/integrations/claude_code/utils.py
++++ b/src/sentry/integrations/claude_code/utils.py
+@@ -2,11 +2,23 @@
+ Utility functions for Claude Code Agent integration.
+ """
+ 
++from datetime import datetime
+ from enum import StrEnum
+ 
++from pydantic import BaseModel
+ 
+-class ClaudeSessionStatus(StrEnum):
+-    PENDING = "pending"
+-    RUNNING = "running"
+-    IDLE = "idle"
+-    CLOSED = "closed"
++
++class ClaudeSessionEventStatus(StrEnum):
++    PENDING = "status_pending"
++    RUNNING = "status_running"
++    IDLE = "status_idle"
++    CLOSED = "status_closed"
++
++
++class ClaudeSessionEvent(BaseModel):
++    id: str | None = None
++    type: str
++    processed_at: datetime | None = None
++
++    class Config:
++        extra = "allow"
+diff --git a/src/sentry/integrations/cursor/webhooks/handler.py b/src/sentry/integrations/cursor/webhooks/handler.py
+index d411dbfcafa4e1..0df1f2e9964bb6 100644
+--- a/src/sentry/integrations/cursor/webhooks/handler.py
++++ b/src/sentry/integrations/cursor/webhooks/handler.py
+@@ -26,7 +26,6 @@
+     CodingAgentStatus,
+     update_coding_agent_state,
+ )
+-from sentry.seer.models import SeerApiError
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -232,26 +231,17 @@ def _update_coding_agent_status(
+         agent_url: str | None = None,
+         result: CodingAgentResult | None = None,
+     ):
+-        try:
+-            update_coding_agent_state(
+-                agent_id=agent_id,
+-                status=status,
+-                agent_url=agent_url,
+-                result=result,
+-            )
+-            logger.info(
+-                "cursor_webhook.status_updated_to_seer",
+-                extra={
+-                    "agent_id": agent_id,
+-                    "status": status.value,
+-                    "has_result": result is not None,
+-                },
+-            )
+-        except SeerApiError:
+-            logger.warning(
+-                "cursor_webhook.seer_update_error",
+-                extra={
+-                    "agent_id": agent_id,
+-                    "status": status.value,
+-                },
+-            )
++        update_coding_agent_state(
++            agent_id=agent_id,
++            status=status,
++            agent_url=agent_url,
++            result=result,
++        )
++        logger.info(
++            "cursor_webhook.status_updated_to_seer",
++            extra={
++                "agent_id": agent_id,
++                "status": status.value,
++                "has_result": result is not None,
++            },
++        )
+diff --git a/src/sentry/middleware/customer_domain.py b/src/sentry/middleware/customer_domain.py
+index bc0de539a98136..6ce410e40cdf86 100644
+--- a/src/sentry/middleware/customer_domain.py
++++ b/src/sentry/middleware/customer_domain.py
+@@ -13,7 +13,7 @@
+ from sentry import features
+ from sentry.organizations.absolute_url import generate_organization_url
+ from sentry.organizations.services.organization import organization_service
+-from sentry.types.region import subdomain_is_region
++from sentry.types.region import subdomain_is_locality
+ from sentry.utils import auth
+ from sentry.utils.http import absolute_uri
+ 
+@@ -93,7 +93,7 @@ def __call__(self, request: HttpRequest) -> HttpResponseBase:
+         ):
+             return self.get_response(request)
+         subdomain = request.subdomain
+-        if subdomain is None or subdomain_is_region(request):
++        if subdomain is None or subdomain_is_locality(request):
+             return self.get_response(request)
+ 
+         if (
+diff --git a/src/sentry/seer/autofix/coding_agent.py b/src/sentry/seer/autofix/coding_agent.py
+index 0d6ff62ee28173..35975fdee6ad9a 100644
+--- a/src/sentry/seer/autofix/coding_agent.py
++++ b/src/sentry/seer/autofix/coding_agent.py
+@@ -1,13 +1,14 @@
+ from __future__ import annotations
+ 
+ import logging
++import re
+ import secrets
+ import string
+ from typing import Any
+ 
+ import sentry_sdk
+ from django.conf import settings as django_settings
+-from requests import HTTPError, RequestException
++from requests import HTTPError
+ from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
+ 
+ from sentry import features
+@@ -15,6 +16,7 @@
+ from sentry.integrations.claude_code.integration import (
+     ClaudeCodeIntegrationMetadata,
+ )
++from sentry.integrations.claude_code.utils import ClaudeSessionEvent, ClaudeSessionEventStatus
+ from sentry.integrations.coding_agent.client import CodingAgentClient
+ from sentry.integrations.coding_agent.integration import CodingAgentIntegration
+ from sentry.integrations.coding_agent.models import CodingAgentLaunchRequest
+@@ -641,43 +643,50 @@ def poll_claude_agent(clients, agent_id, org_id, agent_state: CodingAgentState)
+     if not client:
+         return
+ 
+-    claude_status, new_status = get_claude_session_status(client, agent_id)
+-    if new_status is None:
++    # Fetch all events — the API returns events in chronological order,
++    # so the last element is the most recent event.
++    raw_events = client.list_session_events(agent_id)
++    if not raw_events:
+         return
+ 
+-    # If session went idle, check if the last tool call received a result.
+-    # A missing tool result means the agent stalled (e.g., permission blocked).
+-    if new_status == CodingAgentStatus.COMPLETED:
+-        new_status = check_for_tool_failure(client, agent_id)
++    all_events = [ClaudeSessionEvent.parse_obj(e) for e in raw_events]
++    last_event_type = all_events[-1].type
+ 
+-    result = None
+-    if new_status in (CodingAgentStatus.COMPLETED, CodingAgentStatus.FAILED):
+-        result, new_status = build_result_from_session(
+-            client, agent_id, agent_state.name, new_status
++    if (
++        last_event_type == ClaudeSessionEventStatus.IDLE
++        or last_event_type == ClaudeSessionEventStatus.CLOSED
++    ):
++        new_status = CodingAgentStatus.COMPLETED
++
++        result, new_status = build_result_from_events(
++            all_events, client, agent_id, agent_state.name, new_status
+         )
+ 
+-    if new_status != agent_state.status:
+-        try:
++        if new_status != agent_state.status:
+             update_coding_agent_state(
+                 agent_id=agent_id,
+                 status=new_status,
+                 result=result,
+             )
+-        except Exception:
+-            logger.exception(
+-                "coding_agent.claude_code.state_update_error",
+-                extra={"agent_id": agent_id},
+-            )
+ 
+-    logger.info(
+-        "coding_agent.claude_code.poll_update",
+-        extra={
+-            "agent_id": agent_id,
+-            "claude_status": claude_status,
+-            "new_status": new_status.value,
+-            "pr_url": result.pr_url if result else None,
+-        },
+-    )
++        logger.info(
++            "coding_agent.claude_code.poll_update",
++            extra={
++                "agent_id": agent_id,
++                "last_event_type": last_event_type,
++                "new_status": new_status.value,
++                "pr_url": result.pr_url if result else None,
++            },
++        )
++
++    elif last_event_type == ClaudeSessionEventStatus.PENDING:
++        if agent_state.status != CodingAgentStatus.PENDING:
++            update_coding_agent_state(agent_id=agent_id, status=CodingAgentStatus.PENDING)
++
++    else:
++        # Any other event (status_running, agent, tool_result, etc.) means active.
++        if agent_state.status != CodingAgentStatus.RUNNING:
++            update_coding_agent_state(agent_id=agent_id, status=CodingAgentStatus.RUNNING)
+ 
+ 
+ def get_claude_code_client(clients, agent_id, org_id, integration_id: int | None) -> Any | None:
+@@ -724,65 +733,38 @@ def get_claude_code_client(clients, agent_id, org_id, integration_id: int | None
+     return client
+ 
+ 
+-def check_for_tool_failure(client, agent_id) -> CodingAgentStatus:
+-    events = client.list_session_events(agent_id)
+-    last_tool_use = None
+-    has_tool_result = False
+-    for event in events:
+-        event_type = event.get("type")
+-        if event_type == "agent":
+-            for block in event.get("content", []):
+-                if isinstance(block, dict) and block.get("type") == "tool_use":
+-                    last_tool_use = block.get("id")
+-                    has_tool_result = False
+-        elif event_type == "tool_result":
+-            if event.get("tool_use_id") == last_tool_use:
+-                has_tool_result = True
+-
+-    if last_tool_use and not has_tool_result:
+-        logger.warning(
+-            "coding_agent.claude_code.idle_missing_tool_result",
+-            extra={
+-                "agent_id": agent_id,
+-                "last_tool_use_id": last_tool_use,
+-            },
+-        )
+-        return CodingAgentStatus.FAILED
+-
+-    return CodingAgentStatus.COMPLETED
+-
+-
+-def get_claude_session_status(client, agent_id) -> tuple[str | None, CodingAgentStatus | None]:
+-    try:
+-        session_status = client.get_session_status(agent_id)
+-    except RequestException:
+-        return (None, None)
+-
+-    claude_status = session_status.status
+-    new_status = CodingAgentStatus.from_claude_code_status(claude_status)
++def extract_result_url_from_events(events: list[ClaudeSessionEvent]) -> str | None:
++    """Extract a GitHub PR or branch URL from session events."""
++    pr_pattern = re.compile(r"https://github\.com/[^/]+/[^/]+/pull/\d+")
++    branch_pattern = re.compile(r"https://github\.com/[^/]+/[^/]+/tree/[-\w./]*[-\w]")
+ 
+-    logger.info(
+-        "coding_agent.claude_code.session_status_details",
+-        extra={
+-            "agent_id": agent_id,
+-            "claude_status": claude_status,
+-            "session_result": session_status.result,
+-            "raw_status_response": str(session_status),
+-        },
+-    )
+-    return claude_status, new_status
+-
+-
+-def build_result_from_session(
+-    client, agent_id, agent_name, new_status: CodingAgentStatus
++    for event in reversed(events):
++        if event.type != "agent":
++            continue
++        for block in getattr(event, "content", []):
++            if isinstance(block, dict) and block.get("type") == "text":
++                text = block.get("text", "")
++                pr_match = pr_pattern.search(text)
++                if pr_match:
++                    return pr_match.group(0)
++                branch_match = branch_pattern.search(text)
++                if branch_match:
++                    return branch_match.group(0)
++
++    return None
++
++
++def build_result_from_events(
++    events: list[ClaudeSessionEvent],
++    client: Any,
++    agent_id: str,
++    agent_name: str,
++    new_status: CodingAgentStatus,
+ ) -> tuple[Any | None, CodingAgentStatus]:
+     result = None
+     pr_url = None
+     if new_status == CodingAgentStatus.COMPLETED:
+-        try:
+-            pr_url = client.extract_result_url_from_events(agent_id)
+-        except Exception:
+-            pass
++        pr_url = extract_result_url_from_events(events)
+         if not pr_url:
+             logger.warning(
+                 "coding_agent.claude_code.no_result_url_in_response",
+diff --git a/src/sentry/seer/autofix/utils.py b/src/sentry/seer/autofix/utils.py
+index 43e992cff526a9..646b9079ed5d6d 100644
+--- a/src/sentry/seer/autofix/utils.py
++++ b/src/sentry/seer/autofix/utils.py
+@@ -13,7 +13,6 @@
+ 
+ from sentry import features, options, ratelimits
+ from sentry.constants import DataCategory
+-from sentry.integrations.claude_code.utils import ClaudeSessionStatus
+ from sentry.issues.auto_source_code_config.code_mapping import (
+     get_sorted_code_mapping_configs,
+ )
+@@ -82,20 +81,6 @@ def from_cursor_status(cls, cursor_status: str) -> "CodingAgentStatus | None":
+ 
+         return status_mapping.get(cursor_status.upper(), None)
+ 
+-    @classmethod
+-    def from_claude_code_status(cls, claude_code_status: str) -> "CodingAgentStatus":
+-        status_mapping = {
+-            ClaudeSessionStatus.PENDING: cls.PENDING,
+-            ClaudeSessionStatus.RUNNING: cls.RUNNING,
+-            ClaudeSessionStatus.IDLE: cls.COMPLETED,
+-            ClaudeSessionStatus.CLOSED: cls.COMPLETED,
+-        }
+-        try:
+-            status = ClaudeSessionStatus(claude_code_status.lower())
+-        except ValueError:
+-            return cls.RUNNING
+-        return status_mapping[status]
+-
+ 
+ class AutofixTriggerSource(StrEnum):
+     ROOT_CAUSE = "root_cause"
+@@ -852,7 +837,8 @@ def update_coding_agent_state(
+ ) -> None:
+     """Send coding agent state update to Seer.
+ 
+-    Raises SeerApiError for non-2xx responses.
++    Errors are logged and swallowed so that callers iterating over
++    multiple agents are never interrupted by a single failed update.
+     """
+     updates = CodingAgentStateUpdate(
+         status=status,
+@@ -865,7 +851,21 @@ def update_coding_agent_state(
+         updates=updates,
+     )
+ 
+-    response = make_update_coding_agent_state_request(update_data, timeout=30)
++    try:
++        response = make_update_coding_agent_state_request(update_data, timeout=30)
++    except Exception:
++        logger.exception(
++            "coding_agent.state_update_error",
++            extra={"agent_id": agent_id},
++        )
++        return
+ 
+     if response.status >= 400:
+-        raise SeerApiError(response.data.decode("utf-8"), response.status)
++        logger.error(
++            "coding_agent.seer_update_error",
++            extra={
++                "agent_id": agent_id,
++                "status_code": response.status,
++                "response": response.data.decode("utf-8"),
++            },
++        )
+diff --git a/src/sentry/seer/explorer/tools.py b/src/sentry/seer/explorer/tools.py
+index d70a76958779ad..8cb723641fdfb1 100644
+--- a/src/sentry/seer/explorer/tools.py
++++ b/src/sentry/seer/explorer/tools.py
+@@ -1168,6 +1168,8 @@ def get_issue_details(
+         "timeseries_interval": timeseries_interval,
+         "tags_overview": tags_overview,
+         "user_activity": serialized_activities,
++        "project_id": group.project_id,
++        "project_slug": group.project.slug,
+     }
+ 
+ 
+diff --git a/src/sentry/types/region.py b/src/sentry/types/region.py
+index 953a71d5b685da..89c95e7052a4f2 100644
+--- a/src/sentry/types/region.py
++++ b/src/sentry/types/region.py
+@@ -347,15 +347,21 @@ def get_locality_by_name(name: str) -> Locality:
+         )
+ 
+ 
+-def is_region_name(name: str) -> bool:
+-    return get_global_directory().get_cell_by_name(name) is not None
++def subdomain_is_locality(request: HttpRequest) -> bool:
++    """Check whether the request's subdomain is a locality name.
+ 
+-
+-def subdomain_is_region(request: HttpRequest) -> bool:
++    Locality subdomains (e.g. "us.sentry.io", "de.sentry.io") are reserved for
++    infrastructure routing and must not be treated as organization slugs. Returns
++    False when there is no subdomain or when it does not match any known locality.
++    """
+     subdomain = getattr(request, "subdomain", None)
+     if subdomain is None:
+         return False
+-    return is_region_name(subdomain)
++    return get_global_directory().get_locality_by_name(subdomain) is not None
++
++
++# TODO(cells): Remove alias once getsentry import sites are updated
++subdomain_is_region = subdomain_is_locality
+ 
+ 
+ @control_silo_function
+diff --git a/src/sentry/web/frontend/base.py b/src/sentry/web/frontend/base.py
+index 292ebade1ea1d8..495fc5089219b4 100644
+--- a/src/sentry/web/frontend/base.py
++++ b/src/sentry/web/frontend/base.py
+@@ -43,7 +43,7 @@
+     organization_service,
+ )
+ from sentry.silo.base import SiloLimit, SiloMode
+-from sentry.types.region import subdomain_is_region
++from sentry.types.region import subdomain_is_locality
+ from sentry.users.services.user.service import user_service
+ from sentry.utils import auth
+ from sentry.utils.audit import create_audit_entry
+@@ -393,7 +393,7 @@ def dispatch(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpRespo
+ 
+         """
+         organization_slug = kwargs.get("organization_slug", None)
+-        if request and is_using_customer_domain(request) and not subdomain_is_region(request):
++        if request and is_using_customer_domain(request) and not subdomain_is_locality(request):
+             organization_slug = request.subdomain
+         self.active_organization = determine_active_organization(request, organization_slug)
+ 
+diff --git a/src/sentry/web/frontend/react_page.py b/src/sentry/web/frontend/react_page.py
+index c2982df987fde0..edb7d35624bd2d 100644
+--- a/src/sentry/web/frontend/react_page.py
++++ b/src/sentry/web/frontend/react_page.py
+@@ -18,7 +18,7 @@
+ from sentry.silo.base import SiloMode
+ from sentry.types.region import (
+     find_all_multitenant_locality_names,
+-    subdomain_is_region,
++    subdomain_is_locality,
+ )
+ from sentry.utils.http import is_using_customer_domain, query_string
+ from sentry.web.client_config import get_client_config
+@@ -134,7 +134,7 @@ def handle_react(
+             return HttpResponseRedirect(redirect_url)
+ 
+         # We don't allow HTML pages to be served from region domains.
+-        if request.subdomain and subdomain_is_region(request):
++        if request.subdomain and subdomain_is_locality(request):
+             redirect_url = resolve_activeorg_redirect_url(request)
+             if redirect_url:
+                 logger.info(
+diff --git a/src/sentry/workflow_engine/receivers/detector_workflow.py b/src/sentry/workflow_engine/receivers/detector_workflow.py
+index 69402b317ce7f6..ea589f9b74b3c8 100644
+--- a/src/sentry/workflow_engine/receivers/detector_workflow.py
++++ b/src/sentry/workflow_engine/receivers/detector_workflow.py
+@@ -4,8 +4,8 @@
+ from django.db.models.signals import pre_delete, pre_save
+ from django.dispatch import receiver
+ 
+-from sentry.workflow_engine.caches.workflow import invalidate_processing_workflows
+-from sentry.workflow_engine.models import DetectorWorkflow
++from sentry.workflow_engine.caches.workflow import DEFAULT_VALUE, invalidate_processing_workflows
++from sentry.workflow_engine.models import DetectorWorkflow, Workflow
+ 
+ 
+ @receiver(pre_save, sender=DetectorWorkflow)
+@@ -28,6 +28,7 @@ def invalidate_processing_workflows_cache_pre(
+     # If updating an existing instance, also need to invalidate old relationship
+     old_detector_id = None
+     old_env_id = None
++
+     if instance.pk is not None:
+         try:
+             # This lookup trade-off is okay, because we rarely update these relationships
+@@ -56,7 +57,13 @@ def invalidate_processing_workflows_cache_delete_relationship(
+     Uses transaction.on_commit to ensure invalidation happens after DB commit.
+     """
+     detector_id = instance.detector_id
+-    env_id = instance.workflow.environment_id
++
++    # If we don't have a workflow (e.g., during cascade delete), we should
++    # invalidate all environments related to the detector
++    try:
++        env_id = instance.workflow.environment_id
++    except Workflow.DoesNotExist:
++        env_id = DEFAULT_VALUE
+ 
+     transaction.on_commit(
+         lambda: invalidate_processing_workflows(detector_id, env_id),
+diff --git a/static/app/views/dashboards/widgetCard/index.tsx b/static/app/views/dashboards/widgetCard/index.tsx
+index e4195c52462c83..d36ded6fa00f7a 100644
+--- a/static/app/views/dashboards/widgetCard/index.tsx
++++ b/static/app/views/dashboards/widgetCard/index.tsx
+@@ -2,11 +2,16 @@ import {useEffect, useMemo, useRef, useState} from 'react';
+ import styled from '@emotion/styled';
+ import type {LegendComponentOption} from 'echarts';
+ import type {Location} from 'history';
++import omit from 'lodash/omit';
+ 
++import {openWidgetViewerModal} from 'sentry/actionCreators/modal';
+ import type {Client} from 'sentry/api';
+ import {DateTime} from 'sentry/components/dateTime';
+ import ErrorBoundary from 'sentry/components/errorBoundary';
+-import {isWidgetViewerPath} from 'sentry/components/modals/widgetViewerModal/utils';
++import {
++  isWidgetViewerPath,
++  WidgetViewerQueryField,
++} from 'sentry/components/modals/widgetViewerModal/utils';
+ import usePageFilters from 'sentry/components/pageFilters/usePageFilters';
+ import PanelAlert from 'sentry/components/panels/panelAlert';
+ import Placeholder from 'sentry/components/placeholder';
+@@ -234,7 +239,10 @@ function WidgetCard(props: Props) {
+   }, [timeoutRef]);
+ 
+   const onFullScreenViewClick = () => {
+-    if (!isWidgetViewerPath(location.pathname)) {
++    if (isWidgetViewerPath(location.pathname)) {
++      return;
++    }
++    if (currentDashboardId) {
+       navigate(
+         normalizeUrl({
+           pathname: `/organizations/${organization.slug}/dashboard/${currentDashboardId}/widget/${props.index}/`,
+@@ -248,6 +256,22 @@ function WidgetCard(props: Props) {
+         }),
+         {preventScrollReset: true}
+       );
++    } else {
++      openWidgetViewerModal({
++        organization,
++        widget,
++        widgetLegendState,
++        dashboardFilters,
++        widgetInterval,
++        onClose: () => {
++          // Filter out Widget Viewer Modal query params when exiting the Modal
++          const query = omit(location.query, Object.values(WidgetViewerQueryField));
++          navigate(
++            {pathname: location.pathname, query},
++            {preventScrollReset: true, replace: true}
++          );
++        },
++      });
+     }
+   };
+ 
+@@ -320,13 +344,7 @@ function WidgetCard(props: Props) {
+             actionsMessage={actionsMessage}
+             actions={actions}
+             noVisualizationPadding={canUseTimeseriesVisualization}
+-            onFullScreenViewClick={
+-              disableFullscreen
+-                ? undefined
+-                : currentDashboardId
+-                  ? onFullScreenViewClick
+-                  : undefined
+-            }
++            onFullScreenViewClick={disableFullscreen ? undefined : onFullScreenViewClick}
+             borderless={props.borderless}
+             revealTooltip={props.forceDescriptionTooltip ? 'always' : undefined}
+           >
+@@ -369,13 +387,7 @@ function WidgetCard(props: Props) {
+           error={widgetQueryError}
+           actionsMessage={actionsMessage}
+           actions={actions}
+-          onFullScreenViewClick={
+-            disableFullscreen
+-              ? undefined
+-              : currentDashboardId
+-                ? onFullScreenViewClick
+-                : undefined
+-          }
++          onFullScreenViewClick={disableFullscreen ? undefined : onFullScreenViewClick}
+           borderless={props.borderless}
+           revealTooltip={props.forceDescriptionTooltip ? 'always' : undefined}
+           noVisualizationPadding
+diff --git a/tests/sentry/api/test_base.py b/tests/sentry/api/test_base.py
+index b62ee4251ab1b2..30d34d967fc3e3 100644
+--- a/tests/sentry/api/test_base.py
++++ b/tests/sentry/api/test_base.py
+@@ -23,7 +23,7 @@
+ from sentry.testutils.helpers.response import close_streaming_response, is_streaming_response
+ from sentry.testutils.outbox import outbox_runner
+ from sentry.testutils.silo import all_silo_test, assume_test_silo_mode, create_test_regions
+-from sentry.types.region import subdomain_is_region
++from sentry.types.region import subdomain_is_locality
+ from sentry.utils.cursors import Cursor
+ from sentry.utils.security.orgauthtoken_token import generate_token, hash_token
+ 
+@@ -513,7 +513,7 @@ def test_resolve_region(self) -> None:
+         def request_with_subdomain(subdomain):
+             request = self.make_request(method="GET")
+             request.subdomain = subdomain
+-            return subdomain_is_region(request)
++            return subdomain_is_locality(request)
+ 
+         assert request_with_subdomain("us")
+         assert request_with_subdomain("eu")
+diff --git a/tests/sentry/integrations/claude_code/test_integration.py b/tests/sentry/integrations/claude_code/test_integration.py
+index 743dcc2c56d632..03de5ed65476c0 100644
+--- a/tests/sentry/integrations/claude_code/test_integration.py
++++ b/tests/sentry/integrations/claude_code/test_integration.py
+@@ -86,6 +86,8 @@ def test_build_integration(self):
+         assert metadata["domain_name"] == "anthropic.com"
+         assert metadata["environment_id"] is None
+         assert metadata["workspace_name"] is None
++        assert metadata["agent_id"] is None
++        assert metadata["agent_version"] is None
+ 
+     def test_build_integration_with_environment_and_workspace(self):
+         mock_cls, _ = _mock_client_class()
+@@ -158,6 +160,8 @@ def test_get_client(self):
+             api_key="sk-ant-test-api-key-123",
+             environment_id=None,
+             workspace_name=None,
++            agent_id=None,
++            agent_version=None,
+         )
+ 
+     def test_get_client_with_environment_and_workspace(self):
+@@ -169,6 +173,8 @@ def test_get_client_with_environment_and_workspace(self):
+             metadata=self._make_metadata(
+                 environment_id="env-456",
+                 workspace_name="my-ws",
++                agent_id="agent-123",
++                agent_version="v1",
+             ),
+         )
+         installation = integration.get_installation(organization_id=self.organization.id)
+@@ -181,6 +187,8 @@ def test_get_client_with_environment_and_workspace(self):
+             api_key="sk-ant-test-api-key-123",
+             environment_id="env-456",
+             workspace_name="my-ws",
++            agent_id="agent-123",
++            agent_version="v1",
+         )
+ 
+     def test_get_client_class_not_configured(self):
+@@ -199,11 +207,11 @@ def test_property_getters(self):
+         )
+ 
+         assert installation.api_key == "sk-ant-prop-key"
+-        assert installation.environment_id == "env-prop-123"
++        assert installation.model.metadata["environment_id"] == "env-prop-123"
+ 
+     def test_environment_id_defaults_to_none(self):
+         installation = self._create_installation()
+-        assert installation.environment_id is None
++        assert installation.model.metadata.get("environment_id") is None
+ 
+     # ── update_organization_config ───────────────────────────────────
+ 
+@@ -231,17 +239,6 @@ def test_update_organization_config_clears_workspace_name(self):
+ 
+         assert installation.model.metadata["workspace_name"] is None
+ 
+-    # ── update_environment_id ────────────────────────────────────────
+-
+-    def test_update_environment_id(self):
+-        installation = self._create_installation(api_key="sk-ant-test-key")
+-        assert installation.environment_id is None
+-
+-        installation.update_environment_id("env-new-789")
+-
+-        assert installation.model.metadata["environment_id"] == "env-new-789"
+-        assert installation.model.metadata["api_key"] == "sk-ant-test-key"
+-
+     # ── get_config_data ──────────────────────────────────────────────
+ 
+     def test_get_config_data(self):
+@@ -263,14 +260,24 @@ def test_get_config_data_defaults_to_empty_strings(self):
+ 
+     # ── launch ───────────────────────────────────────────────────────
+ 
+-    def _setup_launch(self, environment_id=None, client_environment_id=None):
+-        """Set up mocks for launch tests. Returns (installation, mock_client)."""
++    def _setup_launch(
++        self,
++        environment_id=None,
++        client_environment_id=None,
++        agent_id=None,
++        agent_version=None,
++        client_agent_id=None,
++        client_agent_version=None,
++    ):
++        """Set up mocks for launch tests. Returns (installation, mock_client, mock_cls, request)."""
+         from sentry.integrations.coding_agent.models import CodingAgentLaunchRequest
+         from sentry.seer.autofix.utils import CodingAgentProviderType, CodingAgentStatus
+         from sentry.seer.models import SeerRepoDefinition
+ 
+         mock_cls, mock_client = _mock_client_class()
+         mock_client.environment_id = client_environment_id
++        mock_client.agent_id = client_agent_id
++        mock_client.agent_version = client_agent_version
+ 
+         mock_state = MagicMock()
+         mock_state.id = "session-456"
+@@ -279,9 +286,13 @@ def _setup_launch(self, environment_id=None, client_environment_id=None):
+         mock_state.name = "testorg/testrepo"
+         mock_client.launch.return_value = mock_state
+ 
+-        metadata_kwargs = {"api_key": "sk-ant-test-key"}
++        metadata_kwargs: dict[str, Any] = {"api_key": "sk-ant-test-key"}
+         if environment_id is not None:
+             metadata_kwargs["environment_id"] = environment_id
++        if agent_id is not None:
++            metadata_kwargs["agent_id"] = agent_id
++        if agent_version is not None:
++            metadata_kwargs["agent_version"] = agent_version
+ 
+         integration = self.create_integration(
+             organization=self.organization,
+@@ -337,28 +348,67 @@ def test_launch_updates_environment_id_when_changed(self):
+ 
+         assert installation.model.metadata["environment_id"] == "env-resolved-123"
+ 
+-    def test_launch_does_not_update_environment_id_when_unchanged(self):
+-        """When client.environment_id matches the stored one, no update should happen."""
++    def test_launch_does_not_update_metadata_when_unchanged(self):
++        """When client IDs match stored ones, metadata should not be persisted."""
+         installation, mock_client, mock_cls, request = self._setup_launch(
+             environment_id="env-same",
+             client_environment_id="env-same",
++            agent_id="agent-same",
++            agent_version="v-same",
++            client_agent_id="agent-same",
++            client_agent_version="v-same",
+         )
+ 
+         with patch(MOCK_GET_CLIENT_CLASS, return_value=mock_cls):
+-            with patch.object(installation, "update_environment_id") as mock_update:
++            with patch.object(installation, "_persist_metadata") as mock_persist:
+                 installation.launch(request=request)
+ 
+-        mock_update.assert_not_called()
++        mock_persist.assert_not_called()
+ 
+-    def test_launch_does_not_update_when_client_has_no_environment_id(self):
+-        """When client.environment_id is None, no update should happen."""
++    def test_launch_does_not_update_when_client_has_no_ids(self):
++        """When client IDs are None, no update should happen."""
+         installation, mock_client, mock_cls, request = self._setup_launch(
+             environment_id="env-existing",
+             client_environment_id=None,
++            agent_id="agent-existing",
++            agent_version="v-existing",
++            client_agent_id=None,
++            client_agent_version=None,
+         )
+ 
+         with patch(MOCK_GET_CLIENT_CLASS, return_value=mock_cls):
+-            with patch.object(installation, "update_environment_id") as mock_update:
++            with patch.object(installation, "_persist_metadata") as mock_persist:
+                 installation.launch(request=request)
+ 
+-        mock_update.assert_not_called()
++        mock_persist.assert_not_called()
++
++    def test_launch_updates_agent_id_when_changed(self):
++        """When the client resolves a new agent, it should be persisted."""
++        installation, mock_client, mock_cls, request = self._setup_launch(
++            agent_id=None,
++            client_agent_id="agent-new-123",
++            client_agent_version="v-new",
++        )
++
++        with patch(MOCK_GET_CLIENT_CLASS, return_value=mock_cls):
++            installation.launch(request=request)
++
++        assert installation.model.metadata["agent_id"] == "agent-new-123"
++        assert installation.model.metadata["agent_version"] == "v-new"
++
++    def test_launch_updates_both_environment_and_agent_when_changed(self):
++        """When both IDs change, both should be persisted in a single update."""
++        installation, mock_client, mock_cls, request = self._setup_launch(
++            environment_id=None,
++            client_environment_id="env-new",
++            agent_id=None,
++            client_agent_id="agent-new",
++            client_agent_version="v-new",
++        )
++
++        with patch(MOCK_GET_CLIENT_CLASS, return_value=mock_cls):
++            installation.launch(request=request)
++
++        assert installation.model.metadata["environment_id"] == "env-new"
++        assert installation.model.metadata["agent_id"] == "agent-new"
++        assert installation.model.metadata["agent_version"] == "v-new"
+diff --git a/tests/sentry/integrations/cursor/test_webhook.py b/tests/sentry/integrations/cursor/test_webhook.py
+index 6abcf94b3ea287..aa0937174111fb 100644
+--- a/tests/sentry/integrations/cursor/test_webhook.py
++++ b/tests/sentry/integrations/cursor/test_webhook.py
+@@ -214,16 +214,3 @@ def test_signature_without_prefix(self, mock_update_state):
+ 
+         response = self._post_with_headers(body, headers)
+         assert response.status_code == 204
+-
+-    @patch("sentry.integrations.cursor.webhooks.handler.update_coding_agent_state")
+-    def test_seer_api_error_is_caught(self, mock_update_state):
+-        from sentry.seer.models import SeerApiError
+-
+-        mock_update_state.side_effect = SeerApiError("boom", status=500)
+-        payload = self._build_status_payload(status="FINISHED")
+-        body = orjson.dumps(payload)
+-        headers = self._signed_headers(body)
+-
+-        response = self._post_with_headers(body, headers)
+-        assert response.status_code == 204
+-        # Even with exception, endpoint must not raise
+diff --git a/tests/sentry/seer/autofix/test_coding_agent.py b/tests/sentry/seer/autofix/test_coding_agent.py
+index 14bfae95a932e6..2487e7a37c3df0 100644
+--- a/tests/sentry/seer/autofix/test_coding_agent.py
++++ b/tests/sentry/seer/autofix/test_coding_agent.py
+@@ -1,8 +1,7 @@
+ from datetime import UTC, datetime
+ from unittest.mock import MagicMock, patch
+ 
+-from requests import HTTPError
+-
++from sentry.integrations.claude_code.utils import ClaudeSessionEvent
+ from sentry.integrations.cursor.integration import CursorAgentIntegration
+ from sentry.integrations.github_copilot.models import (
+     GithubCopilotArtifact,
+@@ -11,6 +10,7 @@
+ )
+ from sentry.seer.autofix.coding_agent import (
+     _launch_agents_for_repos,
++    extract_result_url_from_events,
+     poll_claude_code_agents,
+     poll_github_copilot_agents,
+ )
+@@ -699,6 +699,82 @@ def test_poll_skips_invalid_agent_id(self):
+ MOCK_DJANGO_SETTINGS_PATH = "sentry.seer.autofix.coding_agent.django_settings"
+ 
+ 
++def _make_agent_event(text: str) -> ClaudeSessionEvent:
++    return ClaudeSessionEvent(type="agent", content=[{"type": "text", "text": text}])
++
++
++class TestExtractResultUrlFromEvents(TestCase):
++    def test_extracts_pr_url(self):
++        events = [_make_agent_event("PR created: https://github.com/org/repo/pull/123")]
++        assert extract_result_url_from_events(events) == "https://github.com/org/repo/pull/123"
++
++    def test_extracts_branch_url(self):
++        events = [_make_agent_event("Pushed to https://github.com/org/repo/tree/my-branch")]
++        assert (
++            extract_result_url_from_events(events) == "https://github.com/org/repo/tree/my-branch"
++        )
++
++    def test_strips_trailing_period(self):
++        events = [_make_agent_event("See https://github.com/org/repo/tree/my-branch.")]
++        assert (
++            extract_result_url_from_events(events) == "https://github.com/org/repo/tree/my-branch"
++        )
++
++    def test_strips_trailing_comma(self):
++        events = [_make_agent_event("https://github.com/org/repo/tree/my-branch, ready")]
++        assert (
++            extract_result_url_from_events(events) == "https://github.com/org/repo/tree/my-branch"
++        )
++
++    def test_branch_with_slashes(self):
++        events = [_make_agent_event("https://github.com/org/repo/tree/feat/sub/thing")]
++        assert (
++            extract_result_url_from_events(events)
++            == "https://github.com/org/repo/tree/feat/sub/thing"
++        )
++
++    def test_branch_with_dots_in_name(self):
++        events = [_make_agent_event("https://github.com/org/repo/tree/v1.2.3-fix")]
++        assert (
++            extract_result_url_from_events(events) == "https://github.com/org/repo/tree/v1.2.3-fix"
++        )
++
++    def test_pr_preferred_over_branch(self):
++        events = [
++            _make_agent_event(
++                "Branch https://github.com/org/repo/tree/my-branch "
++                "and PR https://github.com/org/repo/pull/42"
++            )
++        ]
++        assert extract_result_url_from_events(events) == "https://github.com/org/repo/pull/42"
++
++    def test_returns_none_when_no_url(self):
++        events = [_make_agent_event("All done, no link.")]
++        assert extract_result_url_from_events(events) is None
++
++    def test_returns_none_for_empty_events(self):
++        assert extract_result_url_from_events([]) is None
++
++    def test_searches_most_recent_event_first(self):
++        events = [
++            _make_agent_event("https://github.com/org/repo/tree/old-branch"),
++            _make_agent_event("https://github.com/org/repo/tree/new-branch"),
++        ]
++        assert (
++            extract_result_url_from_events(events) == "https://github.com/org/repo/tree/new-branch"
++        )
++
++    def test_skips_non_agent_events(self):
++        events = [
++            ClaudeSessionEvent(
++                type="tool_result",
++                content=[{"type": "text", "text": "https://github.com/org/repo/pull/1"}],
++            ),
++            _make_agent_event("No URL here"),
++        ]
++        assert extract_result_url_from_events(events) is None
++
++
+ class TestPollClaudeCodeAgents(TestCase):
+     def setUp(self):
+         super().setUp()
+@@ -805,11 +881,18 @@ def test_polls_running_agent_and_updates_completed(
+     ):
+         self._mock_integration(mock_integration_service)
+         mock_client = MagicMock()
+-        mock_client.get_session_status.return_value = MagicMock(status="idle", result=None)
+-        mock_client.list_session_events.return_value = []
+-        mock_client.extract_result_url_from_events.return_value = (
+-            "https://github.com/getsentry/sentry/pull/999"
+-        )
++        mock_client.list_session_events.return_value = [
++            {
++                "type": "agent",
++                "content": [
++                    {
++                        "type": "text",
++                        "text": "PR created: https://github.com/getsentry/sentry/pull/999",
++                    }
++                ],
++            },
++            {"type": "status_idle"},
++        ]
+         mock_client.build_result_from_session.return_value = MagicMock(
+             pr_url="https://github.com/getsentry/sentry/pull/999"
+         )
+@@ -819,7 +902,7 @@ def test_polls_running_agent_and_updates_completed(
+         autofix_state = self._create_autofix_state_with_agents(agents)
+         poll_claude_code_agents(autofix_state=autofix_state)
+ 
+-        mock_client.get_session_status.assert_called_once_with("claude-session-123")
++        mock_client.list_session_events.assert_called_once_with("claude-session-123")
+         mock_update_state.assert_called_once()
+         call_kwargs = mock_update_state.call_args[1]
+         assert call_kwargs["agent_id"] == "claude-session-123"
+@@ -833,9 +916,10 @@ def test_marks_failed_when_no_pr_url(
+     ):
+         self._mock_integration(mock_integration_service)
+         mock_client = MagicMock()
+-        mock_client.get_session_status.return_value = MagicMock(status="idle", result=None)
+-        mock_client.list_session_events.return_value = []
+-        mock_client.extract_result_url_from_events.return_value = None
++        mock_client.list_session_events.return_value = [
++            {"type": "agent", "content": [{"type": "text", "text": "Done, no PR."}]},
++            {"type": "status_idle"},
++        ]
+         mock_client.build_result_from_session.return_value = MagicMock(pr_url=None)
+         mock_import_string.return_value = lambda **kwargs: mock_client
+ 
+@@ -850,38 +934,30 @@ def test_marks_failed_when_no_pr_url(
+     @patch(MOCK_UPDATE_STATE_PATH)
+     @patch(MOCK_CLIENT_CLASS_PATH)
+     @patch(MOCK_INTEGRATION_SERVICE_PATH)
+-    def test_marks_failed_when_stalled_tool_use(
++    def test_no_update_when_status_unchanged(
+         self, mock_integration_service, mock_import_string, mock_update_state
+     ):
+         self._mock_integration(mock_integration_service)
+         mock_client = MagicMock()
+-        mock_client.get_session_status.return_value = MagicMock(status="idle", result=None)
+-        mock_client.list_session_events.return_value = [
+-            {
+-                "type": "agent",
+-                "content": [{"type": "tool_use", "id": "tool-1"}],
+-            },
+-        ]
+-        mock_client.build_result_from_session.return_value = MagicMock(pr_url=None)
++        # Last event is status_running — agent is already RUNNING, no update needed
++        mock_client.list_session_events.return_value = [{"type": "status_running"}]
+         mock_import_string.return_value = lambda **kwargs: mock_client
+ 
+         agents = {"claude-session-123": self._create_claude_agent()}
+         autofix_state = self._create_autofix_state_with_agents(agents)
+         poll_claude_code_agents(autofix_state=autofix_state)
+ 
+-        mock_update_state.assert_called_once()
+-        call_kwargs = mock_update_state.call_args[1]
+-        assert call_kwargs["status"] == CodingAgentStatus.FAILED
++        mock_update_state.assert_not_called()
+ 
+     @patch(MOCK_UPDATE_STATE_PATH)
+     @patch(MOCK_CLIENT_CLASS_PATH)
+     @patch(MOCK_INTEGRATION_SERVICE_PATH)
+-    def test_no_update_when_status_unchanged(
++    def test_no_update_when_events_empty(
+         self, mock_integration_service, mock_import_string, mock_update_state
+     ):
+         self._mock_integration(mock_integration_service)
+         mock_client = MagicMock()
+-        mock_client.get_session_status.return_value = MagicMock(status="running", result=None)
++        mock_client.list_session_events.return_value = []
+         mock_import_string.return_value = lambda **kwargs: mock_client
+ 
+         agents = {"claude-session-123": self._create_claude_agent()}
+@@ -893,15 +969,34 @@ def test_no_update_when_status_unchanged(
+     @patch(MOCK_UPDATE_STATE_PATH)
+     @patch(MOCK_CLIENT_CLASS_PATH)
+     @patch(MOCK_INTEGRATION_SERVICE_PATH)
+-    def test_continues_on_http_error(
++    def test_updates_pending_to_running_on_non_idle_event(
+         self, mock_integration_service, mock_import_string, mock_update_state
+     ):
+         self._mock_integration(mock_integration_service)
+         mock_client = MagicMock()
+-        mock_client.get_session_status.side_effect = HTTPError("Request Error")
++        mock_client.list_session_events.return_value = [{"type": "agent", "content": []}]
+         mock_import_string.return_value = lambda **kwargs: mock_client
+ 
+-        agents = {"claude-session-123": self._create_claude_agent()}
++        agents = {"claude-session-123": self._create_claude_agent(status=CodingAgentStatus.PENDING)}
++        autofix_state = self._create_autofix_state_with_agents(agents)
++        poll_claude_code_agents(autofix_state=autofix_state)
++
++        mock_update_state.assert_called_once()
++        call_kwargs = mock_update_state.call_args[1]
++        assert call_kwargs["status"] == CodingAgentStatus.RUNNING
++
++    @patch(MOCK_UPDATE_STATE_PATH)
++    @patch(MOCK_CLIENT_CLASS_PATH)
++    @patch(MOCK_INTEGRATION_SERVICE_PATH)
++    def test_stays_pending_on_status_pending_event(
++        self, mock_integration_service, mock_import_string, mock_update_state
++    ):
++        self._mock_integration(mock_integration_service)
++        mock_client = MagicMock()
++        mock_client.list_session_events.return_value = [{"type": "status_pending"}]
++        mock_import_string.return_value = lambda **kwargs: mock_client
++
++        agents = {"claude-session-123": self._create_claude_agent(status=CodingAgentStatus.PENDING)}
+         autofix_state = self._create_autofix_state_with_agents(agents)
+         poll_claude_code_agents(autofix_state=autofix_state)
+ 
+@@ -944,7 +1039,7 @@ def test_uses_correct_integration_per_agent(
+ 
+         def make_client(**kwargs):
+             client = MagicMock()
+-            client.get_session_status.return_value = MagicMock(status="running", result=None)
++            client.list_session_events.return_value = [{"type": "status_running"}]
+             clients[kwargs["api_key"]] = client
+             return client
+ 
+@@ -973,8 +1068,8 @@ def make_client(**kwargs):
+ 
+         assert mock_integration_service.get_integration.call_count == 2
+         assert len(clients) == 2
+-        clients["sk-ant-aaa"].get_session_status.assert_called_once_with("session-a")
+-        clients["sk-ant-bbb"].get_session_status.assert_called_once_with("session-b")
++        clients["sk-ant-aaa"].list_session_events.assert_called_once_with("session-a")
++        clients["sk-ant-bbb"].list_session_events.assert_called_once_with("session-b")
+ 
+     @patch(MOCK_UPDATE_STATE_PATH)
+     @patch(MOCK_CLIENT_CLASS_PATH)
+@@ -984,7 +1079,7 @@ def test_caches_client_for_same_integration(
+     ):
+         self._mock_integration(mock_integration_service)
+         mock_client = MagicMock()
+-        mock_client.get_session_status.return_value = MagicMock(status="running", result=None)
++        mock_client.list_session_events.return_value = [{"type": "status_running"}]
+         mock_import_string.return_value = lambda **kwargs: mock_client
+ 
+         agent_a = self._create_claude_agent(agent_id="session-a")
+@@ -995,4 +1090,4 @@ def test_caches_client_for_same_integration(
+         poll_claude_code_agents(autofix_state=autofix_state)
+ 
+         mock_integration_service.get_integration.assert_called_once()
+-        assert mock_client.get_session_status.call_count == 2
++        assert mock_client.list_session_events.call_count == 2
+diff --git a/tests/sentry/seer/explorer/test_tools.py b/tests/sentry/seer/explorer/test_tools.py
+index 37e6238c7a7d0c..65a42d69b67078 100644
+--- a/tests/sentry/seer/explorer/test_tools.py
++++ b/tests/sentry/seer/explorer/test_tools.py
+@@ -1445,6 +1445,8 @@ def _assert_issue_response_shape(self, result: dict):
+         assert isinstance(result["timeseries_interval"], str | None)
+         assert isinstance(result["tags_overview"], dict | None)
+         assert isinstance(result["user_activity"], list | None)
++        assert isinstance(result["project_id"], int)
++        assert isinstance(result["project_slug"], str)
+ 
+     # --- basic shape and group lookup ---
+ 
+@@ -1468,6 +1470,8 @@ def test_by_numeric_issue_id(self, mock_tags, mock_ts):
+         self._assert_issue_response_shape(result)
+         assert result["issue"]["id"] == str(group.id)
+         assert result["issue"]["issueTypeDescription"] == group.issue_type.description
++        assert result["project_id"] == group.project_id
++        assert result["project_slug"] == group.project.slug
+ 
+     @patch("sentry.seer.explorer.tools._get_issue_event_timeseries")
+     @patch("sentry.seer.explorer.tools.get_all_tags_overview")
+@@ -1488,6 +1492,8 @@ def test_by_qualified_short_id(self, mock_tags, mock_ts):
+         assert isinstance(result, dict)
+         self._assert_issue_response_shape(result)
+         assert result["issue"]["id"] == str(group.id)
++        assert result["project_id"] == group.project_id
++        assert result["project_slug"] == group.project.slug
+ 
+     # --- timeseries ---
+ 
+diff --git a/tests/sentry/types/test_region.py b/tests/sentry/types/test_region.py
+index b9ba31b1c8a796..7d553702566fed 100644
+--- a/tests/sentry/types/test_region.py
++++ b/tests/sentry/types/test_region.py
+@@ -28,7 +28,7 @@
+     get_cell_for_organization,
+     get_local_region,
+     load_from_config,
+-    subdomain_is_region,
++    subdomain_is_locality,
+ )
+ 
+ 
+@@ -252,7 +252,7 @@ def test_find_all_multitenant_region_names_non_visible(self) -> None:
+             assert set(result) == {"us", "eu"}
+ 
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+-    def test_subdomain_is_region(self) -> None:
++    def test_subdomain_is_locality(self) -> None:
+         regions: list[CellConfig] = [
+             {
+                 "name": "us",
+@@ -267,8 +267,8 @@ def test_subdomain_is_region(self) -> None:
+         with self._in_global_state(directory):
+             req = rf.get("/")
+             setattr(req, "subdomain", "us")
+-            assert subdomain_is_region(req)
++            assert subdomain_is_locality(req)
+ 
+             req = rf.get("/")
+             setattr(req, "subdomain", "acme")
+-            assert not subdomain_is_region(req)
++            assert not subdomain_is_locality(req)
+diff --git a/tests/sentry/workflow_engine/receivers/test_detector_workflow.py b/tests/sentry/workflow_engine/receivers/test_detector_workflow.py
+index d84928f6c06afa..7523ea7e30b857 100644
+--- a/tests/sentry/workflow_engine/receivers/test_detector_workflow.py
++++ b/tests/sentry/workflow_engine/receivers/test_detector_workflow.py
+@@ -1,6 +1,8 @@
+ from unittest.mock import MagicMock, patch
+ 
+ from sentry.testutils.cases import TestCase
++from sentry.workflow_engine.caches.workflow import DEFAULT_VALUE
++from sentry.workflow_engine.models import Workflow
+ 
+ 
+ class DetectorWorkflowReceiverTests(TestCase):
+@@ -54,3 +56,25 @@ def test_cache_invalidate__on_delete(self, mock_invalidate: MagicMock) -> None:
+             self.dw.delete()
+ 
+         mock_invalidate.assert_called_once_with(self.detector.id, self.environment.id)
++
++    def test_cache_invalidate__on_delete__missing_workflow(self) -> None:
++        detector = self.create_detector()
++        workflow = self.create_workflow()
++        dw = self.create_detector_workflow(detector=detector, workflow=workflow)
++        detector_id = detector.id
++
++        def raise_does_not_exist(self: object) -> None:
++            raise Workflow.DoesNotExist()
++
++        with patch(
++            "sentry.workflow_engine.receivers.detector_workflow.invalidate_processing_workflows"
++        ) as mock_invalidate:
++            with self.capture_on_commit_callbacks(execute=True):
++                with patch.object(
++                    type(dw),
++                    "workflow",
++                    property(fget=raise_does_not_exist),
++                ):
++                    dw.delete()
++
++            mock_invalidate.assert_called_once_with(detector_id, DEFAULT_VALUE)

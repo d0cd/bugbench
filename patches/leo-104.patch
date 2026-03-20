@@ -1,184 +1,825 @@
-diff --git a/compiler/ast/src/functions/mod.rs b/compiler/ast/src/functions/mod.rs
-index 33438d856d..97a38cb06d 100644
---- a/compiler/ast/src/functions/mod.rs
-+++ b/compiler/ast/src/functions/mod.rs
-@@ -100,7 +100,7 @@ impl Function {
-         let output_type = match output.len() {
-             0 => Type::Unit,
-             1 => get_output_type(&output[0]),
--            _ => Type::Tuple(Tuple(output.iter().map(|output| get_output_type(output)).collect())),
-+            _ => Type::Tuple(Tuple(output.iter().map(get_output_type).collect())),
-         };
+diff --git a/ast/src/common/assignee.rs b/ast/src/common/assignee.rs
+index 4019f9d6cd..a11b442f29 100644
+--- a/ast/src/common/assignee.rs
++++ b/ast/src/common/assignee.rs
+@@ -14,7 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
  
-         Function { annotations, variant, identifier, input, output, output_type, block, finalize, span, id }
-diff --git a/compiler/passes/src/code_generation/visit_expressions.rs b/compiler/passes/src/code_generation/visit_expressions.rs
-index c6b2125db2..db67c79fe7 100644
---- a/compiler/passes/src/code_generation/visit_expressions.rs
-+++ b/compiler/passes/src/code_generation/visit_expressions.rs
-@@ -458,7 +458,7 @@ impl<'a> CodeGenerator<'a> {
-             Expression::Identifier(identifier) => identifier.name,
-             _ => unreachable!("Parsing guarantees that a function name is always an identifier."),
-         };
--        let return_type = &self.symbol_table.borrow().lookup_fn_symbol(function_name).unwrap().output_type;
-+        let return_type = &self.symbol_table.lookup_fn_symbol(function_name).unwrap().output_type;
-         match return_type {
-             Type::Unit => {
-                 call_instruction.push(';');
-diff --git a/compiler/passes/src/flattening/flatten_expression.rs b/compiler/passes/src/flattening/flatten_expression.rs
-index 97e13627a4..c171d9dd40 100644
---- a/compiler/passes/src/flattening/flatten_expression.rs
-+++ b/compiler/passes/src/flattening/flatten_expression.rs
-@@ -130,7 +130,7 @@ impl ExpressionReconstructor for Flattener<'_> {
-                     elements: first
-                         .elements
-                         .into_iter()
--                        .zip_eq(second.elements.into_iter())
-+                        .zip_eq(second.elements)
-                         .map(|(if_true, if_false)| {
-                             // Reconstruct the true case.
-                             let (if_true, stmts) = self.reconstruct_expression(if_true);
-diff --git a/compiler/passes/src/flattening/flatten_statement.rs b/compiler/passes/src/flattening/flatten_statement.rs
-index cb856869ac..ebb14c9e80 100644
---- a/compiler/passes/src/flattening/flatten_statement.rs
-+++ b/compiler/passes/src/flattening/flatten_statement.rs
-@@ -175,7 +175,7 @@ impl StatementReconstructor for Flattener<'_> {
-                     _ => unreachable!("Parsing guarantees that `function` is an identifier."),
-                 };
+-use crate::{access::AssigneeAccess, ast::Rule, common::Identifier, SpanDef};
++use crate::{access::AssigneeAccess, ast::Rule, common::KeywordOrIdentifier, SpanDef};
  
--                let function = self.symbol_table.borrow().lookup_fn_symbol(function_name).unwrap();
-+                let function = self.symbol_table.lookup_fn_symbol(function_name).unwrap();
-                 match &function.output_type {
-                     // If the function returns a tuple, reconstruct the assignment and add an entry to `self.tuples`.
-                     Type::Tuple(tuple) => {
-@@ -256,7 +256,7 @@ impl StatementReconstructor for Flattener<'_> {
-                     Expression::Identifier(identifier) => {
-                         // Retrieve the entry in the symbol table for the mapping.
-                         // Note that this unwrap is safe since type checking ensures that the mapping exists.
--                        let variable = self.symbol_table.borrow().lookup_variable(identifier.name).unwrap();
-+                        let variable = self.symbol_table.lookup_variable(identifier.name).unwrap();
-                         match &variable.type_ {
-                             Type::Mapping(mapping_type) => &*mapping_type.value,
-                             _ => unreachable!("Type checking guarantee that `arguments[0]` is a mapping."),
-@@ -292,7 +292,7 @@ impl StatementReconstructor for Flattener<'_> {
-                     _ => unreachable!("Parsing guarantees that `function` is an identifier."),
-                 };
+ use pest::Span;
+ use pest_ast::FromPest;
+@@ -24,7 +24,7 @@ use std::fmt;
+ #[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
+ #[pest_ast(rule(Rule::assignee))]
+ pub struct Assignee<'ast> {
+-    pub identifier: Identifier<'ast>,
++    pub name: KeywordOrIdentifier<'ast>,
+     pub accesses: Vec<AssigneeAccess<'ast>>,
+     #[pest_ast(outer())]
+     #[serde(with = "SpanDef")]
+@@ -33,7 +33,7 @@ pub struct Assignee<'ast> {
  
--                let function = self.symbol_table.borrow().lookup_fn_symbol(function_name).unwrap();
-+                let function = self.symbol_table.lookup_fn_symbol(function_name).unwrap();
+ impl<'ast> fmt::Display for Assignee<'ast> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        write!(f, "{}", self.identifier)?;
++        write!(f, "{}", self.name)?;
+         for (i, access) in self.accesses.iter().enumerate() {
+             write!(f, "{}", access)?;
+             if i < self.accesses.len() - 1 {
+diff --git a/ast/src/common/keyword_or_identifier.rs b/ast/src/common/keyword_or_identifier.rs
+new file mode 100644
+index 0000000000..af013bc24b
+--- /dev/null
++++ b/ast/src/common/keyword_or_identifier.rs
+@@ -0,0 +1,43 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{
++    ast::Rule,
++    common::{Identifier, SelfKeyword},
++    functions::InputKeyword,
++};
++
++use pest_ast::FromPest;
++use serde::Serialize;
++use std::fmt;
++
++#[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
++#[pest_ast(rule(Rule::keyword_or_identifier))]
++pub enum KeywordOrIdentifier<'ast> {
++    SelfKeyword(SelfKeyword<'ast>),
++    Input(InputKeyword<'ast>),
++    Identifier(Identifier<'ast>),
++}
++
++impl<'ast> fmt::Display for KeywordOrIdentifier<'ast> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        match self {
++            KeywordOrIdentifier::SelfKeyword(self_keyword) => write!(f, "{}", self_keyword),
++            KeywordOrIdentifier::Input(input_keyword) => write!(f, "{}", input_keyword),
++            KeywordOrIdentifier::Identifier(identifier) => write!(f, "{}", identifier),
++        }
++    }
++}
+diff --git a/ast/src/common/mod.rs b/ast/src/common/mod.rs
+index 870e83a030..7029423a3e 100644
+--- a/ast/src/common/mod.rs
++++ b/ast/src/common/mod.rs
+@@ -26,6 +26,9 @@ pub use eoi::*;
+ pub mod identifier;
+ pub use identifier::*;
  
-                 let output_type = match &function.output_type {
-                     Type::Tuple(tuple) => tuple.clone(),
-@@ -322,21 +322,19 @@ impl StatementReconstructor for Flattener<'_> {
-             }
-             // If the lhs is a tuple and the rhs is a tuple, create a new assign statement for each tuple element.
-             (Expression::Tuple(lhs_tuple), Expression::Tuple(rhs_tuple)) => {
--                statements.extend(lhs_tuple.elements.into_iter().zip(rhs_tuple.elements.into_iter()).map(
--                    |(lhs, rhs)| {
--                        let identifier = match &lhs {
--                            Expression::Identifier(identifier) => identifier,
--                            _ => unreachable!("Type checking guarantees that `lhs` is an identifier."),
--                        };
--                        self.update_structs(identifier, &rhs);
--                        Statement::Assign(Box::new(AssignStatement {
--                            place: lhs,
--                            value: rhs,
--                            span: Default::default(),
--                            id: self.node_builder.next_id(),
--                        }))
--                    },
--                ));
-+                statements.extend(lhs_tuple.elements.into_iter().zip(rhs_tuple.elements).map(|(lhs, rhs)| {
-+                    let identifier = match &lhs {
-+                        Expression::Identifier(identifier) => identifier,
-+                        _ => unreachable!("Type checking guarantees that `lhs` is an identifier."),
-+                    };
-+                    self.update_structs(identifier, &rhs);
-+                    Statement::Assign(Box::new(AssignStatement {
-+                        place: lhs,
-+                        value: rhs,
-+                        span: Default::default(),
-+                        id: self.node_builder.next_id(),
-+                    }))
-+                }));
-                 (Statement::dummy(Default::default(), self.node_builder.next_id()), statements)
-             }
-             // If the lhs is a tuple and the rhs is an identifier that is a tuple, create a new assign statement for each tuple element.
-@@ -347,7 +345,7 @@ impl StatementReconstructor for Flattener<'_> {
-                 // Note that the `unwrap` is safe since the match arm checks that the entry exists.
-                 let rhs_tuple = self.tuples.get(&identifier.name).unwrap().clone();
-                 // Create a new assign statement for each tuple element.
--                for (lhs, rhs) in lhs_tuple.elements.into_iter().zip(rhs_tuple.elements.into_iter()) {
-+                for (lhs, rhs) in lhs_tuple.elements.into_iter().zip(rhs_tuple.elements) {
-                     let identifier = match &lhs {
-                         Expression::Identifier(identifier) => identifier,
-                         _ => unreachable!("Type checking guarantees that `lhs` is an identifier."),
-diff --git a/compiler/passes/src/function_inlining/inline_expression.rs b/compiler/passes/src/function_inlining/inline_expression.rs
-index 6c9b89712f..8402d5354e 100644
---- a/compiler/passes/src/function_inlining/inline_expression.rs
-+++ b/compiler/passes/src/function_inlining/inline_expression.rs
-@@ -59,7 +59,7 @@ impl ExpressionReconstructor for FunctionInliner<'_> {
-                     .input
-                     .iter()
-                     .map(|input| input.identifier().name)
--                    .zip_eq(input.arguments.into_iter())
-+                    .zip_eq(input.arguments)
-                     .collect::<IndexMap<_, _>>();
++pub mod keyword_or_identifier;
++pub use keyword_or_identifier::*;
++
+ pub mod line_end;
+ pub use line_end::*;
  
-                 // Initializer `self.assignment_renamer` with the function parameters.
-diff --git a/compiler/passes/src/function_inlining/inline_statement.rs b/compiler/passes/src/function_inlining/inline_statement.rs
-index fa59281d53..ad1031da4f 100644
---- a/compiler/passes/src/function_inlining/inline_statement.rs
-+++ b/compiler/passes/src/function_inlining/inline_statement.rs
-@@ -38,7 +38,7 @@ impl StatementReconstructor for FunctionInliner<'_> {
-         match (input.place, value) {
-             // If the function call produces a tuple, we need to segment the tuple into multiple assignment statements.
-             (Expression::Tuple(left), Expression::Tuple(right)) if left.elements.len() == right.elements.len() => {
--                statements.extend(left.elements.into_iter().zip(right.elements.into_iter()).map(|(lhs, rhs)| {
-+                statements.extend(left.elements.into_iter().zip(right.elements).map(|(lhs, rhs)| {
-                     Statement::Assign(Box::new(AssignStatement {
-                         place: lhs,
-                         value: rhs,
-diff --git a/compiler/passes/src/static_single_assignment/rename_expression.rs b/compiler/passes/src/static_single_assignment/rename_expression.rs
-index 1a10e603a8..974bd9adcd 100644
---- a/compiler/passes/src/static_single_assignment/rename_expression.rs
-+++ b/compiler/passes/src/static_single_assignment/rename_expression.rs
-@@ -40,7 +40,6 @@ use leo_ast::{
- use leo_span::{sym, Symbol};
+diff --git a/ast/src/common/self_keyword.rs b/ast/src/common/self_keyword.rs
+index 50757fe449..278f125e0c 100644
+--- a/ast/src/common/self_keyword.rs
++++ b/ast/src/common/self_keyword.rs
+@@ -22,6 +22,7 @@ use crate::{
+ use pest::Span;
+ use pest_ast::FromPest;
+ use serde::Serialize;
++use std::fmt;
  
- use indexmap::IndexMap;
--use std::borrow::Borrow;
+ #[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
+ #[pest_ast(rule(Rule::self_keyword))]
+@@ -32,3 +33,9 @@ pub struct SelfKeyword<'ast> {
+     #[serde(with = "SpanDef")]
+     pub span: Span<'ast>,
+ }
++
++impl<'ast> fmt::Display for SelfKeyword<'ast> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "{}", self.keyword)
++    }
++}
+diff --git a/ast/src/expressions/postfix_expression.rs b/ast/src/expressions/postfix_expression.rs
+index a3938ad53e..8c260bd74c 100644
+--- a/ast/src/expressions/postfix_expression.rs
++++ b/ast/src/expressions/postfix_expression.rs
+@@ -14,13 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
  
- impl ExpressionConsumer for StaticSingleAssigner<'_> {
-     type Output = (Expression, Vec<Statement>);
-@@ -212,7 +211,7 @@ impl ExpressionConsumer for StaticSingleAssigner<'_> {
+-use crate::{
+-    access::Access,
+-    ast::Rule,
+-    common::{Identifier, SelfKeyword},
+-    functions::InputKeyword,
+-    SpanDef,
+-};
++use crate::{access::Access, ast::Rule, common::KeywordOrIdentifier, SpanDef};
  
-         // Lookup the struct definition.
-         // Note that type checking guarantees that the correct struct definition exists.
--        let struct_definition: &Struct = self.symbol_table.borrow().lookup_struct(input.name.name).unwrap();
-+        let struct_definition: &Struct = self.symbol_table.lookup_struct(input.name.name).unwrap();
+ use pest::Span;
+ use pest_ast::FromPest;
+@@ -35,11 +29,3 @@ pub struct PostfixExpression<'ast> {
+     #[serde(with = "SpanDef")]
+     pub span: Span<'ast>,
+ }
+-
+-#[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
+-#[pest_ast(rule(Rule::keyword_or_identifier))]
+-pub enum KeywordOrIdentifier<'ast> {
+-    SelfKeyword(SelfKeyword<'ast>),
+-    Input(InputKeyword<'ast>),
+-    Identifier(Identifier<'ast>),
+-}
+diff --git a/ast/src/functions/input/input_keyword.rs b/ast/src/functions/input/input_keyword.rs
+index e70e43f20d..877d2346cd 100644
+--- a/ast/src/functions/input/input_keyword.rs
++++ b/ast/src/functions/input/input_keyword.rs
+@@ -22,6 +22,7 @@ use crate::{
+ use pest::Span;
+ use pest_ast::FromPest;
+ use serde::Serialize;
++use std::fmt;
  
-         // Initialize the list of reordered members.
-         let mut reordered_members = Vec::with_capacity(members.len());
-diff --git a/compiler/passes/src/type_checking/check_expressions.rs b/compiler/passes/src/type_checking/check_expressions.rs
-index 6f4c516d00..7d3ab9e075 100644
---- a/compiler/passes/src/type_checking/check_expressions.rs
-+++ b/compiler/passes/src/type_checking/check_expressions.rs
-@@ -520,16 +520,14 @@ impl<'a> ExpressionVisitor<'a> for TypeChecker<'a> {
+ #[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
+ #[pest_ast(rule(Rule::input_keyword))]
+@@ -32,3 +33,9 @@ pub struct InputKeyword<'ast> {
+     #[serde(with = "SpanDef")]
+     pub span: Span<'ast>,
+ }
++
++impl<'ast> fmt::Display for InputKeyword<'ast> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "{}", self.keyword)
++    }
++}
+diff --git a/ast/src/leo.pest b/ast/src/leo.pest
+index 4bf42da3cf..acaeb7523a 100644
+--- a/ast/src/leo.pest
++++ b/ast/src/leo.pest
+@@ -1,7 +1,7 @@
+ /// Common
  
-     fn visit_cast(&mut self, input: &'a CastExpression, expected: &Self::AdditionalInput) -> Self::Output {
-         // Check that the target type of the cast expression is a castable type.
--        let target_type = Some(input.type_.clone());
--        self.assert_castable_type(&target_type, input.span());
-+        self.assert_castable_type(&Some(input.type_.clone()), input.span());
+ // Declared in common/assignee.rs
+-assignee = { identifier ~ access_assignee* }
++assignee = { keyword_or_identifier ~ access_assignee* }
  
-         // Check that the expression type is a primitive type.
-         let expression_type = self.visit_expression(&input.expression, &None);
-         self.assert_castable_type(&expression_type, input.expression.span());
+ // Declared in files/file.rs
+ file = { SOI ~ NEWLINE* ~ definition* ~ NEWLINE* ~ EOI }
+diff --git a/compiler/src/expression/circuit/circuit.rs b/compiler/src/expression/circuit/circuit.rs
+index b180428ae4..8963e7ca22 100644
+--- a/compiler/src/expression/circuit/circuit.rs
++++ b/compiler/src/expression/circuit/circuit.rs
+@@ -39,7 +39,9 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         members: Vec<CircuitVariableDefinition>,
+         span: Span,
+     ) -> Result<ConstrainedValue<F, G>, ExpressionError> {
+-        let mut program_identifier = new_scope(file_scope.clone(), identifier.to_string());
++        // Circuit definitions are located at the minimum file scope
++        let scopes: Vec<&str> = file_scope.split("_").collect();
++        let mut program_identifier = new_scope(scopes[0].to_string(), identifier.to_string());
  
-         // Check that the expected type matches the target type.
--        // Note that this unwrap is safe since target_type is always `Some`.
--        Some(self.assert_and_return_type(target_type.unwrap(), expected, input.span()))
-+        Some(self.assert_and_return_type(input.type_.clone(), expected, input.span()))
+         if identifier.is_self() {
+             program_identifier = file_scope.clone();
+diff --git a/compiler/src/expression/function/function.rs b/compiler/src/expression/function/function.rs
+index a3cb52f92f..458f552e0b 100644
+--- a/compiler/src/expression/function/function.rs
++++ b/compiler/src/expression/function/function.rs
+@@ -16,7 +16,7 @@
+ 
+ //! Enforce a function call expression in a compiled Leo program.
+ 
+-use crate::{errors::ExpressionError, program::ConstrainedProgram, value::ConstrainedValue, GroupType};
++use crate::{errors::ExpressionError, new_scope, program::ConstrainedProgram, value::ConstrainedValue, GroupType};
+ use leo_typed::{Expression, Span, Type};
+ 
+ use snarkos_models::{
+@@ -35,13 +35,32 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         arguments: Vec<Expression>,
+         span: Span,
+     ) -> Result<ConstrainedValue<F, G>, ExpressionError> {
+-        let function_value = self.enforce_expression(
+-            cs,
+-            file_scope.clone(),
+-            function_scope.clone(),
+-            expected_type,
+-            *function.clone(),
+-        )?;
++        let (declared_circuit_reference, function_value) = match *function.clone() {
++            Expression::CircuitMemberAccess(circuit_identifier, circuit_member, span) => {
++                // Call a circuit function that can mutate self.
++
++                // Save a reference to the circuit we are mutating.
++                let circuit_id_string = format!("{}", circuit_identifier);
++                let declared_circuit_reference = new_scope(function_scope.clone(), circuit_id_string);
++
++                (
++                    declared_circuit_reference,
++                    self.enforce_circuit_access(
++                        cs,
++                        file_scope.clone(),
++                        function_scope.clone(),
++                        expected_type,
++                        circuit_identifier,
++                        circuit_member,
++                        span,
++                    )?,
++                )
++            }
++            function => (
++                function_scope.clone(),
++                self.enforce_expression(cs, file_scope.clone(), function_scope.clone(), expected_type, function)?,
++            ),
++        };
+ 
+         let (outer_scope, function_call) = function_value.extract_function(file_scope.clone(), span.clone())?;
+ 
+@@ -58,6 +77,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+             function_scope,
+             function_call,
+             arguments,
++            declared_circuit_reference,
+         )
+         .map_err(|error| ExpressionError::from(Box::new(error)))
      }
+diff --git a/compiler/src/function/function.rs b/compiler/src/function/function.rs
+index 154bb0f844..80b58f9bbb 100644
+--- a/compiler/src/function/function.rs
++++ b/compiler/src/function/function.rs
+@@ -47,6 +47,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         caller_scope: String,
+         function: Function,
+         input: Vec<Expression>,
++        declared_circuit_reference: String,
+     ) -> Result<ConstrainedValue<F, G>, FunctionError> {
+         let function_name = new_scope(scope.clone(), function.get_name());
  
-     fn visit_struct_init(&mut self, input: &'a StructExpression, additional: &Self::AdditionalInput) -> Self::Output {
+@@ -103,6 +104,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                 None,
+                 statement.clone(),
+                 function.returns.clone(),
++                declared_circuit_reference.clone(),
+             )?;
+ 
+             results.append(&mut result);
+diff --git a/compiler/src/function/main_function.rs b/compiler/src/function/main_function.rs
+index 2a99ba39c2..950d1cdc7d 100644
+--- a/compiler/src/function/main_function.rs
++++ b/compiler/src/function/main_function.rs
+@@ -77,7 +77,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         }
+ 
+         let span = function.span.clone();
+-        let result_value = self.enforce_function(cs, scope, function_name, function, input_variables)?;
++        let result_value = self.enforce_function(cs, scope, function_name, function, input_variables, "".to_owned())?;
+         let output_bytes = OutputBytes::new_from_constrained_value(registers, result_value, span)?;
+ 
+         Ok(output_bytes)
+diff --git a/compiler/src/statement/assign/assign.rs b/compiler/src/statement/assign/assign.rs
+index de63c4bd99..dcd7da37bb 100644
+--- a/compiler/src/statement/assign/assign.rs
++++ b/compiler/src/statement/assign/assign.rs
+@@ -19,6 +19,7 @@
+ use crate::{
+     assignee::resolve_assignee,
+     errors::StatementError,
++    new_scope,
+     program::ConstrainedProgram,
+     value::ConstrainedValue,
+     GroupType,
+@@ -39,6 +40,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         cs: &mut CS,
+         file_scope: String,
+         function_scope: String,
++        declared_circuit_reference: String,
+         indicator: Option<Boolean>,
+         assignee: Assignee,
+         expression: Expression,
+@@ -79,8 +81,34 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                 span,
+             ),
+             Assignee::Tuple(_tuple, index) => self.assign_tuple(cs, indicator, variable_name, index, new_value, span),
+-            Assignee::CircuitField(_assignee, object_name) => {
+-                self.mutute_circuit_variable(cs, indicator, variable_name, object_name, new_value, span)
++            Assignee::CircuitField(assignee, circuit_variable) => {
++                // Mutate a circuit variable using the self keyword.
++                if let Assignee::Identifier(circuit_name) = *assignee {
++                    if circuit_name.is_self() {
++                        let self_circuit_variable_name = new_scope(circuit_name.name, circuit_variable.name.clone());
++                        let self_variable_name = new_scope(file_scope, self_circuit_variable_name);
++                        let value = self.mutate_circuit_variable(
++                            cs,
++                            indicator,
++                            declared_circuit_reference,
++                            circuit_variable,
++                            new_value,
++                            span,
++                        )?;
++
++                        self.store(self_variable_name, value);
++                    } else {
++                        let _value = self.mutate_circuit_variable(
++                            cs,
++                            indicator,
++                            variable_name,
++                            circuit_variable,
++                            new_value,
++                            span,
++                        )?;
++                    }
++                }
++                Ok(())
+             }
+         }
+     }
+diff --git a/compiler/src/statement/assign/circuit_variable.rs b/compiler/src/statement/assign/circuit_variable.rs
+index 8848261e39..53e3dde9f2 100644
+--- a/compiler/src/statement/assign/circuit_variable.rs
++++ b/compiler/src/statement/assign/circuit_variable.rs
+@@ -28,7 +28,7 @@ use snarkos_models::{
+ };
+ 
+ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+-    pub fn mutute_circuit_variable<CS: ConstraintSystem<F>>(
++    pub fn mutate_circuit_variable<CS: ConstraintSystem<F>>(
+         &mut self,
+         cs: &mut CS,
+         indicator: Option<Boolean>,
+@@ -36,7 +36,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         variable_name: Identifier,
+         mut new_value: ConstrainedValue<F, G>,
+         span: Span,
+-    ) -> Result<(), StatementError> {
++    ) -> Result<ConstrainedValue<F, G>, StatementError> {
+         let condition = indicator.unwrap_or(Boolean::Constant(true));
+ 
+         // Get the mutable circuit by name
+@@ -48,19 +48,25 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                 match matched_variable {
+                     Some(member) => match &member.1 {
+                         ConstrainedValue::Function(_circuit_identifier, function) => {
+-                            return Err(StatementError::immutable_circuit_function(
++                            // Throw an error if we try to mutate a circuit function
++                            Err(StatementError::immutable_circuit_function(
+                                 function.identifier.to_string(),
+                                 span,
+-                            ));
++                            ))
+                         }
+-                        ConstrainedValue::Static(_value) => {
+-                            return Err(StatementError::immutable_circuit_function("static".into(), span));
++                        ConstrainedValue::Static(_circuit_function) => {
++                            // Throw an error if we try to mutate a static circuit function
++                            Err(StatementError::immutable_circuit_function("static".into(), span))
+                         }
+                         ConstrainedValue::Mutable(value) => {
++                            // Mutate the circuit variable's value in place
++
++                            // Check that the new value type == old value type
+                             new_value.resolve_type(Some(value.to_type(span.clone())?), span.clone())?;
+ 
++                            // Conditionally select the value if this branch is executed.
+                             let name_unique = format!("select {} {}:{}", new_value, span.line, span.start);
+-                            let selected_value = ConstrainedValue::conditionally_select(
++                            let mut selected_value = ConstrainedValue::conditionally_select(
+                                 cs.ns(|| name_unique),
+                                 &condition,
+                                 &new_value,
+@@ -70,23 +76,29 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                                 StatementError::select_fail(new_value.to_string(), member.1.to_string(), span)
+                             })?;
+ 
++                            // Make sure the new value is still mutable
++                            selected_value = ConstrainedValue::Mutable(Box::new(selected_value));
++
+                             member.1 = selected_value.to_owned();
++
++                            Ok(selected_value.to_owned())
+                         }
+                         _ => {
+-                            return Err(StatementError::immutable_circuit_variable(variable_name.name, span));
++                            // Throw an error if we try to mutate an immutable circuit variable
++                            Err(StatementError::immutable_circuit_variable(variable_name.name, span))
+                         }
+                     },
+                     None => {
+-                        return Err(StatementError::undefined_circuit_variable(
++                        // Throw an error if the circuit variable does not exist in the circuit
++                        Err(StatementError::undefined_circuit_variable(
+                             variable_name.to_string(),
+                             span,
+-                        ));
++                        ))
+                     }
+                 }
+             }
+-            _ => return Err(StatementError::undefined_circuit(variable_name.to_string(), span)),
++            // Throw an error if the circuit definition does not exist in the file
++            _ => Err(StatementError::undefined_circuit(variable_name.to_string(), span)),
+         }
+-
+-        Ok(())
+     }
+ }
+diff --git a/compiler/src/statement/branch/branch.rs b/compiler/src/statement/branch/branch.rs
+index c1e0c0488b..1df2bbce4a 100644
+--- a/compiler/src/statement/branch/branch.rs
++++ b/compiler/src/statement/branch/branch.rs
+@@ -44,6 +44,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                 indicator.clone(),
+                 statement.clone(),
+                 return_type.clone(),
++                "".to_owned(),
+             )?;
+ 
+             results.append(&mut value);
+diff --git a/compiler/src/statement/definition/definition.rs b/compiler/src/statement/definition/definition.rs
+index 737ec4da4c..76da259ba2 100644
+--- a/compiler/src/statement/definition/definition.rs
++++ b/compiler/src/statement/definition/definition.rs
+@@ -154,7 +154,6 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+ 
+         if num_variables == 1 && num_values == 1 {
+             // Define a single variable with a single value
+-
+             let variable = variables.names[0].clone();
+             let expression = self.enforce_expression(
+                 cs,
+diff --git a/compiler/src/statement/statement.rs b/compiler/src/statement/statement.rs
+index 5de1ec4015..69392933df 100644
+--- a/compiler/src/statement/statement.rs
++++ b/compiler/src/statement/statement.rs
+@@ -38,6 +38,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         indicator: Option<Boolean>,
+         statement: Statement,
+         return_type: Option<Type>,
++        declared_circuit_reference: String,
+     ) -> Result<Vec<(Option<Boolean>, ConstrainedValue<F, G>)>, StatementError> {
+         let mut results = vec![];
+ 
+@@ -62,7 +63,16 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                 )?;
+             }
+             Statement::Assign(variable, expression, span) => {
+-                self.enforce_assign_statement(cs, file_scope, function_scope, indicator, variable, expression, span)?;
++                self.enforce_assign_statement(
++                    cs,
++                    file_scope,
++                    function_scope,
++                    declared_circuit_reference,
++                    indicator,
++                    variable,
++                    expression,
++                    span,
++                )?;
+             }
+             Statement::Conditional(statement, span) => {
+                 let mut result = self.enforce_conditional_statement(
+diff --git a/compiler/tests/circuits/define_circuit_inside_circuit_function.leo b/compiler/tests/circuits/define_circuit_inside_circuit_function.leo
+new file mode 100644
+index 0000000000..17a8522b97
+--- /dev/null
++++ b/compiler/tests/circuits/define_circuit_inside_circuit_function.leo
+@@ -0,0 +1,13 @@
++circuit Foo {
++    a: u32,
++}
++
++circuit Bar {
++    static function bar() {
++        let f = Foo { a: 0u32 };
++    }
++}
++
++function main() {
++    let b = Bar::bar();
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mod.rs b/compiler/tests/circuits/mod.rs
+index 912e462a15..b98d5aea99 100644
+--- a/compiler/tests/circuits/mod.rs
++++ b/compiler/tests/circuits/mod.rs
+@@ -134,7 +134,74 @@ fn test_member_static_function_undefined() {
+     expect_fail(program)
+ }
+ 
++// Mutability
++
++#[test]
++fn test_mutate_function_fail() {
++    let bytes = include_bytes!("mut_function_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_mutate_self_variable() {
++    let bytes = include_bytes!("mut_self_variable.leo");
++    let program = parse_program(bytes).unwrap();
++
++    assert_satisfied(program);
++}
++
++#[test]
++fn test_mutate_self_variable_fail() {
++    let bytes = include_bytes!("mut_self_variable_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_mutate_self_function_fail() {
++    let bytes = include_bytes!("mut_self_function_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_mutate_self_static_function_fail() {
++    let bytes = include_bytes!("mut_self_static_function_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_mutate_static_function_fail() {
++    let bytes = include_bytes!("mut_static_function_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_mutate_variable() {
++    let bytes = include_bytes!("mut_variable.leo");
++    let program = parse_program(bytes).unwrap();
++
++    assert_satisfied(program);
++}
++
++#[test]
++fn test_mutate_variable_fail() {
++    let bytes = include_bytes!("mut_variable_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
+ // Self
++
+ #[test]
+ fn test_self_member_pass() {
+     let bytes = include_bytes!("self_member.leo");
+@@ -168,3 +235,11 @@ fn test_pedersen_mock() {
+ 
+     assert_satisfied(program);
+ }
++
++#[test]
++fn test_define_circuit_inside_circuit_function() {
++    let bytes = include_bytes!("define_circuit_inside_circuit_function.leo");
++    let program = parse_program(bytes).unwrap();
++
++    assert_satisfied(program);
++}
+diff --git a/compiler/tests/circuits/mut_function_fail.leo b/compiler/tests/circuits/mut_function_fail.leo
+new file mode 100644
+index 0000000000..ed3092c656
+--- /dev/null
++++ b/compiler/tests/circuits/mut_function_fail.leo
+@@ -0,0 +1,9 @@
++circuit Foo {
++    function bar() {}
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    f.bar = 1u8;
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mut_self_function_fail.leo b/compiler/tests/circuits/mut_self_function_fail.leo
+new file mode 100644
+index 0000000000..18da32c5fb
+--- /dev/null
++++ b/compiler/tests/circuits/mut_self_function_fail.leo
+@@ -0,0 +1,15 @@
++circuit Foo {
++    a: u8,
++
++    function bar() {}
++
++    function set_a(new: u8) {
++        self.bar = new;
++    }
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    f.set_a(1u8);
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mut_self_static_function_fail.leo b/compiler/tests/circuits/mut_self_static_function_fail.leo
+new file mode 100644
+index 0000000000..de87c5fadf
+--- /dev/null
++++ b/compiler/tests/circuits/mut_self_static_function_fail.leo
+@@ -0,0 +1,15 @@
++circuit Foo {
++    a: u8,
++
++    static function bar() {}
++
++    function set_a(new: u8) {
++        self.bar = new;
++    }
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    f.set_a(1u8);
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mut_self_variable.leo b/compiler/tests/circuits/mut_self_variable.leo
+new file mode 100644
+index 0000000000..47b9aeed70
+--- /dev/null
++++ b/compiler/tests/circuits/mut_self_variable.leo
+@@ -0,0 +1,22 @@
++circuit Foo {
++    mut a: u8,
++
++    function set_a(new: u8) {
++        self.a = new;
++        console.assert(self.a == new);
++    }
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    console.assert(f.a == 0u8);
++
++    f.set_a(1u8);
++
++    console.assert(f.a == 1u8);
++
++    f.set_a(2u8);
++
++    console.assert(f.a == 2u8);
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mut_self_variable_fail.leo b/compiler/tests/circuits/mut_self_variable_fail.leo
+new file mode 100644
+index 0000000000..551b041c9e
+--- /dev/null
++++ b/compiler/tests/circuits/mut_self_variable_fail.leo
+@@ -0,0 +1,13 @@
++circuit Foo {
++    a: u8,
++
++    function set_a(new: u8) {
++        self.a = new;
++    }
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    f.set_a(1u8);
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mut_static_function_fail.leo b/compiler/tests/circuits/mut_static_function_fail.leo
+new file mode 100644
+index 0000000000..f1bccaaf89
+--- /dev/null
++++ b/compiler/tests/circuits/mut_static_function_fail.leo
+@@ -0,0 +1,9 @@
++circuit Foo {
++    static function bar() {}
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    f.bar = 1u8;
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mut_variable.leo b/compiler/tests/circuits/mut_variable.leo
+new file mode 100644
+index 0000000000..eaf61ddf02
+--- /dev/null
++++ b/compiler/tests/circuits/mut_variable.leo
+@@ -0,0 +1,17 @@
++circuit Foo {
++    mut a: u8,
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    console.assert(f.a == 0u8);
++
++    f.a = 1u8;
++
++    console.assert(f.a == 1u8);
++
++    f.a = 2u8;
++
++    console.assert(f.a == 2u8);
++}
+\ No newline at end of file
+diff --git a/compiler/tests/circuits/mut_variable_fail.leo b/compiler/tests/circuits/mut_variable_fail.leo
+new file mode 100644
+index 0000000000..bb2e653ee3
+--- /dev/null
++++ b/compiler/tests/circuits/mut_variable_fail.leo
+@@ -0,0 +1,9 @@
++circuit Foo {
++    a: u8,
++}
++
++function main() {
++    let mut f  = Foo { a: 0u8 };
++
++    f.a = 1u8;
++}
+\ No newline at end of file
+diff --git a/typed/src/common/assignee.rs b/typed/src/common/assignee.rs
+index 9bea935574..b5e0a54920 100644
+--- a/typed/src/common/assignee.rs
++++ b/typed/src/common/assignee.rs
+@@ -17,7 +17,7 @@
+ use crate::{Expression, Identifier, RangeOrExpression};
+ use leo_ast::{
+     access::AssigneeAccess as AstAssigneeAccess,
+-    common::{Assignee as AstAssignee, Identifier as AstIdentifier},
++    common::{Assignee as AstAssignee, Identifier as AstIdentifier, KeywordOrIdentifier},
+ };
+ 
+ use serde::{Deserialize, Serialize};
+@@ -38,9 +38,15 @@ impl<'ast> From<AstIdentifier<'ast>> for Assignee {
+     }
+ }
+ 
++impl<'ast> From<KeywordOrIdentifier<'ast>> for Assignee {
++    fn from(name: KeywordOrIdentifier<'ast>) -> Self {
++        Assignee::Identifier(Identifier::from(name))
++    }
++}
++
+ impl<'ast> From<AstAssignee<'ast>> for Assignee {
+     fn from(assignee: AstAssignee<'ast>) -> Self {
+-        let variable = Assignee::from(assignee.identifier);
++        let variable = Assignee::from(assignee.name);
+ 
+         // We start with the id, and we fold the array of accesses by wrapping the current value
+         assignee
+diff --git a/typed/src/common/identifier.rs b/typed/src/common/identifier.rs
+index b02c0cad8a..274bce1a02 100644
+--- a/typed/src/common/identifier.rs
++++ b/typed/src/common/identifier.rs
+@@ -23,8 +23,8 @@ use leo_ast::{
+ use leo_input::common::Identifier as InputAstIdentifier;
+ 
+ use leo_ast::{
+-    common::SelfKeyword,
+-    expressions::{CircuitName, KeywordOrIdentifier},
++    common::{KeywordOrIdentifier, SelfKeyword},
++    expressions::CircuitName,
+     functions::InputKeyword,
+     types::SelfType,
+ };
+diff --git a/typed/src/expression.rs b/typed/src/expression.rs
+index fb17a983b4..4371f55175 100644
+--- a/typed/src/expression.rs
++++ b/typed/src/expression.rs
+@@ -362,7 +362,7 @@ impl<'ast> From<AstExpression<'ast>> for Expression {
+ // Assignee -> Expression for operator assign statements
+ impl<'ast> From<Assignee<'ast>> for Expression {
+     fn from(assignee: Assignee<'ast>) -> Self {
+-        let variable = Expression::Identifier(Identifier::from(assignee.identifier));
++        let variable = Expression::Identifier(Identifier::from(assignee.name));
+ 
+         // we start with the id, and we fold the array of accesses by wrapping the current value
+         assignee

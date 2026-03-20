@@ -1,0 +1,472 @@
+diff --git a/docs/guides/operator/installation.adoc b/docs/guides/operator/installation.adoc
+index d633f0acdd0b..bf33c2cf8704 100644
+--- a/docs/guides/operator/installation.adoc
++++ b/docs/guides/operator/installation.adoc
+@@ -144,4 +144,22 @@ If you do this please be aware:
+ 
+ It is therefore recommended in a multiple Operator install scenario that you keep versions aligned as closely as possible to minimize the potential problems with different versions.
+ 
++=== Upgrading an Operator
++
++While it generally expected that server custom image versions will match the operator version, this can be difficult to properly maintain during an operator upgrade.
++
++The recommended approach is to first update your CRs to custom images utilizing the new version. While the CR configuration will generally be compatible, be aware this may not hold for major version changes, and always consult the upgrade notes for all version changes.
++Once all the Keycloak instances managed by the operator are updated, then update the operator to the new target version.
++
++If due to a major version change or bug an old operator is not compatible with a new custom image version, then you will instead need to stop the old operator when updating the custom images, then bring up the new operator version once the Keycloak CRs are up-to-date.
++
++To stop an operator you uninstall it, or scale down the Deployment to 0 replicas:
++
++[source,bash,subs="attributes+"]
++----
++kubectl scale deployment/keycloak-operator --replicas=0
++----
++
++See <@links.operator id="rolling-updates"/> to understand how the operator will treat server version changes.
++
+ </@tmpl.guide>
+diff --git a/js/apps/admin-ui/src/realm-settings/NewClientPolicyCondition.tsx b/js/apps/admin-ui/src/realm-settings/NewClientPolicyCondition.tsx
+index d6c8c7ce31c9..9de109d078ae 100644
+--- a/js/apps/admin-ui/src/realm-settings/NewClientPolicyCondition.tsx
++++ b/js/apps/admin-ui/src/realm-settings/NewClientPolicyCondition.tsx
+@@ -228,6 +228,7 @@ export default function NewClientPolicyCondition() {
+                   variant={SelectVariant.single}
+                   aria-label={t("conditionType")}
+                   isOpen={openConditionType}
++                  width="trigger"
+                 >
+                   {conditionTypes?.map((condition) => (
+                     <SelectOption
+diff --git a/operator/src/main/java/org/keycloak/operator/controllers/KeycloakClientBaseController.java b/operator/src/main/java/org/keycloak/operator/controllers/KeycloakClientBaseController.java
+index b24d67530e13..1dc5be593cf3 100644
+--- a/operator/src/main/java/org/keycloak/operator/controllers/KeycloakClientBaseController.java
++++ b/operator/src/main/java/org/keycloak/operator/controllers/KeycloakClientBaseController.java
+@@ -67,6 +67,7 @@
+ import org.keycloak.operator.crds.v2alpha1.deployment.Keycloak;
+ import org.keycloak.operator.crds.v2alpha1.deployment.KeycloakStatusAggregator;
+ import org.keycloak.operator.crds.v2alpha1.deployment.KeycloakStatusCondition;
++import org.keycloak.operator.crds.v2alpha1.deployment.spec.FeatureSpec;
+ import org.keycloak.operator.crds.v2alpha1.deployment.spec.HttpSpec;
+ import org.keycloak.representations.admin.v2.BaseClientRepresentation;
+ 
+@@ -95,6 +96,7 @@
+ public abstract class KeycloakClientBaseController<R extends CustomResource<? extends KeycloakClientSpec<S>, KeycloakClientStatus>, T extends BaseClientRepresentation, S extends BaseClientRepresentation>
+         implements Reconciler<R>, Cleaner<R> {
+ 
++    public static final String CLIENT_ADMIN_API_V2 = "client-admin-api:v2";
+     private static final String CLIENT_API_VERSION = "v2";
+     private static final String HTTPS = "https";
+ 
+@@ -153,6 +155,12 @@ public UpdateControl<R> reconcile(R resource, Context<R> context) throws Excepti
+ 
+         KeycloakClientStatusAggregator statusAggregator = new KeycloakClientStatusAggregator(resource);
+ 
++        if (!hasFeatureEnabled(keycloak)) {
++            statusAggregator.setCondition(KeycloakClientStatusCondition.HAS_ERRORS, Boolean.TRUE, "Cannot create/update because the server does not have %s enabled".formatted(CLIENT_ADMIN_API_V2));
++            resource.setStatus(statusAggregator.build());
++            return UpdateControl.patchStatus(resource);
++        }
++
+         S client = resource.getSpec().getClient();
+         // first convert to the target representation - the spec representation is specialized
+         var map = context.getClient().getKubernetesSerialization().convertValue(client, Map.class);
+@@ -197,6 +205,15 @@ public UpdateControl<R> reconcile(R resource, Context<R> context) throws Excepti
+         return updateControl;
+     }
+ 
++    // TODO: this doesn't mesh well with the current feature concept
++    // we specifically need v2 enabled, so we can't simply check for client-admin-api
++    // - the behavior is also version dependent later verions of keycloak presumably will have client-admin-api:v2
++    //   enabled by default, so we'd need to check specifically for that feature being disabled, or remove this check altogether
++    private boolean hasFeatureEnabled(Keycloak keycloak) {
++        return Optional.ofNullable(keycloak.getSpec().getFeatureSpec()).map(FeatureSpec::getEnabledFeatures)
++                .filter(ef -> ef.contains(CLIENT_ADMIN_API_V2)).isPresent();
++    }
++
+     abstract boolean prepareRepresentation(S crRepresentation, T targetRepresentation, Context<?> context);
+ 
+     abstract Class<T> getTargetRepresentation();
+@@ -216,6 +233,14 @@ public DeleteControl cleanup(R resource, Context<R> context) throws Exception {
+             return DeleteControl.defaultDelete();
+         }
+ 
++        if (!hasFeatureEnabled(keycloak)) {
++            // TODO: this behavior is not very straight-forward. For now just log an error
++            // in the server and move on
++            Log.error("Cannot delete Client $s/%s because the server does not have %s enabled.".formatted(
++                    resource.getMetadata().getNamespace(), resource.getMetadata().getName(), CLIENT_ADMIN_API_V2));
++            return DeleteControl.defaultDelete();
++        }
++
+         invoke(resource, context, keycloak, client -> {
+             try {
+                 client.deleteClient();
+diff --git a/operator/src/test/java/org/keycloak/operator/testsuite/integration/KeycloakClientTest.java b/operator/src/test/java/org/keycloak/operator/testsuite/integration/KeycloakClientTest.java
+index 447499a3a774..e486bd71ed0e 100644
+--- a/operator/src/test/java/org/keycloak/operator/testsuite/integration/KeycloakClientTest.java
++++ b/operator/src/test/java/org/keycloak/operator/testsuite/integration/KeycloakClientTest.java
+@@ -59,7 +59,6 @@
+ 
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ 
+-@DisabledIfApiServerTest
+ @Tag(BaseOperatorTest.SLOW)
+ @QuarkusTest
+ public class KeycloakClientTest extends BaseOperatorTest {
+@@ -93,6 +92,7 @@ public void afterEach() {
+         k8sclient.secrets().withName(CLIENT_TLS_SECRET).delete();
+     }
+ 
++    @DisabledIfApiServerTest
+     @Test
+     public void testBasicSamlClientCreationAndDeletionHttp() throws InterruptedException {
+         var kc = getTestKeycloakDeployment(false);
+@@ -126,11 +126,13 @@ public void testBasicSamlClientCreationAndDeletionHttp() throws InterruptedExcep
+     }
+ 
+     @Test
++    @DisabledIfApiServerTest
+     public void testBasicOIDCClientCreationAndDeletionHttp() throws InterruptedException {
+         helpTestBasicOIDCClientCreationAndDeletion(false);
+     }
+ 
+     @Test
++    @DisabledIfApiServerTest
+     public void testBasicOIDCClientCreationAndDeletionHttps() throws InterruptedException {
+         helpTestBasicOIDCClientCreationAndDeletion(true);
+     }
+@@ -220,5 +222,25 @@ private void deployKeycloakWithAdminApiV2(boolean https, Keycloak kc) {
+         initCustomBootstrapAdminServiceAccount(kc);
+         deployKeycloak(k8sclient, kc, true);
+     }
++    
++    @Test
++    public void testFeatureRequired() {
++        var kc = getTestKeycloakDeployment(true);
++        K8sUtils.deployKeycloak(k8sclient, kc, false);
++
++        KeycloakSAMLClient client = new KeycloakSAMLClientBuilder().withNewMetadata().withName("new-client")
++                .endMetadata().withNewSpec().withRealm("master").withKeycloakCRName(kc.getMetadata().getName())
++                .withNewClient().withEnabled(true).endClient().endSpec().build();
++
++        K8sUtils.set(k8sclient, client);
++
++        Awaitility.await().ignoreExceptions()
++                .until(() -> Optional.ofNullable(k8sclient.resource(client).get().getStatus())
++                        .filter(s -> s.getConditions().stream()
++                                .anyMatch(c -> Boolean.TRUE.equals(c.getStatus())
++                                        && KeycloakClientStatusCondition.HAS_ERRORS.equals(c.getType())
++                                        && c.getMessage().contains(KeycloakClientBaseController.CLIENT_ADMIN_API_V2)))
++                        .isPresent());
++    }
+ 
+ }
+diff --git a/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java b/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
+index 40df81b003a7..a0ce080bfecd 100644
+--- a/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
++++ b/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
+@@ -117,6 +117,7 @@ public class DatabaseOptions {
+ 
+     public static final Option<String> DB_POSTGRESQL_TARGET_SERVER_TYPE = new OptionBuilder<>("db-postgres-target-server-type", String.class)
+             .category(OptionCategory.DATABASE)
++            .defaultValue("primary") // cause the propertymapping logic to always advertise this property
+             .hidden()
+             .build();
+ 
+diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
+index b5f0df6476a7..6b7ba9cda46e 100644
+--- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
++++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
+@@ -29,7 +29,8 @@
+ import static org.keycloak.quarkus.runtime.configuration.mappers.DatabasePropertyMappers.Datasources.appendDatasourceMappers;
+ import static org.keycloak.quarkus.runtime.configuration.mappers.PropertyMapper.fromOption;
+ 
+-final class DatabasePropertyMappers implements PropertyMapperGrouping {
++public final class DatabasePropertyMappers implements PropertyMapperGrouping {
++    public static final String PG_TARGET_SERVER_TYPE = "quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType";
+     private static final Logger log = Logger.getLogger(DatabasePropertyMappers.class);
+ 
+     @Override
+@@ -54,9 +55,8 @@ public List<PropertyMapper<?>> getPropertyMappers() {
+                         .paramLabel("jdbc-url")
+                         .build(),
+                 fromOption(DatabaseOptions.DB_POSTGRESQL_TARGET_SERVER_TYPE)
+-                        .to("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType")
+-                        .mapFrom(DatabaseOptions.DB, DatabasePropertyMappers::getPostgresqlTargetServerType)
+-                        .isEnabled(() -> getPostgresqlTargetServerType(Configuration.getConfigValue(DB).getValue(), null) != null)
++                        .to(PG_TARGET_SERVER_TYPE)
++                        .isEnabled(() -> isPostgresqlTargetServerTypeEnabled())
+                         .build(),
+                 fromOption(DatabaseOptions.DB_URL_HOST)
+                         .paramLabel("hostname")
+@@ -125,10 +125,11 @@ public List<PropertyMapper<?>> getPropertyMappers() {
+             .description("Used for internal purposes of H2 database.")
+             .build();
+ 
+-    private static String getPostgresqlTargetServerType(String db, ConfigSourceInterceptorContext context) {
++    public static boolean isPostgresqlTargetServerTypeEnabled() {
++        String db = Configuration.getConfigValue(DB).getValue();
+         Database.Vendor vendor = Database.getVendor(db).orElse(null);
+         if (vendor != Database.Vendor.POSTGRES) {
+-            return null;
++            return false;
+         }
+ 
+         String dbDriver = Configuration.getConfigValue(DatabaseOptions.DB_DRIVER).getValue();
+@@ -137,14 +138,10 @@ private static String getPostgresqlTargetServerType(String db, ConfigSourceInter
+         if (!Objects.equals(Database.getDriver(db, true).orElse(null), dbDriver) &&
+                 !Objects.equals(Database.getDriver(db, false).orElse(null), dbDriver)) {
+             // Custom JDBC-Driver, for example, AWS JDBC Wrapper.
+-            return null;
++            return false;
+         }
+-        if (dbUrl != null && dbUrl.contains("targetServerType")) {
+-            // targetServerType already set to same or different value in db-url, ignore
+-            return null;
+-        }
+-        log.debug("setting targetServerType for PostgreSQL to 'primary'");
+-        return "primary";
++        // targetServerType already set to same or different value in db-url, ignore
++        return dbUrl == null || !dbUrl.contains("targetServerType");
+     }
+ 
+     /**
+diff --git a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java
+index f5e32b234536..c27464e1bb25 100644
+--- a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java
++++ b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java
+@@ -30,6 +30,7 @@
+ import org.keycloak.Config;
+ import org.keycloak.config.CachingOptions;
+ import org.keycloak.quarkus.runtime.Environment;
++import org.keycloak.quarkus.runtime.configuration.mappers.DatabasePropertyMappers;
+ import org.keycloak.quarkus.runtime.configuration.mappers.HttpPropertyMappers;
+ import org.keycloak.quarkus.runtime.vault.FilesKeystoreVaultProviderFactory;
+ import org.keycloak.quarkus.runtime.vault.FilesPlainTextVaultProviderFactory;
+@@ -390,21 +391,21 @@ public void testDatabaseProperties() {
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres");
+         config = createConfig();
+-        assertEquals("primary", config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
+-
++        assertTrue(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
++        assertTrue(StreamSupport.stream(config.getPropertyNames().spliterator(), false).anyMatch(DatabasePropertyMappers.PG_TARGET_SERVER_TYPE::equals));
++        assertEquals("primary", config.getConfigValue(DatabasePropertyMappers.PG_TARGET_SERVER_TYPE).getValue());
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres", "--db-url-properties=?targetServerType=any");
+         config = createConfig();
+-        assertNull(config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
+-        assertEquals("jdbc:postgresql://localhost:5432/keycloak?targetServerType=any", config.getConfigValue("quarkus.datasource.jdbc.url").getValue());
++        assertFalse(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres", "--db-driver=software.amazon.jdbc.Driver");
+         config = createConfig();
+-        assertNull(config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
++        assertFalse(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres", "--db-url=jdbc:postgresql://localhost:5432/keycloak?targetServerType=any");
+         config = createConfig();
+-        assertNull(config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
++        assertFalse(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
+     }
+ 
+     // KEYCLOAK-15632
+diff --git a/services/src/main/java/org/keycloak/protocol/docker/DockerAuthV2Protocol.java b/services/src/main/java/org/keycloak/protocol/docker/DockerAuthV2Protocol.java
+index ded51b4219a3..d68c6398b782 100644
+--- a/services/src/main/java/org/keycloak/protocol/docker/DockerAuthV2Protocol.java
++++ b/services/src/main/java/org/keycloak/protocol/docker/DockerAuthV2Protocol.java
+@@ -10,6 +10,8 @@
+ import jakarta.ws.rs.core.UriInfo;
+ 
+ import org.keycloak.common.util.SecretGenerator;
++import org.keycloak.events.Details;
++import org.keycloak.events.Errors;
+ import org.keycloak.events.EventBuilder;
+ import org.keycloak.events.EventType;
+ import org.keycloak.jose.jws.JWSBuilder;
+@@ -136,11 +138,13 @@ public Response authenticated(final AuthenticationSessionModel authSession, fina
+                         .setIssued_at(expiresInIso8601String);
+                 return new ResponseBuilderImpl().status(Response.Status.OK).header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON).entity(responseEntity).build();
+             } else {
+-                logger.errorv("Unable to handle request for event type {0}.  Currently only LOGIN event types are supported by docker protocol.", event.getEvent() == null ? "null" : event.getEvent().getType());
++                event.detail(Details.REASON, "Unable to handle request. Currently only LOGIN event types are supported by docker protocol.");
++                event.error(Errors.INVALID_REQUEST);
+                 throw new ErrorResponseException("invalid_request", "Event type not supported", Response.Status.BAD_REQUEST);
+             }
+         } catch (final InstantiationException e) {
+-            logger.errorv("Error attempting to create Key ID for Docker JOSE header: ", e.getMessage());
++            event.detail(Details.REASON, "Error attempting to create Key ID for Docker JOSE header: " + e.getMessage());
++            event.error(Errors.GENERIC_AUTHENTICATION_ERROR);
+             throw new ErrorResponseException("token_error", "Unable to construct JOSE header for JWT", Response.Status.INTERNAL_SERVER_ERROR);
+         }
+ 
+diff --git a/services/src/main/java/org/keycloak/protocol/docker/DockerEndpoint.java b/services/src/main/java/org/keycloak/protocol/docker/DockerEndpoint.java
+index 6581df7c3810..5cc041377251 100644
+--- a/services/src/main/java/org/keycloak/protocol/docker/DockerEndpoint.java
++++ b/services/src/main/java/org/keycloak/protocol/docker/DockerEndpoint.java
+@@ -5,6 +5,7 @@
+ import jakarta.ws.rs.core.Response;
+ 
+ import org.keycloak.common.Profile;
++import org.keycloak.events.Details;
+ import org.keycloak.events.Errors;
+ import org.keycloak.events.EventBuilder;
+ import org.keycloak.events.EventType;
+@@ -70,7 +71,7 @@ public Response build() {
+         // So back button doesn't work
+         CacheControlUtil.noBackButtonCacheControlHeader(session);
+ 
+-        return handleBrowserAuthenticationRequest(authenticationSession, new DockerAuthV2Protocol(session, realm, session.getContext().getUri(), headers, event.event(login)), false, false);
++        return handleBrowserAuthenticationRequest(authenticationSession, new DockerAuthV2Protocol(session, realm, session.getContext().getUri(), headers, event), false, false);
+     }
+ 
+     private void updateAuthenticationSession() {
+@@ -90,18 +91,20 @@ private void updateAuthenticationSession() {
+ 
+     private void checkService() {
+         if (service == null) {
++            event.detail(Details.REASON, "Missing parameter: " + DockerAuthV2Protocol.SERVICE_PARAM);
+             event.error(Errors.INVALID_REQUEST);
+             throw new ErrorResponseException("invalid_request", "service parameter must be provided", Response.Status.BAD_REQUEST);
+         }
++        event.client(service);
+         client = realm.getClientByClientId(service);
+         if (client == null) {
++            event.detail(Details.REASON, "Client specified by 'service' parameter does not exist");
+             event.error(Errors.CLIENT_NOT_FOUND);
+-            logger.errorv("Failed to lookup client given by service={0} parameter for realm: {1}.", service, realm.getName());
+             throw new ErrorResponseException("invalid_client", "Client specified by 'service' parameter does not exist", Response.Status.BAD_REQUEST);
+         }
+         if (!client.isEnabled()) {
++            event.detail(Details.REASON, "Client specified by 'service' is disabled");
+             event.error(Errors.CLIENT_DISABLED);
+-            logger.errorv("The service {0} in realm {1} is disabled.", service, realm.getName());
+             throw new ErrorResponseException("invalid_client", "Client specified by 'service' is disabled", Response.Status.BAD_REQUEST);
+         }
+         session.getContext().setClient(client);
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerClientTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerClientTest.java
+index 13c9dfc174ad..6a90ced2561e 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerClientTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerClientTest.java
+@@ -12,16 +12,24 @@
+ import org.keycloak.common.Profile;
+ import org.keycloak.common.util.PemUtils;
+ import org.keycloak.crypto.KeyStatus;
++import org.keycloak.events.Details;
++import org.keycloak.events.Errors;
++import org.keycloak.events.EventType;
+ import org.keycloak.models.Constants;
++import org.keycloak.protocol.docker.DockerAuthV2Protocol;
+ import org.keycloak.representations.idm.ClientRepresentation;
+ import org.keycloak.representations.idm.KeysMetadataRepresentation;
+ import org.keycloak.representations.idm.RealmRepresentation;
++import org.keycloak.representations.idm.UserRepresentation;
+ import org.keycloak.testsuite.AbstractKeycloakTest;
++import org.keycloak.testsuite.AssertEvents;
+ import org.keycloak.testsuite.admin.ApiUtil;
+ import org.keycloak.testsuite.arquillian.annotation.EnableFeature;
+ 
++import org.hamcrest.Matchers;
+ import org.junit.Assert;
+ import org.junit.BeforeClass;
++import org.junit.Rule;
+ import org.junit.Test;
+ import org.slf4j.LoggerFactory;
+ import org.testcontainers.containers.BindMode;
+@@ -53,6 +61,9 @@ public class DockerClientTest extends AbstractKeycloakTest {
+     private GenericContainer dockerRegistryContainer = null;
+     private GenericContainer dockerClientContainer = null;
+ 
++    @Rule
++    public AssertEvents events = new AssertEvents(this);
++
+     private static String hostIp;
+ 
+     @BeforeClass
+@@ -148,10 +159,13 @@ public void afterAbstractKeycloakTest() throws Exception {
+ 
+     @Test
+     public void shouldPerformDockerAuthAgainstRegistry() throws Exception {
++        UserRepresentation dockerUser = ApiUtil.findUserByUsername(adminClient.realm(REALM_ID), DOCKER_USER);
++
+         log.info("Starting the attempt for login...");
+         Container.ExecResult result = dockerClientContainer.execInContainer("docker", "login", "-u", DOCKER_USER, "-p", DOCKER_USER_PASSWORD, REGISTRY_HOSTNAME + ":" + REGISTRY_PORT);
+         printCommandResult(result);
+         assertThat("Error performing login", result.getExitCode(), is(0));
++        assertLogin(dockerUser);
+ 
+         // create a empty Dockerfile in /tmp
+         result = dockerClientContainer.execInContainer("sh", "-c", "echo -e \"FROM scratch\\nWORKDIR /\" > /tmp/Dockerfile");
+@@ -167,11 +181,13 @@ public void shouldPerformDockerAuthAgainstRegistry() throws Exception {
+         result = dockerClientContainer.execInContainer("docker", "push", REGISTRY_HOSTNAME + ":" + REGISTRY_PORT + "/empty");
+         printCommandResult(result);
+         assertThat("Error pushing to registry", result.getExitCode(), is(0));
++        assertLogin(dockerUser);
+ 
+         // logout
+         result = dockerClientContainer.execInContainer("docker", "logout");
+         printCommandResult(result);
+         assertThat("Error performing logout", result.getExitCode(), is(0));
++        assertLogin(dockerUser);
+ 
+         // disable and login should fail
+         ClientResource client = ApiUtil.findClientByClientId(adminClient.realm(REALM_ID), CLIENT_ID);
+@@ -183,10 +199,33 @@ public void shouldPerformDockerAuthAgainstRegistry() throws Exception {
+         printCommandResult(result);
+         assertThat("Error performing login", result.getExitCode(), not(is(0)));
+         assertThat("Service is not disabled", result.getStderr(), containsString("Client specified by 'service' is disabled"));
++        assertLoginErrorClientDisabled();
+     }
+ 
+     private void printCommandResult(Container.ExecResult result) {
+         log.infof("Command executed with exit code %d. Output follows:\nSTDOUT: %s\n---\nSTDERR: %s",
+                 result.getExitCode(), result.getStdout(), result.getStderr());
+     }
++
++    private void assertLogin(UserRepresentation dockerUser) {
++        events.expectLogin()
++                .realm(REALM_ID)
++                .ipAddress(Matchers.any(String.class))
++                .client(CLIENT_ID)
++                .user(dockerUser.getId())
++                .detail(Details.AUTH_METHOD, DockerAuthV2Protocol.LOGIN_PROTOCOL)
++                .detail(Details.USERNAME, DOCKER_USER)
++                .removeDetail(Details.REDIRECT_URI)
++                .assertEvent();
++    }
++
++    private void assertLoginErrorClientDisabled() {
++        events.expect(EventType.LOGIN_ERROR)
++                .realm(REALM_ID)
++                .ipAddress(Matchers.any(String.class))
++                .client(CLIENT_ID)
++                .user((String) null)
++                .error(Errors.CLIENT_DISABLED)
++                .assertEvent();
++    }
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerTestRealmSetup.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerTestRealmSetup.java
+index 9032e1982a18..29fc65b7a644 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerTestRealmSetup.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/docker/DockerTestRealmSetup.java
+@@ -4,7 +4,6 @@
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Optional;
+-import java.util.UUID;
+ 
+ import org.keycloak.protocol.docker.DockerAuthV2Protocol;
+ import org.keycloak.representations.idm.ClientRepresentation;
+@@ -19,10 +18,11 @@ private DockerTestRealmSetup() {
+ 
+     public static RealmRepresentation createRealm(final String realmId) {
+         final RealmRepresentation createdRealm = new RealmRepresentation();
+-        createdRealm.setId(UUID.randomUUID().toString());
++        createdRealm.setId(realmId);
+         createdRealm.setRealm(realmId);
+         createdRealm.setEnabled(true);
+         createdRealm.setAuthenticatorConfig(new ArrayList<>());
++        createdRealm.setEventsListeners(List.of("jboss-logging", "event-queue"));
+ 
+         return createdRealm;
+     }

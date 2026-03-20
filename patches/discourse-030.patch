@@ -1,40 +1,105 @@
-diff --git a/plugins/discourse-ai/spec/lib/completions/prompt_messages_builder_spec.rb b/plugins/discourse-ai/spec/lib/completions/prompt_messages_builder_spec.rb
-index 7aa106fc23..1513858dd2 100644
---- a/plugins/discourse-ai/spec/lib/completions/prompt_messages_builder_spec.rb
-+++ b/plugins/discourse-ai/spec/lib/completions/prompt_messages_builder_spec.rb
-@@ -440,7 +440,7 @@ describe DiscourseAi::Completions::PromptMessagesBuilder do
+diff --git a/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb b/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb
+index 1a0eed654b3d8..9e84e4325a5b7 100644
+--- a/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb
++++ b/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb
+@@ -122,28 +122,65 @@ def set_image_as_thumbnail(post, image_link)
+ 
+       def topics_polled_from_feed
+         raw_feed = fetch_raw_feed
+-        return [] if raw_feed.blank?
++
++        if raw_feed.blank?
++          Rails.logger.warn("RSS Polling: Failed to fetch feed from #{feed_url}")
++          return []
++        end
+ 
+         parsed_feed = RSS::Parser.parse(raw_feed, false)
+-        return [] if parsed_feed.blank?
++
++        if parsed_feed.blank?
++          Rails.logger.warn("RSS Polling: Unable to parse feed from #{feed_url}")
++          return []
++        end
+ 
+         parsed_feed.items.map { |item| ::DiscourseRssPolling::FeedItem.new(item) }
+-      rescue RSS::NotWellFormedError, RSS::InvalidRSSError
++      rescue RSS::NotWellFormedError, RSS::InvalidRSSError => e
++        Discourse.warn_exception(e, message: "RSS Polling: Invalid RSS from #{feed_url}")
+         []
+       end
+ 
+       def fetch_raw_feed
++        url, headers = extract_api_credentials(@feed_url)
+         body = +""
+ 
+-        FinalDestination
+-          .new(@feed_url)
+-          .get do |response, chunk, uri|
+-            throw :done if uri.blank? || !response.is_a?(Net::HTTPSuccess)
+-            body << chunk
++        fd = FinalDestination.new(url, headers:)
++        response_status = nil
++
++        fd.get do |response, chunk, uri|
++          if uri.blank? || !response.is_a?(Net::HTTPSuccess)
++            response_status = response&.code
++            throw :done
+           end
++          body << chunk
++        end
++
++        if body.blank? && response_status.present?
++          Rails.logger.warn(
++            "RSS Polling: HTTP #{response_status} when fetching #{feed_url} (status: #{fd.status})",
++          )
++        end
+ 
+         body.presence
+       end
++
++      def extract_api_credentials(url)
++        uri = URI.parse(url)
++        return url, {} if uri.query.blank?
++
++        params = CGI.parse(uri.query)
++        api_key = params.delete("api_key")&.first
++        api_username = params.delete("api_username")&.first
++
++        return url, {} if api_key.blank?
++
++        headers = { "Api-Key" => api_key }
++        headers["Api-Username"] = api_username if api_username.present?
++
++        uri.query = params.empty? ? nil : URI.encode_www_form(params)
++        [uri.to_s, headers]
++      end
+     end
+   end
+ end
+diff --git a/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb b/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb
+index 0693e527c247a..89fb79b3a7bc2 100644
+--- a/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb
++++ b/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb
+@@ -144,15 +144,17 @@
+       }.not_to raise_error
      end
  
-     it "handles uploads correctly in topic style messages (and times)" do
--      freeze_time 1.month.ago
-+      freeze_time 31.days.ago
+-    it "works with authentication in query parameters" do
++    it "sends API credentials as headers instead of query parameters" do
+       authenticated_url = "#{feed_url}?api_key=test123&api_username=testuser"
  
-       # Use Discourse's upload format in the post raw content
-       upload_markdown = "![test|658x372](#{image_upload1.short_url})"
-@@ -457,7 +457,7 @@ describe DiscourseAi::Completions::PromptMessagesBuilder do
+       Discourse.redis.del("rss-polling-feed-polled:#{Digest::SHA1.hexdigest(authenticated_url)}")
  
-       upload2_markdown = "![test|658x372](#{image_upload2.short_url})"
+-      stub_request(:get, authenticated_url).to_return(
+-        status: 200,
+-        body: file_from_fixtures("feed.rss", "feed"),
+-      )
++      stub_request(:get, feed_url).with(
++        headers: {
++          "Api-Key" => "test123",
++          "Api-Username" => "testuser",
++        },
++      ).to_return(status: 200, body: file_from_fixtures("feed.rss", "feed"))
  
--      freeze_time 1.month.from_now
-+      freeze_time 31.days.from_now
- 
-       post2_with_upload =
-         Fabricate(
-@@ -533,7 +533,7 @@ describe DiscourseAi::Completions::PromptMessagesBuilder do
-     end
- 
-     it "handles uploads correctly in topic style messages (and times)" do
--      freeze_time 1.month.ago
-+      freeze_time 31.days.ago
- 
-       # Use Discourse's upload format in the post raw content
-       upload_markdown = "![test1|658x372](#{image_upload1.short_url})"
-@@ -551,7 +551,7 @@ describe DiscourseAi::Completions::PromptMessagesBuilder do
-       long_title = "A" * 40
-       upload2_markdown = "![#{long_title}|658x372](#{image_upload2.short_url})"
- 
--      freeze_time 1.month.from_now
-+      freeze_time 31.days.from_now
- 
-       post2_with_upload =
-         Fabricate(
+       expect {
+         job.execute(feed_url: authenticated_url, author_username: author.username)

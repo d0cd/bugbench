@@ -1,249 +1,3402 @@
-diff --git a/pkg/storage/unified/client.go b/pkg/storage/unified/client.go
-index 3d56bdd94db..c992b3afb0d 100644
---- a/pkg/storage/unified/client.go
-+++ b/pkg/storage/unified/client.go
-@@ -23,7 +23,6 @@ import (
- 	"github.com/grafana/dskit/grpcclient"
- 	"github.com/grafana/dskit/middleware"
- 	"github.com/grafana/dskit/services"
--	grafanarest "github.com/grafana/grafana/pkg/apiserver/rest"
- 	infraDB "github.com/grafana/grafana/pkg/infra/db"
- 	"github.com/grafana/grafana/pkg/infra/tracing"
- 	secrets "github.com/grafana/grafana/pkg/registry/apis/secret/contracts"
-@@ -70,23 +69,14 @@ func ProvideUnifiedStorageClient(opts *Options,
- 		GrpcClientKeepaliveTime: apiserverCfg.Key("grpc_client_keepalive_time").MustDuration(0),
- 	}, opts.Cfg, opts.Features, opts.DB, opts.Tracer, opts.Reg, opts.Authzc, opts.Docs, storageMetrics, indexMetrics, opts.SecureValues)
- 	if err == nil {
--		// Decide whether to disable SQL fallback stats per resource in Mode 5.
--		// Otherwise we would still try to query the legacy SQL database in Mode 5.
--		var disableDashboardsFallback, disableFoldersFallback bool
--		if opts.Cfg != nil {
--			// String are static here, so we don't need to import the packages.
--			foldersMode := opts.Cfg.UnifiedStorage["folders.folder.grafana.app"].DualWriterMode
--			disableFoldersFallback = foldersMode == grafanarest.Mode5
--			dashboardsMode := opts.Cfg.UnifiedStorage["dashboards.dashboard.grafana.app"].DualWriterMode
--			disableDashboardsFallback = dashboardsMode == grafanarest.Mode5
--		}
--
- 		// Used to get the folder stats
-+		// Pass cfg directly so the federated client reads the current dual-writer mode
-+		// at query time, not at creation time. This is important because auto-migration
-+		// may set Mode5 after the client is created during startup.
- 		client = federated.NewFederatedClient(
- 			client, // The original
- 			legacysql.NewDatabaseProvider(opts.DB),
--			disableDashboardsFallback,
--			disableFoldersFallback,
-+			opts.Cfg,
- 		)
- 	}
+diff --git a/docs/sources/shared/visualizations/annotations/options.md b/docs/sources/shared/visualizations/annotations/options.md
+index edb6da2033974..7ce9335259d76 100644
+--- a/docs/sources/shared/visualizations/annotations/options.md
++++ b/docs/sources/shared/visualizations/annotations/options.md
+@@ -6,4 +6,5 @@ comments: |
  
-diff --git a/pkg/storage/unified/federated/client.go b/pkg/storage/unified/federated/client.go
-index 9de0479863d..cca1c332482 100644
---- a/pkg/storage/unified/federated/client.go
-+++ b/pkg/storage/unified/federated/client.go
-@@ -5,18 +5,18 @@ import (
- 
- 	"google.golang.org/grpc"
- 
-+	"github.com/grafana/grafana/pkg/setting"
- 	"github.com/grafana/grafana/pkg/storage/legacysql"
- 	"github.com/grafana/grafana/pkg/storage/unified/resource"
- 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
- )
- 
--func NewFederatedClient(base resource.ResourceClient, sql legacysql.LegacyDatabaseProvider, disableDashboardsFallback bool, disableFoldersFallback bool) resource.ResourceClient {
-+func NewFederatedClient(base resource.ResourceClient, sql legacysql.LegacyDatabaseProvider, cfg *setting.Cfg) resource.ResourceClient {
- 	return &federatedClient{
- 		ResourceClient: base,
- 		stats: &LegacyStatsGetter{
--			SQL:                          sql,
--			DisableSQLFallbackDashboards: disableDashboardsFallback,
--			DisableSQLFallbackFolders:    disableFoldersFallback,
-+			SQL: sql,
-+			Cfg: cfg,
- 		},
- 	}
+ | Option                | Description                                                                                                                               |
+ | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+-| Multi-row annotations | Breaks each annotation data frame into a separate row in the visualization. Only visible in panels that display more then one annotation. |
++| Multi-row annotations | Breaks each annotation data frame into a separate row in the visualization. Only visible in panels that display more than one annotation. |
++| Annotation clustering | Joins adjacent point annotations into a single annotation region.                                                                         |
+diff --git a/packages/grafana-data/src/types/annotations.ts b/packages/grafana-data/src/types/annotations.ts
+index e76ddc16d5177..075762cf29c07 100644
+--- a/packages/grafana-data/src/types/annotations.ts
++++ b/packages/grafana-data/src/types/annotations.ts
+@@ -49,6 +49,7 @@ export interface AnnotationEvent {
  }
-diff --git a/pkg/storage/unified/federated/stats.go b/pkg/storage/unified/federated/stats.go
-index ce2d6199b2b..4b08ac8b9f8 100644
---- a/pkg/storage/unified/federated/stats.go
-+++ b/pkg/storage/unified/federated/stats.go
-@@ -6,16 +6,31 @@ import (
  
- 	claims "github.com/grafana/authlib/types"
+ export interface AnnotationEventUIModel {
++  // @todo this is actually a number, and sending a string will break the API response! https://github.com/grafana/grafana/issues/120097
+   id?: string;
+   from: number;
+   to: number;
+diff --git a/packages/grafana-e2e-selectors/src/selectors/pages.ts b/packages/grafana-e2e-selectors/src/selectors/pages.ts
+index c22ad6c5fa3bd..9b06ada8c80c6 100644
+--- a/packages/grafana-e2e-selectors/src/selectors/pages.ts
++++ b/packages/grafana-e2e-selectors/src/selectors/pages.ts
+@@ -663,6 +663,9 @@ export const versionedPages = {
+       marker: {
+         '10.0.0': 'data-testid annotation-marker',
+       },
++      clusterTooltip: {
++        '13.0.0': 'data-testid annotation-cluster-tooltip',
++      },
+     },
+     Rows: {
+       Repeated: {
+diff --git a/packages/grafana-schema/src/common/common.gen.ts b/packages/grafana-schema/src/common/common.gen.ts
+index e3c9ff283fcdb..6f21a6355dfbb 100644
+--- a/packages/grafana-schema/src/common/common.gen.ts
++++ b/packages/grafana-schema/src/common/common.gen.ts
+@@ -502,10 +502,14 @@ export enum VizOrientation {
+   Vertical = 'vertical',
+ }
  
-+	grafanarest "github.com/grafana/grafana/pkg/apiserver/rest"
- 	"github.com/grafana/grafana/pkg/services/sqlstore"
-+	"github.com/grafana/grafana/pkg/setting"
- 	"github.com/grafana/grafana/pkg/storage/legacysql"
- 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
- )
+-/**
+- * Breaks out each annotation frame into multiple lanes on the x-axis
+- */
+ export interface VizAnnotations {
++  /**
++   * Sets whether clustering is enabled. Set as a number to provide for threshold customization in the future without breaking API changes. Any value > 0 will enable clustering.
++   */
++  clustering?: number;
++  /**
++   * Breaks out each annotation frame into multiple lanes on the x-axis
++   */
+   multiLane?: boolean;
+ }
  
- // Read stats from legacy SQL
- type LegacyStatsGetter struct {
--	SQL                          legacysql.LegacyDatabaseProvider
--	DisableSQLFallbackDashboards bool
--	DisableSQLFallbackFolders    bool
-+	SQL legacysql.LegacyDatabaseProvider
-+	Cfg *setting.Cfg
+diff --git a/packages/grafana-schema/src/common/mudball.cue b/packages/grafana-schema/src/common/mudball.cue
+index f7aeaeda57b5e..c3510862d299c 100644
+--- a/packages/grafana-schema/src/common/mudball.cue
++++ b/packages/grafana-schema/src/common/mudball.cue
+@@ -158,9 +158,11 @@ ReduceDataOptions: {
+ // TODO docs
+ VizOrientation: "auto" | "vertical" | "horizontal" @cuetsy(kind="enum")
+ 
+-// Breaks out each annotation frame into multiple lanes on the x-axis
+ VizAnnotations: {
++    // Breaks out each annotation frame into multiple lanes on the x-axis
+ 	multiLane?: bool
++	// Sets whether clustering is enabled. Set as a number to provide for threshold customization in the future without breaking API changes. Any value > 0 will enable clustering.
++	clustering?: number
+ } @cuetsy(kind="interface")
+ 
+ // TODO docs
+diff --git a/public/app/features/panel/options/builder/ClusteringSwitchEditor.test.tsx b/public/app/features/panel/options/builder/ClusteringSwitchEditor.test.tsx
+new file mode 100644
+index 0000000000000..0b81c0d73b802
+--- /dev/null
++++ b/public/app/features/panel/options/builder/ClusteringSwitchEditor.test.tsx
+@@ -0,0 +1,80 @@
++import { render, screen } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++
++import {
++  ClusteringSwitchEditor,
++  DEFAULT_CLUSTERING_ANNOTATION_SPACING,
++  DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED,
++} from './ClusteringSwitchEditor';
++
++describe('ClusteringSwitchEditor', () => {
++  it('should render a switch', () => {
++    render(
++      <ClusteringSwitchEditor
++        value={DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED}
++        onChange={() => {}}
++        item={{} as never}
++        context={{} as never}
++      />
++    );
++    expect(screen.getByRole('switch')).toBeInTheDocument();
++  });
++  it('should display switch as unchecked when value is DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED', () => {
++    render(
++      <ClusteringSwitchEditor
++        value={DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED}
++        onChange={() => {}}
++        item={{} as never}
++        context={{} as never}
++      />
++    );
++    expect(screen.getByRole('switch')).not.toBeChecked();
++  });
++  it('should display switch as checked when value is greater than 0', () => {
++    render(
++      <ClusteringSwitchEditor
++        value={DEFAULT_CLUSTERING_ANNOTATION_SPACING}
++        onChange={() => {}}
++        item={{} as never}
++        context={{} as never}
++      />
++    );
++    expect(screen.getByRole('switch')).toBeChecked();
++  });
++  it('should display switch as checked when value is 0', () => {
++    render(<ClusteringSwitchEditor value={0} onChange={() => {}} item={{} as never} context={{} as never} />);
++    expect(screen.getByRole('switch')).toBeChecked();
++  });
++  it('should display switch as checked when value is 1', () => {
++    render(<ClusteringSwitchEditor value={1} onChange={() => {}} item={{} as never} context={{} as never} />);
++    expect(screen.getByRole('switch')).toBeChecked();
++  });
++  it('should call onChange when toggling from off to on', async () => {
++    const onChange = jest.fn();
++    render(
++      <ClusteringSwitchEditor
++        value={DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED}
++        onChange={onChange}
++        item={{} as never}
++        context={{} as never}
++      />
++    );
++    await userEvent.click(screen.getByRole('switch'));
++    expect(onChange).toHaveBeenCalledTimes(1);
++    expect(onChange).toHaveBeenCalledWith(DEFAULT_CLUSTERING_ANNOTATION_SPACING);
++  });
++  it('should call onChange when toggling from on to off', async () => {
++    const onChange = jest.fn();
++    render(
++      <ClusteringSwitchEditor
++        value={DEFAULT_CLUSTERING_ANNOTATION_SPACING}
++        onChange={onChange}
++        item={{} as never}
++        context={{} as never}
++      />
++    );
++    await userEvent.click(screen.getByRole('switch'));
++    expect(onChange).toHaveBeenCalledTimes(1);
++    expect(onChange).toHaveBeenCalledWith(DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED);
++  });
++});
+diff --git a/public/app/features/panel/options/builder/ClusteringSwitchEditor.tsx b/public/app/features/panel/options/builder/ClusteringSwitchEditor.tsx
+new file mode 100644
+index 0000000000000..e4e9fb62326de
+--- /dev/null
++++ b/public/app/features/panel/options/builder/ClusteringSwitchEditor.tsx
+@@ -0,0 +1,19 @@
++import { StandardEditorProps } from '@grafana/data';
++import { Switch } from '@grafana/ui';
++
++export const DEFAULT_CLUSTERING_ANNOTATION_SPACING = 24;
++export const DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED = -1;
++
++export const ClusteringSwitchEditor = ({ onChange, value, id }: StandardEditorProps<number>) => (
++  <Switch
++    id={id}
++    value={value > DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED}
++    onChange={(event) =>
++      onChange(
++        event?.currentTarget.checked
++          ? DEFAULT_CLUSTERING_ANNOTATION_SPACING
++          : DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED
++      )
++    }
++  />
++);
+diff --git a/public/app/features/panel/options/builder/annotations.ts b/public/app/features/panel/options/builder/annotations.ts
+index dd0f72e7ce01c..6556266b94a16 100644
+--- a/public/app/features/panel/options/builder/annotations.ts
++++ b/public/app/features/panel/options/builder/annotations.ts
+@@ -1,5 +1,8 @@
+ import { DataTopic, PanelOptionsEditorBuilder } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
++
++import { ClusteringSwitchEditor, DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED } from './ClusteringSwitchEditor';
+ 
+ /**
+  * Adds common text control options to a visualization options
+@@ -23,4 +26,20 @@ export function addAnnotationOptions<T>(builder: PanelOptionsEditorBuilder<T>) {
+       annotations &&
+       annotations?.filter((df) => df.meta?.dataTopic === DataTopic.Annotations && df.length > 0).length > 1,
+   });
++
++  builder.addCustomEditor({
++    editor: ClusteringSwitchEditor,
++    id: 'clusteringSwitchEditor',
++    path: 'annotations.clustering',
++    category,
++    name: t('grafana-ui.builder.annotations.clustering.name', 'Enable annotation clustering'),
++    description: t(
++      'grafana-ui.builder.annotations.clustering.desc',
++      'Combines high density point annotations into region annotations'
++    ),
++    defaultValue: DEFAULT_CLUSTERING_ANNOTATION_SPACING_DISABLED,
++    showIf: (_, __, annotations) =>
++      config.featureToggles.annotationsClustering &&
++      annotations?.some((df) => df.meta?.dataTopic === DataTopic.Annotations),
++  });
+ }
+diff --git a/public/app/plugins/panel/candlestick/CandlestickPanel.tsx b/public/app/plugins/panel/candlestick/CandlestickPanel.tsx
+index 57e7e434ec9ab..3e48f38cd5b18 100644
+--- a/public/app/plugins/panel/candlestick/CandlestickPanel.tsx
++++ b/public/app/plugins/panel/candlestick/CandlestickPanel.tsx
+@@ -12,22 +12,22 @@ import {
+   KeyboardPlugin,
+   TooltipPlugin2,
+   UPlotConfigBuilder,
+-  XAxisInteractionAreaPlugin,
+   usePanelContext,
+   useTheme2,
++  XAxisInteractionAreaPlugin,
+ } from '@grafana/ui';
+ import { AxisProps, ScaleProps, TimeRange2, TooltipHoverMode } from '@grafana/ui/internal';
+ import { TimeSeries } from 'app/core/components/TimeSeries/TimeSeries';
+ 
+ import { TimeSeriesTooltip } from '../timeseries/TimeSeriesTooltip';
+-import { AnnotationsPlugin2 } from '../timeseries/plugins/AnnotationsPlugin2';
++import { AnnotationsPlugin } from '../timeseries/plugins/AnnotationPlugin';
+ import { ExemplarsPlugin } from '../timeseries/plugins/ExemplarsPlugin';
+ import { OutsideRangePlugin } from '../timeseries/plugins/OutsideRangePlugin';
+ import { ThresholdControlsPlugin } from '../timeseries/plugins/ThresholdControlsPlugin';
+ import { getXAnnotationFrames } from '../timeseries/plugins/utils';
+ 
+ import { prepareCandlestickFields } from './fields';
+-import { type Options, defaultCandlestickColors, VizDisplayMode } from './panelcfg.gen';
++import { defaultCandlestickColors, type Options, VizDisplayMode } from './panelcfg.gen';
+ import { drawMarkers, FieldIndices } from './utils';
+ 
+ interface CandlestickPanelProps extends PanelProps<Options> {}
+@@ -323,14 +323,15 @@ export const CandlestickPanel = ({
+                 maxWidth={options.tooltip.maxWidth}
+               />
+             )}
+-            <AnnotationsPlugin2
++            <AnnotationsPlugin
+               replaceVariables={replaceVariables}
+-              multiLane={options.annotations?.multiLane}
++              options={options.annotations}
+               annotations={data.annotations ?? []}
+               config={uplotConfig}
+               timeZone={timeZone}
+               newRange={newAnnotationRange}
+               setNewRange={setNewAnnotationRange}
++              canvasRegionRendering={false}
+             />
+             <OutsideRangePlugin config={uplotConfig} onChangeTimeRange={onChangeTimeRange} />
+             {data.annotations && (
+diff --git a/public/app/plugins/panel/heatmap/HeatmapPanel.tsx b/public/app/plugins/panel/heatmap/HeatmapPanel.tsx
+index 3871f709f2ba9..1a54321d095bb 100644
+--- a/public/app/plugins/panel/heatmap/HeatmapPanel.tsx
++++ b/public/app/plugins/panel/heatmap/HeatmapPanel.tsx
+@@ -5,14 +5,14 @@ import { DashboardCursorSync, PanelProps, TimeRange } from '@grafana/data';
+ import { PanelDataErrorView } from '@grafana/runtime';
+ import { ScaleDistributionConfig } from '@grafana/schema';
+ import {
+-  TooltipPlugin2,
++  EventBusPlugin,
+   TooltipDisplayMode,
++  TooltipPlugin2,
+   UPlotChart,
+   usePanelContext,
+   useStyles2,
+   useTheme2,
+   VizLayout,
+-  EventBusPlugin,
+   XAxisInteractionAreaPlugin,
+ } from '@grafana/ui';
+ import { FacetedData, TimeRange2, TooltipHoverMode } from '@grafana/ui/internal';
+@@ -20,7 +20,7 @@ import { ColorScale } from 'app/core/components/ColorScale/ColorScale';
+ import { readHeatmapRowsCustomMeta } from 'app/features/transformers/calculateHeatmap/heatmap';
+ 
+ import { getXAxisConfig } from '../../../core/components/TimeSeries/utils';
+-import { AnnotationsPlugin2 } from '../timeseries/plugins/AnnotationsPlugin2';
++import { AnnotationsPlugin } from '../timeseries/plugins/AnnotationPlugin';
+ import { OutsideRangePlugin } from '../timeseries/plugins/OutsideRangePlugin';
+ import { getXAnnotationFrames } from '../timeseries/plugins/utils';
+ 
+@@ -258,9 +258,9 @@ const HeatmapPanelViz = ({
+                 maxWidth={options.tooltip.maxWidth}
+               />
+             )}
+-            <AnnotationsPlugin2
++            <AnnotationsPlugin
+               replaceVariables={replaceVariables}
+-              multiLane={options.annotations?.multiLane}
++              options={options.annotations}
+               annotations={data.annotations ?? []}
+               config={builder}
+               timeZone={timeZone}
+diff --git a/public/app/plugins/panel/state-timeline/StateTimelinePanel.tsx b/public/app/plugins/panel/state-timeline/StateTimelinePanel.tsx
+index 4342b64639be9..1863b58163adf 100644
+--- a/public/app/plugins/panel/state-timeline/StateTimelinePanel.tsx
++++ b/public/app/plugins/panel/state-timeline/StateTimelinePanel.tsx
+@@ -7,9 +7,9 @@ import {
+   EventBusPlugin,
+   TooltipDisplayMode,
+   TooltipPlugin2,
+-  XAxisInteractionAreaPlugin,
+   usePanelContext,
+   useTheme2,
++  XAxisInteractionAreaPlugin,
+ } from '@grafana/ui';
+ import { TimeRange2, TooltipHoverMode } from '@grafana/ui/internal';
+ import { TimelineChart } from 'app/core/components/TimelineChart/TimelineChart';
+@@ -19,7 +19,7 @@ import {
+   TimelineMode,
+ } from 'app/core/components/TimelineChart/utils';
+ 
+-import { AnnotationsPlugin2 } from '../timeseries/plugins/AnnotationsPlugin2';
++import { AnnotationsPlugin } from '../timeseries/plugins/AnnotationPlugin';
+ import { OutsideRangePlugin } from '../timeseries/plugins/OutsideRangePlugin';
+ import { getXAnnotationFrames } from '../timeseries/plugins/utils';
+ import { getTimezones } from '../timeseries/utils';
+@@ -152,9 +152,9 @@ export const StateTimelinePanel = ({
+                 />
+               )}
+               {alignedFrame.fields[0].config.custom?.axisPlacement !== AxisPlacement.Hidden && (
+-                <AnnotationsPlugin2
++                <AnnotationsPlugin
+                   replaceVariables={replaceVariables}
+-                  multiLane={options.annotations?.multiLane}
++                  options={options.annotations}
+                   annotations={data.annotations ?? []}
+                   config={builder}
+                   timeZone={timeZone}
+diff --git a/public/app/plugins/panel/status-history/StatusHistoryPanel.tsx b/public/app/plugins/panel/status-history/StatusHistoryPanel.tsx
+index 9455eab2e6ef2..9b13ad81b0589 100644
+--- a/public/app/plugins/panel/status-history/StatusHistoryPanel.tsx
++++ b/public/app/plugins/panel/status-history/StatusHistoryPanel.tsx
+@@ -23,7 +23,7 @@ import {
+ import { StateTimelineTooltip } from '../state-timeline/StateTimelineTooltip';
+ import { usePagination } from '../state-timeline/hooks';
+ import { containerStyles } from '../state-timeline/styles';
+-import { AnnotationsPlugin2 } from '../timeseries/plugins/AnnotationsPlugin2';
++import { AnnotationsPlugin } from '../timeseries/plugins/AnnotationPlugin';
+ import { OutsideRangePlugin } from '../timeseries/plugins/OutsideRangePlugin';
+ import { getXAnnotationFrames } from '../timeseries/plugins/utils';
+ import { getTimezones } from '../timeseries/utils';
+@@ -167,9 +167,9 @@ export const StatusHistoryPanel = ({
+                 />
+               )}
+               {alignedFrame.fields[0].config.custom?.axisPlacement !== AxisPlacement.Hidden && (
+-                <AnnotationsPlugin2
++                <AnnotationsPlugin
+                   replaceVariables={replaceVariables}
+-                  multiLane={options.annotations?.multiLane}
++                  options={options.annotations}
+                   annotations={data.annotations ?? []}
+                   config={builder}
+                   timeZone={timeZone}
+diff --git a/public/app/plugins/panel/timeseries/TimeSeriesPanel.tsx b/public/app/plugins/panel/timeseries/TimeSeriesPanel.tsx
+index a85ef58cdc7b4..70464e0c3ed3e 100644
+--- a/public/app/plugins/panel/timeseries/TimeSeriesPanel.tsx
++++ b/public/app/plugins/panel/timeseries/TimeSeriesPanel.tsx
+@@ -1,14 +1,14 @@
+ import { useMemo, useState } from 'react';
+ 
+ import {
+-  PanelProps,
+-  DataFrameType,
++  alignTimeRangeCompareData,
+   DashboardCursorSync,
+   DataFrame,
+-  alignTimeRangeCompareData,
++  DataFrameType,
++  FieldType,
++  PanelProps,
+   shouldAlignTimeCompare,
+   useDataLinksContext,
+-  FieldType,
+ } from '@grafana/data';
+ import { config, PanelDataErrorView } from '@grafana/runtime';
+ import { TooltipDisplayMode, VizOrientation } from '@grafana/schema';
+@@ -16,15 +16,15 @@ import {
+   EventBusPlugin,
+   KeyboardPlugin,
+   TooltipPlugin2,
+-  XAxisInteractionAreaPlugin,
+   usePanelContext,
++  XAxisInteractionAreaPlugin,
+ } from '@grafana/ui';
+ import { FILTER_OUT_OPERATOR, TimeRange2, TooltipHoverMode } from '@grafana/ui/internal';
+ import { TimeSeries } from 'app/core/components/TimeSeries/TimeSeries';
+ 
+ import { TimeSeriesTooltip } from './TimeSeriesTooltip';
+ import { Options } from './panelcfg.gen';
+-import { AnnotationsPlugin2 } from './plugins/AnnotationsPlugin2';
++import { AnnotationsPlugin } from './plugins/AnnotationPlugin';
+ import { ExemplarsPlugin, getVisibleLabels } from './plugins/ExemplarsPlugin';
+ import { OutsideRangePlugin } from './plugins/OutsideRangePlugin';
+ import { ThresholdControlsPlugin } from './plugins/ThresholdControlsPlugin';
+@@ -216,14 +216,15 @@ export const TimeSeriesPanel = ({
+             )}
+             {!isVerticallyOriented && (
+               <>
+-                <AnnotationsPlugin2
++                <AnnotationsPlugin
+                   replaceVariables={replaceVariables}
+-                  multiLane={options.annotations?.multiLane}
++                  options={options.annotations}
+                   annotations={data.annotations ?? []}
+                   config={uplotConfig}
+                   timeZone={timeZone}
+                   newRange={newAnnotationRange}
+                   setNewRange={setNewAnnotationRange}
++                  canvasRegionRendering={false}
+                 />
+                 <OutsideRangePlugin config={uplotConfig} onChangeTimeRange={onChangeTimeRange} />
+                 {data.annotations && (
+diff --git a/public/app/plugins/panel/timeseries/plugins/AnnotationPlugin.test.tsx b/public/app/plugins/panel/timeseries/plugins/AnnotationPlugin.test.tsx
+new file mode 100644
+index 0000000000000..6956a8c8302e1
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/AnnotationPlugin.test.tsx
+@@ -0,0 +1,68 @@
++import { render } from '@testing-library/react';
++
++import { config } from '@grafana/runtime';
++import { UPlotConfigBuilder } from '@grafana/ui';
++
++import { AnnotationsPlugin } from './AnnotationPlugin';
++import { AnnotationsPlugin2 } from './AnnotationsPlugin2';
++import { AnnotationsPlugin2Cluster } from './AnnotationsPlugin2Cluster';
++
++jest.mock('./AnnotationsPlugin2');
++jest.mock('./AnnotationsPlugin2Cluster');
++const mockAnnotationsPlugin2 = jest.mocked(AnnotationsPlugin2);
++const mockAnnotationsPlugin2Cluster = jest.mocked(AnnotationsPlugin2Cluster);
++
++/**
++ * This test checks that we're rendering the expected component for the given value of the feature flag
++ */
++describe('AnnotationsPlugin', () => {
++  const defaultProps = {
++    config: {} as UPlotConfigBuilder,
++    annotations: [],
++    timeZone: 'browser',
++    newRange: null,
++    setNewRange: jest.fn(),
++    replaceVariables: (v: string) => v,
++    options: {},
++  };
++  let originalFeatureToggle: boolean | undefined = undefined;
++  beforeEach(() => {
++    originalFeatureToggle = config.featureToggles.annotationsClustering;
++    mockAnnotationsPlugin2.mockClear();
++    mockAnnotationsPlugin2Cluster.mockClear();
++    mockAnnotationsPlugin2.mockImplementation(() => null);
++    mockAnnotationsPlugin2Cluster.mockImplementation(() => null);
++  });
++  afterEach(() => {
++    config.featureToggles.annotationsClustering = originalFeatureToggle;
++  });
++  it('renders AnnotationsPlugin2Cluster when annotationsClustering is enabled', () => {
++    config.featureToggles.annotationsClustering = true;
++    render(<AnnotationsPlugin {...defaultProps} />);
++    expect(mockAnnotationsPlugin2Cluster).toHaveBeenCalledWith(
++      expect.objectContaining({ config: defaultProps.config, annotations: [] }),
++      expect.objectContaining({})
++    );
++    expect(mockAnnotationsPlugin2).not.toHaveBeenCalled();
++  });
++  it.each([false, undefined])(`renders AnnotationsPlugin2 when annotationsClustering is %s`, (value) => {
++    config.featureToggles.annotationsClustering = value;
++    render(<AnnotationsPlugin {...defaultProps} />);
++    expect(mockAnnotationsPlugin2).toHaveBeenCalledWith(
++      expect.objectContaining({
++        config: defaultProps.config,
++        multiLane: undefined,
++      }),
++      expect.objectContaining({})
++    );
++    expect(mockAnnotationsPlugin2Cluster).not.toHaveBeenCalled();
++  });
++  it('passes multiLane from options to AnnotationsPlugin2 when clustering is disabled', () => {
++    config.featureToggles.annotationsClustering = false;
++    render(<AnnotationsPlugin {...defaultProps} options={{ multiLane: true }} />);
++    expect(mockAnnotationsPlugin2).toHaveBeenCalledWith(
++      expect.objectContaining({ multiLane: true }),
++      expect.objectContaining({})
++    );
++  });
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/AnnotationPlugin.tsx b/public/app/plugins/panel/timeseries/plugins/AnnotationPlugin.tsx
+new file mode 100644
+index 0000000000000..38cd0aa836913
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/AnnotationPlugin.tsx
+@@ -0,0 +1,14 @@
++import React from 'react';
++
++import { config } from '@grafana/runtime';
++
++import { AnnotationsPlugin2 } from './AnnotationsPlugin2';
++import { AnnotationsPlugin2Cluster } from './AnnotationsPlugin2Cluster';
++
++export const AnnotationsPlugin = (props: React.ComponentProps<typeof AnnotationsPlugin2Cluster>) => {
++  if (config.featureToggles.annotationsClustering) {
++    return <AnnotationsPlugin2Cluster {...props} />;
++  }
++  const { options, ...rest } = props;
++  return <AnnotationsPlugin2 {...rest} multiLane={options?.multiLane} />;
++};
+diff --git a/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2.tsx b/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2.tsx
+index 8f33981048cc7..187516ebc1443 100644
+--- a/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2.tsx
++++ b/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2.tsx
+@@ -64,6 +64,18 @@ function getVals(frame: DataFrame) {
+   return vals;
+ }
+ 
++/**
++ * @deprecated - remove and replace with AnnotationsPlugin2Cluster
++ * @param annotations
++ * @param timeZone
++ * @param config
++ * @param newRange
++ * @param setNewRange
++ * @param replaceVariables
++ * @param canvasRegionRendering
++ * @param multiLane
++ * @constructor
++ */
+ export const AnnotationsPlugin2 = ({
+   annotations,
+   timeZone,
+diff --git a/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2Cluster.test.tsx b/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2Cluster.test.tsx
+new file mode 100644
+index 0000000000000..95274afbcc28d
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2Cluster.test.tsx
+@@ -0,0 +1,852 @@
++import { act, render, screen } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++import React from 'react';
++import uPlot from 'uplot';
++
++import {
++  applyFieldOverrides,
++  arrayToDataFrame,
++  createDataFrame,
++  createTheme,
++  dateTimeFormat,
++  FieldConfigOptionsRegistry,
++  systemDateFormats,
++} from '@grafana/data';
++import { selectors } from '@grafana/e2e-selectors';
++import { PanelContext, UPlotConfigBuilder, usePanelContext } from '@grafana/ui';
++import { TimeRange2 } from '@grafana/ui/internal';
++
++import { AnnotationsPlugin2Cluster } from './AnnotationsPlugin2Cluster';
++import { DEFAULT_CLUSTERING_ANNOTATION_SPACING } from './annotations2-cluster/constants';
++import {
++  allAnnotationRegions,
++  allAnnotations,
++  mockAlertingFrame,
++  mockAnnotationFrame,
++  mockIRMAnnotation,
++  mockIRMAnnotationRegion,
++  mockIRMClusteringAnnotation,
++} from './mocks/mockAnnotationFrames';
++import { ANNOTATION_LANE_SIZE } from './utils';
++
++const minTime = 1759388895560;
++const maxTime = 1759390250000 + 1;
++const plotWidth = 600;
++
++jest.mock('uplot', () => {
++  const setDataMock = jest.fn();
++  const setSizeMock = jest.fn();
++  const initializeMock = jest.fn();
++  const destroyMock = jest.fn();
++  const valToPos = jest.fn().mockImplementation((time: number, scale = 'x') => {
++    // time delta
++    const dt = maxTime - minTime;
++    // adjusted time
++    const t = time - minTime;
++    // normalized time
++    const nt = t / dt;
++    // convert to pixels
++    return Math.min(nt * plotWidth);
++  });
++  const redraw = jest.fn();
++  return jest.fn().mockImplementation((opts?: Partial<uPlot.Options>) => {
++    return {
++      ...jest.requireActual('uplot'),
++      bbox: {
++        show: true,
++        left: 0,
++        top: 0,
++        width: plotWidth,
++        height: plotWidth,
++      },
++      scales: {
++        x: {
++          min: minTime,
++          max: maxTime,
++        },
++      },
++      setData: setDataMock,
++      setSize: setSizeMock,
++      initialize: initializeMock,
++      destroy: destroyMock,
++      valToPos,
++      redraw,
++      rect: {
++        width: plotWidth,
++      },
++
++      root: {
++        querySelector: jest.fn().mockImplementation(() => document.getElementById('grafana-portal-container')),
++      },
++      ...opts,
++    };
++  });
++});
++
++jest.mock('@grafana/ui', () => ({
++  ...jest.requireActual('@grafana/ui'),
++  usePanelContext: jest.fn().mockImplementation(() => ({
++    canExecuteActions: () => false,
++  })),
++}));
++
++jest.mock('@grafana/runtime', () => ({
++  ...jest.requireActual('@grafana/runtime'),
++  getBackendSrv: () => ({
++    get: jest.fn().mockImplementation(() => ({
++      result: {
++        tags: [],
++      },
++    })),
++  }),
++}));
++
++const mockUsePanelContext = jest.mocked(usePanelContext);
++
++const uplotMock = jest.requireMock('uplot');
++const uplotMockInstance = uplotMock();
++uplotMockInstance.setData.mockImplementationOnce(() => {});
++
++describe('AnnotationsPlugin2', () => {
++  let hooks: Record<string, (u: uPlot) => {}> = {};
++  let config: UPlotConfigBuilder;
++  const setUp = (
++    props?: Partial<React.ComponentProps<typeof AnnotationsPlugin2Cluster>>,
++    configOverride?: UPlotConfigBuilder,
++    uPlotProps?: Partial<uPlot.Options>
++  ) => {
++    function applyReady() {
++      act(() => {
++        //@ts-ignore
++        hooks.ready(new uPlot(uPlotProps));
++      });
++    }
++
++    // Manually set static property
++    uPlot.pxRatio = 2;
++
++    const annotations = props?.annotations ?? [mockAnnotationFrame];
++    const frames = annotations.map((fr) => createDataFrame(fr));
++    // @todo we need to call applyFieldOverrides to add the link supplier to the frames on the frames in AnnotationsPlugin2
++    const withOverrides = applyFieldOverrides({
++      data: frames,
++      fieldConfig: {
++        defaults: {},
++        overrides: [],
++      },
++      replaceVariables: (value) => value,
++      theme: createTheme(),
++      fieldConfigRegistry: new FieldConfigOptionsRegistry(),
++    });
++
++    const result = render(
++      <div>
++        <AnnotationsPlugin2Cluster
++          options={{}}
++          config={configOverride ?? config}
++          timeZone={'browser'}
++          newRange={null}
++          setNewRange={function (newRange: TimeRange2 | null): void {}}
++          replaceVariables={(value) => value}
++          {...props}
++          annotations={withOverrides}
++        />
++        <div id="grafana-portal-container"></div>
++      </div>
++    );
++
++    applyReady();
++    return result;
++  };
++
++  beforeEach(() => {
++    hooks = {};
++    config = {
++      addHook: jest.fn((type, hook) => {
++        hooks[type] = hook;
++      }),
++      scales: [{ props: { scaleKey: 'x' } }, { props: { scaleKey: 'y' } }],
++    } as unknown as UPlotConfigBuilder;
++  });
++
++  describe('all', () => {
++    afterEach(() => {
++      jest.restoreAllMocks();
++    });
++    describe.each([mockIRMAnnotation, mockIRMAnnotationRegion])('Tooltips', (frame) => {
++      afterEach(() => {
++        jest.restoreAllMocks();
++      });
++
++      it.each([userEvent.hover, userEvent.click])('avatar', async (event) => {
++        setUp({ annotations: [frame] });
++        const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++        expect(firstMarker).toBeVisible();
++        await event(firstMarker);
++        expect(screen.queryByTestId('mock-annotation-title')).toBeVisible();
++        expect(screen.queryByTestId('mock-annotation-text')).toBeVisible();
++        expect(screen.queryByTestId('mock-annotation-text')?.querySelector('img')).toBeVisible();
++      });
++      it.each([userEvent.hover, userEvent.click])('text', async (event) => {
++        setUp({ annotations: [frame] });
++        const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++        expect(firstMarker).toBeVisible();
++        await event(firstMarker);
++        expect(screen.queryByTestId('mock-annotation-text')).toBeVisible();
++        expect(screen.queryByTestId('mock-annotation-text')).toHaveTextContent(
++          'A very large label value payload (>16MB) triggered a panic in the code. We disabled the gateway as a temporary mitigation. Declared by your mom'
++        );
++      });
++      it.each([userEvent.hover, userEvent.click])('title', async (event) => {
++        setUp({ annotations: [frame] });
++        const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++        expect(firstMarker).toBeVisible();
++        await event(firstMarker);
++        expect(screen.queryByTestId('mock-annotation-title')).toBeVisible();
++        expect(screen.queryByTestId('mock-annotation-title')).toHaveTextContent('prod-000-writes-error');
++      });
++      it.each([userEvent.hover, userEvent.click])('inline links', async (event) => {
++        setUp({ annotations: [frame] });
++        const thirdMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[2];
++        expect(thirdMarker).toBeVisible();
++        await event(thirdMarker);
++        const titleLink = screen.queryByTestId('mock-annotation-title');
++        expect(titleLink).toBeVisible();
++        expect(titleLink).toHaveAttribute('href', '/a/grafana-irm-app/incidents/4683');
++        expect(titleLink).toHaveAttribute('target', '_blank');
++        expect(titleLink).toHaveTextContent('Vendor BYOC cell Failed to get annotations');
++      });
++      it.each([userEvent.hover, userEvent.click])('tags', async (event) => {
++        const expectedTags = [
++          'service:dashboard-service',
++          'service:datasources',
++          'squad:alerting',
++          'squad:databases-sre',
++          'squad:insights',
++          'squad:loki',
++        ];
++        setUp({ annotations: [frame] });
++        const thirdMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[2];
++        expect(thirdMarker).toBeVisible();
++        await event(thirdMarker);
++        const tags = screen.getAllByTestId('annotation-tag');
++
++        expectedTags.forEach((tag, index) => {
++          expect(tags[index]).toBeVisible();
++          expect(tags[index]).toHaveTextContent(tag);
++        });
++      });
++
++      describe('pinning', () => {
++        afterEach(() => {
++          jest.restoreAllMocks();
++        });
++        it('pins on click', async () => {
++          mockUsePanelContext.mockReturnValue({
++            canExecuteActions: () => false,
++            canEditAnnotations: () => false,
++            canDeleteAnnotations: () => false,
++          } as PanelContext);
++
++          setUp({ annotations: [frame] });
++          const thirdMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[2];
++          expect(thirdMarker).toBeVisible();
++
++          // Pin the annotation tooltip on click
++          await userEvent.click(thirdMarker);
++
++          // Focus is within the tooltip, on the first icon (in this case close since edit and delete are not defined)
++          expect(screen.getByLabelText('Close')).toHaveFocus();
++
++          // Can close tooltip via keyboard press
++          await userEvent.keyboard('{Enter}');
++
++          expect(screen.queryByLabelText('Close')).not.toBeInTheDocument();
++        });
++
++        it('cannot hover other tooltips while pinned', async () => {
++          mockUsePanelContext.mockReturnValue({
++            canExecuteActions: () => false,
++            canEditAnnotations: () => false,
++            canDeleteAnnotations: () => false,
++          } as PanelContext);
++
++          setUp({ annotations: [frame] });
++          const thirdMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[2];
++          const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++          expect(thirdMarker).toBeVisible();
++
++          // Pin the annotation tooltip on click
++          await userEvent.click(thirdMarker);
++
++          expect(screen.queryByTestId('mock-annotation-title')).toBeVisible();
++          expect(screen.queryByTestId('mock-annotation-title')).toHaveTextContent(
++            'Vendor BYOC cell Failed to get annotations'
++          );
++
++          // Hover over another marker
++          await userEvent.hover(firstMarker);
++
++          // Should only be one title visible
++          expect(screen.queryAllByTestId('mock-annotation-title')).toHaveLength(1);
++          // The current tooltip should stay visible
++          expect(screen.queryByTestId('mock-annotation-title')).toHaveTextContent(
++            'Vendor BYOC cell Failed to get annotations'
++          );
++        });
++
++        it('cannot hover other tooltips while wip is being edited', async () => {
++          mockUsePanelContext.mockReturnValue({
++            canExecuteActions: () => true,
++            canEditAnnotations: () => true,
++            canDeleteAnnotations: () => true,
++          } as PanelContext);
++
++          setUp({
++            annotations: [frame],
++            // newRange sets the wip annotation
++            newRange: { from: minTime + 10, to: minTime + 10 },
++          });
++
++          // Wait for AnnotationsPlugin2 setTimeout(forceUpdate) to complete
++          await act(async () => {
++            await new Promise((resolve) => setTimeout(resolve, 0));
++          });
++
++          // WIP edit state should be visible
++          expect(screen.getByText('Add annotation')).toBeVisible();
++
++          // Wip edit state should have close icon (like the pinned state)
++          expect(screen.getByRole('button', { name: 'Close' })).toBeVisible();
++
++          const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++          const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++
++          expect(firstMarker).toBeVisible();
++          expect(markers).toHaveLength(4);
++
++          // Hover over another marker that is not the wip anno
++          await userEvent.hover(firstMarker);
++
++          // Should only be one tooltip visible
++          expect(screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.tooltip)).toHaveLength(1);
++
++          // And it should be the wip edit tooltip
++          expect(screen.getByText('Add annotation')).toBeVisible();
++
++          // Close the wip anno
++          await userEvent.click(screen.getByRole('button', { name: 'Close' }));
++
++          expect(screen.queryByText('Add annotation')).not.toBeInTheDocument();
++        });
++
++        it('pins on keyboard', async () => {
++          mockUsePanelContext.mockReturnValue({
++            canExecuteActions: () => false,
++            canEditAnnotations: () => false,
++            canDeleteAnnotations: () => false,
++          } as PanelContext);
++
++          setUp({ annotations: [frame] });
++          const thirdMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[2];
++          expect(thirdMarker).toBeVisible();
++
++          // Pin the annotation tooltip on focus
++          act(() => {
++            thirdMarker.focus();
++          });
++          expect(thirdMarker).toHaveFocus();
++
++          // Verify the tooltip is rendered
++          expect(screen.queryByTestId('mock-annotation-title')).toBeVisible();
++
++          // But the close button isn't rendered until pinned
++          expect(screen.queryByLabelText('Close')).not.toBeInTheDocument();
++
++          // Pin the annotation tooltip
++          await userEvent.keyboard('{Enter}');
++
++          // Focus is within the tooltip, on the first icon (in this case close since edit and delete are not defined)
++          expect(screen.getByLabelText('Close')).toHaveFocus();
++
++          // Can close tooltip via keyboard press
++          await userEvent.keyboard('{Enter}');
++
++          // Assert tooltip is now closed
++          expect(screen.queryByLabelText('Close')).not.toBeInTheDocument();
++          expect(screen.queryByTestId('mock-annotation-title')).not.toBeInTheDocument();
++        });
++      });
++
++      describe('editing & deleting', () => {
++        afterEach(() => {
++          jest.restoreAllMocks();
++        });
++
++        it.each([userEvent.hover, userEvent.click])(
++          'actions not visible if can execute actions is not set',
++          async (event) => {
++            mockUsePanelContext.mockReturnValue({
++              canExecuteActions: () => false,
++              canEditAnnotations: () => false,
++              canDeleteAnnotations: () => false,
++            } as PanelContext);
++            setUp({ annotations: [frame] });
++            const thirdMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[2];
++            expect(thirdMarker).toBeVisible();
++            await event(thirdMarker);
++            const editButton = screen.queryByLabelText('Edit');
++            expect(editButton).not.toBeInTheDocument();
++            const deleteButton = screen.queryByLabelText('Delete');
++            expect(deleteButton).not.toBeInTheDocument();
++          }
++        );
++
++        it.each([userEvent.hover, userEvent.click])('edit', async (event) => {
++          mockUsePanelContext.mockReturnValue({
++            canExecuteActions: () => true,
++            canEditAnnotations: () => true,
++            canDeleteAnnotations: () => false,
++          } as PanelContext);
++          setUp({ annotations: [frame] });
++          const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++          expect(markers).toHaveLength(3);
++          // first marker cannot be edited or deleted since it has an id of 0
++          const firstMarker = markers[0];
++          await event(firstMarker);
++          expect(screen.queryByLabelText('Edit')).not.toBeInTheDocument();
++
++          const thirdMarker = markers[2];
++          expect(thirdMarker).toBeVisible();
++          await event(thirdMarker);
++          const editButton = screen.getByLabelText('Edit');
++          expect(editButton).toBeVisible();
++          await userEvent.click(editButton);
++
++          // Edit view has two editable fields, description and tags
++          // Description input
++          expect(screen.getByText('Description')).toBeVisible();
++          const descriptionTextArea = screen.getByDisplayValue(/The vendor BYOC cell experienced annotation/);
++          expect(descriptionTextArea).toBeVisible();
++
++          // Tags input
++          expect(screen.getByText('Tags')).toBeVisible();
++          const tagButton = screen.getByLabelText('Remove squad:loki');
++          expect(tagButton).toBeVisible();
++        });
++
++        it.each([userEvent.hover, userEvent.click])('delete', async (event) => {
++          const onAnnotationDelete = jest.fn().mockImplementation((id: number) => {}) as (id: number) => void;
++          // @ts-expect-error @todo https://github.com/grafana/grafana/issues/120097 - id is typed incorrectly as string but string breaks annotation API
++          mockUsePanelContext.mockReturnValue({
++            canExecuteActions: () => true,
++            canEditAnnotations: () => true,
++            canDeleteAnnotations: () => true,
++            onAnnotationDelete,
++          } as PanelContext);
++          setUp({ annotations: [frame] });
++
++          const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++          expect(markers).toHaveLength(3);
++          // first marker cannot be edited or deleted since it has an id of 0
++          const firstMarker = markers[0];
++          await event(firstMarker);
++          expect(screen.queryByLabelText('Delete')).not.toBeInTheDocument();
++
++          const thirdMarker = markers[2];
++          expect(thirdMarker).toBeVisible();
++          await event(thirdMarker);
++          const deleteButton = screen.getByLabelText('Delete');
++          expect(deleteButton).toBeVisible();
++          expect(onAnnotationDelete).not.toHaveBeenCalled();
++          await userEvent.click(deleteButton);
++          // from the 'id' field
++          expect(onAnnotationDelete).toHaveBeenCalledWith(4683);
++        });
++      });
++    });
++  });
++  describe('points', () => {
++    it('should render', async () => {
++      setUp();
++      expect(screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker).length).toEqual(4);
++    });
++
++    describe('markers', () => {
++      it.each([...allAnnotations])('all annotations should render', (frame) => {
++        setUp({ annotations: [frame] });
++        expect(screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker).length).toEqual(frame.length);
++      });
++      it('specified color should be used', () => {
++        const { container } = setUp({ annotations: [mockIRMAnnotation] });
++        const annotationButtons = container.querySelectorAll('button');
++        expect(annotationButtons[0].getAttribute('style')).toMatch(/border-bottom-color: #F00;/);
++        expect(annotationButtons[1].getAttribute('style')).toMatch(/border-bottom-color: #F0F;/);
++        expect(annotationButtons[2].getAttribute('style')).toMatch(/border-bottom-color: #00F;/);
++      });
++    });
++
++    describe('tooltips ', () => {
++      it.each([userEvent.hover, userEvent.click])('time', async (event) => {
++        setUp({ annotations: [mockIRMAnnotation] });
++        const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++        expect(firstMarker).toBeVisible();
++        await event(firstMarker);
++        expect(screen.getByText('2025-10-02 02:08:15')).toBeVisible();
++      });
++    });
++  });
++  describe('regions', () => {
++    it('should render', async () => {
++      setUp();
++      expect(screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker).length).toEqual(4);
++    });
++
++    describe('region markers', () => {
++      it.each([allAnnotationRegions])('all annotation regions should render', (frame) => {
++        setUp({ annotations: [frame] });
++        expect(screen.getAllByTestId(selectors.pages.Dashboard.Annotations.marker).length).toEqual(frame.length);
++      });
++
++      it('background color should be used', () => {
++        const { container } = setUp({ annotations: [mockIRMAnnotationRegion] });
++        const annotationButtons = container.querySelectorAll('button');
++
++        expect(annotationButtons[0].getAttribute('style')).toMatch(/background: rgb\(255, 0, 0\);/);
++        expect(annotationButtons[0].getAttribute('style')).toMatch(/width: 89px/);
++        expect(annotationButtons[1].getAttribute('style')).toMatch(/background: rgb\(255, 0, 255\);/);
++        expect(annotationButtons[2].getAttribute('style')).toMatch(/background: rgb\(0, 0, 255\);/);
++      });
++    });
++
++    describe('tooltips', () => {
++      it.each([userEvent.hover, userEvent.click])('time', async (event) => {
++        setUp({ annotations: [mockIRMAnnotation] });
++        const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++        expect(firstMarker).toBeVisible();
++        await event(firstMarker);
++        expect(screen.getByText('2025-10-02 02:08:15')).toBeVisible();
++      });
++    });
++  });
++  describe('wip', () => {
++    // These might be better to test in e2e since they are generated in the parent viz component
++    it.todo('can create annotation region');
++    it.todo('can create annotation');
++  });
++
++  describe('options', () => {
++    it('should not throw if options are undefined', () => {
++      setUp({
++        annotations: [mockIRMClusteringAnnotation],
++        options: undefined,
++      });
++      const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++      expect(markers.length).toEqual(4);
++    });
++    describe('multiRowAnnotations', () => {
++      it('should render each frame into separate lanes in the viz', () => {
++        setUp({
++          annotations: [mockAlertingFrame, mockIRMAnnotationRegion],
++          options: { multiLane: true },
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers).toHaveLength(14);
++        expect(markers[0].getAttribute('style')).toContain('top: 0px');
++        expect(markers[13].getAttribute('style')).toContain(`top: ${ANNOTATION_LANE_SIZE}px`);
++      });
++    });
++    describe('clustering', () => {
++      it('should not cluster', async () => {
++        // should cluster all points within 48px
++        setUp({
++          annotations: [mockIRMClusteringAnnotation],
++          options: {
++            clustering: -1,
++          },
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers.length).toEqual(4);
++      });
++
++      it('should cluster', async () => {
++        // should cluster all points within 48px
++        setUp({
++          annotations: [mockIRMClusteringAnnotation],
++          options: {
++            clustering: DEFAULT_CLUSTERING_ANNOTATION_SPACING,
++          },
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers.length).toEqual(2);
++        await userEvent.click(markers[0]);
++
++        // The first three annotations should get clustered, let's make sure the header includes the formatted time range
++        const startTime = dateTimeFormat(mockIRMClusteringAnnotation.fields[2].values[0], {
++          format: systemDateFormats.fullDate,
++        });
++
++        const endTime = dateTimeFormat(mockIRMClusteringAnnotation.fields[2].values[2], {
++          format: systemDateFormats.fullDate,
++        });
++
++        expect(screen.getByText(`${startTime} - ${endTime}`));
++
++        // Assert the tooltip body contains the title and the text
++        const titles = screen.getAllByTestId('mock-annotation-title');
++        expect(titles).toHaveLength(3);
++        expect(titles[0]).toBeVisible();
++
++        const texts = screen.getAllByTestId('mock-annotation-text');
++        expect(texts).toHaveLength(3);
++        expect(texts[0]).toBeVisible();
++
++        // Assert all of the titles are rolled-up and rendered
++        expect(titles[0]).toHaveTextContent('prod-000-writes-error');
++        expect(titles[1]).toHaveTextContent('prod-001-writes-error');
++        expect(titles[2]).toHaveTextContent('LogsDeleteRequestProcessingStuck (dev-us-west-0, notify)');
++        // Assert all of the text are rolled-up and rendered
++        expect(texts[0]).toHaveTextContent('(>16MB)');
++        expect(texts[1]).toHaveTextContent('(>32MB)');
++        expect(texts[2]).toHaveTextContent('Declared by Ada');
++      });
++
++      it.each([userEvent.hover, userEvent.click])('clusters should render links and actions', async (event) => {
++        mockUsePanelContext.mockReturnValue({
++          canExecuteActions: () => true,
++        } as PanelContext);
++        setUp({
++          annotations: [mockAlertingFrame],
++          options: {
++            clustering: DEFAULT_CLUSTERING_ANNOTATION_SPACING,
++          },
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers).toHaveLength(3);
++        // Open tooltip
++        await event(markers[0]);
++        expect(screen.getByTestId(selectors.pages.Dashboard.Annotations.clusterTooltip)).toBeVisible();
++        expect(screen.getByText('Link 1')).toBeVisible();
++        expect(screen.getByText('Link 2')).toBeVisible();
++        expect(screen.queryByText('Action 1')).toBeVisible();
++        expect(screen.queryByText('Action 2')).toBeVisible();
++      });
++    });
++  });
++
++  describe('annotation fields', () => {
++    describe('alert state', () => {
++      // when newState and alertId are both defined we show a custom alert header
++      it('should render', async () => {
++        setUp({
++          annotations: [mockAlertingFrame],
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers).toHaveLength(11);
++
++        await userEvent.hover(markers[0]);
++        expect(screen.getByText('ALERTING')).toBeVisible();
++      });
++      // When alert state is defined we only render the annotation text, and not the title
++      it('should not render annotation title', async () => {
++        setUp({
++          annotations: [mockAlertingFrame],
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers).toHaveLength(11);
++        userEvent.hover(markers[0]);
++
++        await userEvent.hover(markers[0]);
++        expect(screen.queryByText('Title 1')).not.toBeInTheDocument();
++      });
++      it('should render text', async () => {
++        setUp({
++          annotations: [mockAlertingFrame],
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers).toHaveLength(11);
++
++        await userEvent.hover(markers[0]);
++        expect(screen.getByText('Launching HG Instance ops with hgrun version 1')).toBeVisible();
++      });
++      // The alert title currently renders after the text if the alertId and alertState is defined
++      it('should render alert specific title', async () => {
++        setUp({
++          annotations: [mockAlertingFrame],
++        });
++        const markers = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker);
++        expect(markers).toHaveLength(11);
++
++        await userEvent.hover(markers[0]);
++        expect(screen.getByText('Error: Alerting error test!')).toBeVisible();
++      });
++    });
++  });
++  describe('overrides', () => {
++    afterEach(() => {
++      jest.restoreAllMocks();
++    });
++
++    it.each([userEvent.hover, userEvent.click])('links', async (event) => {
++      mockUsePanelContext.mockReturnValue({
++        canExecuteActions: () => false,
++      } as PanelContext);
++      setUp({
++        annotations: [mockAlertingFrame],
++      });
++      const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++      await event(firstMarker);
++      expect(screen.getByText('Link 1')).toBeVisible();
++      expect(screen.getByText('Link 2')).toBeVisible();
++      expect(screen.queryByText('Action 1')).not.toBeInTheDocument();
++      expect(screen.queryByText('Action 2')).not.toBeInTheDocument();
++    });
++
++    it.each([userEvent.hover, userEvent.click])('actions', async (event) => {
++      mockUsePanelContext.mockReturnValue({
++        canExecuteActions: () => true,
++      } as PanelContext);
++      setUp({
++        annotations: [mockAlertingFrame],
++      });
++      const firstMarker = screen.queryAllByTestId(selectors.pages.Dashboard.Annotations.marker)[0];
++      await event(firstMarker);
++      expect(screen.getByText('Link 1')).toBeVisible();
++      expect(screen.getByText('Link 2')).toBeVisible();
++      expect(screen.getByText('Action 1')).toBeVisible();
++      expect(screen.getByText('Action 2')).toBeVisible();
++    });
++  });
++  // These are somewhat fragile regression tests, but as long as the uplot draw hook implementation is not changed they should pass
++  describe('uplot', () => {
++    function createMockUPlot(overrides: Partial<uPlot> = {}): uPlot {
++      const ctx = {
++        save: jest.fn(),
++        restore: jest.fn(),
++        beginPath: jest.fn(),
++        rect: jest.fn(),
++        clip: jest.fn(),
++        lineWidth: 0,
++        setLineDash: jest.fn(),
++        fillStyle: '',
++        fillRect: jest.fn(),
++        strokeStyle: '',
++        strokeRect: jest.fn(),
++        stroke: jest.fn(),
++        moveTo: jest.fn(),
++        lineTo: jest.fn(),
++      } as unknown as CanvasRenderingContext2D;
++      const valToPos = jest.fn().mockImplementation((val: number) => val);
++      return {
++        ctx,
++        bbox: { left: 0, top: 0, width: 600, height: 200 },
++        valToPos,
++        root: { querySelector: jest.fn(() => null) },
++        ...overrides,
++      } as unknown as uPlot;
++    }
++
++    function invokeDrawHook(hooks: Record<string, (u: uPlot) => void>, mockU: uPlot) {
++      if (hooks.draw) {
++        hooks.draw(mockU);
++      }
++    }
++
++    beforeEach(() => {
++      hooks = {};
++      config = {
++        addHook: jest.fn((type, hook) => {
++          hooks[type] = hook;
++        }),
++        scales: [{ props: { scaleKey: 'x' } }, { props: { scaleKey: 'y' } }],
++      } as unknown as UPlotConfigBuilder;
++    });
++
++    describe('xAnnos', () => {
++      it('should draw point annotations indicator lines', () => {
++        setUp({ annotations: [mockAnnotationFrame] }, config);
++        const mockU = createMockUPlot();
++        const ctx = mockU.ctx as jest.Mocked<CanvasRenderingContext2D>;
++        invokeDrawHook(hooks, mockU);
++        expect(ctx.rect).toHaveBeenCalledWith(0, 0, 600, 200);
++        expect(ctx.lineWidth).toBe(2);
++        // The actual dashed line
++        expect(ctx.setLineDash).toHaveBeenCalledWith([5, 5]);
++        // No region fill
++        expect(ctx.fillRect).not.toHaveBeenCalled();
++      });
++      it('should draw region fill', () => {
++        setUp({
++          annotations: [mockIRMAnnotationRegion],
++          canvasRegionRendering: true,
++        });
++        const mockU = createMockUPlot();
++        const ctx = mockU.ctx as jest.Mocked<CanvasRenderingContext2D>;
++        invokeDrawHook(hooks, mockU);
++        // Also dashed lines
++        expect(ctx.setLineDash).toHaveBeenCalledWith([5, 5]);
++        // Yes region fill
++        expect(ctx.fillRect).toHaveBeenCalled();
++      });
++      it('multi-lane disables indicator line and rect fill', () => {
++        setUp({
++          annotations: [mockAnnotationFrame],
++          options: { multiLane: true },
++        });
++        const mockU = createMockUPlot();
++        const ctx = mockU.ctx as jest.Mocked<CanvasRenderingContext2D>;
++        invokeDrawHook(hooks, mockU);
++
++        expect(ctx.stroke).not.toHaveBeenCalled();
++        expect(ctx.fillRect).not.toHaveBeenCalled();
++        expect(ctx.setLineDash).not.toHaveBeenCalled();
++      });
++    });
++
++    describe('xyAnnos', () => {
++      const getXYMarkProps = (lineStyle: 'solid' | 'dash') => {
++        const time = 0;
++        const xMin = 10;
++        const xMax = 100;
++        const yMin = 20;
++        const yMax = 50;
++        const xymark = arrayToDataFrame([
++          {
++            time,
++            xMin,
++            xMax,
++            yMin,
++            yMax,
++            isRegion: true,
++            fillOpacity: 0.15,
++            lineWidth: 1,
++            lineStyle,
++          },
++        ]);
++        xymark.name = 'xymark';
++        return { xMin, xMax, yMin, yMax, xymark };
++      };
++
++      it('should render solid rect', () => {
++        const { xMin, xMax, yMin, yMax, xymark } = getXYMarkProps('solid');
++        setUp({ annotations: [xymark] }, config);
++        const mockU = createMockUPlot();
++        const ctx = mockU.ctx as jest.Mocked<CanvasRenderingContext2D>;
++        invokeDrawHook(hooks, mockU);
++        expect(ctx.fillRect).toHaveBeenNthCalledWith(1, xMin, yMax, xMax - xMin, yMin - yMax);
++        expect(ctx.setLineDash).toHaveBeenCalledWith([]);
++        expect(ctx.strokeRect).toHaveBeenCalledWith(xMin, yMax, xMax - xMin, yMin - yMax);
++        expect(ctx.stroke).not.toHaveBeenCalled();
++      });
++
++      it('should render dashed rect', () => {
++        const { xymark } = getXYMarkProps('dash');
++        setUp({ annotations: [xymark] }, config);
++        const mockU = createMockUPlot();
++        const ctx = mockU.ctx as jest.Mocked<CanvasRenderingContext2D>;
++        invokeDrawHook(hooks, mockU);
++        expect(ctx.setLineDash).toHaveBeenCalledWith([5, 5]);
++      });
++    });
++  });
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2Cluster.tsx b/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2Cluster.tsx
+new file mode 100644
+index 0000000000000..fb2e909cac899
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/AnnotationsPlugin2Cluster.tsx
+@@ -0,0 +1,342 @@
++import * as React from 'react';
++import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
++import { createPortal } from 'react-dom';
++import tinycolor from 'tinycolor2';
++import uPlot from 'uplot';
++
++import { colorManipulator, DataFrame, InterpolateFunction } from '@grafana/data';
++import { TimeZone, VizAnnotations } from '@grafana/schema';
++import {
++  DEFAULT_ANNOTATION_COLOR,
++  getPortalContainer,
++  UPlotConfigBuilder,
++  usePanelContext,
++  useTheme2,
++} from '@grafana/ui';
++import { TimeRange2 } from '@grafana/ui/internal';
++
++import { AnnotationMarker2 } from './annotations2-cluster/AnnotationMarker2';
++import { AnnotationVals, XYAnnoVals } from './annotations2-cluster/types';
++import { ClusteringMode, useAnnotationClustering } from './annotations2-cluster/useAnnotationClustering';
++import { useAnnotations } from './annotations2-cluster/useAnnotations';
++import { ANNOTATION_LANE_SIZE } from './utils';
++
++interface AnnotationsPlugin2ClusterProps {
++  config: UPlotConfigBuilder;
++  options: VizAnnotations | undefined;
++  annotations: DataFrame[];
++  timeZone: TimeZone;
++  newRange: TimeRange2 | null;
++  setNewRange: (newRange: TimeRange2 | null) => void;
++  canvasRegionRendering?: boolean;
++  replaceVariables: InterpolateFunction;
 +}
 +
-+func (s *LegacyStatsGetter) isDashboardsFallbackDisabled() bool {
-+	if s.Cfg == nil {
-+		return false
-+	}
-+	return s.Cfg.UnifiedStorage["dashboards.dashboard.grafana.app"].DualWriterMode == grafanarest.Mode5
++// TODO: batch by color, use Path2D objects
++const renderLine = (ctx: CanvasRenderingContext2D, y0: number, y1: number, x: number, color: string) => {
++  ctx.beginPath();
++  ctx.moveTo(x, y0);
++  ctx.lineTo(x, y1);
++  ctx.strokeStyle = color;
++  ctx.stroke();
++};
++
++const DEFAULT_ANNOTATION_COLOR_HEX8 = tinycolor(DEFAULT_ANNOTATION_COLOR).toHex8String();
++
++function getVals<T = AnnotationVals | {}>(frame: DataFrame) {
++  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
++  let vals = {} as T;
++  frame.fields.forEach((f) => {
++    // @ts-expect-error data frames have unknown value types but we can assert that they have string indices since the annotation fields spec is hardcoded.
++    vals[f.name] = f.values;
++  });
++
++  return vals;
 +}
 +
-+func (s *LegacyStatsGetter) isFoldersFallbackDisabled() bool {
-+	if s.Cfg == nil {
-+		return false
-+	}
-+	return s.Cfg.UnifiedStorage["folders.folder.grafana.app"].DualWriterMode == grafanarest.Mode5
- }
- 
- func (s *LegacyStatsGetter) GetStats(ctx context.Context, in *resourcepb.ResourceStatsRequest) (*resourcepb.ResourceStatsResponse, error) {
-@@ -66,7 +81,7 @@ func (s *LegacyStatsGetter) GetStats(ctx context.Context, in *resourcepb.Resourc
- 		}
- 
- 		// Legacy dashboard table
--		if !s.DisableSQLFallbackDashboards {
-+		if !s.isDashboardsFallbackDisabled() {
- 			err = fn("dashboard", "org_id=? AND folder_uid=? AND is_folder=false", group, "dashboards", true)
- 			if err != nil {
- 				return err
-@@ -74,7 +89,7 @@ func (s *LegacyStatsGetter) GetStats(ctx context.Context, in *resourcepb.Resourc
- 		}
- 
- 		// Legacy folder table
--		if !s.DisableSQLFallbackFolders {
-+		if !s.isFoldersFallbackDisabled() {
- 			err = fn("folder", "org_id=? AND parent_uid=?", group, "folders", true)
- 			if err != nil {
- 				return err
-diff --git a/pkg/storage/unified/federated/stats_test.go b/pkg/storage/unified/federated/stats_test.go
-index fe543cbe201..2564a62b805 100644
---- a/pkg/storage/unified/federated/stats_test.go
-+++ b/pkg/storage/unified/federated/stats_test.go
-@@ -9,6 +9,7 @@ import (
- 	"github.com/stretchr/testify/require"
- 	"k8s.io/apiserver/pkg/endpoints/request"
- 
-+	rest "github.com/grafana/grafana/pkg/apiserver/rest"
- 	"github.com/grafana/grafana/pkg/components/simplejson"
- 	"github.com/grafana/grafana/pkg/expr"
- 	"github.com/grafana/grafana/pkg/infra/db"
-@@ -21,6 +22,7 @@ import (
- 	ngalertstore "github.com/grafana/grafana/pkg/services/ngalert/store"
- 	"github.com/grafana/grafana/pkg/services/tag/tagimpl"
- 	"github.com/grafana/grafana/pkg/services/user"
-+	"github.com/grafana/grafana/pkg/setting"
- 	"github.com/grafana/grafana/pkg/storage/legacysql"
- 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
- 	"github.com/grafana/grafana/pkg/tests/testsuite"
-@@ -116,6 +118,16 @@ func TestIntegrationDirectSQLStats(t *testing.T) {
- 		SQL: legacysql.NewDatabaseProvider(db),
- 	}
- 
-+	// Helper to create a cfg with specific dual-writer modes
-+	cfgWithModes := func(dashboardsMode, foldersMode int) *setting.Cfg {
-+		return &setting.Cfg{
-+			UnifiedStorage: map[string]setting.UnifiedStorageConfig{
-+				"dashboards.dashboard.grafana.app": {DualWriterMode: rest.DualWriterMode(dashboardsMode)},
-+				"folders.folder.grafana.app":       {DualWriterMode: rest.DualWriterMode(foldersMode)},
-+			},
-+		}
-+	}
++/**
++ * Refactored version of the AnnotationsPlugin2 behind `annotationsClustering` feature flag.
++ * @param annotations
++ * @param timeZone
++ * @param config
++ * @param newRange
++ * @param setNewRange
++ * @param replaceVariables
++ * @param canvasRegionRendering
++ * @param options
++ * @constructor
++ */
++export const AnnotationsPlugin2Cluster = ({
++  annotations,
++  timeZone,
++  config,
++  newRange,
++  setNewRange,
++  replaceVariables,
++  canvasRegionRendering = true,
++  options,
++}: AnnotationsPlugin2ClusterProps) => {
++  const [plot, setPlot] = useState<uPlot>();
++  const [portalRoot] = useState(() => getPortalContainer());
++  const [pinnedAnnotationId, setPinnedAnnotationId] = useState<string | undefined>();
++  const getColorByName = useTheme2().visualization.getColorByName;
 +
- 	t.Run("GetStatsForFolder1", func(t *testing.T) {
- 		ctx := context.Background()
- 		ctx = request.WithNamespace(ctx, "default")
-@@ -155,9 +167,8 @@ func TestIntegrationDirectSQLStats(t *testing.T) {
- 		ctx = request.WithNamespace(ctx, "default")
- 
- 		store := &LegacyStatsGetter{
--			SQL:                          legacysql.NewDatabaseProvider(db),
--			DisableSQLFallbackDashboards: true,
--			DisableSQLFallbackFolders:    false,
-+			SQL: legacysql.NewDatabaseProvider(db),
-+			Cfg: cfgWithModes(5, 0), // dashboards Mode5, folders Mode0
- 		}
- 
- 		stats, err := store.GetStats(ctx, &resourcepb.ResourceStatsRequest{
-@@ -185,9 +196,8 @@ func TestIntegrationDirectSQLStats(t *testing.T) {
- 		ctx = request.WithNamespace(ctx, "default")
- 
- 		store := &LegacyStatsGetter{
--			SQL:                          legacysql.NewDatabaseProvider(db),
--			DisableSQLFallbackDashboards: false,
--			DisableSQLFallbackFolders:    true,
-+			SQL: legacysql.NewDatabaseProvider(db),
-+			Cfg: cfgWithModes(0, 5), // dashboards Mode0, folders Mode5
- 		}
- 
- 		stats, err := store.GetStats(ctx, &resourcepb.ResourceStatsRequest{
-@@ -215,9 +225,8 @@ func TestIntegrationDirectSQLStats(t *testing.T) {
- 		ctx = request.WithNamespace(ctx, "default")
- 
- 		store := &LegacyStatsGetter{
--			SQL:                          legacysql.NewDatabaseProvider(db),
--			DisableSQLFallbackDashboards: true,
--			DisableSQLFallbackFolders:    true,
-+			SQL: legacysql.NewDatabaseProvider(db),
-+			Cfg: cfgWithModes(5, 5), // both Mode5
- 		}
- 
- 		stats, err := store.GetStats(ctx, &resourcepb.ResourceStatsRequest{
-@@ -279,4 +288,51 @@ func TestIntegrationDirectSQLStats(t *testing.T) {
- 			}
- 		]`, string(jj))
- 	})
++  const [_, forceUpdate] = useReducer((x) => x + 1, 0);
 +
-+	// Verify that changing the cfg mode dynamically affects the stats query.
-+	// This is the key behavior for the fix: auto-migration sets Mode5 after the
-+	// LegacyStatsGetter is created, and the getter must pick up the change.
-+	t.Run("DynamicModeChange", func(t *testing.T) {
-+		ctx := context.Background()
-+		ctx = request.WithNamespace(ctx, "default")
++  const clusteringMode: ClusteringMode | null =
++    options?.clustering && options.clustering > 0 ? ClusteringMode.Render : null;
++  const { canExecuteActions } = usePanelContext();
++  const userCanExecuteActions = canExecuteActions?.() ?? false;
 +
-+		cfg := cfgWithModes(0, 0) // start with Mode0 for both
-+		store := &LegacyStatsGetter{
-+			SQL: legacysql.NewDatabaseProvider(db),
-+			Cfg: cfg,
-+		}
++  const { xAnnos, xyAnnos } = useAnnotations({ annotations, newRange });
 +
-+		// With Mode0, legacy dashboard stats should be returned
-+		stats, err := store.GetStats(ctx, &resourcepb.ResourceStatsRequest{
-+			Namespace: "default",
-+			Folder:    folder1UID,
-+		})
-+		require.NoError(t, err)
-+		var hasDashboards bool
-+		for _, s := range stats.Stats {
-+			if s.Resource == "dashboards" {
-+				hasDashboards = true
-+			}
-+		}
-+		require.True(t, hasDashboards, "dashboards stats should be present in Mode0")
++  const clusteredAnnos = useAnnotationClustering({
++    annotations: xAnnos,
++    clusteringMode,
++    plotWidth: plot?.bbox.width,
++    // if the plot hasn't defined the time range yet, we don't want to cluster until it does
++    timeRange: { from: plot?.scales?.x?.min ?? -1, to: plot?.scales?.x?.max ?? -1 },
++  });
++  const exitWipEdit = useCallback(() => {
++    setNewRange(null);
++  }, [setNewRange]);
 +
-+		// Simulate auto-migration setting Mode5 after client creation
-+		cfg.UnifiedStorage["dashboards.dashboard.grafana.app"] = setting.UnifiedStorageConfig{
-+			DualWriterMode: rest.Mode5,
-+		}
++  const xAnnoRef = useRef(clusteredAnnos);
++  xAnnoRef.current = clusteredAnnos;
 +
-+		// Now legacy dashboard stats should be skipped
-+		stats, err = store.GetStats(ctx, &resourcepb.ResourceStatsRequest{
-+			Namespace: "default",
-+			Folder:    folder1UID,
-+		})
-+		require.NoError(t, err)
-+		hasDashboards = false
-+		for _, s := range stats.Stats {
-+			if s.Resource == "dashboards" {
-+				hasDashboards = true
-+			}
-+		}
-+		require.False(t, hasDashboards, "dashboards stats should be disabled after Mode5 is set")
-+	})
- }
++  const xyAnnoRef = useRef(xyAnnos);
++  xyAnnoRef.current = xyAnnos;
++
++  const newRangeRef = useRef(newRange);
++  newRangeRef.current = newRange;
++
++  const xAxisRef = useRef<HTMLDivElement | undefined>(undefined);
++
++  useLayoutEffect(() => {
++    config.addHook('ready', (u) => {
++      xAxisRef.current = u.root.querySelector<HTMLDivElement>('.u-axis')!;
++      setPlot(u);
++    });
++
++    config.addHook('draw', (u) => {
++      const xAnnos = xAnnoRef.current;
++      const xyAnnos = xyAnnoRef.current;
++      const ctx = u.ctx;
++
++      ctx.save();
++
++      ctx.beginPath();
++      ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
++      ctx.clip();
++
++      // @todo Add panel options https://github.com/grafana/grafana/issues/119763
++      const shouldRenderRegion = !options?.multiLane;
++      const shouldRenderLine = !options?.multiLane;
++
++      // Multi-lane annotations do not support vertical lines or shaded regions
++      xAnnos.forEach((frame) => {
++        const vals = getVals<AnnotationVals>(frame);
++
++        // render line
++        if (shouldRenderLine) {
++          const y0 = u.bbox.top;
++          const y1 = y0 + u.bbox.height;
++
++          ctx.lineWidth = 2;
++          ctx.setLineDash([5, 5]);
++
++          // Render region
++          if (shouldRenderRegion) {
++            for (let i = 0; i < vals.time.length; i++) {
++              // skip rendering annos that are clustered (have non-null cluster index)
++              if (skipClusteredAnno(vals, i)) {
++                continue;
++              }
++              const isRegion = vals.isRegion?.[i];
++              const timeEnd = vals.timeEnd?.[i];
++              const color = getColorByName(vals.color?.[i] ?? DEFAULT_ANNOTATION_COLOR_HEX8);
++
++              const x0 = u.valToPos(vals.time[i], 'x', true);
++              renderLine(ctx, y0, y1, x0, color);
++
++              // If dataframe does not have end times, let's omit rendering the region for now to prevent runtime error in valToPos
++              // @todo do we want to fix isRegion to render a point (or use "to" as timeEnd) when we're missing timeEnd?
++              if (isRegion && timeEnd) {
++                const x1 = u.valToPos(timeEnd, 'x', true);
++                renderLine(ctx, y0, y1, x1, color);
++
++                if (canvasRegionRendering) {
++                  ctx.fillStyle = colorManipulator.alpha(color, 0.1);
++                  ctx.fillRect(x0, y0, x1 - x0, u.bbox.height);
++                }
++              }
++            }
++          }
++        }
++      });
++
++      // xMin, xMax, yMin, yMax, color, lineWidth, lineStyle, fillOpacity, text
++      xyAnnos.forEach((frame) => {
++        const vals = getVals<XYAnnoVals>(frame);
++
++        const xKey = config.scales[0].props.scaleKey;
++        const yKey = config.scales[1].props.scaleKey;
++
++        for (let i = 0; i < frame.length; i++) {
++          const color = getColorByName(vals.color?.[i] || DEFAULT_ANNOTATION_COLOR_HEX8);
++
++          const x0 = u.valToPos(vals.xMin?.[i], xKey, true);
++          const x1 = u.valToPos(vals.xMax?.[i], xKey, true);
++          const y0 = u.valToPos(vals.yMax?.[i], yKey, true);
++          const y1 = u.valToPos(vals.yMin?.[i], yKey, true);
++
++          ctx.fillStyle = colorManipulator.alpha(color, vals.fillOpacity[i]);
++          ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
++
++          ctx.lineWidth = Math.round(vals.lineWidth[i] * uPlot.pxRatio);
++
++          if (vals.lineStyle[i] === 'dash') {
++            // maybe extract this to vals.lineDash[i] in future?
++            ctx.setLineDash([5, 5]);
++          } else {
++            // solid
++            ctx.setLineDash([]);
++          }
++
++          ctx.strokeStyle = color;
++          ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
++        }
++      });
++
++      ctx.restore();
++    });
++  }, [config, canvasRegionRendering, getColorByName, options?.multiLane, options?.clustering]);
++
++  // ensure xAnnos are re-drawn whenever they change
++  useEffect(() => {
++    if (plot) {
++      plot.redraw();
++
++      // this forces a second redraw after uPlot is updated (in the Plot.tsx didUpdate) with new data/scales
++      // and ensures the anno marker positions in the dom are re-rendered in correct places
++      // (this is temp fix until uPlot integration is refactored)
++      setTimeout(() => {
++        forceUpdate();
++      }, 0);
++    }
++  }, [xAnnos, plot]);
++
++  if (plot && xAxisRef.current) {
++    const wipFrame = xAnnos.filter((fr) => fr.meta?.custom?.isWip)?.[0];
++    const wipVals = wipFrame ? getVals<AnnotationVals>(wipFrame) : null;
++    const isWipVisible = wipFrame?.meta?.custom?.isWip && wipVals?.time?.[0] && wipVals?.time?.[0] > 0;
++
++    const markers = xAnnoRef.current.flatMap((frame, frameIdx) => {
++      const isWipFrame = frame?.meta?.custom?.isWip;
++      const vals = getVals<AnnotationVals>(frame);
++      const markers: React.ReactNode[] = [];
++
++      // Top offset for multi-lane annotations
++      const top = options?.multiLane ? frameIdx * ANNOTATION_LANE_SIZE : undefined;
++
++      for (let i = 0; i < vals.time.length; i++) {
++        if (skipClusteredAnno(vals, i)) {
++          continue;
++        }
++        const isRegion = vals.isRegion?.[i];
++        const timeEnd = vals.timeEnd?.[i];
++        const color = getColorByName(vals.color?.[i] || DEFAULT_ANNOTATION_COLOR);
++        const left = Math.round(plot.valToPos(vals.time[i], 'x')) || 0; // handles -0
++
++        let style: React.CSSProperties | null = null;
++        let isVisible = true;
++
++        if (isRegion && timeEnd != null) {
++          const right = Math.round(plot.valToPos(timeEnd, 'x')) || 0; // handles -0
++
++          isVisible = left < plot.rect.width && right > 0;
++
++          if (isVisible) {
++            const clampedLeft = Math.max(0, left);
++            const clampedRight = Math.min(plot.rect.width, right);
++
++            style = { left: clampedLeft, background: color, width: clampedRight - clampedLeft, top };
++          }
++        } else {
++          isVisible = left >= 0 && left <= plot.rect.width;
++
++          if (isVisible) {
++            style = { left, borderBottomColor: color, top };
++          }
++        }
++
++        // @TODO: Reset newRange after annotation is saved
++        if (isVisible) {
++          const annotationKey = getAnnotationKey(frameIdx, i);
++          const setPinned = (active: boolean) => {
++            if (active) {
++              setPinnedAnnotationId(annotationKey);
++            } else {
++              setPinnedAnnotationId(undefined);
++            }
++          };
++
++          // Do not let other tooltips render if one is already pinned, or the wip is being edited
++          const showTooltipOnHover = !pinnedAnnotationId && !isWipVisible;
++
++          // The tooltip should render as pinned if the pinned state index matches this annotation
++          const isPinned = pinnedAnnotationId === annotationKey;
++
++          markers.push(
++            <AnnotationMarker2
++              key={annotationKey}
++              setPinned={setPinned}
++              isPinned={isPinned}
++              showTooltipOnHover={showTooltipOnHover}
++              frame={frame}
++              annoIdx={i}
++              annoVals={vals}
++              style={style}
++              timeZone={timeZone}
++              exitWipEdit={isWipFrame ? exitWipEdit : null}
++              portalRoot={portalRoot}
++              canExecuteActions={userCanExecuteActions}
++              replaceVariables={replaceVariables}
++            />
++          );
++        }
++      }
++
++      return markers;
++    });
++
++    return createPortal(markers, xAxisRef.current);
++  }
++
++  return null;
++};
++
++/**
++ * Defines when to skip rendering a clustered annotation
++ * @param vals
++ * @param i
++ */
++const skipClusteredAnno = (vals: AnnotationVals, i: number) => {
++  return (
++    // We don't currently cluster region annotations
++    !vals.isRegion?.[i] &&
++    // We use the clusterIdx to define when an annotation is a cluster
++    vals.clusterIdx?.[i] !== undefined &&
++    vals.clusterIdx?.[i] !== null &&
++    vals.clusterIdx?.[i] >= 0
++  );
++};
++
++/**
++ * helper method to return a unique identifier for an annotation
++ * @param frameIdx
++ * @param i
++ */
++const getAnnotationKey = (frameIdx: number, i: number) => {
++  return `${frameIdx}:${i}`;
++};
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAlertState.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAlertState.tsx
+new file mode 100644
+index 0000000000000..07dcc13fa3f20
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAlertState.tsx
+@@ -0,0 +1,30 @@
++import { css } from '@emotion/css';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { useStyles2 } from '@grafana/ui';
++import alertDef from 'app/features/alerting/state/alertDef';
++
++interface Props {
++  alertState: string | undefined;
++}
++
++export const AnnotationAlertState = ({ alertState }: Props) => {
++  const styles = useStyles2(getStyles);
++  if (!alertState) {
++    return null;
++  }
++
++  const stateModel = alertDef.getStateDisplayModel(alertState);
++  return (
++    <div className={styles.alertState}>
++      <i className={stateModel.stateClass}>{stateModel.text}</i>
++    </div>
++  );
++};
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  alertState: css({
++    paddingRight: theme.spacing(1),
++    fontWeight: theme.typography.fontWeightMedium,
++  }),
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAvatar.test.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAvatar.test.tsx
+new file mode 100644
+index 0000000000000..59bb562c01f1b
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAvatar.test.tsx
+@@ -0,0 +1,31 @@
++import { render, screen } from '@testing-library/react';
++
++import { AnnotationAvatar } from './AnnotationAvatar';
++
++describe('AnnotationAvatar', () => {
++  it('does not render when empty', () => {
++    const { container } = render(<AnnotationAvatar src={undefined} />);
++    expect(container).toBeEmptyDOMElement();
++  });
++
++  describe('sanitizes javascript', () => {
++    it('alert', () => {
++      render(<AnnotationAvatar src="javascript:alert('pwned')" />);
++      const img = screen.getByRole('img', { name: 'Annotation avatar' });
++      expect(img).toHaveAttribute('src', 'about:blank');
++    });
++
++    it('void', () => {
++      render(<AnnotationAvatar src="javascript:void(0)" />);
++      const img = screen.getByRole('img', { name: 'Annotation avatar' });
++      expect(img).toHaveAttribute('src', 'about:blank');
++    });
++  });
++
++  it('allows https URLs through', () => {
++    const safeUrl = 'https://grafana.com/static/assets/img/grot-404.svg';
++    render(<AnnotationAvatar src={safeUrl} />);
++    const img = screen.getByRole('img', { name: 'Annotation avatar' });
++    expect(img).toHaveAttribute('src', safeUrl);
++  });
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAvatar.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAvatar.tsx
+new file mode 100644
+index 0000000000000..7ee5a30ec5c45
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationAvatar.tsx
+@@ -0,0 +1,24 @@
++import { css } from '@emotion/css';
++
++import { GrafanaTheme2, textUtil } from '@grafana/data';
++import { useStyles2 } from '@grafana/ui';
++
++interface Props {
++  src: string | undefined;
++}
++
++export function AnnotationAvatar({ src }: Props) {
++  const styles = useStyles2(getStyles);
++  return src && <img className={styles.avatar} alt="Annotation avatar" src={textUtil.sanitizeUrl(src)} />;
++}
++
++const getStyles = (theme: GrafanaTheme2) => {
++  return {
++    avatar: css({
++      borderRadius: theme.shape.radius.circle,
++      width: 16,
++      height: 16,
++      marginRight: theme.spacing(1),
++    }),
++  };
++};
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationEditor2.test.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationEditor2.test.tsx
+new file mode 100644
+index 0000000000000..ebf81035011a2
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationEditor2.test.tsx
+@@ -0,0 +1,81 @@
++import { render, screen } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++
++import { usePanelContext } from '@grafana/ui';
++
++import { AnnotationEditor2 } from './AnnotationEditor2';
++import { AnnotationVals } from './types';
++
++jest.mock('@grafana/ui', () => ({
++  ...jest.requireActual('@grafana/ui'),
++  usePanelContext: jest.fn(),
++}));
++
++const mockUsePanelContext = jest.mocked(usePanelContext);
++
++describe('onSubmit', () => {
++  const annoVals: AnnotationVals = {
++    time: [1759388895560],
++    timeEnd: [1759389095560],
++    text: ['My description'],
++    tags: [['tag1', 'tag2']],
++    id: [null],
++    isRegion: [true],
++  };
++
++  beforeEach(() => {
++    jest.clearAllMocks();
++  });
++
++  it('is called on annotation create', async () => {
++    const onAnnotationCreate = jest.fn().mockResolvedValue(undefined);
++    mockUsePanelContext.mockReturnValue({
++      onAnnotationCreate,
++      onAnnotationUpdate: jest.fn(),
++      eventsScope: '',
++      // @ts-ignore
++      eventBus: jest.fn(),
++    });
++
++    render(<AnnotationEditor2 annoVals={annoVals} annoIdx={0} timeZone="browser" dismiss={jest.fn()} />);
++    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
++
++    expect(onAnnotationCreate).toHaveBeenCalledWith({
++      id: undefined,
++      tags: ['tag1', 'tag2'],
++      description: 'My description',
++      from: 1759388895560,
++      to: 1759389095560,
++    });
++  });
++
++  it('is called on annotation update', async () => {
++    const onAnnotationUpdate = jest.fn().mockResolvedValue(undefined);
++    mockUsePanelContext.mockReturnValue({
++      onAnnotationCreate: jest.fn(),
++      onAnnotationUpdate,
++      eventsScope: '',
++      // @ts-ignore
++      eventBus: jest.fn(),
++    });
++
++    render(
++      <AnnotationEditor2
++        annoVals={{ ...annoVals, ...{ id: [4683] } }}
++        annoIdx={0}
++        timeZone="browser"
++        dismiss={jest.fn()}
++      />
++    );
++
++    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
++
++    expect(onAnnotationUpdate).toHaveBeenCalledWith({
++      id: 4683,
++      tags: ['tag1', 'tag2'],
++      description: 'My description',
++      from: 1759388895560,
++      to: 1759389095560,
++    });
++  });
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationEditor2.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationEditor2.tsx
+new file mode 100644
+index 0000000000000..75014af222400
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationEditor2.tsx
+@@ -0,0 +1,195 @@
++import { css } from '@emotion/css';
++import { useRef, useEffect } from 'react';
++import { Controller } from 'react-hook-form';
++import { useAsyncFn, useClickAway } from 'react-use';
++
++import { AnnotationEventUIModel, GrafanaTheme2, dateTimeFormat, systemDateFormats } from '@grafana/data';
++import { Trans, t } from '@grafana/i18n';
++import { Button, Field, Stack, TextArea, usePanelContext, useStyles2 } from '@grafana/ui';
++import { Form } from 'app/core/components/Form/Form';
++import { TagFilter } from 'app/core/components/TagFilter/TagFilter';
++import { annotationServer } from 'app/features/annotations/api';
++
++import { AnnotationTooltipHeaderCloseIcon } from './AnnotationTooltipHeaderCloseIcon';
++import { AnnotationVals } from './types';
++
++interface Props {
++  annoVals: AnnotationVals;
++  annoIdx: number;
++  timeZone: string;
++  dismiss: () => void;
++}
++
++interface AnnotationEditFormDTO {
++  description: string;
++  tags: string[];
++}
++
++export const AnnotationEditor2 = ({ annoVals, annoIdx, dismiss, timeZone, ...otherProps }: Props) => {
++  const styles = useStyles2(getStyles);
++  const { onAnnotationCreate, onAnnotationUpdate } = usePanelContext();
++  const focusRef = useRef<HTMLButtonElement | null>(null);
++  const clickAwayRef = useRef(null);
++
++  useClickAway(clickAwayRef, dismiss);
++
++  // focus text area on render
++  useEffect(() => {
++    focusRef.current?.focus();
++  }, []);
++
++  const [createAnnotationState, createAnnotation] = useAsyncFn(async (event: AnnotationEventUIModel) => {
++    const result = await onAnnotationCreate!(event);
++    dismiss();
++    return result;
++  });
++
++  const [updateAnnotationState, updateAnnotation] = useAsyncFn(async (event: AnnotationEventUIModel) => {
++    const result = await onAnnotationUpdate!(event);
++    dismiss();
++    return result;
++  });
++
++  const timeFormatter = (value: number) =>
++    dateTimeFormat(value, {
++      format: systemDateFormats.fullDate,
++      timeZone,
++    });
++
++  const isUpdatingAnnotation = annoVals.id?.[annoIdx] != null;
++  const isRegionAnnotation = annoVals.isRegion?.[annoIdx];
++  const operation = isUpdatingAnnotation ? updateAnnotation : createAnnotation;
++  const stateIndicator = isUpdatingAnnotation ? updateAnnotationState : createAnnotationState;
++  const timeEnd = annoVals.timeEnd?.[annoIdx];
++  const timeVal = annoVals.time[annoIdx];
++  const time =
++    isRegionAnnotation && timeEnd != null
++      ? `${timeFormatter(timeVal)} - ${timeFormatter(timeEnd)}`
++      : timeFormatter(timeVal);
++
++  const onSubmit = ({ tags, description }: AnnotationEditFormDTO) => {
++    operation({
++      // @ts-expect-error @todo https://github.com/grafana/grafana/issues/120097 - id is typed incorrectly as string but breaks annotation API
++      id: annoVals.id?.[annoIdx] ?? undefined,
++      tags,
++      description,
++      from: Math.round(annoVals.time[annoIdx]!),
++      to: Math.round(annoVals.timeEnd?.[annoIdx] ?? annoVals.time[annoIdx]!),
++    });
++  };
++
++  // Annotation editor
++  return (
++    <div ref={clickAwayRef} className={styles.editor} {...otherProps}>
++      <div className={styles.header}>
++        <Stack justifyContent={'space-between'} alignItems={'center'}>
++          <Stack gap={0} width="100%" justifyContent={'space-between'} alignItems={'center'}>
++            <div>
++              {isUpdatingAnnotation
++                ? t('timeseries.annotation-editor2.edit-annotation', 'Edit annotation')
++                : t('timeseries.annotation-editor2.add-annotation', 'Add annotation')}
++            </div>
++            <div>{time}</div>
++          </Stack>
++          <AnnotationTooltipHeaderCloseIcon
++            forwardRef={focusRef}
++            onClick={(e) => {
++              // Don't trigger onClick
++              e.stopPropagation();
++              dismiss();
++            }}
++          />
++        </Stack>
++      </div>
++      <Form<AnnotationEditFormDTO>
++        onSubmit={onSubmit}
++        defaultValues={{ description: annoVals.text?.[annoIdx] ?? '', tags: annoVals.tags?.[annoIdx] || [] }}
++      >
++        {({ register, errors, control }) => {
++          return (
++            <>
++              <div className={styles.content}>
++                {/* eslint-disable-next-line no-restricted-syntax */}
++                <Field
++                  autoFocus={true}
++                  label={t('timeseries.annotation-editor2.label-description', 'Description')}
++                  invalid={!!errors.description}
++                  error={errors?.description?.message}
++                >
++                  <TextArea
++                    data-testid={'annotation-editor-description'}
++                    className={styles.textarea}
++                    {...register('description', {
++                      required: 'Annotation description is required',
++                    })}
++                  />
++                </Field>
++                {/* eslint-disable-next-line no-restricted-syntax */}
++                <Field label={t('timeseries.annotation-editor2.label-tags', 'Tags')}>
++                  <Controller
++                    control={control}
++                    name="tags"
++                    render={({ field: { ref, onChange, ...field } }) => {
++                      return (
++                        <TagFilter
++                          allowCustomValue
++                          placeholder={t('timeseries.annotation-editor2.placeholder-add-tags', 'Add tags')}
++                          onChange={onChange}
++                          tagOptions={annotationServer().tags}
++                          tags={field.value}
++                        />
++                      );
++                    }}
++                  />
++                </Field>
++              </div>
++              <div className={styles.footer}>
++                <Stack justifyContent={'flex-end'}>
++                  <Button size={'sm'} variant="secondary" onClick={dismiss} fill="outline">
++                    <Trans i18nKey="timeseries.annotation-editor2.cancel">Cancel</Trans>
++                  </Button>
++                  <Button size={'sm'} type={'submit'} disabled={stateIndicator?.loading}>
++                    {stateIndicator?.loading
++                      ? t('timeseries.annotation-editor2.saving', 'Saving')
++                      : t('timeseries.annotation-editor2.save', 'Save')}
++                  </Button>
++                </Stack>
++              </div>
++            </>
++          );
++        }}
++      </Form>
++    </div>
++  );
++};
++
++const getStyles = (theme: GrafanaTheme2) => {
++  return {
++    editor: css({
++      background: theme.colors.background.elevated,
++      border: `1px solid ${theme.colors.border.weak}`,
++      borderRadius: theme.shape.radius.default,
++      boxShadow: theme.shadows.z3,
++      userSelect: 'text',
++      width: '460px',
++    }),
++    content: css({
++      padding: theme.spacing(1),
++    }),
++    header: css({
++      borderBottom: `1px solid ${theme.colors.border.weak}`,
++      padding: theme.spacing(0.5, 1),
++      fontWeight: theme.typography.fontWeightBold,
++      fontSize: theme.typography.fontSize,
++      color: theme.colors.text.primary,
++    }),
++    footer: css({
++      borderTop: `1px solid ${theme.colors.border.weak}`,
++      padding: theme.spacing(1, 1),
++    }),
++    textarea: css({
++      color: theme.colors.text.secondary,
++      fontSize: theme.typography.bodySmall.fontSize,
++    }),
++  };
++};
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationMarker2.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationMarker2.tsx
+new file mode 100644
+index 0000000000000..d3a3522454532
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationMarker2.tsx
+@@ -0,0 +1,216 @@
++import { css } from '@emotion/css';
++import { autoUpdate } from '@floating-ui/dom';
++import { useFloating } from '@floating-ui/react';
++import * as React from 'react';
++import { ReactNode, useState } from 'react';
++import { createPortal } from 'react-dom';
++
++import { ActionModel, DataFrame, GrafanaTheme2, InterpolateFunction, LinkModel } from '@grafana/data';
++import { selectors } from '@grafana/e2e-selectors';
++import { t } from '@grafana/i18n';
++import { TimeZone } from '@grafana/schema';
++import { ClickOutsideWrapper, floatingUtils, useStyles2 } from '@grafana/ui';
++import { getDataLinks, getFieldActions } from 'app/plugins/panel/status-history/utils';
++
++import { AnnotationEditor2 } from './AnnotationEditor2';
++import { AnnotationTooltip2 } from './AnnotationTooltip2';
++import { AnnotationTooltip2Cluster } from './AnnotationTooltip2Cluster';
++import { AnnotationVals } from './types';
++
++interface AnnotationMarkerProps {
++  // Annotation dataframe
++  frame: DataFrame;
++  // The values from the annotation fields
++  annoVals: AnnotationVals;
++  // The value index, sometimes called rowIndex
++  annoIdx: number;
++  // Styles calculated from plot, e.g. calculated region width & annotation offset
++  style: React.CSSProperties | null;
++  // Method to close user created (wip) annotation
++  exitWipEdit?: null | (() => void);
++  // From PanelContext.canExecuteActions(), controls whether the user has permission to execute field actions
++  canExecuteActions: boolean;
++  // Sets if the user pinned via keyboard or mouse click
++  setPinned: (pin: boolean) => void;
++  // Current pin state
++  isPinned: boolean;
++  // Determines if we should display the tooltip when hovering, keeps adjacent annotations from rendering a tooltip that overlays the pinned tooltip
++  showTooltipOnHover: boolean;
++  timeZone: TimeZone;
++  portalRoot: HTMLElement;
++  replaceVariables: InterpolateFunction;
++}
++
++export const AnnotationMarker2 = ({
++  frame,
++  annoVals,
++  annoIdx,
++  style,
++  exitWipEdit,
++  timeZone,
++  portalRoot,
++  replaceVariables,
++  canExecuteActions,
++  setPinned,
++  showTooltipOnHover,
++  isPinned,
++}: AnnotationMarkerProps) => {
++  const styles = useStyles2(getStyles);
++  const placement = 'bottom';
++  const isRegion = annoVals?.isRegion?.[annoIdx] === true;
++
++  // Set when editing
++  const [editAnnotationId, setEditAnnotationId] = useState(exitWipEdit != null ? annoIdx : null);
++  const [isHovering, setIsHovering] = useState(false);
++  const isClustering =
++    annoVals.isRegion?.[annoIdx] && annoVals.clusterIdx?.[annoIdx] != null && annoVals.clusterIdx?.[annoIdx] > -1;
++
++  const { refs, floatingStyles } = useFloating({
++    open: true,
++    placement,
++    middleware: floatingUtils.getPositioningMiddleware(placement),
++    whileElementsMounted: autoUpdate,
++    strategy: 'fixed',
++  });
++
++  const onClose = () => {
++    setPinned(false);
++    setIsHovering(false);
++  };
++  const links: LinkModel[] = [];
++  const actions: ActionModel[] = [];
++
++  if (isHovering || isPinned) {
++    frame.fields.forEach((field) => {
++      // Since field overrides are not yet supported for annotation frames, every value in the field will have the same links... except the clustering index because it's generated on-the-fly and not had getFieldOverrides called on it
++      const annotationIndexForLinks = isClustering ? 0 : annoIdx;
++
++      // @todo https://github.com/grafana/grafana/issues/119619, need to set getLinks on field, or applyFieldOverrides on dataframe
++      links.push(...getDataLinks(field, annotationIndexForLinks));
++
++      if (canExecuteActions) {
++        actions.push(...getFieldActions(frame, field, replaceVariables, annotationIndexForLinks));
++      }
++    });
++  }
++
++  const isEditing = editAnnotationId !== null;
++  const showTooltip = (isPinned && !isEditing) || (showTooltipOnHover && isHovering && !isEditing);
++
++  // We cannot use the array index for editing annotations since clustered and wip annotations will get sorted by date, so we need to grab them by the 'id' field which is populated by the annotations API
++  const annoId = annoVals?.id?.[annoIdx];
++  const _editIdx = annoVals?.id?.findIndex((annoId) => annoId === editAnnotationId);
++  // wip will not have an id to set, so we need to pass in the raw idx of this annotation, as long as wip is not already clustered, this should continue to work
++  const editIdx = _editIdx !== undefined && _editIdx > -1 ? _editIdx : annoIdx;
++
++  let contents: ReactNode | null = null;
++  if (!isEditing && showTooltip && isClustering) {
++    contents = (
++      <AnnotationTooltip2Cluster
++        actions={actions}
++        links={links}
++        onClose={onClose}
++        isPinned={isPinned}
++        annoIdx={annoIdx}
++        annoVals={annoVals}
++        timeZone={timeZone}
++        onEdit={(annotationId: number) => setEditAnnotationId(annotationId)}
++      />
++    );
++  } else if (showTooltip) {
++    contents = (
++      <AnnotationTooltip2
++        annoIdx={annoIdx}
++        annoVals={annoVals}
++        timeZone={timeZone}
++        onClose={onClose}
++        isPinned={isPinned}
++        onEdit={annoId !== undefined ? () => setEditAnnotationId(annoId) : undefined}
++        links={links}
++        actions={actions}
++      />
++    );
++  } else if (isEditing) {
++    contents = (
++      <AnnotationEditor2
++        annoIdx={editIdx}
++        annoVals={annoVals}
++        timeZone={timeZone}
++        dismiss={() => {
++          exitWipEdit?.();
++          setEditAnnotationId(null);
++          onClose();
++        }}
++      />
++    );
++  }
++
++  return (
++    <button
++      aria-label={
++        isRegion
++          ? t('timeseries.annotation-marker.annotation-region-label', 'Annotation region')
++          : t('timeseries.annotation-marker.annotation-label', 'Annotation')
++      }
++      ref={refs.setReference}
++      className={isRegion ? styles.annoRegion : styles.annoMarker}
++      style={style!}
++      onFocus={() => setIsHovering(true)}
++      onBlur={() => setIsHovering(false)}
++      onClick={() => setPinned(true)}
++      onMouseEnter={() => showTooltipOnHover && setIsHovering(true)}
++      onMouseLeave={() => setIsHovering(false)}
++      data-testid={selectors.pages.Dashboard.Annotations.marker}
++    >
++      {contents &&
++        createPortal(
++          <div ref={refs.setFloating} className={styles.annoBox} style={floatingStyles} data-testid="annotation-marker">
++            <ClickOutsideWrapper includeButtonPress={false} useCapture={true} onClick={() => setPinned(false)}>
++              {contents}
++            </ClickOutsideWrapper>
++          </div>,
++          portalRoot
++        )}
++    </button>
++  );
++};
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  annoMarker: css({
++    position: 'absolute',
++    width: 0,
++    height: 0,
++    border: 'none',
++    borderLeft: '5px solid transparent',
++    borderRight: '5px solid transparent',
++    borderBottomWidth: '5px',
++    borderBottomStyle: 'solid',
++    transform: 'translateX(-50%)',
++    cursor: 'pointer',
++    zIndex: 1,
++    padding: 0,
++    background: 'none',
++  }),
++  annoRegion: css({
++    border: 'none',
++    position: 'absolute',
++    height: '5px',
++    cursor: 'pointer',
++    zIndex: 1,
++    padding: 0,
++    background: 'none',
++  }),
++  // NOTE: shares much with TooltipPlugin2
++  annoBox: css({
++    top: 0,
++    left: 0,
++    zIndex: theme.zIndex.tooltip,
++    borderRadius: theme.shape.radius.default,
++    position: 'absolute',
++    background: theme.colors.background.primary,
++    border: `1px solid ${theme.colors.border.weak}`,
++    boxShadow: theme.shadows.z2,
++    userSelect: 'text',
++    minWidth: '300px',
++  }),
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltip2.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltip2.tsx
+new file mode 100644
+index 0000000000000..33dfc307e0ad8
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltip2.tsx
+@@ -0,0 +1,82 @@
++import { css } from '@emotion/css';
++
++import { ActionModel, GrafanaTheme2, LinkModel } from '@grafana/data';
++import { usePanelContext, useStyles2 } from '@grafana/ui';
++import { VizTooltipFooter } from '@grafana/ui/internal';
++
++import { AnnotationTooltipBody } from './AnnotationTooltipBody';
++import { AnnotationTooltipHeader } from './AnnotationTooltipHeader';
++import { getAnnotationTooltip } from './getAnnotationTooltip';
++import { AnnotationVals } from './types';
++
++export interface AnnotationTooltipProps {
++  annoVals: AnnotationVals;
++  annoIdx: number;
++  timeZone: string;
++  isPinned: boolean;
++  onClose: () => void;
++  onEdit?: () => void;
++  links?: LinkModel[];
++  actions?: ActionModel[];
++}
++
++const retFalse = () => false;
++
++export const AnnotationTooltip2 = ({
++  annoVals,
++  annoIdx,
++  timeZone,
++  isPinned,
++  onClose,
++  onEdit,
++  links = [],
++  actions = [],
++}: AnnotationTooltipProps) => {
++  const styles = useStyles2(getStyles);
++  const { canEditAnnotations = retFalse, canDeleteAnnotations = retFalse, onAnnotationDelete } = usePanelContext();
++  const { onDelete, canEdit, canDelete, time, text, alertText, alertState, avatarImgSrc, title } = getAnnotationTooltip(
++    annoVals,
++    annoIdx,
++    timeZone,
++    canEditAnnotations,
++    canDeleteAnnotations,
++    // @ts-expect-error @todo https://github.com/grafana/grafana/issues/120097 - id is typed incorrectly as string but breaks annotation API
++    onAnnotationDelete
++  );
++
++  return (
++    <div className={styles.wrapper}>
++      <AnnotationTooltipHeader
++        avatarImg={avatarImgSrc}
++        alertState={alertState}
++        timeRange={time}
++        canEdit={canEdit}
++        canDelete={canDelete}
++        isPinned={isPinned}
++        onEdit={onEdit}
++        onDelete={onDelete}
++        onRemove={(e) => {
++          // Don't trigger onClick
++          e.stopPropagation();
++          onClose();
++        }}
++      />
++
++      <AnnotationTooltipBody title={title} text={text} alertText={alertText} tags={annoVals.tags?.[annoIdx] ?? []} />
++
++      {(links.length > 0 || actions.length > 0) && <VizTooltipFooter dataLinks={links} actions={actions} />}
++    </div>
++  );
++};
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  wrapper: css({
++    zIndex: theme.zIndex.tooltip,
++    whiteSpace: 'initial',
++    borderRadius: theme.shape.radius.default,
++    background: theme.colors.background.elevated,
++    border: `1px solid ${theme.colors.border.weak}`,
++    boxShadow: theme.shadows.z3,
++    userSelect: 'text',
++  }),
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltip2Cluster.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltip2Cluster.tsx
+new file mode 100644
+index 0000000000000..616365cc7e606
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltip2Cluster.tsx
+@@ -0,0 +1,150 @@
++import { css } from '@emotion/css';
++import * as React from 'react';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { selectors } from '@grafana/e2e-selectors';
++import { t } from '@grafana/i18n';
++import { ScrollContainer, usePanelContext, useStyles2 } from '@grafana/ui';
++import { VizTooltipFooter } from '@grafana/ui/internal';
++import alertDef from 'app/features/alerting/state/alertDef';
++
++import { AnnotationTooltipProps } from './AnnotationTooltip2';
++import { AnnotationTooltipBody } from './AnnotationTooltipBody';
++import { AnnotationTooltipHeader } from './AnnotationTooltipHeader';
++import { getAnnotationTooltip } from './getAnnotationTooltip';
++
++const retFalse = () => false;
++
++export interface AnnotationClusterTooltipProps extends Omit<AnnotationTooltipProps, 'onEdit'> {
++  // clustered tooltips need to know which annotation is being edited
++  onEdit: (annotationId: number) => void;
++}
++
++export const AnnotationTooltip2Cluster = ({
++  annoVals,
++  annoIdx,
++  timeZone,
++  onEdit,
++  isPinned,
++  onClose,
++  links,
++  actions,
++}: AnnotationClusterTooltipProps) => {
++  const styles = useStyles2(getStyles);
++  const { canEditAnnotations = retFalse, canDeleteAnnotations = retFalse, onAnnotationDelete } = usePanelContext();
++
++  const annotationTooltipComponents: React.ReactNode[] = [];
++  const clusterIdx = annoVals.clusterIdx?.[annoIdx];
++  let annotationCount = 0;
++
++  for (let i = 0; i < annoVals.time.length; i++) {
++    if (annoVals.clusterIdx?.[i] === clusterIdx && i !== annoIdx) {
++      annotationCount++;
++      const { onDelete, canEdit, canDelete, time, alertState, avatarImgSrc } = getAnnotationTooltip(
++        annoVals,
++        i,
++        timeZone,
++        canEditAnnotations,
++        canDeleteAnnotations,
++        // @ts-expect-error @todo https://github.com/grafana/grafana/issues/120097 - id is typed incorrectly as string but breaks annotation API
++        onAnnotationDelete
++      );
++
++      const text = annoVals.text?.[i] ?? '';
++      const alertText = annoVals.data?.[i] ? alertDef.getAlertAnnotationText(annoVals.data[i]) : '';
++      const title = annoVals.title?.[i] ?? '';
++      const annotationId = annoVals.id?.[i];
++
++      annotationTooltipComponents.push(
++        <div className={annotationCount % 2 !== 0 ? styles.zebra : styles.annotationWrapper}>
++          <AnnotationTooltipHeader
++            clusterIndex={annotationCount}
++            avatarImg={avatarImgSrc}
++            alertState={alertState}
++            timeRange={time}
++            canEdit={canEdit}
++            canDelete={canDelete}
++            isPinned={false}
++            onEdit={annotationId != null ? () => onEdit(annotationId) : undefined}
++            onDelete={onDelete}
++            onRemove={(e) => {
++              // Don't trigger onClick
++              e.stopPropagation();
++              onClose();
++            }}
++          />
++
++          <AnnotationTooltipBody title={title} text={text} alertText={alertText} tags={annoVals?.tags?.[i] ?? []} />
++        </div>
++      );
++    }
++  }
++
++  const { time } = getAnnotationTooltip(
++    annoVals,
++    annoIdx,
++    timeZone,
++    canEditAnnotations,
++    canDeleteAnnotations,
++    // @ts-expect-error @todo https://github.com/grafana/grafana/issues/120097 - id is typed incorrectly as string but breaks annotation API
++    onAnnotationDelete
++  );
++
++  const count =
++    annotationTooltipComponents.length.toString() +
++    ' ' +
++    t('timeseries.annotation-tooltip2.cluster-header', 'annotations');
++
++  return (
++    <div data-testid={selectors.pages.Dashboard.Annotations.clusterTooltip} className={styles.wrapper}>
++      <ScrollContainer maxHeight="260px">
++        <AnnotationTooltipHeader
++          clusterLength={count}
++          isCluster={true}
++          timeRange={time}
++          canEdit={false}
++          canDelete={false}
++          isPinned={isPinned}
++          onRemove={(e) => {
++            // Don't trigger onClick
++            e.stopPropagation();
++            onClose();
++          }}
++        />
++        {annotationTooltipComponents.map((item, clusterIndex) => (
++          <div key={clusterIndex}>
++            {item}
++            <div className={styles.hr}></div>
++          </div>
++        ))}
++
++        {/* @todo move to inner cluster loop when annotation field overrides are supported https://github.com/grafana/grafana/issues/112685, https://github.com/grafana/grafana/issues/119619 */}
++        <VizTooltipFooter actions={actions} dataLinks={links ?? []} />
++      </ScrollContainer>
++    </div>
++  );
++};
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  zebra: css({
++    backgroundColor: theme.colors.background.primary,
++    paddingBottom: theme.spacing(1.5),
++  }),
++  annotationWrapper: css({
++    paddingBottom: theme.spacing(1.5),
++  }),
++  wrapper: css({
++    zIndex: theme.zIndex.tooltip,
++    whiteSpace: 'initial',
++    borderRadius: theme.shape.radius.default,
++    background: theme.colors.background.elevated,
++    border: `1px solid ${theme.colors.border.weak}`,
++    boxShadow: theme.shadows.z3,
++    userSelect: 'text',
++    overflow: 'hidden',
++  }),
++  hr: css({
++    borderTop: `1px solid ${theme.colors.border.medium}`,
++    width: '100%',
++  }),
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipBody.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipBody.tsx
+new file mode 100644
+index 0000000000000..d72d19f275add
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipBody.tsx
+@@ -0,0 +1,51 @@
++import { css } from '@emotion/css';
++
++import { GrafanaTheme2, textUtil } from '@grafana/data';
++import { Stack, Tag, useStyles2 } from '@grafana/ui';
++
++export function AnnotationTooltipBody({
++  text,
++  title,
++  alertText,
++  tags,
++}: {
++  title?: string | null;
++  text: string;
++  alertText: string;
++  tags: string[];
++}) {
++  const styles = useStyles2(getStyles);
++  return (
++    <div className={styles.body}>
++      {title && <div dangerouslySetInnerHTML={{ __html: textUtil.sanitize(title) }}></div>}
++      {text && <div className={styles.text} dangerouslySetInnerHTML={{ __html: textUtil.sanitize(text) }} />}
++      {alertText}
++      <div>
++        <Stack gap={0.5} wrap={true}>
++          {tags.map((t, i) => (
++            <Tag data-testid={'annotation-tag'} name={t} key={`${t}-${i}`} />
++          ))}
++        </Stack>
++      </div>
++    </div>
++  );
++}
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  body: css({
++    label: 'annotation-body',
++    padding: theme.spacing(1),
++    fontSize: theme.typography.bodySmall.fontSize,
++    color: theme.colors.text.secondary,
++    fontWeight: 400,
++    a: {
++      color: theme.colors.text.link,
++      '&:hover': {
++        textDecoration: 'underline',
++      },
++    },
++  }),
++  text: css({
++    paddingBottom: theme.spacing(1),
++  }),
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipHeader.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipHeader.tsx
+new file mode 100644
+index 0000000000000..c157af2d4e954
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipHeader.tsx
+@@ -0,0 +1,157 @@
++import { css } from '@emotion/css';
++import memoize from 'micro-memoize';
++import { useEffect, useRef } from 'react';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { t } from '@grafana/i18n';
++import { IconButton, Stack, useStyles2 } from '@grafana/ui';
++
++import { AnnotationAlertState } from './AnnotationAlertState';
++import { AnnotationAvatar } from './AnnotationAvatar';
++import { AnnotationTooltipHeaderCloseIcon } from './AnnotationTooltipHeaderCloseIcon';
++
++export function AnnotationTooltipHeader({
++  clusterLength,
++  clusterIndex,
++  text,
++  avatarImg,
++  alertState,
++  timeRange,
++  canEdit,
++  canDelete,
++  isPinned,
++  onEdit,
++  onDelete,
++  onRemove,
++  isCluster = false,
++}: {
++  clusterLength?: string;
++  clusterIndex?: number;
++  text?: string;
++  avatarImg?: string | undefined;
++  alertState?: string | undefined;
++  timeRange: string;
++  canEdit: false | boolean;
++  canDelete: boolean;
++  isPinned: boolean;
++  onEdit?: () => void;
++  onDelete?: () => void;
++  onRemove?: (e: React.MouseEvent<HTMLButtonElement>) => void;
++  isCluster?: boolean;
++}) {
++  const styles = useStyles2(memoize(getStyles));
++  const focusRef = useRef<HTMLButtonElement | null>(null);
++  useEffect(() => {
++    if (isPinned) {
++      focusRef.current?.focus();
++    }
++  }, [isPinned]);
++
++  return (
++    <div className={isCluster ? styles.clusterWrapper : styles.wrapper}>
++      <div className={styles.header}>
++        <Stack gap={2} basis="100%" justifyContent="space-between" alignItems="center">
++          <div className={styles.meta}>
++            {clusterIndex && <span className={styles.clusterIndex}>{clusterIndex}</span>}
++            <span>
++              <AnnotationAvatar src={avatarImg} />
++              <AnnotationAlertState alertState={alertState} />
++            </span>
++            <Stack width="100%" basis="100%" justifyContent="space-between" alignItems="center">
++              <span className={styles.timeRange}>{timeRange}</span>
++              {clusterLength && <span className={styles.clusterCount}>{clusterLength}</span>}
++            </Stack>
++          </div>
++          <div className={styles.controls}>
++            {(canEdit || canDelete || isPinned) && (
++              <>
++                {canEdit && (
++                  <IconButton
++                    ref={focusRef}
++                    name={'pen'}
++                    size={'sm'}
++                    onClick={onEdit}
++                    tooltip={t('timeseries.annotation-tooltip2.tooltip-edit', 'Edit')}
++                  />
++                )}
++                {canDelete && (
++                  <IconButton
++                    ref={canEdit ? null : focusRef}
++                    name={'trash-alt'}
++                    size={'sm'}
++                    onClick={onDelete}
++                    tooltip={t('timeseries.annotation-tooltip2.tooltip-delete', 'Delete')}
++                  />
++                )}
++                {onRemove && isPinned && (
++                  <AnnotationTooltipHeaderCloseIcon
++                    onClick={onRemove}
++                    forwardRef={canEdit || canDelete ? null : focusRef}
++                  />
++                )}
++              </>
++            )}
++          </div>
++        </Stack>
++      </div>
++      {text && (
++        <Stack gap={2} basis="100%" alignItems="center">
++          <span className={styles.subHeader}>{text}</span>
++        </Stack>
++      )}
++    </div>
++  );
++}
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  wrapper: css({
++    borderBottom: `1px solid ${theme.colors.border.weak}`,
++  }),
++  subHeader: css({
++    fontSize: theme.typography.bodySmall.fontSize,
++    padding: theme.spacing(0, 1),
++  }),
++  clusterIndex: css({
++    fontWeight: theme.typography.fontWeightBold,
++    marginRight: theme.spacing(1),
++  }),
++  clusterCount: css({
++    fontSize: theme.typography.bodySmall.fontSize,
++  }),
++  timeRange: css({
++    fontFamily: theme.typography.fontFamilyMonospace,
++  }),
++  clusterWrapper: css({
++    background: theme.colors.background.elevated,
++    position: 'sticky',
++    top: 0,
++    left: 0,
++    zIndex: 1,
++    boxShadow: theme.shadows.z1,
++    borderBottom: `1px solid ${theme.colors.border.weak}`,
++  }),
++  header: css({
++    label: 'annotation-header',
++    padding: theme.spacing(0.5, 1),
++    fontWeight: theme.typography.fontWeightBold,
++    fontSize: theme.typography.fontSize,
++    color: theme.colors.text.primary,
++    display: 'flex',
++  }),
++  meta: css({
++    width: '100%',
++    display: 'flex',
++    whiteSpace: 'nowrap',
++    color: theme.colors.text.primary,
++    fontWeight: 400,
++  }),
++  controls: css({
++    // space for all three icons
++    minWidth: '54px',
++    justifyContent: 'flex-end',
++    display: 'flex',
++    '> :last-child': {
++      marginLeft: 0,
++    },
++  }),
++});
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipHeaderCloseIcon.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipHeaderCloseIcon.tsx
+new file mode 100644
+index 0000000000000..c974a6aeecfc5
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/AnnotationTooltipHeaderCloseIcon.tsx
+@@ -0,0 +1,20 @@
++import React from 'react';
++
++import { t } from '@grafana/i18n';
++import { IconButton } from '@grafana/ui';
++
++interface Props {
++  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
++  forwardRef?: React.Ref<HTMLButtonElement> | null;
++}
++export function AnnotationTooltipHeaderCloseIcon({ onClick, forwardRef }: Props) {
++  return (
++    <IconButton
++      ref={forwardRef}
++      name={'times'}
++      size={'sm'}
++      onClick={onClick}
++      tooltip={t('timeseries.annotation-editor2.tooltip-close', 'Close')}
++    />
++  );
++}
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/constants.ts b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/constants.ts
+new file mode 100644
+index 0000000000000..a724536d2f517
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/constants.ts
+@@ -0,0 +1,2 @@
++// Recommended minimum spacing between interactive elements (a11y)
++export const DEFAULT_CLUSTERING_ANNOTATION_SPACING = 24;
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/getAnnotationTooltip.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/getAnnotationTooltip.tsx
+new file mode 100644
+index 0000000000000..23a7c06f4940a
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/getAnnotationTooltip.tsx
+@@ -0,0 +1,58 @@
++import { dateTimeFormat, systemDateFormats } from '@grafana/data';
++import alertDef from 'app/features/alerting/state/alertDef';
++
++import { AnnotationVals } from './types';
++
++const timeFormatter = (value: number, timeZone: string) =>
++  dateTimeFormat(value, {
++    format: systemDateFormats.fullDate,
++    timeZone,
++  });
++
++export function getAnnotationTooltip(
++  annoVals: AnnotationVals,
++  annoIdx: number,
++  timeZone: string,
++  canEditAnnotations: (dsUID: string) => boolean,
++  canDeleteAnnotations: (dsUID: string) => boolean,
++  onAnnotationDelete?: (id: number) => void
++) {
++  const annoId = annoVals.id?.[annoIdx];
++  const dashboardUID = annoVals.dashboardUID?.[annoIdx] ?? undefined;
++  const timeEnd = annoVals.timeEnd?.[annoIdx];
++  const isRegion = annoVals.isRegion?.[annoIdx] && timeEnd != null;
++
++  // grafana can be configured to load alert rules from loki. Those annotations cannot be edited or deleted. The id being 0 is the best indicator the annotation came from loki
++  const canUpdateAnno = dashboardUID !== undefined && annoId != null && annoId > 0;
++  const canEdit = canUpdateAnno && canEditAnnotations(dashboardUID);
++  const canDelete = canUpdateAnno && canDeleteAnnotations(dashboardUID) && onAnnotationDelete != null;
++
++  let time: string = timeFormatter(annoVals.time[annoIdx], timeZone);
++  const text: string = annoVals.text?.[annoIdx] ?? '';
++
++  if (isRegion) {
++    time += ' - ' + timeFormatter(timeEnd, timeZone);
++  }
++
++  // Alerting specific
++  const alertId = annoVals.alertId?.[annoIdx];
++  const alertText = annoVals.data?.[annoIdx] ? alertDef.getAlertAnnotationText(annoVals.data[annoIdx]) : '';
++  const newState = annoVals.newState?.[annoIdx];
++  const alertState = alertId !== undefined && newState ? newState : undefined;
++
++  const title = !alertText ? annoVals.title?.[annoIdx] : undefined;
++  const avatarImgSrc =
++    annoVals.login?.[annoIdx] && annoVals.avatarUrl?.[annoIdx] ? annoVals.avatarUrl?.[annoIdx] : undefined;
++
++  return {
++    title,
++    onDelete: annoId != null && onAnnotationDelete ? () => onAnnotationDelete(annoId) : undefined,
++    canEdit,
++    canDelete,
++    time,
++    text,
++    alertText,
++    alertState,
++    avatarImgSrc,
++  };
++}
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/types.ts b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/types.ts
+new file mode 100644
+index 0000000000000..4b1133b1d858b
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/types.ts
+@@ -0,0 +1,33 @@
++type NullableString = null | string;
++type NullableNumber = null | number;
++export type AnnotationVals = {
++  time: number[];
++  isRegion?: boolean[];
++  color?: string[];
++
++  id?: NullableNumber[];
++  clusterIdx?: NullableNumber[];
++  timeEnd?: NullableNumber[];
++  alertId?: NullableNumber[];
++
++  text?: NullableString[];
++  title?: NullableString[];
++  dashboardUID?: NullableString[];
++  newState?: NullableString[];
++  login?: NullableString[];
++  avatarUrl?: NullableString[];
++
++  /** Alert payload per row (e.g. evalMatches, error) for getAlertAnnotationText */
++  data?: unknown[];
++  tags?: string[][];
++};
++export type XYAnnoVals = {
++  color: string[];
++  xMin: number[];
++  xMax: number[];
++  yMax: number[];
++  yMin: number[];
++  fillOpacity: number[];
++  lineWidth: number[];
++  lineStyle: string[];
++};
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/useAnnotationClustering.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/useAnnotationClustering.tsx
+new file mode 100644
+index 0000000000000..41d13e2b47020
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/useAnnotationClustering.tsx
+@@ -0,0 +1,170 @@
++import { useMemo } from 'react';
++import uPlot from 'uplot';
++
++import { DataFrame, FieldType } from '@grafana/data';
++import { maybeSortFrame } from '@grafana/data/internal';
++import { TimeRange2 } from '@grafana/ui/internal';
++
++import { DEFAULT_CLUSTERING_ANNOTATION_SPACING } from './constants';
++
++interface Props {
++  annotations: DataFrame[];
++  clusteringMode: ClusteringMode | null;
++  timeRange: TimeRange2;
++  plotWidth: number | undefined;
++}
++
++export enum ClusteringMode {
++  Hover = 'hover',
++  Render = 'render',
++}
++
++export const useAnnotationClustering = ({ annotations, clusteringMode, plotWidth, timeRange }: Props) => {
++  const { outAnnos } = useMemo(() => {
++    const clusteredAnnotations: DataFrame[] = [];
++
++    // per-frame clustering
++    if (clusteringMode === ClusteringMode.Render) {
++      for (let frameIdx = 0; frameIdx < annotations.length; frameIdx++) {
++        const frame = annotations[frameIdx];
++
++        const timeVals: number[] = frame.fields.find((f) => f.name === 'time')?.values ?? [];
++        const colorVals: string[] = frame.fields.find((f) => f.name === 'color')?.values ?? [];
++
++        if (timeVals.length > 1 && plotWidth) {
++          let { clusterIdx, clusters } = buildAnnotationClusters(frame, timeVals, plotWidth, timeRange);
++
++          // Shallow copy fields and values and append the clusterIdx field
++          const clusteredFields = frame.fields.map((field) => ({
++            ...field,
++            // Copy values
++            values: [...field.values],
++          }));
++          clusteredFields.push({
++            type: FieldType.number,
++            name: 'clusterIdx',
++            values: clusterIdx,
++            config: {},
++          });
++          const timeEndFrame: DataFrame = {
++            ...frame,
++            fields: clusteredFields,
++          };
++
++          const hasTimeEndField = timeEndFrame.fields.findIndex((field) => field.name === 'timeEnd') !== -1;
++
++          // If the annotation frame doesn't already have an end field defined we'll need to add one so we can create valid annotation regions
++          if (!hasTimeEndField) {
++            timeEndFrame.fields.push({
++              type: FieldType.time,
++              name: 'timeEnd',
++              values: Array(timeEndFrame.fields[0].values.length).fill(null),
++              config: {},
++            });
++          }
++
++          // append cluster annotation regions to frame
++          for (let ci = 0; ci < clusters.length; ci++) {
++            const idxs = clusters[ci];
++            const valMapping: Record<string, () => number | boolean | string> = {
++              // Push the first clustered annotation as the annotation region start time
++              time: () => timeVals[idxs[0]],
++              // push the last clustered annotation as the annotation region end time
++              timeEnd: () => timeVals[idxs[idxs.length - 1]],
++              // Clusters are regions
++              isRegion: () => true,
++              // Push color of the first annotation in the region
++              color: () => colorVals[idxs[0]],
++              // Push cluster index
++              clusterIdx: () => ci,
++            };
++            for (const field of timeEndFrame.fields) {
++              field.values.push(valMapping?.[field.name]?.() ?? null);
++            }
++          }
++          // Set data frame length
++          timeEndFrame.length = timeEndFrame.fields[0].values.length;
++          clusteredAnnotations.push(timeEndFrame);
++        } else {
++          clusteredAnnotations.push(frame);
++        }
++      }
++    } else if (clusteringMode === ClusteringMode.Hover) {
++      // Have the tooltip be clustered, but not the annotations: https://github.com/grafana/grafana/issues/119436
++      console.warn('Hover mode not implemented');
++    }
++
++    // Sort clustered frames
++    return {
++      outAnnos:
++        clusteredAnnotations.length > 0
++          ? clusteredAnnotations.map((frame) =>
++              maybeSortFrame(
++                frame,
++                frame.fields.findIndex((field) => field.name === 'time')
++              )
++            )
++          : annotations,
++    };
++  }, [annotations, clusteringMode, plotWidth, timeRange]);
++
++  return outAnnos;
++};
++
++const buildAnnotationClusters = (frame: DataFrame, timeVals: number[], plotWidth: number, timeRange: TimeRange2) => {
++  const isRegionVals: boolean[] =
++    frame.fields.find((f) => f.name === 'isRegion')?.values ?? Array(timeVals.length).fill(false);
++  const clusterIdx: Array<number | null> = Array(timeVals.length).fill(null);
++  const clusters: number[][] = [];
++
++  let thisCluster: number[] = [];
++  let prevIdx = null;
++  const mergeThreshold = calculateMergeThreshold(timeRange, plotWidth);
++
++  for (let j = 0; j < timeVals.length; j++) {
++    let time = timeVals[j];
++
++    // Don't cluster regions?
++    if (!isRegionVals[j]) {
++      if (prevIdx != null) {
++        // if we're within the threshold
++        if (time - timeVals[prevIdx] <= mergeThreshold) {
++          // open cluster
++          if (thisCluster.length === 0) {
++            thisCluster.push(prevIdx);
++            clusterIdx[prevIdx] = clusters.length;
++          }
++          thisCluster.push(j);
++          clusterIdx[j] = clusters.length;
++        } else {
++          // close cluster
++          if (thisCluster.length > 0) {
++            clusters.push(thisCluster);
++            thisCluster = [];
++          }
++        }
++      }
++
++      prevIdx = j;
++    }
++  }
++
++  // close cluster
++  if (thisCluster.length > 0) {
++    clusters.push(thisCluster);
++  }
++
++  return { clusterIdx, clusters };
++};
++
++const calculateMergeThreshold = (timeRange: TimeRange2, plotWidth: number) => {
++  // If the plot width is zero, something is very wrong! Let's avoid clustering in this case.
++  if (!plotWidth || plotWidth < 0 || isNaN(plotWidth)) {
++    return -1;
++  }
++
++  const pixelThreshold = DEFAULT_CLUSTERING_ANNOTATION_SPACING * uPlot.pxRatio;
++  const dt = timeRange.to - timeRange.from;
++  const thresholdRatio = pixelThreshold / plotWidth;
++  return thresholdRatio * dt;
++};
+diff --git a/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/useAnnotations.tsx b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/useAnnotations.tsx
+new file mode 100644
+index 0000000000000..4a4bfed4efeae
+--- /dev/null
++++ b/public/app/plugins/panel/timeseries/plugins/annotations2-cluster/useAnnotations.tsx
+@@ -0,0 +1,62 @@
++import { useMemo } from 'react';
++import tinycolor from 'tinycolor2';
++
++import { arrayToDataFrame, DataFrame, DataTopic } from '@grafana/data';
++import { maybeSortFrame } from '@grafana/data/internal';
++import { DEFAULT_ANNOTATION_COLOR } from '@grafana/ui';
++import { TimeRange2 } from '@grafana/ui/internal';
++
++import { getXAnnotationFrames, getXYAnnotationFrames } from '../utils';
++
++interface Props {
++  annotations: DataFrame[];
++  newRange: TimeRange2 | null;
++}
++
++const DEFAULT_ANNOTATION_COLOR_HEX8 = tinycolor(DEFAULT_ANNOTATION_COLOR).toHex8String();
++
++/**
++ * edit mode wip frame
++ * @param newRange
++ */
++const buildWipAnnoFrame = (newRange: TimeRange2) => {
++  let isRegion = newRange.to > newRange.from;
++
++  const wipAnnoFrame = arrayToDataFrame([
++    {
++      time: newRange.from,
++      timeEnd: isRegion ? newRange.to : null,
++      isRegion: isRegion,
++      // #00d3ffff
++      color: DEFAULT_ANNOTATION_COLOR_HEX8,
++      tags: [],
++    },
++  ]);
++
++  wipAnnoFrame.meta = {
++    dataTopic: DataTopic.Annotations,
++    custom: {
++      isWip: true,
++    },
++  };
++  return wipAnnoFrame;
++};
++
++export const useAnnotations = ({ annotations, newRange }: Props) => {
++  return useMemo(() => {
++    let sortedAnnotations = annotations.map((frame) =>
++      maybeSortFrame(
++        frame,
++        frame.fields.findIndex((field) => field.name === 'time')
++      )
++    );
++    const xAnnos = getXAnnotationFrames(sortedAnnotations);
++    const xyAnnos = getXYAnnotationFrames(annotations);
++
++    if (newRange) {
++      xAnnos.push(buildWipAnnoFrame(newRange));
++    }
++
++    return { xAnnos, xyAnnos };
++  }, [annotations, newRange]);
++};
+diff --git a/public/app/plugins/panel/timeseries/plugins/mocks/mockAnnotationFrames.ts b/public/app/plugins/panel/timeseries/plugins/mocks/mockAnnotationFrames.ts
+index 4628b745cf20c..b0528f600df05 100644
+--- a/public/app/plugins/panel/timeseries/plugins/mocks/mockAnnotationFrames.ts
++++ b/public/app/plugins/panel/timeseries/plugins/mocks/mockAnnotationFrames.ts
+@@ -189,6 +189,12 @@ export const mockIRMAnnotation: DataFrame = {
+       // id of 0 means the annotation is not editable or deletable
+       values: [0, 4665, 4683],
+     },
++    {
++      name: 'dashboardUID',
++      config: {},
++      type: FieldType.string,
++      values: ['abc-123', 'def-456', 'jkl-789'],
++    },
+     {
+       name: 'source',
+       config: {},
+@@ -322,6 +328,12 @@ export const mockIRMAnnotationRegion: DataFrame = {
+       // id of 0 means the annotation is not editable or deletable
+       values: [0, 4665, 4683],
+     },
++    {
++      name: 'dashboardUID',
++      config: {},
++      type: FieldType.string,
++      values: ['abc-123', 'def-456', 'jkl-789'],
++    },
+     {
+       name: 'source',
+       config: {},
+@@ -381,6 +393,147 @@ export const mockIRMAnnotationRegion: DataFrame = {
+   ],
+ };
+ 
++export const mockIRMClusteringAnnotation: DataFrame = {
++  length: 4,
++  meta: {
++    dataTopic: DataTopic.Annotations,
++  },
++  fields: [
++    {
++      name: 'type',
++      config: {},
++      type: FieldType.string,
++      values: [
++        'Show `squad:loki` Incidents',
++        'Show `squad:loki` Incidents',
++        'Show `squad:loki` Incidents',
++        'Show `squad:loki` Incidents',
++      ],
++    },
++    {
++      name: 'color',
++      config: {},
++      type: FieldType.string,
++      values: ['#F00', '#F0F', '#00F', '#DDD'],
++    },
++    {
++      name: 'time',
++      config: {},
++      type: FieldType.time,
++      values: [1759388895560, 1759388896560, 1759388995560, 1759389995560],
++    },
++    {
++      name: 'title',
++      config: {},
++      type: FieldType.string,
++      values: [
++        "<a data-testid='mock-annotation-title' target='_blank' href='/a/grafana-irm-app/incidents/4655'><b>prod-000-writes-error</b></a>",
++        "<a data-testid='mock-annotation-title' target='_blank' href='/a/grafana-irm-app/incidents/4656'><b>prod-001-writes-error</b></a>",
++        "<a data-testid='mock-annotation-title' target='_blank' href='/a/grafana-irm-app/incidents/4667'><b>LogsDeleteRequestProcessingStuck (dev-us-west-0, notify)</b></a>",
++        "<a data-testid='mock-annotation-title' target='_blank' href='/a/grafana-irm-app/incidents/4683'><b>Vendor BYOC cell Failed to get annotations</b></a>",
++      ],
++    },
++    {
++      name: 'text',
++      config: {},
++      type: FieldType.string,
++      values: [
++        "<div data-testid='mock-annotation-text' style='max-width: 230px;'><p>A very large label value payload (>16MB) triggered a panic in the code. We disabled the gateway as a temporary mitigation.</p> Declared by <img height='100%' width='14' style='border-radius: 6px; margin-right:4px;' src='https://www.gravatar.com/avatar/4edf116c0e3ee9af875ea934d417c899?s=512&d=https%3A%2F%2Favatars.slack-edge.com%2F2021-10-04%2F2555752049286_b9cf6475b53000b437ea_192.jpg'>your mom</div>",
++        "<div data-testid='mock-annotation-text' style='max-width: 230px;'><p>A very large label value payload (>32MB) triggered a panic in the code. We disabled the gateway as a temporary mitigation.</p> Declared by <img height='100%' width='14' style='border-radius: 6px; margin-right:4px;' src='https://www.gravatar.com/avatar/4edf116c0e3ee9af875ea934d417c899?s=512&d=https%3A%2F%2Favatars.slack-edge.com%2F2021-10-04%2F2555752049286_b9cf6475b53000b437ea_192.jpg'>Alfred</div>",
++        "<div data-testid='mock-annotation-text' style='max-width: 230px;'><p></p> Declared by <img height='100%' width='14' style='border-radius: 6px; margin-right:4px;' src='https://www.gravatar.com/avatar/07f61391eab846fb5c7fbc035dbb3091?s=512&d=https%3A%2F%2Favatars.slack-edge.com%2F2025-09-01%2F9442928521986_e04cf65c19859e880ef1_192.jpg'>Ada</div>",
++        "<div data-testid='mock-annotation-text' style='max-width: 230px;'><p>The vendor BYOC cell experienced annotation retrieval failures due to a DNS misconfiguration where the hostname was resolving to the wrong regional endpoint, causing 530 status code errors on alert state history queries. The team identified the root cause as a recent DNS name format change and merged a fix, which was rolled out to resolve the issue.</p> Declared by <img height='100%' width='14' style='border-radius: 6px; margin-right:4px;' src='https://www.gravatar.com/avatar/592723e91b4f16fa4241f6818e601000?s=512&d=https%3A%2F%2Favatars.slack-edge.com%2F2024-07-01%2F7363759362996_d8a231a9ad749aac0a19_192.png'>Theo</div>",
++      ],
++    },
++    {
++      name: 'tags',
++      config: {},
++      type: FieldType.other,
++      values: [
++        ['squad:adaptive-telemetry', 'squad:loki', 'team_name:loki'],
++        ['squad:adaptive-telemetry', 'squad:loki', 'team_name:loki'],
++        ['squad:loki'],
++        [
++          'service:dashboard-service',
++          'service:datasources',
++          'squad:alerting',
++          'squad:databases-sre',
++          'squad:insights',
++          'squad:loki',
++        ],
++      ],
++    },
++    {
++      name: 'id',
++      config: {},
++      type: FieldType.number,
++      values: [4655, 4656, 4665, 4683],
++    },
++    {
++      name: 'dashboardUID',
++      config: {},
++      type: FieldType.string,
++      values: ['abc-123', 'def-456', 'jkl-789', 'ccc-ddd'],
++    },
++    {
++      name: 'source',
++      config: {},
++      type: FieldType.other,
++      values: [
++        {
++          enable: true,
++          hide: false,
++          iconColor: 'yellow',
++          name: 'Show `squad:loki` Incidents',
++          mappings: {
++            id: {
++              source: 'field',
++              value: 'Incident ID',
++            },
++            tags: {
++              source: 'field',
++              value: 'Labels',
++            },
++            text: {
++              source: 'field',
++              value: 'Incident Description',
++            },
++            time: {
++              source: 'field',
++              value: 'Incident started',
++            },
++            timeEnd: {
++              source: 'field',
++              value: 'Incident ended',
++            },
++            title: {
++              source: 'field',
++              value: 'Incident Title',
++            },
++          },
++          target: {
++            queryString: "label:'squad:loki'",
++            queryType: 'incidents',
++            refId: 'Anno',
++          },
++          datasource: {
++            uid: 'a12a4bc8-78ce-4d25-b28b-2fd6b1a88691',
++            type: 'grafana-incident-datasource',
++          },
++        },
++        null,
++        null,
++        null,
++      ],
++    },
++    {
++      name: 'isRegion',
++      config: {},
++      type: FieldType.boolean,
++      values: [false, false, false, false],
++    },
++  ],
++};
++
+ export const mockAnnotationRegionFrame: DataFrame = {
+   length: 4,
+   meta: {
+diff --git a/public/locales/en-US/grafana.json b/public/locales/en-US/grafana.json
+index 4def93c21f327..feec16ebff595 100644
+--- a/public/locales/en-US/grafana.json
++++ b/public/locales/en-US/grafana.json
+@@ -14958,6 +14958,7 @@
+       "annotation-region-label": "Annotation region"
+     },
+     "annotation-tooltip2": {
++      "cluster-header": "annotations",
+       "tooltip-delete": "Delete",
+       "tooltip-edit": "Edit"
+     },

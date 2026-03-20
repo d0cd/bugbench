@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% block title %}Dataset — bugeval{% endblock %}
+{% block content %}
+<h1>Dataset Inspector</h1>
+
+<div id="loading" class="text-muted">Loading...</div>
+<div id="dataset-content" style="display:none;">
+
+  <!-- Overview cards -->
+  <div class="stat-grid" id="stat-cards"></div>
+
+  <!-- Quality card -->
+  <div class="card" id="quality-card" style="display:none;">
+    <h2>Quality</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+      <div id="alignment-section"></div>
+      <div id="flagged-section"></div>
+    </div>
+  </div>
+
+  <!-- Distributions -->
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;"
+       id="distributions"></div>
+
+  <!-- Expected findings -->
+  <div class="card mt-16" id="findings-card">
+    <h2>Expected Findings <span class="text-muted" id="findings-total"></span></h2>
+    <div class="filter-bar">
+      <select id="findings-repo-filter">
+        <option value="">All repos</option>
+      </select>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Case</th><th>File</th><th>Line</th>
+          <th>Summary</th><th>Repo</th>
+        </tr>
+      </thead>
+      <tbody id="findings-body"></tbody>
+    </table>
+    <div class="pagination" id="findings-pagination"></div>
+  </div>
+</div>
+
+<script>
+(function() {
+  var statsUrl = "/api/dataset/stats";
+  var findingsUrl = "/api/dataset/findings";
+  var findingsPage = 1;
+  var findingsPerPage = 50;
+  var findingsRepo = "";
+
+  function esc(s) {
+    var d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  function renderStats(s) {
+    var cards = document.getElementById("stat-cards");
+    var items = [
+      {n: s.total, l: "Total Cases"},
+      {n: s.verified, l: "Verified"},
+      {n: s.flagged, l: "Flagged"},
+      {n: s.needs_review, l: "Needs Review"},
+      {n: s.avg_findings.toFixed(1), l: "Avg Findings/Case"}
+    ];
+    cards.innerHTML = items.map(function(i) {
+      return '<div class="stat-card"><div class="stat-num">' +
+        esc(String(i.n)) + '</div><div class="stat-label">' +
+        esc(i.l) + '</div></div>';
+    }).join("");
+
+    // Quality card
+    var qc = document.getElementById("quality-card");
+    var alSec = document.getElementById("alignment-section");
+    var flSec = document.getElementById("flagged-section");
+    qc.style.display = "";
+
+    if (s.alignment) {
+      alSec.innerHTML = '<h3>Alignment</h3><table>' +
+        '<tr><td><span class="badge badge-aligned">aligned</span></td>' +
+        '<td>' + s.alignment.aligned + '</td></tr>' +
+        '<tr><td><span class="badge badge-file-only">file-only</span></td>' +
+        '<td>' + s.alignment.file_only + '</td></tr>' +
+        '<tr><td><span class="badge badge-misaligned">misaligned</span></td>' +
+        '<td>' + s.alignment.misaligned + '</td></tr></table>';
+    } else {
+      alSec.innerHTML = '<h3>Alignment</h3>' +
+        '<p class="text-muted">No alignment data.</p>';
+    }
+
+    flSec.innerHTML = '<h3>Flagged</h3><table>' +
+      '<tr><td><span class="badge badge-red">groundedness-failed</span></td>' +
+      '<td>' + s.flagged + '</td></tr>' +
+      '<tr><td><span class="badge badge-green">pass</span></td>' +
+      '<td>' + (s.total - s.flagged) + '</td></tr></table>';
+
+    // Distributions
+    var dists = document.getElementById("distributions");
+    var distOrder = [
+      "category","difficulty","severity","repo","pr_size","language","visibility"
+    ];
+    var html = "";
+    distOrder.forEach(function(field) {
+      var dist = s.distributions[field];
+      if (!dist) return;
+      var entries = Object.keys(dist).map(function(k) {
+        return {key: k, count: dist[k]};
+      });
+      var maxVal = Math.max.apply(null, entries.map(function(e){return e.count;})) || 1;
+      var label = field.replace(/_/g, " ");
+      label = label.charAt(0).toUpperCase() + label.slice(1);
+      html += '<div class="card"><h2>' + esc(label) + '</h2><table>';
+      entries.forEach(function(e) {
+        var pct = Math.round(e.count / s.total * 100);
+        var barW = Math.round(e.count / maxVal * 100);
+        var href = "/cases?" + encodeURIComponent(field) +
+          "=" + encodeURIComponent(e.key);
+        html += '<tr><td style="width:40%;">' +
+          '<a href="' + href + '">' + esc(e.key) + '</a></td>' +
+          '<td style="width:15%;text-align:right;">' + e.count + '</td>' +
+          '<td><div class="dist-bar">' +
+          '<div class="dist-bar-fill" style="width:' + barW +
+          'px;"></div><span class="dist-bar-label">' +
+          pct + '%</span></div></td></tr>';
+      });
+      html += '</table></div>';
+    });
+    dists.innerHTML = html;
+
+    // Populate repo filter for findings
+    var repos = Object.keys(s.distributions.repo || {}).sort();
+    var sel = document.getElementById("findings-repo-filter");
+    repos.forEach(function(r) {
+      var opt = document.createElement("option");
+      opt.value = r;
+      opt.textContent = r;
+      sel.appendChild(opt);
+    });
+  }
+
+  function loadFindings() {
+    var url = findingsUrl + "?page=" + findingsPage +
+      "&per_page=" + findingsPerPage;
+    if (findingsRepo) url += "&repo=" + encodeURIComponent(findingsRepo);
+    fetch(url).then(function(r){return r.json();}).then(renderFindings);
+  }
+
+  function renderFindings(data) {
+    document.getElementById("findings-total").textContent =
+      "(" + data.total + " total)";
+    var body = document.getElementById("findings-body");
+    body.innerHTML = data.findings.map(function(f) {
+      return '<tr><td><a href="/cases/' + esc(f.case_id) + '">' +
+        esc(f.case_id) + '</a></td>' +
+        '<td style="font-family:monospace;font-size:12px;">' +
+        esc(f.file) + '</td>' +
+        '<td>' + f.line + '</td>' +
+        '<td>' + esc(f.summary) + '</td>' +
+        '<td>' + esc(f.repo) + '</td></tr>';
+    }).join("");
+
+    // Pagination
+    var pag = document.getElementById("findings-pagination");
+    var html = "";
+    if (data.page > 1) {
+      html += '<a href="#" data-page="' + (data.page - 1) + '">Prev</a>';
+    }
+    html += '<span class="current">' + data.page +
+      ' / ' + data.pages + '</span>';
+    if (data.page < data.pages) {
+      html += '<a href="#" data-page="' + (data.page + 1) + '">Next</a>';
+    }
+    pag.innerHTML = html;
+    pag.querySelectorAll("a").forEach(function(a) {
+      a.addEventListener("click", function(e) {
+        e.preventDefault();
+        findingsPage = parseInt(a.dataset.page);
+        loadFindings();
+      });
+    });
+  }
+
+  document.getElementById("findings-repo-filter")
+    .addEventListener("change", function() {
+      findingsRepo = this.value;
+      findingsPage = 1;
+      loadFindings();
+    });
+
+  // Initial load
+  fetch(statsUrl).then(function(r){return r.json();}).then(function(s) {
+    renderStats(s);
+    document.getElementById("loading").style.display = "none";
+    document.getElementById("dataset-content").style.display = "";
+    loadFindings();
+  });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,1040 @@
+diff --git a/.github/workflows/release-build.yml b/.github/workflows/release-build.yml
+index e262b2aa9e7da..44c5140b413a7 100644
+--- a/.github/workflows/release-build.yml
++++ b/.github/workflows/release-build.yml
+@@ -110,35 +110,20 @@ jobs:
+           script: |
+             const {REF, VERSION, BUILD_ID, BUCKET, GRAFANA_COMMIT, SOURCE_EVENT, REPO} = process.env;
+ 
+-            const workflows = [];
+-            if (REF === 'main' && SOURCE_EVENT === 'schedule') {
+-              workflows.push('release-build-nightly.yml');
+-            } else if (REF === 'main') {
+-              workflows.push('release-build-pro.yml');
+-              workflows.push('release-build-enterprise.yml');
+-            } else if (REF.startsWith('release-')) {
+-              workflows.push('release-build-enterprise.yml');
+-            }
+-
+-            const inputs = {
+-              "version": VERSION,
+-              "build-id": String(BUILD_ID),
+-              "bucket": BUCKET,
+-              "grafana-commit": GRAFANA_COMMIT,
+-              "source-event": SOURCE_EVENT,
+-              "upstream": REPO,
+-            };
+-
+-            for (const workflow_id of workflows) {
+-              core.info(`Dispatching ${workflow_id} on ref ${REF}`);
+-              await github.rest.actions.createWorkflowDispatch({
+-                  owner: 'grafana',
+-                  repo: 'grafana-enterprise',
+-                  workflow_id,
+-                  ref: REF,
+-                  inputs,
+-              });
+-            }
++            await github.rest.actions.createWorkflowDispatch({
++                owner: 'grafana',
++                repo: 'grafana-enterprise',
++                workflow_id: 'release-build.yml',
++                ref:  REF,
++                inputs: {
++                  "version": VERSION,
++                  "build-id": String(BUILD_ID),
++                  "bucket": BUCKET,
++                  "grafana-commit": GRAFANA_COMMIT,
++                  "source-event": SOURCE_EVENT,
++                  "upstream": REPO,
++                }
++            })
+ 
+   build:
+     runs-on: github-hosted-ubuntu-x64-large
+diff --git a/packages/grafana-data/src/types/featureToggles.gen.ts b/packages/grafana-data/src/types/featureToggles.gen.ts
+index cf4ccaf4b6751..a0067efab1003 100644
+--- a/packages/grafana-data/src/types/featureToggles.gen.ts
++++ b/packages/grafana-data/src/types/featureToggles.gen.ts
+@@ -1652,4 +1652,9 @@ export interface FeatureToggles {
+   * @default false
+   */
+   flameGraphWithCallTree?: boolean;
++  /**
++  * Enables an inline version of Log Details that creates no new scrolls
++  * @default false
++  */
++  inlineLogDetailsNoScrolls?: boolean;
+ }
+diff --git a/pkg/services/featuremgmt/registry.go b/pkg/services/featuremgmt/registry.go
+index 8ec1655461921..0c26531136735 100644
+--- a/pkg/services/featuremgmt/registry.go
++++ b/pkg/services/featuremgmt/registry.go
+@@ -2618,6 +2618,13 @@ var (
+ 			FrontendOnly: true,
+ 			Expression:   "false",
+ 		},
++		{
++			Name:        "inlineLogDetailsNoScrolls",
++			Description: "Enables an inline version of Log Details that creates no new scrolls",
++			Stage:       FeatureStageExperimental,
++			Owner:       grafanaObservabilityLogsSquad,
++			Expression:  "false",
++		},
+ 	}
+ )
+ 
+diff --git a/pkg/services/featuremgmt/toggles_gen.csv b/pkg/services/featuremgmt/toggles_gen.csv
+index 9d08c1bb21ba8..ae01bb45c414b 100644
+--- a/pkg/services/featuremgmt/toggles_gen.csv
++++ b/pkg/services/featuremgmt/toggles_gen.csv
+@@ -325,3 +325,4 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2026-02-26,datasourcesApiServerEnableHealthEndpoint,experimental,@grafana/grafana-datasources-core-services,false,false,false
+ 2026-02-27,analyticsFramework,experimental,@grafana/grafana-frontend-platform,false,false,false
+ 2026-03-10,flameGraphWithCallTree,experimental,@grafana/observability-traces-and-profiling,false,false,true
++2026-03-04,inlineLogDetailsNoScrolls,experimental,@grafana/observability-logs,false,false,false
+diff --git a/pkg/services/featuremgmt/toggles_gen.go b/pkg/services/featuremgmt/toggles_gen.go
+index 62df9318fbbf4..595942dd108d5 100644
+--- a/pkg/services/featuremgmt/toggles_gen.go
++++ b/pkg/services/featuremgmt/toggles_gen.go
+@@ -897,4 +897,8 @@ const (
+ 	// FlagAnalyticsFramework
+ 	// Enables new analytics framework
+ 	FlagAnalyticsFramework = "analyticsFramework"
++
++	// FlagInlineLogDetailsNoScrolls
++	// Enables an inline version of Log Details that creates no new scrolls
++	FlagInlineLogDetailsNoScrolls = "inlineLogDetailsNoScrolls"
+ )
+diff --git a/pkg/services/featuremgmt/toggles_gen.json b/pkg/services/featuremgmt/toggles_gen.json
+index 6bf7d8d626c81..3e24d68cccf3e 100644
+--- a/pkg/services/featuremgmt/toggles_gen.json
++++ b/pkg/services/featuremgmt/toggles_gen.json
+@@ -2218,6 +2218,19 @@
+         "expression": "false"
+       }
+     },
++    {
++      "metadata": {
++        "name": "inlineLogDetailsNoScrolls",
++        "resourceVersion": "1772636622548",
++        "creationTimestamp": "2026-03-04T15:03:42Z"
++      },
++      "spec": {
++        "description": "Enables an inline version of Log Details that creates no new scrolls",
++        "stage": "experimental",
++        "codeowner": "@grafana/observability-logs",
++        "expression": "false"
++      }
++    },
+     {
+       "metadata": {
+         "name": "interactiveLearning",
+diff --git a/public/app/features/logs/components/panel/LogLine.test.tsx b/public/app/features/logs/components/panel/LogLine.test.tsx
+index 1277afa4eb224..ab99475f96496 100644
+--- a/public/app/features/logs/components/panel/LogLine.test.tsx
++++ b/public/app/features/logs/components/panel/LogLine.test.tsx
+@@ -18,6 +18,10 @@ import { defaultProps, defaultValue } from './__mocks__/LogListContext';
+ import { LogListModel } from './processing';
+ import { LogLineVirtualization } from './virtualization';
+ 
++jest.mock('@openfeature/react-sdk', () => ({
++  useBooleanFlagValue: jest.fn().mockReturnValue(false),
++}));
++
+ jest.mock('@grafana/assistant', () => ({
+   ...jest.requireActual('@grafana/assistant'),
+   useAssistant: jest.fn().mockReturnValue({
+diff --git a/public/app/features/logs/components/panel/LogLine.tsx b/public/app/features/logs/components/panel/LogLine.tsx
+index 1cca38265f9a4..45336f48422a2 100644
+--- a/public/app/features/logs/components/panel/LogLine.tsx
++++ b/public/app/features/logs/components/panel/LogLine.tsx
+@@ -11,6 +11,7 @@ import {
+   useLayoutEffect,
+ } from 'react';
+ import Highlighter from 'react-highlight-words';
++import { useIntersection } from 'react-use';
+ import tinycolor from 'tinycolor2';
+ 
+ import { findHighlightChunksInText, GrafanaTheme2, LogsDedupStrategy, TimeRange } from '@grafana/data';
+@@ -128,19 +129,27 @@ const LogLineComponent = memo(
+       wrapLogMessage && log.collapsed !== undefined ? log.collapsed : undefined
+     );
+     const logLineRef = useRef<HTMLDivElement | null>(null);
++    const intersection = useIntersection(logLineRef, {});
+     const pinned = useLogIsPinned(log);
+     const permalinked = useLogIsPermalinked(log);
+ 
+     const handleLogLineResize = useCallback(() => {
+-      if (!onOverflow || !logLineRef.current || !virtualization || !height) {
++      if (!onOverflow || !logLineRef.current || !height) {
++        return;
++      }
++      /*
++       * We want to skip measurements when the element is not visible or part of a reused node
++       * by react window, as it provides inaccurate measurements.
++       */
++      if (!intersection?.isIntersecting) {
+         return;
+       }
+       const calculatedHeight = typeof height === 'number' ? height : undefined;
+-      const actualHeight = getLogLineDOMHeight(virtualization, logLineRef.current, calculatedHeight, log.collapsed);
++      const actualHeight = getLogLineDOMHeight(logLineRef.current, calculatedHeight);
+       if (actualHeight) {
+         onOverflow(index, log.uid, actualHeight);
+       }
+-    }, [height, index, log.collapsed, log.uid, onOverflow, virtualization]);
++    }, [height, index, intersection?.isIntersecting, log.uid, onOverflow]);
+ 
+     useLayoutEffect(() => {
+       handleLogLineResize();
+@@ -167,15 +176,15 @@ const LogLineComponent = memo(
+       };
+     }, [handleLogLineResize]);
+ 
++    // Sync collapsed from log when log identity or wrapLogMessage changes.
++    // Critical for react-window: when a row is recycled for a different log, we must reset state from the new log.
+     useEffect(() => {
+       if (!wrapLogMessage) {
+         setCollapsed(undefined);
+-      } else if (collapsed === undefined && log.collapsed !== undefined) {
+-        setCollapsed(log.collapsed);
+-      } else if (collapsed !== undefined && log.collapsed === undefined) {
+-        setCollapsed(log.collapsed);
++      } else {
++        setCollapsed(log.collapsed ?? undefined);
+       }
+-    }, [collapsed, log.collapsed, wrapLogMessage]);
++    }, [log.uid, log.collapsed, wrapLogMessage]);
+ 
+     const handleMouseOver = useCallback(() => onLogLineHover?.(log), [log, onLogLineHover]);
+ 
+@@ -199,12 +208,11 @@ const LogLineComponent = memo(
+     const detailsShown = detailsDisplayed(log);
+ 
+     return (
+-      <>
++      <div ref={onOverflow ? logLineRef : undefined} data-log-index={index}>
+         {/* A button element could be used but in Safari it prevents text selection. Fallback available for a11y in LogLineMenu  */}
+         {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events */}
+         <div
+           className={`${styles.logLine} ${variant ?? ''} ${pinned ? styles.pinnedLogLine : ''} ${permalinked ? styles.permalinkedLogLine : ''} ${detailsShown ? styles.detailsDisplayed : ''} ${isLogDetailsFocused ? styles.currentLog : ''} ${fontSize === 'small' ? styles.fontSizeSmall : styles.fontSizeDefault} ${enableLogDetails ? styles.clickable : ''}`}
+-          ref={onOverflow ? logLineRef : undefined}
+           onMouseEnter={handleMouseOver}
+           onFocus={handleMouseOver}
+           onClick={handleClick}
+@@ -305,7 +313,7 @@ const LogLineComponent = memo(
+             timeZone={timeZone}
+           />
+         )}
+-      </>
++      </div>
+     );
+   }
+ );
+diff --git a/public/app/features/logs/components/panel/LogLineDetails.test.tsx b/public/app/features/logs/components/panel/LogLineDetails.test.tsx
+index 1b473c90a95b2..f1c2dc731ef4a 100644
+--- a/public/app/features/logs/components/panel/LogLineDetails.test.tsx
++++ b/public/app/features/logs/components/panel/LogLineDetails.test.tsx
+@@ -30,6 +30,10 @@ import { LogLineDetails, Props } from './LogLineDetails';
+ import { LogListContext, LogListContextData } from './LogListContext';
+ import { defaultValue } from './__mocks__/LogListContext';
+ 
++jest.mock('@openfeature/react-sdk', () => ({
++  useBooleanFlagValue: jest.fn().mockReturnValue(false),
++}));
++
+ jest.mock('../fieldSelector/FieldSelector');
+ jest.mock('../fieldSelector/fieldSelectorUtils');
+ 
+diff --git a/public/app/features/logs/components/panel/LogLineDetails.tsx b/public/app/features/logs/components/panel/LogLineDetails.tsx
+index c66a5845e873d..a722c19cab667 100644
+--- a/public/app/features/logs/components/panel/LogLineDetails.tsx
++++ b/public/app/features/logs/components/panel/LogLineDetails.tsx
+@@ -1,16 +1,18 @@
+ import { css } from '@emotion/css';
++import { useBooleanFlagValue } from '@openfeature/react-sdk';
+ import { Resizable } from 're-resizable';
+-import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
++import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ 
+ import { GrafanaTheme2, TimeRange } from '@grafana/data';
+ import { t } from '@grafana/i18n';
+ import { reportInteraction } from '@grafana/runtime';
+-import { getDragStyles, Icon, Tab, TabsBar, useStyles2 } from '@grafana/ui';
++import { getDragStyles, Icon, ScrollContainer, Tab, TabsBar, useStyles2 } from '@grafana/ui';
+ 
+ import { getFieldSelectorWidth } from '../fieldSelector/fieldSelectorUtils';
+ 
+ import { getDetailsScrollPosition, saveDetailsScrollPosition, useLogDetailsContext } from './LogDetailsContext';
+ import { LogLineDetailsComponent } from './LogLineDetailsComponent';
++import { LogLineDetailsHeader } from './LogLineDetailsHeader';
+ import { LogListFontSize } from './LogList';
+ import { useLogListContext } from './LogListContext';
+ import { LogListModel } from './processing';
+@@ -32,7 +34,8 @@ export const LogLineDetails = memo(
+   ({ containerElement, focusLogLine, logs, timeRange, timeZone, showControls, showFieldSelector }: Props) => {
+     const { noInteractions, fontSize, logOptionsStorageKey } = useLogListContext();
+     const { detailsWidth, setDetailsWidth } = useLogDetailsContext();
+-    const styles = useStyles2(getStyles, 'sidebar', showControls, fontSize);
++    const inlineLogDetailsNoScrolls = useBooleanFlagValue('inlineLogDetailsNoScrolls', false);
++    const styles = useStyles2(getStyles, 'sidebar', showControls, fontSize, inlineLogDetailsNoScrolls);
+     const dragStyles = useStyles2(getDragStyles);
+     const containerRef = useRef<HTMLDivElement | null>(null);
+ 
+@@ -79,8 +82,11 @@ const LogLineDetailsTabs = memo(
+   ({ focusLogLine, logs, timeRange, timeZone }: Pick<Props, 'focusLogLine' | 'logs' | 'timeRange' | 'timeZone'>) => {
+     const { app, fontSize, noInteractions, wrapLogMessage } = useLogListContext();
+     const { currentLog, setCurrentLog, showDetails, toggleDetails } = useLogDetailsContext();
++    const [search, setSearch] = useState('');
++    const inputRef = useRef('');
++    const inlineLogDetailsNoScrolls = useBooleanFlagValue('inlineLogDetailsNoScrolls', false);
+ 
+-    const styles = useStyles2(getStyles, 'sidebar', undefined, fontSize);
++    const styles = useStyles2(getStyles, 'sidebar', undefined, fontSize, inlineLogDetailsNoScrolls);
+ 
+     useEffect(() => {
+       // When wrapping is enabled and details is in sidebar mode, the logs panel width changes and the
+@@ -98,6 +104,13 @@ const LogLineDetailsTabs = memo(
+       // eslint-disable-next-line react-hooks/exhaustive-deps
+     }, []);
+ 
++    const handleSearch = useCallback((newSearch: string) => {
++      inputRef.current = newSearch;
++      startTransition(() => {
++        setSearch(inputRef.current);
++      });
++    }, []);
++
+     const tabs = useMemo(() => showDetails.slice().reverse(), [showDetails]);
+ 
+     if (!currentLog) {
+@@ -105,7 +118,7 @@ const LogLineDetailsTabs = memo(
+     }
+ 
+     return (
+-      <>
++      <div className={styles.tabsWrapper}>
+         {showDetails.length > 1 && (
+           <TabsBar>
+             {tabs.map((log) => {
+@@ -131,16 +144,17 @@ const LogLineDetailsTabs = memo(
+             })}
+           </TabsBar>
+         )}
+-        <div className={styles.scrollContainer}>
++        <LogLineDetailsHeader focusLogLine={focusLogLine} log={currentLog} search={search} onSearch={handleSearch} />
++        <ScrollContainer>
+           <LogLineDetailsComponent
+-            focusLogLine={focusLogLine}
+             log={currentLog}
+             logs={logs}
++            search={search}
+             timeRange={timeRange}
+             timeZone={timeZone}
+           />
+-        </div>
+-      </>
++        </ScrollContainer>
++      </div>
+     );
+   }
+ );
+@@ -157,8 +171,12 @@ export interface InlineLogLineDetailsProps {
+ export const InlineLogLineDetails = memo(({ logs, log, onResize, timeRange, timeZone }: InlineLogLineDetailsProps) => {
+   const { app, fontSize, noInteractions } = useLogListContext();
+   const { detailsWidth } = useLogDetailsContext();
+-  const styles = useStyles2(getStyles, 'inline', undefined, fontSize);
++  const inlineLogDetailsNoScrolls = useBooleanFlagValue('inlineLogDetailsNoScrolls', false);
++  const styles = useStyles2(getStyles, 'inline', undefined, fontSize, inlineLogDetailsNoScrolls);
+   const scrollRef = useRef<HTMLDivElement | null>(null);
++  const [search, setSearch] = useState('');
++  const inputRef = useRef('');
++  const [autoScrolled, setAutoScrolled] = useState(false);
+ 
+   useEffect(() => {
+     if (!noInteractions) {
+@@ -178,19 +196,39 @@ export const InlineLogLineDetails = memo(({ logs, log, onResize, timeRange, time
+     saveDetailsScrollPosition(log, scrollRef.current?.scrollTop ?? 0);
+   }, [log]);
+ 
++  const handleSearch = useCallback((newSearch: string) => {
++    inputRef.current = newSearch;
++    startTransition(() => {
++      setSearch(inputRef.current);
++    });
++  }, []);
++
++  // Keep scroll position when adding filters or using displayed fields
++  // Remove after inlineLogDetailsNoScrolls is enabled by default
+   useEffect(() => {
+-    if (!scrollRef.current) {
++    if (!scrollRef.current || inlineLogDetailsNoScrolls || autoScrolled) {
+       return;
+     }
+-    scrollRef.current.scrollTop = getDetailsScrollPosition(log);
+-  }, [log]);
++    if (scrollRef.current.scrollHeight === scrollRef.current.clientHeight) {
++      return;
++    }
++    scrollRef.current.scrollTo(0, getDetailsScrollPosition(log));
++    setAutoScrolled(true);
++  }, [inlineLogDetailsNoScrolls, autoScrolled, log, scrollRef.current?.scrollHeight]);
+ 
+   return (
+     <div className={`${styles.inlineWrapper} log-line-inline-details`} style={{ maxWidth: detailsWidth }}>
+       <div className={styles.inlineContainer}>
+-        <div className={styles.scrollContainer} ref={scrollRef} onScroll={saveScroll}>
+-          <LogLineDetailsComponent log={log} logs={logs} timeRange={timeRange} timeZone={timeZone} />
+-        </div>
++        <LogLineDetailsHeader log={log} search={search} onSearch={handleSearch} />
++        {inlineLogDetailsNoScrolls ? (
++          <div>
++            <LogLineDetailsComponent log={log} logs={logs} search={search} timeRange={timeRange} timeZone={timeZone} />
++          </div>
++        ) : (
++          <ScrollContainer ref={scrollRef} onScroll={saveScroll}>
++            <LogLineDetailsComponent log={log} logs={logs} search={search} timeRange={timeRange} timeZone={timeZone} />
++          </ScrollContainer>
++        )}
+       </div>
+     </div>
+   );
+@@ -203,11 +241,12 @@ const getStyles = (
+   theme: GrafanaTheme2,
+   mode: LogLineDetailsMode,
+   showControls: boolean | undefined,
+-  fontSize: LogListFontSize
++  fontSize: LogListFontSize,
++  inlineLogDetailsNoScrolls: boolean
+ ) => ({
+   inlineWrapper: css({
+     gridColumn: '1 / -1',
+-    height: `${LOG_LINE_DETAILS_HEIGHT}vh`,
++    height: inlineLogDetailsNoScrolls === false ? `${LOG_LINE_DETAILS_HEIGHT}vh` : undefined,
+     padding: theme.spacing(1, 2, 1.5, 2),
+     marginRight: 1,
+   }),
+@@ -215,8 +254,9 @@ const getStyles = (
+     backgroundColor: theme.colors.background.secondary,
+     border: `1px solid ${theme.colors.border.weak}`,
+     borderRadius: theme.shape.radius.default,
++    display: 'flex',
++    flexDirection: 'column',
+     height: '100%',
+-    overflow: 'auto',
+     fontSize: fontSize === 'small' ? theme.typography.bodySmall.fontSize : undefined,
+     lineHeight: fontSize === 'small' ? theme.typography.bodySmall.lineHeight : undefined,
+   }),
+@@ -228,15 +268,8 @@ const getStyles = (
+     borderTopRightRadius: showControls ? undefined : theme.shape.radius.default,
+     boxShadow: theme.shadows.z3,
+     height: '100%',
+-    overflow: 'auto',
+     fontSize: fontSize === 'small' ? theme.typography.bodySmall.fontSize : undefined,
+     lineHeight: fontSize === 'small' ? theme.typography.bodySmall.lineHeight : undefined,
+   }),
+-  scrollContainer: css({
+-    overflow: 'auto',
+-    height: '100%',
+-  }),
+-  componentWrapper: css({
+-    padding: theme.spacing(0, 1, 1, 1),
+-  }),
++  tabsWrapper: css({ height: '100%', display: 'flex', flexDirection: 'column' }),
+ });
+diff --git a/public/app/features/logs/components/panel/LogLineDetailsComponent.tsx b/public/app/features/logs/components/panel/LogLineDetailsComponent.tsx
+index af721d13e3c71..361d78081a61b 100644
+--- a/public/app/features/logs/components/panel/LogLineDetailsComponent.tsx
++++ b/public/app/features/logs/components/panel/LogLineDetailsComponent.tsx
+@@ -1,6 +1,6 @@
+ import { css } from '@emotion/css';
+ import { camelCase, groupBy } from 'lodash';
+-import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+ 
+ import { DataFrameType, DataSourceApi, GrafanaTheme2, hasLogsLabelTypesSupport, store, TimeRange } from '@grafana/data';
+ import { t, Trans } from '@grafana/i18n';
+@@ -13,7 +13,6 @@ import { createLogLineLinks } from '../logParser';
+ 
+ import { LogLineDetailsDisplayedFields } from './LogLineDetailsDisplayedFields';
+ import { LabelWithLinks, LogLineDetailsFields, LogLineDetailsLabelFields } from './LogLineDetailsFields';
+-import { LogLineDetailsHeader } from './LogLineDetailsHeader';
+ import { LogLineDetailsLinks } from './LogLineDetailsLinks';
+ import { LogLineDetailsLog } from './LogLineDetailsLog';
+ import { LogLineDetailsTrace } from './LogLineDetailsTrace';
+@@ -23,20 +22,19 @@ import { getTempoTraceFromLinks } from './links';
+ import { LogListModel } from './processing';
+ 
+ interface LogLineDetailsComponentProps {
+-  focusLogLine?: (log: LogListModel) => void;
+   log: LogListModel;
+   logs: LogListModel[];
++  search?: string;
+   timeRange: TimeRange;
+   timeZone: string;
+ }
+ 
+ export const LogLineDetailsComponent = memo(
+-  ({ focusLogLine, log, logs, timeRange, timeZone }: LogLineDetailsComponentProps) => {
++  ({ log, logs, search = '', timeRange, timeZone }: LogLineDetailsComponentProps) => {
+     const { displayedFields, noInteractions, logOptionsStorageKey, setDisplayedFields, syntaxHighlighting } =
+       useLogListContext();
+-    const [search, setSearch] = useState('');
++
+     const [ds, setDs] = useState<DataSourceApi | null | undefined>(undefined);
+-    const inputRef = useRef('');
+     const styles = useStyles2(getStyles);
+ 
+     const extensionLinks = useAttributesExtensionLinks(log, timeRange);
+@@ -123,13 +121,6 @@ export const LogLineDetailsComponent = memo(
+       [logOptionsStorageKey, noInteractions]
+     );
+ 
+-    const handleSearch = useCallback((newSearch: string) => {
+-      inputRef.current = newSearch;
+-      startTransition(() => {
+-        setSearch(inputRef.current);
+-      });
+-    }, []);
+-
+     const noDetails =
+       !fieldsWithLinks.links.length &&
+       !fieldsWithLinks.linksFromVariableMap.length &&
+@@ -169,70 +160,45 @@ export const LogLineDetailsComponent = memo(
+     }
+ 
+     return (
+-      <>
+-        <LogLineDetailsHeader focusLogLine={focusLogLine} log={log} search={search} onSearch={handleSearch} />
+-        <div className={styles.componentWrapper}>
++      <div className={styles.componentWrapper}>
++        <ControlledCollapse
++          className={styles.collapsable}
++          label={t('logs.log-line-details.log-line-section', 'Log line')}
++          isOpen={logLineOpen}
++          onToggle={(isOpen: boolean) => handleToggle('logLineOpen', isOpen)}
++        >
++          <LogLineDetailsLog log={log} syntaxHighlighting={syntaxHighlighting ?? true} />
++        </ControlledCollapse>
++        {displayedFields.length > 0 && setDisplayedFields && (
++          <ControlledCollapse
++            label={t('logs.log-line-details.displayed-fields-section', 'Organize displayed fields')}
++            isOpen={displayedFieldsOpen}
++            onToggle={(isOpen: boolean) => handleToggle('displayedFieldsOpen', isOpen)}
++          >
++            <LogLineDetailsDisplayedFields />
++          </ControlledCollapse>
++        )}
++        {allLinks.length > 0 && (
+           <ControlledCollapse
+             className={styles.collapsable}
+-            label={t('logs.log-line-details.log-line-section', 'Log line')}
+-            isOpen={logLineOpen}
+-            onToggle={(isOpen: boolean) => handleToggle('logLineOpen', isOpen)}
++            label={t('logs.log-line-details.links-section', 'Links')}
++            isOpen={linksOpen}
++            onToggle={(isOpen: boolean) => handleToggle('linksOpen', isOpen)}
+           >
+-            <LogLineDetailsLog log={log} syntaxHighlighting={syntaxHighlighting ?? true} />
++            <LogLineDetailsLinks log={log} logs={logs} fields={allLinks} search={search} />
+           </ControlledCollapse>
+-          {displayedFields.length > 0 && setDisplayedFields && (
+-            <ControlledCollapse
+-              label={t('logs.log-line-details.displayed-fields-section', 'Organize displayed fields')}
+-              isOpen={displayedFieldsOpen}
+-              onToggle={(isOpen: boolean) => handleToggle('displayedFieldsOpen', isOpen)}
+-            >
+-              <LogLineDetailsDisplayedFields />
+-            </ControlledCollapse>
+-          )}
+-          {allLinks.length > 0 && (
+-            <ControlledCollapse
+-              className={styles.collapsable}
+-              label={t('logs.log-line-details.links-section', 'Links')}
+-              isOpen={linksOpen}
+-              onToggle={(isOpen: boolean) => handleToggle('linksOpen', isOpen)}
+-            >
+-              <LogLineDetailsLinks log={log} logs={logs} fields={allLinks} search={search} />
+-            </ControlledCollapse>
+-          )}
+-          {trace && (
+-            <ControlledCollapse
+-              label={t('logs.log-line-details.trace-section', 'Trace')}
+-              isOpen={traceOpen}
+-              onToggle={(isOpen: boolean) => handleToggle('traceOpen', isOpen)}
+-            >
+-              <LogLineDetailsTrace timeRange={timeRange} timeZone={timeZone} traceRef={trace} />
+-            </ControlledCollapse>
+-          )}
+-          {labelGroups.map((group) =>
+-            group === '' ? (
+-              <ControlledCollapse
+-                className={styles.collapsable}
+-                key={'fields'}
+-                label={t('logs.log-line-details.fields-section', 'Fields')}
+-                isOpen={fieldsOpen}
+-                onToggle={(isOpen: boolean) => handleToggle('fieldsOpen', isOpen)}
+-              >
+-                <LogLineDetailsLabelFields log={log} logs={logs} fields={groupedLabels[group]} search={search} />
+-                <LogLineDetailsFields log={log} logs={logs} fields={fieldsWithoutLinks} search={search} />
+-              </ControlledCollapse>
+-            ) : (
+-              <ControlledCollapse
+-                className={styles.collapsable}
+-                key={group}
+-                label={group}
+-                isOpen={store.getBool(`${logOptionsStorageKey}.log-details.${groupOptionName(group)}`, true)}
+-                onToggle={(isOpen: boolean) => handleToggle(groupOptionName(group), isOpen)}
+-              >
+-                <LogLineDetailsLabelFields log={log} logs={logs} fields={groupedLabels[group]} search={search} />
+-              </ControlledCollapse>
+-            )
+-          )}
+-          {!labelGroups.length && fieldsWithoutLinks.length > 0 && (
++        )}
++        {trace && (
++          <ControlledCollapse
++            label={t('logs.log-line-details.trace-section', 'Trace')}
++            isOpen={traceOpen}
++            onToggle={(isOpen: boolean) => handleToggle('traceOpen', isOpen)}
++          >
++            <LogLineDetailsTrace timeRange={timeRange} timeZone={timeZone} traceRef={trace} />
++          </ControlledCollapse>
++        )}
++        {labelGroups.map((group) =>
++          group === '' ? (
+             <ControlledCollapse
+               className={styles.collapsable}
+               key={'fields'}
+@@ -240,16 +206,38 @@ export const LogLineDetailsComponent = memo(
+               isOpen={fieldsOpen}
+               onToggle={(isOpen: boolean) => handleToggle('fieldsOpen', isOpen)}
+             >
++              <LogLineDetailsLabelFields log={log} logs={logs} fields={groupedLabels[group]} search={search} />
+               <LogLineDetailsFields log={log} logs={logs} fields={fieldsWithoutLinks} search={search} />
+             </ControlledCollapse>
+-          )}
+-          {noDetails && (
+-            <Box marginTop={1} paddingLeft={0.5}>
+-              <Trans i18nKey="logs.log-line-details.no-details">No fields to display.</Trans>
+-            </Box>
+-          )}
+-        </div>
+-      </>
++          ) : (
++            <ControlledCollapse
++              className={styles.collapsable}
++              key={group}
++              label={group}
++              isOpen={store.getBool(`${logOptionsStorageKey}.log-details.${groupOptionName(group)}`, true)}
++              onToggle={(isOpen: boolean) => handleToggle(groupOptionName(group), isOpen)}
++            >
++              <LogLineDetailsLabelFields log={log} logs={logs} fields={groupedLabels[group]} search={search} />
++            </ControlledCollapse>
++          )
++        )}
++        {!labelGroups.length && fieldsWithoutLinks.length > 0 && (
++          <ControlledCollapse
++            className={styles.collapsable}
++            key={'fields'}
++            label={t('logs.log-line-details.fields-section', 'Fields')}
++            isOpen={fieldsOpen}
++            onToggle={(isOpen: boolean) => handleToggle('fieldsOpen', isOpen)}
++          >
++            <LogLineDetailsFields log={log} logs={logs} fields={fieldsWithoutLinks} search={search} />
++          </ControlledCollapse>
++        )}
++        {noDetails && (
++          <Box marginTop={1} paddingLeft={0.5}>
++            <Trans i18nKey="logs.log-line-details.no-details">No fields to display.</Trans>
++          </Box>
++        )}
++      </div>
+     );
+   }
+ );
+diff --git a/public/app/features/logs/components/panel/LogLineDetailsHeader.tsx b/public/app/features/logs/components/panel/LogLineDetailsHeader.tsx
+index 6968c4c138cb4..5178b3c6bafc6 100644
+--- a/public/app/features/logs/components/panel/LogLineDetailsHeader.tsx
++++ b/public/app/features/logs/components/panel/LogLineDetailsHeader.tsx
+@@ -38,7 +38,7 @@ export const LogLineDetailsHeader = ({ focusLogLine, log, search, onSearch }: Pr
+     isAssistantAvailable,
+     openAssistantByLog,
+   } = useLogListContext();
+-  const { closeDetails, detailsMode, setDetailsMode } = useLogDetailsContext();
++  const { closeDetails, detailsMode, setDetailsMode, toggleDetails } = useLogDetailsContext();
+   const pinned = useLogIsPinned(log);
+   const styles = useStyles2(getStyles, detailsMode, wrapLogMessage);
+   const containerRef = useRef<HTMLDivElement | null>(null);
+@@ -146,6 +146,10 @@ export const LogLineDetailsHeader = ({ focusLogLine, log, search, onSearch }: Pr
+     [onSearch, reportInteractionWrapper]
+   );
+ 
++  const closeInlineDetails = useCallback(() => {
++    toggleDetails(log);
++  }, [log, toggleDetails]);
++
+   return (
+     <div className={styles.header} ref={containerRef}>
+       <Input
+@@ -250,12 +254,21 @@ export const LogLineDetailsHeader = ({ focusLogLine, log, search, onSearch }: Pr
+           onClick={toggleDetailsMode}
+         />
+         <div className={styles.divider} />
+-        <IconButton
+-          name="times"
+-          tooltip={t('logs.log-line-details.close', 'Close log details')}
+-          variant="primary"
+-          onClick={closeDetails}
+-        />
++        {detailsMode === 'sidebar' ? (
++          <IconButton
++            name="times"
++            tooltip={t('logs.log-line-details.close-sidebar-details', 'Close log details sidebar')}
++            variant="primary"
++            onClick={closeDetails}
++          />
++        ) : (
++          <IconButton
++            name="times"
++            tooltip={t('logs.log-line-details.close-inline-details', 'Close details for this log')}
++            variant="primary"
++            onClick={closeInlineDetails}
++          />
++        )}
+       </div>
+     </div>
+   );
+@@ -272,6 +285,8 @@ const getStyles = (theme: GrafanaTheme2, mode: LogLineDetailsMode, wrapLogMessag
+   }),
+   header: css({
+     alignItems: 'center',
++    borderTopLeftRadius: theme.shape.radius.default,
++    borderTopRightRadius: theme.shape.radius.default,
+     background: theme.colors.background.canvas,
+     display: 'flex',
+     flexDirection: !wrapLogMessage && mode === 'inline' ? 'row-reverse' : 'row',
+diff --git a/public/app/features/logs/components/panel/LogList.test.tsx b/public/app/features/logs/components/panel/LogList.test.tsx
+index 1379096409493..c3bba24e0d36b 100644
+--- a/public/app/features/logs/components/panel/LogList.test.tsx
++++ b/public/app/features/logs/components/panel/LogList.test.tsx
+@@ -24,6 +24,10 @@ import { OTEL_LOG_LINE_ATTRIBUTES_FIELD_NAME, OTEL_PROBE_FIELD } from '../otel/f
+ 
+ import { LogList, Props } from './LogList';
+ 
++jest.mock('@openfeature/react-sdk', () => ({
++  useBooleanFlagValue: jest.fn().mockReturnValue(false),
++}));
++
+ jest.mock('@grafana/assistant', () => ({
+   ...jest.requireActual('@grafana/assistant'),
+   useAssistant: jest.fn().mockReturnValue({
+@@ -553,10 +557,10 @@ describe('LogList', () => {
+       await userEvent.click(screen.getByLabelText('Show this field instead of the message'));
+       expect(onClickShowField).toHaveBeenCalledTimes(1);
+ 
+-      await userEvent.click(screen.getByLabelText('Close log details'));
++      await userEvent.click(screen.getByLabelText('Close log details sidebar'));
+ 
+       expect(screen.queryByText('Fields')).not.toBeInTheDocument();
+-      expect(screen.queryByText('Close log details')).not.toBeInTheDocument();
++      expect(screen.queryByLabelText('Close log details sidebar')).not.toBeInTheDocument();
+     });
+ 
+     test('Supports showing inline log details', async () => {
+@@ -596,10 +600,10 @@ describe('LogList', () => {
+       await userEvent.click(screen.getByLabelText('Show this field instead of the message'));
+       expect(onClickShowField).toHaveBeenCalledTimes(1);
+ 
+-      await userEvent.click(screen.getByLabelText('Close log details'));
++      await userEvent.click(screen.getByLabelText('Close details for this log'));
+ 
+       expect(screen.queryByText('Fields')).not.toBeInTheDocument();
+-      expect(screen.queryByText('Close log details')).not.toBeInTheDocument();
++      expect(screen.queryByLabelText('Close details for this log')).not.toBeInTheDocument();
+     });
+ 
+     test('Allows people to select text without opening log details', async () => {
+@@ -617,7 +621,7 @@ describe('LogList', () => {
+       expect(screen.queryByText('name_of_the_label')).not.toBeInTheDocument();
+       expect(screen.queryByText('value of the label')).not.toBeInTheDocument();
+       expect(screen.queryByText('Fields')).not.toBeInTheDocument();
+-      expect(screen.queryByText('Close log details')).not.toBeInTheDocument();
++      expect(screen.queryByLabelText('Close log details sidebar')).not.toBeInTheDocument();
+ 
+       spy.mockRestore();
+     });
+diff --git a/public/app/features/logs/components/panel/LogList.tsx b/public/app/features/logs/components/panel/LogList.tsx
+index 65c9ff01e4493..a2e104605efa9 100644
+--- a/public/app/features/logs/components/panel/LogList.tsx
++++ b/public/app/features/logs/components/panel/LogList.tsx
+@@ -550,11 +550,9 @@ const LogListComponent = ({
+               height={listHeight}
+               itemCount={itemCount}
+               itemSize={getLogLineSize.bind(null, virtualization, filteredLogs, widthContainer, displayedFields, {
+-                detailsMode,
+                 hasLogsWithErrors,
+                 hasSampledLogs,
+                 showDuplicates: dedupStrategy !== LogsDedupStrategy.none,
+-                showDetails,
+                 showTime,
+                 wrap: wrapLogMessage,
+               })}
+diff --git a/public/app/features/logs/components/panel/virtualization.test.ts b/public/app/features/logs/components/panel/virtualization.test.ts
+index f5a8e7ab6fd26..dc6f215f138ae 100644
+--- a/public/app/features/logs/components/panel/virtualization.test.ts
++++ b/public/app/features/logs/components/panel/virtualization.test.ts
+@@ -3,17 +3,14 @@ import { createTheme, LogsSortOrder } from '@grafana/data';
+ import { LOG_LINE_BODY_FIELD_NAME } from '../LogDetailsBody';
+ import { createLogLine } from '../mocks/logRow';
+ 
+-import { LOG_LINE_DETAILS_HEIGHT } from './LogLineDetails';
+ import { LogListModel, PreProcessOptions } from './processing';
+-import { LogLineVirtualization, getLogLineSize, DisplayOptions, FIELD_GAP_MULTIPLIER } from './virtualization';
++import { LogLineVirtualization, getLogLineSize, DisplayOptions } from './virtualization';
+ 
+ describe('Virtualization', () => {
+   let log: LogListModel, container: HTMLDivElement;
+ 
+   let virtualization = new LogLineVirtualization(createTheme(), 'default');
+ 
+-  const GAP = virtualization.getGridSize() * FIELD_GAP_MULTIPLIER;
+-  const DETAILS_HEIGHT = window.innerHeight * (LOG_LINE_DETAILS_HEIGHT / 100) + GAP / 2;
+   const PADDING_BOTTOM = 6;
+   const LINE_HEIGHT = virtualization.getLineHeight();
+   const SINGLE_LINE_HEIGHT = LINE_HEIGHT + PADDING_BOTTOM;
+@@ -24,10 +21,8 @@ describe('Virtualization', () => {
+   let TWO_LINES_OF_CHARACTERS: number;
+ 
+   const defaultOptions: DisplayOptions = {
+-    detailsMode: 'sidebar',
+     wrap: false,
+     showTime: false,
+-    showDetails: [],
+     showDuplicates: false,
+     hasLogsWithErrors: false,
+     hasSampledLogs: false,
+@@ -55,16 +50,9 @@ describe('Virtualization', () => {
+       expect(size).toBe(SINGLE_LINE_HEIGHT);
+     });
+ 
+-    test('Returns the a single line plus inline details if the display mode is unwrapped', () => {
+-      const size = getLogLineSize(
+-        virtualization,
+-        [log],
+-        container,
+-        [],
+-        { ...defaultOptions, showTime: true, showDetails: [log], detailsMode: 'inline' },
+-        0
+-      );
+-      expect(size).toBe(SINGLE_LINE_HEIGHT + DETAILS_HEIGHT);
++    test('Returns the a single line plus the display mode is unwrapped', () => {
++      const size = getLogLineSize(virtualization, [log], container, [], { ...defaultOptions, showTime: true }, 0);
++      expect(size).toBe(SINGLE_LINE_HEIGHT);
+     });
+ 
+     test('Should not throw when an undefined index is passed', () => {
+@@ -73,7 +61,7 @@ describe('Virtualization', () => {
+         [log],
+         container,
+         [],
+-        { ...defaultOptions, showTime: true, showDetails: [log], detailsMode: 'inline' },
++        { ...defaultOptions, showTime: true },
+         1 // Index out of bounds
+       );
+       expect(size).toBe(SINGLE_LINE_HEIGHT);
+@@ -107,21 +95,6 @@ describe('Virtualization', () => {
+       expect(size).toBe((virtualization.getTruncationLineCount() + 1) * LINE_HEIGHT);
+     });
+ 
+-    test('Returns the size of a truncated long line with inline details', () => {
+-      // Very small container
+-      log.collapsed = true;
+-      jest.spyOn(container, 'clientWidth', 'get').mockReturnValue(10);
+-      const size = getLogLineSize(
+-        virtualization,
+-        [log],
+-        container,
+-        [],
+-        { ...defaultOptions, wrap: true, showTime: true, showDetails: [log], detailsMode: 'inline' },
+-        0
+-      );
+-      expect(size).toBe((virtualization.getTruncationLineCount() + 1) * LINE_HEIGHT + DETAILS_HEIGHT);
+-    });
+-
+     test.each([true, false])('Measures a log line with controls %s and displayed time %s', (showTime: boolean) => {
+       const size = getLogLineSize(virtualization, [log], container, [], { ...defaultOptions, wrap: true, showTime }, 0);
+       expect(size).toBe(SINGLE_LINE_HEIGHT);
+@@ -159,24 +132,6 @@ describe('Virtualization', () => {
+       expect(size).toBe(THREE_LINES_HEIGHT);
+     });
+ 
+-    test('Measures a multi-line log line with level, controls, displayed time, and inline details', () => {
+-      log = createLogLine(
+-        { labels: { place: 'luna' }, entry: new Array(TWO_LINES_OF_CHARACTERS).fill('e').join('') },
+-        preProcessOptions
+-      );
+-
+-      const size = getLogLineSize(
+-        virtualization,
+-        [log],
+-        container,
+-        [],
+-        { ...defaultOptions, wrap: true, showTime: true, showDetails: [log], detailsMode: 'inline' },
+-        0
+-      );
+-      // Two lines for the log and one extra for level and time
+-      expect(size).toBe(THREE_LINES_HEIGHT + DETAILS_HEIGHT);
+-    });
+-
+     test('Measures a multi-line log line with displayed fields', () => {
+       log = createLogLine(
+         {
+diff --git a/public/app/features/logs/components/panel/virtualization.ts b/public/app/features/logs/components/panel/virtualization.ts
+index 02e74c6551856..de4e470e94d12 100644
+--- a/public/app/features/logs/components/panel/virtualization.ts
++++ b/public/app/features/logs/components/panel/virtualization.ts
+@@ -3,7 +3,6 @@ import ansicolor from 'ansicolor';
+ import { BusEventWithPayload, GrafanaTheme2 } from '@grafana/data';
+ 
+ import { LogLineTimestampResolution } from './LogLine';
+-import { LOG_LINE_DETAILS_HEIGHT, LogLineDetailsMode } from './LogLineDetails';
+ import { LogListFontSize } from './LogList';
+ import { LogListModel } from './processing';
+ 
+@@ -158,7 +157,7 @@ export class LogLineVirtualization {
+           testLogLine = textLine.substring(start, start + logLineCharsLength - delta);
+           let measuredLine = testLogLine;
+           if (logLines > 0) {
+-            measuredLine.trimStart();
++            measuredLine = measuredLine.trimStart();
+           }
+           width = this.measureTextWidth(measuredLine);
+           delta += 1;
+@@ -258,10 +257,8 @@ export class LogLineVirtualization {
+ }
+ 
+ export interface DisplayOptions {
+-  detailsMode: LogLineDetailsMode;
+   hasLogsWithErrors?: boolean;
+   hasSampledLogs?: boolean;
+-  showDetails: LogListModel[];
+   showDuplicates: boolean;
+   showTime: boolean;
+   wrap: boolean;
+@@ -272,25 +269,15 @@ export function getLogLineSize(
+   logs: LogListModel[],
+   container: HTMLDivElement | null,
+   displayedFields: string[],
+-  { detailsMode, hasLogsWithErrors, hasSampledLogs, showDuplicates, showDetails, showTime, wrap }: DisplayOptions,
++  { hasLogsWithErrors, hasSampledLogs, showDuplicates, showTime, wrap }: DisplayOptions,
+   index: number
+ ) {
+   if (!container) {
+     return 0;
+   }
+-  const gap = virtualization.getGridSize() * FIELD_GAP_MULTIPLIER;
+-  const detailsHeight =
+-    detailsMode === 'inline' && logs[index] && showDetails.findIndex((log) => log.uid === logs[index].uid) >= 0
+-      ? window.innerHeight * (LOG_LINE_DETAILS_HEIGHT / 100) + gap / 2
+-      : 0;
+   // !logs[index] means the line is not yet loaded by infinite scrolling
+-  if (!wrap || !logs[index]) {
+-    return virtualization.getLineHeight() + virtualization.getPaddingBottom() + detailsHeight;
+-  }
+-  // If a long line is collapsed, we show the line count + an extra line for the expand/collapse control
+-  logs[index].updateCollapsedState(displayedFields, container);
+-  if (logs[index].collapsed) {
+-    return (virtualization.getTruncationLineCount() + 1) * virtualization.getLineHeight() + detailsHeight;
++  if (!logs[index]) {
++    return virtualization.getLineHeight() + virtualization.getPaddingBottom();
+   }
+ 
+   const storedSize = virtualization.retrieveLogLineSize(logs[index].uid, container);
+@@ -298,6 +285,19 @@ export function getLogLineSize(
+     return storedSize;
+   }
+ 
++  // Unwrapped logs always measure 1 line
++  if (!wrap) {
++    return virtualization.getLineHeight() + virtualization.getPaddingBottom();
++  }
++
++  const gap = virtualization.getGridSize() * FIELD_GAP_MULTIPLIER;
++
++  // If a long line is collapsed, we show the line count + an extra line for the expand/collapse control
++  logs[index].updateCollapsedState(displayedFields, container);
++  if (logs[index].collapsed) {
++    return (virtualization.getTruncationLineCount() + 1) * virtualization.getLineHeight();
++  }
++
+   let textToMeasure = '';
+   const iconsGap = virtualization.getGridSize() * 0.5;
+   let optionsWidth = 0;
+@@ -328,9 +328,7 @@ export function getLogLineSize(
+ 
+   const { height } = virtualization.measureTextHeight(textToMeasure, getLogContainerWidth(container), optionsWidth);
+   // When the log is collapsed, add an extra line for the expand/collapse control
+-  return logs[index].collapsed === false
+-    ? height + virtualization.getLineHeight() + detailsHeight
+-    : height + detailsHeight;
++  return logs[index].collapsed === false ? height + virtualization.getLineHeight() : height;
+ }
+ 
+ export interface LogFieldDimension {
+@@ -339,34 +337,12 @@ export interface LogFieldDimension {
+   width: number;
+ }
+ 
+-export function getLogLineDOMHeight(
+-  virtualization: LogLineVirtualization,
+-  element: HTMLDivElement,
+-  calculatedHeight?: number,
+-  collapsed?: boolean
+-): number | null {
+-  if (collapsed !== undefined && calculatedHeight) {
+-    calculatedHeight -= virtualization.getLineHeight();
+-  }
+-  const inlineDetails = element.parentElement
+-    ? Array.from(element.parentElement.children).filter((element) =>
+-        element.classList.contains('log-line-inline-details')
+-      )
+-    : undefined;
+-  const detailsHeight = inlineDetails?.length ? inlineDetails[0].clientHeight : 0;
+-
+-  // Line overflows container
+-  let measuredHeight = element.scrollHeight + detailsHeight;
+-  const height = calculatedHeight ?? element.clientHeight;
+-  if (measuredHeight > height) {
+-    return collapsed !== undefined ? measuredHeight + virtualization.getLineHeight() : measuredHeight;
+-  }
+-
+-  // Line is smaller than container
+-  const child = element.children[1];
+-  measuredHeight = child.clientHeight + detailsHeight;
+-  if (child instanceof HTMLDivElement && measuredHeight < height) {
+-    return collapsed !== undefined ? measuredHeight + virtualization.getLineHeight() : measuredHeight;
++export function getLogLineDOMHeight(element: HTMLDivElement, calculatedHeight?: number): number | null {
++  // Line overflows or is smaller than container
++  let measuredHeight = element.scrollHeight;
++  const height = calculatedHeight ?? element.scrollHeight;
++  if (measuredHeight > 0 && measuredHeight !== height) {
++    return measuredHeight;
+   }
+ 
+   // No overflow or undermeasurement
+diff --git a/public/locales/en-US/grafana.json b/public/locales/en-US/grafana.json
+index 8d480543bfe81..0f36fe0f60f1c 100644
+--- a/public/locales/en-US/grafana.json
++++ b/public/locales/en-US/grafana.json
+@@ -10894,7 +10894,8 @@
+     },
+     "log-line-details": {
+       "clear-search": "Clear",
+-      "close": "Close log details",
++      "close-inline-details": "Close details for this log",
++      "close-sidebar-details": "Close log details sidebar",
+       "copy-shortlink": "Copy shortlink",
+       "copy-to-clipboard": "Copy to clipboard",
+       "displayed-fields-section": "Organize displayed fields",

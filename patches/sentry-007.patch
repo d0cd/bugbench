@@ -1,14 +1,1129 @@
-diff --git a/static/app/views/preprod/buildComparison/main/sizeCompareMainContent.tsx b/static/app/views/preprod/buildComparison/main/sizeCompareMainContent.tsx
-index 6624f2d1f13..29c0cfadb8e 100644
---- a/static/app/views/preprod/buildComparison/main/sizeCompareMainContent.tsx
-+++ b/static/app/views/preprod/buildComparison/main/sizeCompareMainContent.tsx
-@@ -109,7 +109,8 @@ export function SizeCompareMainContent() {
-         !!mainArtifactComparison?.head_size_metric_id &&
-         !!mainArtifactComparison?.base_size_metric_id &&
-         !!organization.slug &&
--        !!baseArtifactId,
-+        !!baseArtifactId &&
-+        mainArtifactComparison?.state === SizeAnalysisComparisonState.SUCCESS,
-     }
-   );
+diff --git a/src/sentry/api/endpoints/organization_fork.py b/src/sentry/api/endpoints/organization_fork.py
+index 3bf518a71df57c..53e3efb5be5baf 100644
+--- a/src/sentry/api/endpoints/organization_fork.py
++++ b/src/sentry/api/endpoints/organization_fork.py
+@@ -22,7 +22,7 @@
+ )
+ from sentry.relocation.models.relocation import Relocation
+ from sentry.relocation.tasks.process import uploading_start
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ from sentry.utils.db import atomic_transaction
  
+ ERR_DUPLICATE_ORGANIZATION_FORK = Template(
+@@ -100,7 +100,7 @@ def post(self, request: Request, organization_id_or_slug) -> Response:
+             )
+ 
+         # Figure out which region the organization being forked lives in.
+-        requesting_region_name = get_local_region().name
++        requesting_region_name = get_local_cell().name
+         replying_region_name = org_mapping.region_name
+         if replying_region_name in CANNOT_FORK_FROM_REGION:
+             return Response(
+diff --git a/src/sentry/eventstream/item_helpers.py b/src/sentry/eventstream/item_helpers.py
+index 60e79559808b11..9922dc62c0cd19 100644
+--- a/src/sentry/eventstream/item_helpers.py
++++ b/src/sentry/eventstream/item_helpers.py
+@@ -314,8 +314,8 @@ def _extract_http(
+         if method:
+             out["http_method"] = method
+ 
+-        headers = request.get("headers", [])
+-        for header_name, header_value in headers:
++        headers = request.get("headers", []) or []
++        for header_name, header_value in [h for h in headers if h is not None]:
+             if header_name == "Referer" or header_name == "Referrer":
+                 out["http_referrer"] = header_value
+ 
+diff --git a/src/sentry/models/organization.py b/src/sentry/models/organization.py
+index 9ec2b4775faa47..c0f0617a7f6632 100644
+--- a/src/sentry/models/organization.py
++++ b/src/sentry/models/organization.py
+@@ -280,9 +280,9 @@ def handle_async_replication(self, shard_identifier: int) -> None:
+         from sentry.hybridcloud.services.organization_mapping.service import (
+             organization_mapping_service,
+         )
+-        from sentry.types.region import get_local_region
++        from sentry.types.region import get_local_cell
+ 
+-        update = update_organization_mapping_from_instance(self, get_local_region())
++        update = update_organization_mapping_from_instance(self, get_local_cell())
+         organization_mapping_service.upsert(organization_id=self.id, update=update)
+ 
+     @classmethod
+diff --git a/src/sentry/preprod/api/endpoints/builds.py b/src/sentry/preprod/api/endpoints/builds.py
+index 51c94d19256af8..f53c34330c5572 100644
+--- a/src/sentry/preprod/api/endpoints/builds.py
++++ b/src/sentry/preprod/api/endpoints/builds.py
+@@ -1,3 +1,6 @@
++import logging
++from typing import Any
++
+ from rest_framework.request import Request
+ from rest_framework.response import Response
+ 
+@@ -16,6 +19,8 @@
+ from sentry.preprod.models import PreprodArtifact
+ from sentry.preprod.quotas import get_size_retention_cutoff
+ 
++logger = logging.getLogger(__name__)
++
+ ERR_FEATURE_REQUIRED = "Feature {} is not enabled for the organization."
+ 
+ 
+@@ -35,15 +40,25 @@ def get(self, request: Request, organization: Organization) -> Response:
+                 status=403,
+             )
+ 
+-        on_results = lambda artifacts: [
+-            transform_preprod_artifact_to_build_details(artifact).dict() for artifact in artifacts
+-        ]
++        def on_results(artifacts: list[PreprodArtifact]) -> list[dict[str, Any]]:
++            results = []
++            for artifact in artifacts:
++                try:
++                    results.append(transform_preprod_artifact_to_build_details(artifact).dict())
++                except Exception:
++                    logger.exception(
++                        "preprod.builds.transform_failed", extra={"artifact_id": artifact.id}
++                    )
++            return results
++
+         paginate = lambda queryset: self.paginate(
+             order_by="-date_added",
+             request=request,
+             queryset=queryset,
+             on_results=on_results,
+             paginator_cls=OffsetPaginator,
++            default_per_page=25,
++            max_per_page=100,
+         )
+ 
+         try:
+@@ -61,6 +76,9 @@ def get(self, request: Request, organization: Organization) -> Response:
+ 
+         try:
+             queryset = queryset_for_query(query, organization)
++            queryset = queryset.select_related(
++                "project", "build_configuration", "commit_comparison", "mobile_app_info"
++            ).prefetch_related("preprodartifactsizemetrics_set")
+             queryset = queryset.filter(date_added__gte=cutoff)
+             if start:
+                 queryset = queryset.filter(date_added__gte=start)
+diff --git a/src/sentry/preprod/artifact_search.py b/src/sentry/preprod/artifact_search.py
+index 1b36286e0dba8b..5d197ae85627cd 100644
+--- a/src/sentry/preprod/artifact_search.py
++++ b/src/sentry/preprod/artifact_search.py
+@@ -40,6 +40,7 @@
+         "download_size",
+         "git_pr_number",
+         "install_size",
++        "state",
+     },
+     # Keys that support date filtering
+     # date_keys={"date_built", "date_added"},
+@@ -69,6 +70,7 @@
+         "is",
+         "platform_name",
+         "size_state",
++        "state",
+     },
+     # Enable boolean operators
+     # allow_boolean=True,
+diff --git a/src/sentry/receivers/outbox/region.py b/src/sentry/receivers/outbox/region.py
+index ac540b171daa6f..b9f044ff5e4725 100644
+--- a/src/sentry/receivers/outbox/region.py
++++ b/src/sentry/receivers/outbox/region.py
+@@ -32,7 +32,7 @@
+ from sentry.receivers.outbox import maybe_process_tombstone
+ from sentry.relocation.services.relocation_export.service import control_relocation_export_service
+ from sentry.sentry_apps.services.app.service import app_service
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ from sentry.workflow_engine.models import Action
+ 
+ logger = logging.getLogger(__name__)
+@@ -118,7 +118,7 @@ def process_organization_mapping_customer_id_update(
+ 
+     if payload and "customer_id" in payload:
+         update = update_organization_mapping_from_instance(
+-            org, get_local_region(), customer_id=CustomerId(value=payload["customer_id"])
++            org, get_local_cell(), customer_id=CustomerId(value=payload["customer_id"])
+         )
+         organization_mapping_service.upsert(organization_id=org.id, update=update)
+ 
+diff --git a/src/sentry/relocation/tasks/process.py b/src/sentry/relocation/tasks/process.py
+index 33dc29701f9dbb..95414abe4dd3a5 100644
+--- a/src/sentry/relocation/tasks/process.py
++++ b/src/sentry/relocation/tasks/process.py
+@@ -80,7 +80,7 @@
+ from sentry.taskworker.namespaces import relocation_tasks
+ from sentry.taskworker.retry import LastAction, Retry
+ from sentry.taskworker.task import Task
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ from sentry.users.models.lostpasswordhash import LostPasswordHash
+ from sentry.users.models.user import User
+ from sentry.users.services.lost_password_hash import lost_password_hash_service
+@@ -288,7 +288,7 @@ def uploading_start(uuid: str, replying_region_name: str | None, org_slug: str |
+             # Send out the cross-region request.
+             control_relocation_export_service.request_new_export(
+                 relocation_uuid=str(uuid),
+-                requesting_region_name=get_local_region().name,
++                requesting_region_name=get_local_cell().name,
+                 replying_region_name=replying_region_name,
+                 org_slug=org_slug,
+                 encrypt_with_public_key=public_key_pem,
+@@ -1164,7 +1164,7 @@ def _convert_durations(obj: Any) -> Any:
+             timeout=_parse_duration(cb_conf["timeout"]),
+             options=convert_dict_key_case(cb_conf["options"], camel_to_snake_keep_underscores),
+             tags=[
+-                f"relocation-into-{get_local_region().name}",
++                f"relocation-into-{get_local_cell().name}",
+                 f"relocation-id-{uuid}",
+             ],
+         )
+diff --git a/src/sentry/relocation/tasks/transfer.py b/src/sentry/relocation/tasks/transfer.py
+index f0131e0efea870..f300ee8ce843db 100644
+--- a/src/sentry/relocation/tasks/transfer.py
++++ b/src/sentry/relocation/tasks/transfer.py
+@@ -21,7 +21,7 @@
+ from sentry.tasks.base import instrumented_task
+ from sentry.taskworker.namespaces import relocation_control_tasks, relocation_tasks
+ from sentry.taskworker.task import Task
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ 
+ logger = logging.getLogger("sentry.relocation")
+ 
+@@ -183,7 +183,7 @@ def process_relocation_transfer_control(transfer_id: int) -> None:
+     processing_deadline_duration=60,
+ )
+ def process_relocation_transfer_region(transfer_id: int) -> None:
+-    log_context = {"id": transfer_id, "silo": "region", "region": get_local_region().name}
++    log_context = {"id": transfer_id, "silo": "region", "region": get_local_cell().name}
+ 
+     try:
+         transfer = RegionRelocationTransfer.objects.get(id=transfer_id)
+diff --git a/src/sentry/services/organization/provisioning.py b/src/sentry/services/organization/provisioning.py
+index c20ca6047a0f4d..6a79d1eb9baba5 100644
+--- a/src/sentry/services/organization/provisioning.py
++++ b/src/sentry/services/organization/provisioning.py
+@@ -18,7 +18,7 @@
+ from sentry.organizations.services.organization import RpcOrganization, organization_service
+ from sentry.services.organization.model import OrganizationProvisioningOptions
+ from sentry.silo.base import SiloMode
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ 
+ 
+ class OrganizationProvisioningException(Exception):
+@@ -33,7 +33,7 @@ def _validate_or_default_region(self, region_name: str | None):
+                 "A region name must be provided when provisioning an organization from the Control Silo"
+             )
+         elif silo_mode != SiloMode.CONTROL:
+-            local_region = get_local_region()
++            local_region = get_local_cell()
+ 
+             assert not region_name or region_name == local_region.name, (
+                 "Cannot provision an organization in another region"
+diff --git a/src/sentry/testutils/factories.py b/src/sentry/testutils/factories.py
+index 734e44a8487028..d5855f15527348 100644
+--- a/src/sentry/testutils/factories.py
++++ b/src/sentry/testutils/factories.py
+@@ -167,7 +167,7 @@
+ from sentry.testutils.outbox import outbox_runner
+ from sentry.testutils.silo import assume_test_silo_mode
+ from sentry.types.activity import ActivityType
+-from sentry.types.region import Cell, get_cell_by_name, get_local_region
++from sentry.types.region import Cell, get_cell_by_name, get_local_cell
+ from sentry.types.token import AuthTokenType
+ from sentry.uptime.models import (
+     IntervalSecondsLiteral,
+@@ -384,7 +384,7 @@ def create_organization(name=None, owner=None, region: Cell | str | None = None,
+ 
+         with contextlib.ExitStack() as ctx:
+             if region is None or SiloMode.get_current_mode() == SiloMode.MONOLITH:
+-                region_name = get_local_region().name
++                region_name = get_local_cell().name
+             else:
+                 if isinstance(region, Cell):
+                     region_name = region.name
+diff --git a/src/sentry/types/region.py b/src/sentry/types/region.py
+index 89c95e7052a4f2..03defe5dfb4ef7 100644
+--- a/src/sentry/types/region.py
++++ b/src/sentry/types/region.py
+@@ -390,7 +390,7 @@ def get_cell_for_organization(organization_id_or_slug: str) -> Cell:
+ 
+ def get_local_locality() -> Locality:
+     """Get the locality for the cell this server instance is running in."""
+-    cell = get_local_region()
++    cell = get_local_cell()
+     locality = get_global_directory().get_locality_for_cell(cell.name)
+     if locality is None:
+         raise RegionResolutionError(f"No locality found for cell {cell.name!r}")
+@@ -408,7 +408,7 @@ def get_locality_name_for_cell(cell_name: str) -> str:
+     return locality.name
+ 
+ 
+-def get_local_region() -> Cell:
++def get_local_cell() -> Cell:
+     """Get the cell in which this server instance is running.
+ 
+     Return the monolith cell if this server instance is in monolith mode.
+@@ -437,6 +437,10 @@ def get_local_region() -> Cell:
+     return get_cell_by_name(settings.SENTRY_REGION)
+ 
+ 
++# TODO(cells): Remove alias once getsentry import sites are updated
++get_local_region = get_local_cell
++
++
+ @control_silo_function
+ def _find_orgs_for_user(user_id: int) -> set[int]:
+     from sentry.models.organizationmembermapping import OrganizationMemberMapping
+diff --git a/src/sentry/utils/snowflake.py b/src/sentry/utils/snowflake.py
+index cd9485029ec3a1..d8d5c7a0317337 100644
+--- a/src/sentry/utils/snowflake.py
++++ b/src/sentry/utils/snowflake.py
+@@ -13,7 +13,7 @@
+ from sentry_redis_tools.clients import RedisCluster, StrictRedis
+ 
+ from sentry.db.postgres.transactions import enforce_constraints
+-from sentry.types.region import RegionContextError, get_local_region
++from sentry.types.region import RegionContextError, get_local_cell
+ from sentry.utils import redis
+ 
+ if TYPE_CHECKING:
+@@ -117,7 +117,7 @@ def generate_snowflake_id(redis_key: str) -> int:
+     segment_values[VERSION_ID] = msb_0_ordering(settings.SNOWFLAKE_VERSION_ID, VERSION_ID.length)
+ 
+     try:
+-        segment_values[REGION_ID] = get_local_region().snowflake_id
++        segment_values[REGION_ID] = get_local_cell().snowflake_id
+     except RegionContextError:  # expected if running in monolith mode
+         segment_values[REGION_ID] = NULL_REGION_ID
+ 
+diff --git a/static/app/components/discover/transactionsList.spec.tsx b/static/app/components/discover/transactionsList.spec.tsx
+index f33d8848dc0fa4..1676965f677ff5 100644
+--- a/static/app/components/discover/transactionsList.spec.tsx
++++ b/static/app/components/discover/transactionsList.spec.tsx
+@@ -173,7 +173,7 @@ describe('TransactionsList', () => {
+       expect(screen.getByRole('button', {name: 'Next'})).toBeInTheDocument();
+ 
+       const gridCells = screen.getAllByTestId('grid-cell');
+-      expect(gridCells.map(e => e.textContent)).toEqual(['/a', '100', '/b', '1000']);
++      expect(gridCells.map(e => e.textContent)).toEqual(['/a', '100', '/b', '1,000']);
+     });
+ 
+     it('renders a trend view', async () => {
+@@ -294,7 +294,7 @@ describe('TransactionsList', () => {
+       expect(await screen.findByTestId('transactions-table')).toBeInTheDocument();
+ 
+       const gridCells = screen.getAllByTestId('grid-cell');
+-      expect(gridCells.map(e => e.textContent)).toEqual(['/a', '100', '/b', '1000']);
++      expect(gridCells.map(e => e.textContent)).toEqual(['/a', '100', '/b', '1,000']);
+ 
+       const filterDropdown = screen.getByRole('button', {
+         name: 'Filter Transactions',
+@@ -329,7 +329,7 @@ describe('TransactionsList', () => {
+         // now the sort is descending by count
+         expect(
+           screen.getAllByTestId('grid-cell').map(e => e.textContent?.trim())
+-        ).toEqual(['/b', '1000', '/a', '100']);
++        ).toEqual(['/b', '1,000', '/a', '100']);
+       });
+     });
+ 
+@@ -393,7 +393,7 @@ describe('TransactionsList', () => {
+       expect(screen.queryByTestId('loading-indicator')).not.toBeInTheDocument();
+ 
+       const gridCells = screen.getAllByTestId('grid-cell');
+-      expect(gridCells.map(e => e.textContent)).toEqual(['/a', '100', '/b', '1000']);
++      expect(gridCells.map(e => e.textContent)).toEqual(['/a', '100', '/b', '1,000']);
+     });
+   });
+ });
+diff --git a/static/app/components/issueDiff/index.spec.tsx b/static/app/components/issueDiff/index.spec.tsx
+index 4ce30400557b04..8b5e8eaee23396 100644
+--- a/static/app/components/issueDiff/index.spec.tsx
++++ b/static/app/components/issueDiff/index.spec.tsx
+@@ -45,12 +45,6 @@ describe('IssueDiff', () => {
+     MockApiClient.clearMockResponses();
+   });
+ 
+-  it('is loading when initially rendering', async () => {
+-    render(<IssueDiff baseIssueId="base" targetIssueId="target" />);
+-    expect(screen.queryByTestId('split-diff')).not.toBeInTheDocument();
+-    expect(await screen.findByTestId('split-diff')).toBeInTheDocument();
+-  });
+-
+   it('can dynamically import SplitDiff', async () => {
+     render(
+       <IssueDiff
+diff --git a/static/app/components/issueDiff/index.tsx b/static/app/components/issueDiff/index.tsx
+index 8e8f8d4ce0b23c..1a2c5c421cfe3d 100644
+--- a/static/app/components/issueDiff/index.tsx
++++ b/static/app/components/issueDiff/index.tsx
+@@ -1,12 +1,12 @@
+ import {lazy, useEffect, useMemo, useRef} from 'react';
+-import {css} from '@emotion/react';
+-import styled from '@emotion/styled';
+ import {useQuery} from '@tanstack/react-query';
+ 
++import {Flex} from '@sentry/scraps/layout';
++
+ import {isStacktraceNewestFirst} from 'sentry/components/events/interfaces/utils';
+ import LazyLoad from 'sentry/components/lazyLoad';
+ import LoadingError from 'sentry/components/loadingError';
+-import LoadingIndicator from 'sentry/components/loadingIndicator';
++import Placeholder from 'sentry/components/placeholder';
+ import {t} from 'sentry/locale';
+ import type {Event} from 'sentry/types/event';
+ import {trackAnalytics} from 'sentry/utils/analytics';
+@@ -16,6 +16,8 @@ import {useLocation} from 'sentry/utils/useLocation';
+ import useOrganization from 'sentry/utils/useOrganization';
+ 
+ const SplitDiffLazy = lazy(() => import('../splitDiff'));
++const STACKTRACE_SECTION_SEPARATOR = '\n\n';
++const SKELETON_ROW_COUNT = 8;
+ 
+ interface IssueDiffProps {
+   baseIssueId: string;
+@@ -26,6 +28,32 @@ interface IssueDiffProps {
+   targetEventId?: string;
+ }
+ 
++function getCombinedStacktrace({
++  event,
++  hasSimilarityEmbeddingsFeature,
++  newestFirst,
++}: {
++  event: Event | undefined;
++  hasSimilarityEmbeddingsFeature: boolean;
++  newestFirst: boolean;
++}): string {
++  if (!event) {
++    return '';
++  }
++
++  const stacktrace = getStacktraceBody({
++    event,
++    hasSimilarityEmbeddingsFeature,
++    includeLocation: false,
++    rawTrace: false,
++    newestFirst,
++    includeJSContext: true,
++  });
++
++  const orderedStacktrace = newestFirst ? stacktrace.toReversed() : stacktrace;
++  return orderedStacktrace.join(STACKTRACE_SECTION_SEPARATOR);
++}
++
+ export function IssueDiff({
+   baseIssueId,
+   targetIssueId,
+@@ -108,34 +136,26 @@ export function IssueDiff({
+     enabled: Boolean(resolvedTargetEventId),
+   });
+ 
+-  const baseStacktrace = useMemo(() => {
+-    if (!baseEventQuery.data) {
+-      return [];
+-    }
+-    return getStacktraceBody({
+-      event: baseEventQuery.data,
+-      hasSimilarityEmbeddingsFeature,
+-      includeLocation: false,
+-      rawTrace: false,
+-      newestFirst,
+-      includeJSContext: true,
+-    });
+-  }, [baseEventQuery.data, hasSimilarityEmbeddingsFeature, newestFirst]);
+-
+-  const targetStacktrace = useMemo(() => {
+-    if (!targetEventQuery.data) {
+-      return [];
+-    }
+-
+-    return getStacktraceBody({
+-      event: targetEventQuery.data,
++  const {combinedBase, combinedTarget} = useMemo(
++    () => ({
++      combinedBase: getCombinedStacktrace({
++        event: baseEventQuery.data,
++        hasSimilarityEmbeddingsFeature,
++        newestFirst,
++      }),
++      combinedTarget: getCombinedStacktrace({
++        event: targetEventQuery.data,
++        hasSimilarityEmbeddingsFeature,
++        newestFirst,
++      }),
++    }),
++    [
++      baseEventQuery.data,
++      targetEventQuery.data,
+       hasSimilarityEmbeddingsFeature,
+-      includeLocation: false,
+-      rawTrace: false,
+       newestFirst,
+-      includeJSContext: true,
+-    });
+-  }, [targetEventQuery.data, hasSimilarityEmbeddingsFeature, newestFirst]);
++    ]
++  );
+ 
+   useEffect(() => {
+     if (
+@@ -164,61 +184,63 @@ export function IssueDiff({
+     targetEventQuery.data,
+   ]);
+ 
+-  const baseArray = useMemo(() => {
+-    return newestFirst ? baseStacktrace.toReversed() : baseStacktrace;
+-  }, [baseStacktrace, newestFirst]);
+-
+-  const targetArray = useMemo(() => {
+-    return newestFirst ? targetStacktrace.toReversed() : targetStacktrace;
+-  }, [newestFirst, targetStacktrace]);
+-
+   const hasError =
+     baseLatestQuery.isError ||
+     targetLatestQuery.isError ||
+     baseEventQuery.isError ||
+     targetEventQuery.isError;
+ 
+-  const loading = baseEventQuery.isPending || targetEventQuery.isPending;
++  const isLoading = baseEventQuery.isPending || targetEventQuery.isPending;
+ 
+   if (hasError) {
+     return (
+-      <StyledIssueDiff isLoading={false}>
++      <Flex background="secondary" overflow="auto" padding="md" direction="column">
+         <LoadingError message={t('Error loading events')} />
+-      </StyledIssueDiff>
++      </Flex>
+     );
+   }
+ 
++  if (isLoading) {
++    return <IssueDiffLoadingState />;
++  }
++
+   return (
+-    <StyledIssueDiff isLoading={loading}>
+-      {loading ? (
+-        <LoadingIndicator />
+-      ) : (
+-        baseArray.map((value: string, index: number) => (
+-          <LazyLoad
+-            key={index}
+-            LazyComponent={SplitDiffLazy}
+-            base={value}
+-            target={targetArray[index] ?? ''}
+-            type="lines"
+-          />
+-        ))
+-      )}
+-    </StyledIssueDiff>
++    <Flex background="secondary" overflow="auto" padding="md" direction="column">
++      <LazyLoad
++        LazyComponent={SplitDiffLazy}
++        base={combinedBase}
++        target={combinedTarget}
++        type="lines"
++        loadingFallback={<IssueDiffLoadingSkeletonRows />}
++      />
++    </Flex>
+   );
+ }
+ 
+-const StyledIssueDiff = styled('div')<{isLoading: boolean}>`
+-  background-color: ${p => p.theme.tokens.background.secondary};
+-  overflow: auto;
+-  padding: ${p => p.theme.space.md};
+-  display: flex;
+-  flex-direction: column;
+-
+-  ${p =>
+-    p.isLoading &&
+-    css`
+-      background-color: ${p.theme.tokens.background.primary};
+-      justify-content: center;
+-      align-items: center;
+-    `};
+-`;
++function IssueDiffLoadingState() {
++  return (
++    <Flex
++      background="primary"
++      overflow="auto"
++      padding="md"
++      direction="column"
++      data-test-id="issue-diff-loading-skeleton"
++    >
++      <IssueDiffLoadingSkeletonRows />
++    </Flex>
++  );
++}
++
++function IssueDiffLoadingSkeletonRows() {
++  return (
++    <Flex direction="column" gap="sm">
++      {Array.from({length: SKELETON_ROW_COUNT}).map((_, index) => (
++        <Flex key={index} align="center">
++          <Placeholder height="18px" style={{flex: 1}} />
++          <Flex width="20px" flexShrink={0} />
++          <Placeholder height="18px" style={{flex: 1}} />
++        </Flex>
++      ))}
++    </Flex>
++  );
++}
+diff --git a/static/app/components/splitDiff.spec.tsx b/static/app/components/splitDiff.spec.tsx
+index 306b5504ccce19..1a94f0b3a422a3 100644
+--- a/static/app/components/splitDiff.spec.tsx
++++ b/static/app/components/splitDiff.spec.tsx
+@@ -11,13 +11,13 @@ baz`;
+ 
+     render(<SplitDiff base={base} target={target} />);
+ 
+-    const rows = within(screen.getByTestId('split-diff')).getAllByRole('row');
+-    const firstRowCells = within(rows[0]!).getAllByRole('cell');
+-    const secondRowCells = within(rows[1]!).getAllByRole('cell');
++    const diff = screen.getByTestId('split-diff');
++    const leftCells = within(diff).getAllByTestId('split-diff-left-cell');
++    const rightCells = within(diff).getAllByTestId('split-diff-right-cell');
+ 
+-    expect(firstRowCells[0]).toHaveTextContent('foo');
+-    expect(firstRowCells[2]).toHaveTextContent('foo');
+-    expect(secondRowCells[0]).toHaveTextContent('bar');
+-    expect(secondRowCells[2]).toHaveTextContent('baz');
++    expect(leftCells[0]).toHaveTextContent('foo');
++    expect(rightCells[0]).toHaveTextContent('foo');
++    expect(leftCells[1]).toHaveTextContent('bar');
++    expect(rightCells[1]).toHaveTextContent('baz');
+   });
+ });
+diff --git a/static/app/components/splitDiff.tsx b/static/app/components/splitDiff.tsx
+index e109e407a404bf..78ba1f94054781 100644
+--- a/static/app/components/splitDiff.tsx
++++ b/static/app/components/splitDiff.tsx
+@@ -3,8 +3,6 @@ import styled from '@emotion/styled';
+ import type {Change} from 'diff';
+ import {diffChars, diffLines, diffWords} from 'diff';
+ 
+-import {Flex} from '@sentry/scraps/layout';
+-
+ import {unreachable} from 'sentry/utils/unreachable';
+ 
+ // @TODO(jonasbadalic): This used to be defined on the theme, but is component specific and lacks dark mode.
+@@ -94,73 +92,103 @@ function SplitDiff({className, type = 'lines', base, target}: Props) {
+     return processedLines;
+   }, [base, target, type]);
+ 
++  const displayRows = useMemo(
++    () =>
++      groupedChanges.map(line => {
++        const highlightAdded = line.find(result => result.added);
++        const highlightRemoved = line.find(result => result.removed);
++        const displayData = getDisplayData(line, highlightAdded, highlightRemoved);
++
++        return {
++          highlightAdded,
++          highlightRemoved,
++          leftSegments: displayData.filter(result => !result.added),
++          rightSegments: displayData.filter(result => !result.removed),
++        };
++      }),
++    [groupedChanges]
++  );
++
+   return (
+-    <SplitTable className={className} data-test-id="split-diff">
++    <SplitDiffContainer className={className} data-test-id="split-diff">
+       <SplitBody>
+-        {groupedChanges.map((line, j) => {
+-          const highlightAdded = line.find(result => result.added);
+-          const highlightRemoved = line.find(result => result.removed);
++        {displayRows.map((row, j) => {
++          return (
++            <Cell
++              key={`left-${j}`}
++              data-test-id="split-diff-left-cell"
++              row={j + 1}
++              side="left"
++              isRemoved={row.highlightRemoved}
++            >
++              <Line>
++                {row.leftSegments.map((result, i) => (
++                  <Word key={i} isRemoved={result.removed}>
++                    {result.value}
++                  </Word>
++                ))}
++              </Line>
++            </Cell>
++          );
++        })}
+ 
++        {displayRows.map((row, j) => {
+           return (
+-            <tr key={j}>
+-              <Cell isRemoved={highlightRemoved}>
+-                <Flex wrap="wrap">
+-                  {getDisplayData(line, highlightAdded, highlightRemoved)
+-                    .filter(result => !result.added)
+-                    .map((result, i) => (
+-                      <Word key={i} isRemoved={result.removed}>
+-                        {result.value}
+-                      </Word>
+-                    ))}
+-                </Flex>
+-              </Cell>
+-
+-              <Gap />
+-
+-              <Cell isAdded={highlightAdded}>
+-                <Flex wrap="wrap">
+-                  {getDisplayData(line, highlightAdded, highlightRemoved)
+-                    .filter(result => !result.removed)
+-                    .map((result, i) => (
+-                      <Word key={i} isAdded={result.added}>
+-                        {result.value}
+-                      </Word>
+-                    ))}
+-                </Flex>
+-              </Cell>
+-            </tr>
++            <Cell
++              key={`right-${j}`}
++              data-test-id="split-diff-right-cell"
++              row={j + 1}
++              side="right"
++              isAdded={row.highlightAdded}
++            >
++              <Line>
++                {row.rightSegments.map((result, i) => (
++                  <Word key={i} isAdded={result.added}>
++                    {result.value}
++                  </Word>
++                ))}
++              </Line>
++            </Cell>
+           );
+         })}
+       </SplitBody>
+-    </SplitTable>
++    </SplitDiffContainer>
+   );
+ }
+ 
+-const SplitTable = styled('table')`
+-  table-layout: fixed;
+-  border-collapse: collapse;
++const SplitDiffContainer = styled('div')`
+   width: 100%;
+ `;
+ 
+-const SplitBody = styled('tbody')`
++const SplitBody = styled('div')`
+   font-family: ${p => p.theme.font.family.mono};
+   font-size: ${p => p.theme.font.size.sm};
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr);
+ `;
+ 
+-const Cell = styled('td')<{isAdded?: Change; isRemoved?: Change}>`
+-  vertical-align: top;
++const Cell = styled('div')<{
++  row: number;
++  side: 'left' | 'right';
++  isAdded?: Change;
++  isRemoved?: Change;
++}>`
++  grid-row: ${p => p.row};
++  grid-column: ${p => (p.side === 'left' ? 1 : 3)};
++  min-width: 0;
++  min-height: 1.4em;
+   overflow: hidden;
+   ${p => p.isRemoved && `background-color: ${DIFF_COLORS.removedRow}`};
+   ${p => p.isAdded && `background-color: ${DIFF_COLORS.addedRow}`};
+ `;
+ 
+-const Gap = styled('td')`
+-  width: 20px;
++const Line = styled('div')`
++  white-space: pre-wrap;
+ `;
+ 
+ const Word = styled('span')<{isAdded?: boolean; isRemoved?: boolean}>`
+   white-space: pre-wrap;
+-  word-break: break-all;
++  overflow-wrap: anywhere;
+   ${p => p.isRemoved && `background-color: ${DIFF_COLORS.removed}`};
+   ${p => p.isAdded && `background-color: ${DIFF_COLORS.added}`};
+ `;
+diff --git a/static/app/utils/discover/fieldRenderers.tsx b/static/app/utils/discover/fieldRenderers.tsx
+index 8d5dab42449851..83dcee57ba980d 100644
+--- a/static/app/utils/discover/fieldRenderers.tsx
++++ b/static/app/utils/discover/fieldRenderers.tsx
+@@ -32,8 +32,8 @@ import {defined} from 'sentry/utils';
+ import {trackAnalytics} from 'sentry/utils/analytics';
+ import toArray from 'sentry/utils/array/toArray';
+ import {browserHistory} from 'sentry/utils/browserHistory';
+-import type {EventData, MetaType} from 'sentry/utils/discover/eventView';
+ import type EventView from 'sentry/utils/discover/eventView';
++import type {EventData, MetaType} from 'sentry/utils/discover/eventView';
+ import type {RateUnit} from 'sentry/utils/discover/fields';
+ import {
+   ABYTE_UNITS,
+@@ -303,7 +303,11 @@ export const FIELD_FORMATTERS: FieldFormatters = {
+     isSortable: true,
+     renderFunc: (field, data) => (
+       <NumberContainer>
+-        {typeof data[field] === 'number' ? formatFloat(data[field], 4) : emptyValue}
++        {typeof data[field] === 'number'
++          ? formatFloat(data[field], 4).toLocaleString(undefined, {
++              maximumFractionDigits: 4,
++            })
++          : emptyValue}
+       </NumberContainer>
+     ),
+   },
+diff --git a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.spec.tsx b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.spec.tsx
+index e95cc8635914e3..0caac049ebc53e 100644
+--- a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.spec.tsx
++++ b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.spec.tsx
+@@ -20,6 +20,8 @@ describe('formatYAxisValue', () => {
+       [0.00003, '0.00003'],
+       [17.1238, '17.1238'],
+       [170, '170'],
++      [17111, '17K'],
++      [17_000_110, '17M'],
+       [1772313.1, '1,772,313.1'],
+       [1772313.11123, '1,772,313.11123'],
+     ])('Formats %s as %s', (value, formattedValue) => {
+diff --git a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.tsx b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.tsx
+index 0d56a03594cb4a..5af1d54f1169d3 100644
+--- a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.tsx
++++ b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatYAxisValue.tsx
+@@ -55,6 +55,9 @@ export function formatYAxisValue(value: number, type: string, unit?: string): st
+     case 'integer':
+       return formatAbbreviatedNumber(value);
+     case 'number':
++      if (Number.isInteger(value)) {
++        return formatAbbreviatedNumber(value);
++      }
+       return value.toLocaleString(undefined, {
+         maximumFractionDigits: 20,
+       });
+diff --git a/static/app/views/insights/mobile/screens/views/screenDetailsPage.tsx b/static/app/views/insights/mobile/screens/views/screenDetailsPage.tsx
+index 9f739c9bcb23f2..b147984da38e19 100644
+--- a/static/app/views/insights/mobile/screens/views/screenDetailsPage.tsx
++++ b/static/app/views/insights/mobile/screens/views/screenDetailsPage.tsx
+@@ -132,7 +132,9 @@ function ScreenDetailsPage() {
+               module={moduleName}
+               hideDefaultTabs
+               tabs={{tabList, value: selectedTabKey, onTabChange: handleTabChange}}
+-              headerActions={isProjectCrossPlatform && <PlatformSelector />}
++              headerActions={
++                isProjectCrossPlatform && !hasPlatformizedInsights && <PlatformSelector />
++              }
+               headerTitle={transactionName}
+               breadcrumbs={[
+                 {
+diff --git a/static/app/views/insights/pages/mobile/layout.tsx b/static/app/views/insights/pages/mobile/layout.tsx
+index 615ade688c4e95..60a07f873c0723 100644
+--- a/static/app/views/insights/pages/mobile/layout.tsx
++++ b/static/app/views/insights/pages/mobile/layout.tsx
+@@ -2,6 +2,7 @@ import {Fragment} from 'react';
+ import {Outlet, useMatches} from 'react-router-dom';
+ 
+ import {PageHeadingQuestionTooltip} from 'sentry/components/pageHeadingQuestionTooltip';
++import useHasPlatformizedInsights from 'sentry/views/insights/common/utils/useHasPlatformizedInsights';
+ import useCrossPlatformProject from 'sentry/views/insights/mobile/common/queries/useCrossPlatformProject';
+ import {PlatformSelector} from 'sentry/views/insights/mobile/screenload/components/platformSelector';
+ import {
+@@ -14,6 +15,7 @@ import {ModuleName} from 'sentry/views/insights/types';
+ 
+ function MobileVitalsHeader() {
+   const {isProjectCrossPlatform} = useCrossPlatformProject();
++  const hasPlatformizedInsights = useHasPlatformizedInsights();
+ 
+   return (
+     <MobileHeader
+@@ -26,7 +28,9 @@ function MobileVitalsHeader() {
+           />
+         </Fragment>
+       }
+-      headerActions={isProjectCrossPlatform && <PlatformSelector />}
++      headerActions={
++        isProjectCrossPlatform && !hasPlatformizedInsights && <PlatformSelector />
++      }
+       module={ModuleName.MOBILE_VITALS}
+     />
+   );
+diff --git a/static/app/views/seerExplorer/utils.tsx b/static/app/views/seerExplorer/utils.tsx
+index af1c728a2b49e7..9eace7b4d774ee 100644
+--- a/static/app/views/seerExplorer/utils.tsx
++++ b/static/app/views/seerExplorer/utils.tsx
+@@ -115,27 +115,46 @@ const TOOL_FORMATTERS: Record<string, ToolFormatter> = {
+   },
+ 
+   get_issue_details: (args, isLoading) => {
+-    const {issue_id, event_id, start, end} = args;
++    const {short_id, issue_id, start, end, event_id} = args;
+ 
+-    if (issue_id) {
++    if (event_id) {
++      // event_id only present in some older versions (issue_and_event_details)
++      return isLoading
++        ? `Inspecting event ${event_id.slice(0, 8)}...`
++        : `Inspected event ${event_id.slice(0, 8)}`;
++    }
++
++    if (short_id || issue_id) {
+       if (start && end) {
+         return isLoading
+-          ? `Inspecting issue ${issue_id} between ${start} to ${end}...`
+-          : `Inspected issue ${issue_id} between ${start} to ${end}`;
++          ? `Inspecting issue ${short_id || issue_id} between ${start} to ${end}...`
++          : `Inspected issue ${short_id || issue_id} between ${start} to ${end}`;
+       }
+       return isLoading
+-        ? `Inspecting issue ${issue_id}...`
+-        : `Inspected issue ${issue_id}`;
++        ? `Inspecting issue ${short_id || issue_id}...`
++        : `Inspected issue ${short_id || issue_id}`;
+     }
++    return isLoading ? `Inspecting issue...` : `Inspected issue`;
++  },
+ 
+-    if (event_id) {
++  get_event_details: (args, isLoading) => {
++    const {selected_event, issue_id, start, end} = args;
++    if (selected_event) {
++      if (selected_event === 'recommended' && issue_id) {
++        if (start && end) {
++          return isLoading
++            ? `Inspecting recommended event for issue ${issue_id} between ${start} to ${end}...`
++            : `Inspected recommended event for issue ${issue_id} between ${start} to ${end}`;
++        }
++        return isLoading
++          ? `Inspecting recommended event for issue ${issue_id}...`
++          : `Inspected recommended event for issue ${issue_id}`;
++      }
+       return isLoading
+-        ? `Inspecting event ${event_id.slice(0, 8)}...`
+-        : `Inspected event ${event_id.slice(0, 8)}`;
++        ? `Inspecting event ${selected_event.slice(0, 8)}...`
++        : `Inspected event ${selected_event.slice(0, 8)}`;
+     }
+-
+-    // Should not happen unless there's a bug.
+-    return isLoading ? `Inspecting issue...` : `Inspected issue`;
++    return isLoading ? `Inspecting event...` : `Inspected event`;
+   },
+ 
+   code_search: (args, isLoading) => {
+@@ -468,6 +487,18 @@ export function toggleSeerExplorerPanel(): void {
+   document.dispatchEvent(keyboardEvent);
+ }
+ 
++/**
++ * Validate an ISO string and return it with 'Z' suffix stripped.
++ * Returns undefined if invalid.
++ */
++function validateIso(val: unknown): string | undefined {
++  if (!val || typeof val !== 'string') {
++    return undefined;
++  }
++  const d = new Date(val);
++  return isNaN(d.getTime()) ? undefined : d.toISOString().replace(/Z$/, '');
++}
++
+ /**
+  * Build a URL/LocationDescriptor for a tool link based on its kind and params
+  */
+@@ -634,10 +665,31 @@ export function buildToolLinkUrl(
+       };
+     }
+     case 'get_issue_details': {
+-      const {event_id, issue_id} = toolLink.params;
++      const {issue_id, start, end, event_id} = toolLink.params;
++      const query = {
++        start: validateIso(start),
++        end: validateIso(end),
++      };
++
++      if (issue_id) {
++        if (event_id) {
++          // Should only be present in older version (get_issue_and_event_details)
++          return {pathname: `/issues/${issue_id}/events/${event_id}/`, query};
++        }
++        return {pathname: `/issues/${issue_id}/`, query};
++      }
++
++      return null;
++    }
++    case 'get_event_details': {
++      const {event_id, issue_id, start, end} = toolLink.params;
+ 
+       if (event_id && issue_id) {
+-        return {pathname: `/issues/${issue_id}/events/${event_id}/`};
++        const query = {
++          start: validateIso(start),
++          end: validateIso(end),
++        };
++        return {pathname: `/issues/${issue_id}/events/${event_id}/`, query};
+       }
+ 
+       return null;
+diff --git a/tests/sentry/hybridcloud/models/test_outbox.py b/tests/sentry/hybridcloud/models/test_outbox.py
+index 10a1dccf87b71e..6a09c911772910 100644
+--- a/tests/sentry/hybridcloud/models/test_outbox.py
++++ b/tests/sentry/hybridcloud/models/test_outbox.py
+@@ -28,7 +28,7 @@
+ from sentry.testutils.helpers.datetime import freeze_time
+ from sentry.testutils.outbox import outbox_runner
+ from sentry.testutils.silo import assume_test_silo_mode, assume_test_silo_mode_of, control_silo_test
+-from sentry.types.region import Cell, RegionCategory, get_local_region
++from sentry.types.region import Cell, RegionCategory, get_local_cell
+ from sentry.users.models.user import User
+ 
+ 
+@@ -76,7 +76,7 @@ def test_control_sharding_keys(self) -> None:
+         user2 = Factories.create_user()
+ 
+         with assume_test_silo_mode(SiloMode.REGION):
+-            expected_region_name = get_local_region().name
++            expected_region_name = get_local_cell().name
+             om = OrganizationMember.objects.create(
+                 organization_id=org.id,
+                 user_id=user1.id,
+diff --git a/tests/sentry/hybridcloud/rpc/test_caching.py b/tests/sentry/hybridcloud/rpc/test_caching.py
+index c43e7c0cd437de..b514db2dd95d07 100644
+--- a/tests/sentry/hybridcloud/rpc/test_caching.py
++++ b/tests/sentry/hybridcloud/rpc/test_caching.py
+@@ -20,7 +20,7 @@
+ from sentry.testutils.factories import Factories
+ from sentry.testutils.pytest.fixtures import django_db_all
+ from sentry.testutils.silo import assume_test_silo_mode, control_silo_test, no_silo_test
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ from sentry.users.services.user import RpcUser
+ from sentry.users.services.user.service import user_service
+ 
+@@ -52,7 +52,7 @@ def get_user(user_id: int) -> RpcUser:
+         assert next_user == old_u
+ 
+         region_caching_service.clear_key(
+-            region_name=get_local_region().name, key=get_user.key_from(old_u.id)
++            region_name=get_local_cell().name, key=get_user.key_from(old_u.id)
+         )
+ 
+     cached_users = [get_user.get_one(u.id) for u in users]
+@@ -193,7 +193,7 @@ def get_users(user_ids: list[int]) -> list[RpcUser]:
+         assert not u.username.endswith("moo")
+         # Clear cache simulating outbox logic
+         region_caching_service.clear_key(
+-            region_name=get_local_region().name, key=get_users.key_from(u.id)
++            region_name=get_local_cell().name, key=get_users.key_from(u.id)
+         )
+ 
+     cached_users = sorted(get_users(user_ids), key=lambda u: u.id)
+@@ -272,7 +272,7 @@ def get_users(user_ids: list[int]) -> list[RpcUser]:
+     # Clear cache to simulate outbox processing
+     for user in users:
+         region_caching_service.clear_key(
+-            region_name=get_local_region().name, key=get_users.key_from(user.id)
++            region_name=get_local_cell().name, key=get_users.key_from(user.id)
+         )
+ 
+     # Read from the cache directly and drain the generator
+diff --git a/tests/sentry/hybridcloud/services/test_control_organization_provisioning.py b/tests/sentry/hybridcloud/services/test_control_organization_provisioning.py
+index 37a69c6214a3ac..c6379c356203ee 100644
+--- a/tests/sentry/hybridcloud/services/test_control_organization_provisioning.py
++++ b/tests/sentry/hybridcloud/services/test_control_organization_provisioning.py
+@@ -24,7 +24,7 @@
+ from sentry.silo.base import SiloMode
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.silo import all_silo_test, assume_test_silo_mode, create_test_regions
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ from sentry.utils.security.orgauthtoken_token import hash_token
+ 
+ 
+@@ -36,7 +36,7 @@ def setUp(self) -> None:
+         )
+ 
+         self.region_name = (
+-            "us" if SiloMode.get_current_mode() == SiloMode.CONTROL else get_local_region().name
++            "us" if SiloMode.get_current_mode() == SiloMode.CONTROL else get_local_cell().name
+         )
+ 
+     def generate_provisioning_args(
+diff --git a/tests/sentry/hybridcloud/test_organizationmapping.py b/tests/sentry/hybridcloud/test_organizationmapping.py
+index e7653aa4b75b3b..cbe4bc0768167e 100644
+--- a/tests/sentry/hybridcloud/test_organizationmapping.py
++++ b/tests/sentry/hybridcloud/test_organizationmapping.py
+@@ -23,7 +23,7 @@
+     create_test_regions,
+     region_silo_test,
+ )
+-from sentry.types.region import get_local_region
++from sentry.types.region import get_local_cell
+ 
+ 
+ def assert_matching_organization_mapping(
+@@ -211,7 +211,7 @@ def test_replicates_all_flags(self) -> None:
+         organization_mapping_service.upsert(
+             organization_id=self.organization.id,
+             update=update_organization_mapping_from_instance(
+-                organization=self.organization, region=get_local_region()
++                organization=self.organization, region=get_local_cell()
+             ),
+         )
+ 
+diff --git a/tests/sentry/types/test_region.py b/tests/sentry/types/test_region.py
+index 7d553702566fed..8997ae999f8c8c 100644
+--- a/tests/sentry/types/test_region.py
++++ b/tests/sentry/types/test_region.py
+@@ -26,7 +26,7 @@
+     find_regions_for_user,
+     get_cell_by_name,
+     get_cell_for_organization,
+-    get_local_region,
++    get_local_cell,
+     load_from_config,
+     subdomain_is_locality,
+ )
+@@ -96,21 +96,21 @@ def test_region_config_parsing_in_control(self) -> None:
+         assert directory.cells == frozenset(self._EXPECTED_OUTPUTS)
+ 
+     @override_settings(SILO_MODE=SiloMode.REGION, SENTRY_REGION="us")
+-    def test_get_local_region(self) -> None:
++    def test_get_local_cell(self) -> None:
+         with override_settings(SENTRY_MONOLITH_REGION="us"):
+             directory = load_from_config(self._INPUTS, [])
+         with self._in_global_state(directory):
+-            assert get_local_region() == self._EXPECTED_OUTPUTS[0]
++            assert get_local_cell() == self._EXPECTED_OUTPUTS[0]
+ 
+     def test_get_generated_monolith_region(self) -> None:
+         with (
+             override_settings(SILO_MODE=SiloMode.MONOLITH, SENTRY_MONOLITH_REGION="defaultland"),
+             self._in_global_state(load_from_config([], [])),
+         ):
+-            local_region = get_local_region()
+-            assert local_region.name == "defaultland"
+-            assert local_region.snowflake_id == 0
+-            assert local_region.category == RegionCategory.MULTI_TENANT
++            local_cell = get_local_cell()
++            assert local_cell.name == "defaultland"
++            assert local_cell.snowflake_id == 0
++            assert local_cell.category == RegionCategory.MULTI_TENANT
+ 
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+     @unguarded_write(using=router.db_for_write(OrganizationMapping))

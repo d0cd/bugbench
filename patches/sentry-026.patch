@@ -1,42 +1,402 @@
-diff --git a/src/sentry/objectstore/endpoints/organization.py b/src/sentry/objectstore/endpoints/organization.py
-index 0f3012f6b26..e8115ee015e 100644
---- a/src/sentry/objectstore/endpoints/organization.py
-+++ b/src/sentry/objectstore/endpoints/organization.py
-@@ -25,6 +25,7 @@ from sentry.api.api_owners import ApiOwner
- from sentry.api.api_publish_status import ApiPublishStatus
- from sentry.api.base import region_silo_endpoint
- from sentry.api.bases import OrganizationEndpoint
-+from sentry.api.bases.organization import OrganizationReleasePermission
- from sentry.models.organization import Organization
- from sentry.objectstore import parse_accept_encoding
+diff --git a/src/sentry/integrations/perforce/client.py b/src/sentry/integrations/perforce/client.py
+index 2af04bd3bb4eeb..5527f51a65fd57 100644
+--- a/src/sentry/integrations/perforce/client.py
++++ b/src/sentry/integrations/perforce/client.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
  
-@@ -38,6 +39,7 @@ class OrganizationObjectstoreEndpoint(OrganizationEndpoint):
-         "DELETE": ApiPublishStatus.EXPERIMENTAL,
+ import logging
++import tempfile
+ from collections.abc import Generator, Sequence
+ from contextlib import contextmanager
+ from datetime import datetime, timezone
+@@ -132,6 +133,8 @@ def _connect(self) -> Generator[P4]:
+         Context manager for P4 connections with automatic cleanup.
+ 
+         Yields a connected P4 instance and ensures disconnection on exit.
++        Uses a per-connection temporary directory for P4TRUST to avoid
++        lock contention between concurrent connections from different tenants.
+ 
+         Uses P4Python API:
+         - p4.connect(): https://www.perforce.com/manuals/p4python/Content/P4Python/python.programming.html#python.programming.connecting
+@@ -142,84 +145,91 @@ def _connect(self) -> Generator[P4]:
+             with self._connect() as p4:
+                 result = p4.run("info")
+         """
+-        p4 = P4()
+-        p4.port = self.p4port
+-        p4.user = self.user
+-        p4.password = self.password
+-
+-        if self.client_name:
+-            p4.client = self.client_name
+-
+-        p4.exception_level = 1  # Only errors raise exceptions
+-
+-        # Connect to Perforce server
+-        try:
+-            p4.connect()
+-        except P4Exception as e:
+-            error_msg = str(e)
+-            # Provide helpful error message for connection failures
+-            if "SSL" in error_msg or "trust" in error_msg.lower():
+-                raise ApiError(
+-                    f"Failed to connect to Perforce (SSL issue): {error_msg}. "
+-                    f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
+-                )
+-            raise ApiError(f"Failed to connect to Perforce: {error_msg}")
+-
+-        # Assert SSL trust after connection (if needed)
+-        # This must be done after p4.connect() but before p4.run_login()
+-        if self.ssl_fingerprint and self.p4port.startswith("ssl"):
++        # Use a temporary directory for P4TRUST and P4TICKETS to isolate each
++        # connection. Without this, all connections share ~/.p4trust and its
++        # lock file (~/.p4trust.lck), causing lock contention and failures
++        # when multiple tenants connect concurrently.
++        with tempfile.TemporaryDirectory(prefix="sentry-p4-") as tmpdir:
++            p4 = P4()
++            p4.port = self.p4port
++            p4.user = self.user
++            p4.password = self.password
++            p4.trust_file = f"{tmpdir}/.p4trust"
++            p4.ticket_file = f"{tmpdir}/.p4tickets"
++
++            if self.client_name:
++                p4.client = self.client_name
++
++            p4.exception_level = 1  # Only errors raise exceptions
++
++            # Connect to Perforce server
+             try:
+-                p4.run_trust("-i", self.ssl_fingerprint)
+-            except P4Exception as trust_error:
++                p4.connect()
++            except P4Exception as e:
++                error_msg = str(e)
++                # Provide helpful error message for connection failures
++                if "SSL" in error_msg or "trust" in error_msg.lower():
++                    raise ApiError(
++                        f"Failed to connect to Perforce (SSL issue): {error_msg}. "
++                        f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
++                    )
++                raise ApiError(f"Failed to connect to Perforce: {error_msg}")
++
++            # Assert SSL trust after connection (if needed)
++            # This must be done after p4.connect() but before p4.run_login()
++            if self.ssl_fingerprint and self.p4port.startswith("ssl"):
+                 try:
+-                    p4.disconnect()
+-                except Exception:
+-                    pass
+-                raise ApiError(
+-                    f"Failed to establish SSL trust: {trust_error}. "
+-                    f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
+-                )
++                    p4.run_trust("-i", self.ssl_fingerprint)
++                except P4Exception as trust_error:
++                    try:
++                        p4.disconnect()
++                    except Exception:
++                        pass
++                    raise ApiError(
++                        f"Failed to establish SSL trust: {trust_error}. "
++                        f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
++                    )
+ 
+-        # Authenticate based on auth_type
+-        # - password: Requires run_login() to exchange password for session ticket
+-        # - ticket: Already authenticated via p4.password, no login needed
+-        if self.password and self.auth_type == "password":
+-            try:
+-                p4.run_login()
+-            except P4Exception as login_error:
++            # Authenticate based on auth_type
++            # - password: Requires run_login() to exchange password for session ticket
++            # - ticket: Already authenticated via p4.password, no login needed
++            if self.password and self.auth_type == "password":
+                 try:
+-                    p4.disconnect()
+-                except Exception:
+-                    pass
+-                raise ApiUnauthorized(
+-                    f"Failed to authenticate with Perforce: {login_error}. "
+-                    "Verify your password is correct."
+-                )
+-        elif self.password and self.auth_type == "ticket":
+-            # Ticket authentication: p4.password is already set to the ticket
+-            # Verify ticket works by running a test command
+-            try:
+-                p4.run("info")
+-            except P4Exception as e:
++                    p4.run_login()
++                except P4Exception as login_error:
++                    try:
++                        p4.disconnect()
++                    except Exception:
++                        pass
++                    raise ApiUnauthorized(
++                        f"Failed to authenticate with Perforce: {login_error}. "
++                        "Verify your password is correct."
++                    )
++            elif self.password and self.auth_type == "ticket":
++                # Ticket authentication: p4.password is already set to the ticket
++                # Verify ticket works by running a test command
+                 try:
+-                    p4.disconnect()
+-                except Exception:
+-                    pass
+-                raise ApiUnauthorized(
+-                    f"Failed to authenticate with Perforce ticket: {e}. "
+-                    "Verify your P4 ticket is valid. Obtain a new ticket with: p4 login -p"
+-                )
++                    p4.run("info")
++                except P4Exception as e:
++                    try:
++                        p4.disconnect()
++                    except Exception:
++                        pass
++                    raise ApiUnauthorized(
++                        f"Failed to authenticate with Perforce ticket: {e}. "
++                        "Verify your P4 ticket is valid. Obtain a new ticket with: p4 login -p"
++                    )
+ 
+-        try:
+-            yield p4
+-        finally:
+-            # Ensure cleanup
+             try:
+-                if p4.connected():
+-                    p4.disconnect()
+-            except Exception as e:
+-                # Log disconnect failures as they may indicate connection leaks
+-                logger.warning("Failed to disconnect from Perforce: %s", e, exc_info=True)
++                yield p4
++            finally:
++                # Ensure cleanup
++                try:
++                    if p4.connected():
++                        p4.disconnect()
++                except Exception as e:
++                    # Log disconnect failures as they may indicate connection leaks
++                    logger.warning("Failed to disconnect from Perforce: %s", e, exc_info=True)
+ 
+     def check_file(self, repo: Repository, path: str, version: str | None) -> object | None:
+         """
+diff --git a/src/sentry/spans/buffer_logger.py b/src/sentry/spans/buffer_logger.py
+index c0bc3b6f7d42b0..641efbd3de7c26 100644
+--- a/src/sentry/spans/buffer_logger.py
++++ b/src/sentry/spans/buffer_logger.py
+@@ -331,6 +331,10 @@ def emit_observability_metrics(
+         )
+ 
+     if oversized_count > 0:
++        logger.info(
++            "Parent span set oversized, skipping SUNIONSTORE",
++            extra={"oversized_count": oversized_count},
++        )
+         metrics.incr(
+             "spans.buffer.process_spans.parent_span_set_already_oversized.count",
+             amount=oversized_count,
+diff --git a/static/app/views/dashboards/datasetConfig/spans.tsx b/static/app/views/dashboards/datasetConfig/spans.tsx
+index bc30fc00cdb887..cca58ad92ad471 100644
+--- a/static/app/views/dashboards/datasetConfig/spans.tsx
++++ b/static/app/views/dashboards/datasetConfig/spans.tsx
+@@ -45,6 +45,7 @@ import {
+ import {combineBaseFieldsWithTags} from 'sentry/views/dashboards/datasetConfig/utils/combineBaseFieldsWithEapTags';
+ import {DisplayType, type WidgetQuery} from 'sentry/views/dashboards/types';
+ import {
++  isEventsStats,
+   isGroupedMultiSeriesEventsStats,
+   isMultiSeriesEventsStats,
+ } from 'sentry/views/dashboards/utils/isEventsStats';
+@@ -194,7 +195,16 @@ function extractSeriesMetadata<T>({
      }
-     owner = ApiOwner.FOUNDATIONAL_STORAGE
-+    permission_classes = (OrganizationReleasePermission,)
-     parser_classes = ()  # don't attempt to parse request data, so we can access the raw body in wsgi.input
+   });
  
-     def _check_flag(self, request: Request, organization: Organization) -> Response | None:
-diff --git a/tests/sentry/objectstore/endpoints/test_organization.py b/tests/sentry/objectstore/endpoints/test_organization.py
-index cd6c0abf36d..1b3b9feba45 100644
---- a/tests/sentry/objectstore/endpoints/test_organization.py
-+++ b/tests/sentry/objectstore/endpoints/test_organization.py
-@@ -40,7 +40,7 @@ class OrganizationObjectstoreEndpointTest(TransactionTestCase):
-         self.organization = self.create_organization(owner=self.user)
-         self.api_key = self.create_api_key(
-             organization=self.organization,
--            scope_list=["org:admin"],
-+            scope_list=["project:releases"],
-         )
+-  if (isMultiSeriesEventsStats(data)) {
++  if (isEventsStats(data)) {
++    // Plain EventsStats: single aggregate, no grouping. Meta is at the top level.
++    if (data.meta) {
++      widgetQuery.aggregates?.forEach(aggregate => {
++        if (aggregate && !(aggregate in result)) {
++          result[aggregate] = getMetaField(data.meta, aggregate);
++        }
++      });
++    }
++  } else if (isMultiSeriesEventsStats(data)) {
+     // If there's only one aggregate and multiple groupings, series names are group names
+     // In this case, we can use the first meta value for all series
+     const firstMeta = widgetQuery.fieldMeta?.find(meta => meta !== null);
+diff --git a/static/app/views/dashboards/utils.tsx b/static/app/views/dashboards/utils.tsx
+index a0253a92862292..c3f5f39a18a44d 100644
+--- a/static/app/views/dashboards/utils.tsx
++++ b/static/app/views/dashboards/utils.tsx
+@@ -25,12 +25,14 @@ import {getUtcDateString} from 'sentry/utils/dates';
+ import EventView from 'sentry/utils/discover/eventView';
+ import {DURATION_UNITS} from 'sentry/utils/discover/fieldRenderers';
+ import {
++  ABYTE_UNITS,
+   getAggregateAlias,
+   getAggregateArg,
+   isEquation,
+   isMeasurement,
+   RATE_UNIT_MULTIPLIERS,
+   RateUnit,
++  SIZE_UNIT_MULTIPLIERS,
+   stripEquationPrefix,
+ } from 'sentry/utils/discover/fields';
+ import {DisplayModes, type SavedQueryDatasets} from 'sentry/utils/discover/types';
+@@ -110,6 +112,13 @@ export function getThresholdUnitSelectOptions(
+     }));
+   }
  
-     def get_endpoint_url(self) -> str:
-@@ -177,7 +177,7 @@ class OrganizationObjectstoreEndpointWithControlSiloTest(TransactionTestCase):
-         self.organization = self.create_organization(owner=self.user)
-         self.api_key = self.create_api_key(
-             organization=self.organization,
--            scope_list=["org:admin"],
-+            scope_list=["project:releases"],
-         )
++  if (dataType === 'size') {
++    return Object.values(ABYTE_UNITS).map(unit => ({
++      label: unit,
++      value: unit,
++    }));
++  }
++
+   return [];
+ }
  
-     def tearDown(self) -> None:
+@@ -121,7 +130,10 @@ export function normalizeUnit(value: number, unit: string, dataType: string): nu
+       : dataType === 'duration'
+         ? // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+           DURATION_UNITS[unit]
+-        : 1;
++        : dataType === 'size'
++          ? // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
++            SIZE_UNIT_MULTIPLIERS[unit]
++          : 1;
+   return value * multiplier;
+ }
+ 
+diff --git a/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx b/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx
+index 9a993a075deb68..202860d3655f13 100644
+--- a/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx
++++ b/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx
+@@ -106,9 +106,7 @@ export function Thresholds({
+   const maxOneValue = thresholdsConfig?.max_values[ThresholdMaxKeys.MAX_1] ?? '';
+   const maxTwoValue = thresholdsConfig?.max_values[ThresholdMaxKeys.MAX_2] ?? '';
+   const unit = thresholdsConfig?.unit ?? dataUnit;
+-  const unitOptions = ['duration', 'rate'].includes(dataType)
+-    ? getThresholdUnitSelectOptions(dataType)
+-    : [];
++  const unitOptions = getThresholdUnitSelectOptions(dataType);
+ 
+   const isHigherBetter = preferredPolarity === '+';
+ 
+diff --git a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+index e55226ed120659..d89a51bbf43add 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+@@ -165,6 +165,8 @@ function WidgetBuilderV2({
+     } else if (results.timeseriesResultsTypes) {
+       const keys = Object.keys(results.timeseriesResultsTypes);
+       dataType = results.timeseriesResultsTypes[keys[0]!];
++      const rawUnit = results.timeseriesResultsUnits?.[keys[0]!];
++      dataUnit = rawUnit ?? undefined;
+     }
+ 
+     setThresholdMetaState({dataType, dataUnit});
+diff --git a/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx b/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx
+index 6f238e7d754c99..bf011c637822c7 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx
+@@ -1,4 +1,4 @@
+-import {Fragment} from 'react';
++import {Fragment, useEffect, useRef} from 'react';
+ import cloneDeep from 'lodash/cloneDeep';
+ 
+ import {t, tct} from 'sentry/locale';
+@@ -25,6 +25,28 @@ function ThresholdsSection({
+   setError,
+ }: ThresholdsSectionProps) {
+   const {state, dispatch} = useWidgetBuilderContext();
++
++  const prevDataTypeRef = useRef<string | undefined>(undefined);
++  useEffect(() => {
++    const prevDataType = prevDataTypeRef.current;
++    prevDataTypeRef.current = dataType;
++    // When the data type changes and there's a stored unit, reset it so the
++    // unit selector shows the correct options for the new data type.
++    if (
++      prevDataType !== undefined &&
++      prevDataType !== dataType &&
++      state.thresholds?.unit
++    ) {
++      dispatch({
++        type: BuilderStateAction.SET_THRESHOLDS,
++        payload: {
++          ...state.thresholds,
++          unit: null,
++        },
++      });
++    }
++  }, [dataType, dispatch, state.thresholds]);
++
+   return (
+     <Fragment>
+       <SectionHeader
+diff --git a/static/app/views/dashboards/widgetCard/index.tsx b/static/app/views/dashboards/widgetCard/index.tsx
+index 3afb9888d0ab15..a1619c610ab326 100644
+--- a/static/app/views/dashboards/widgetCard/index.tsx
++++ b/static/app/views/dashboards/widgetCard/index.tsx
+@@ -20,7 +20,7 @@ import type {Series} from 'sentry/types/echarts';
+ import type {WithRouterProps} from 'sentry/types/legacyReactRouter';
+ import type {Confidence, Organization} from 'sentry/types/organization';
+ import type {TableDataWithTitle} from 'sentry/utils/discover/discoverQuery';
+-import type {AggregationOutputType, Sort} from 'sentry/utils/discover/fields';
++import type {AggregationOutputType, DataUnit, Sort} from 'sentry/utils/discover/fields';
+ import {statsPeriodToDays} from 'sentry/utils/duration/statsPeriodToDays';
+ import {getFieldDefinition} from 'sentry/utils/fields';
+ import {hasOnDemandMetricWidgetFeature} from 'sentry/utils/onDemandMetrics/features';
+@@ -63,6 +63,7 @@ import {WidgetFrame} from './widgetFrame';
+ export type OnDataFetchedParams = {
+   tableResults?: TableDataWithTitle[];
+   timeseriesResultsTypes?: Record<string, AggregationOutputType>;
++  timeseriesResultsUnits?: Record<string, DataUnit>;
+ };
+ 
+ const DAYS_TO_MS = 24 * 60 * 60 * 1000;
+@@ -133,6 +134,7 @@ type Data = {
+   tableResults?: TableDataWithTitle[];
+   timeseriesResults?: Series[];
+   timeseriesResultsTypes?: Record<string, AggregationOutputType>;
++  timeseriesResultsUnits?: Record<string, DataUnit>;
+   totalIssuesCount?: string;
+ };
+ 
+@@ -149,6 +151,7 @@ function WidgetCard(props: Props) {
+       props.onDataFetched({
+         tableResults: newData.tableResults,
+         timeseriesResultsTypes: newData.timeseriesResultsTypes,
++        timeseriesResultsUnits: newData.timeseriesResultsUnits,
+       });
+     }
+ 
+diff --git a/static/app/views/dashboards/widgetCard/visualizationWidget.tsx b/static/app/views/dashboards/widgetCard/visualizationWidget.tsx
+index 9093063f6b12ff..b49bb82d4ca672 100644
+--- a/static/app/views/dashboards/widgetCard/visualizationWidget.tsx
++++ b/static/app/views/dashboards/widgetCard/visualizationWidget.tsx
+@@ -66,6 +66,7 @@ interface VisualizationWidgetProps {
+     tableResults?: any[];
+     timeseriesResults?: Series[];
+     timeseriesResultsTypes?: Record<string, AggregationOutputType>;
++    timeseriesResultsUnits?: Record<string, DataUnit>;
+     totalIssuesCount?: string;
+   }) => void;
+   onWidgetTableResizeColumn?: (columns: TabularColumn[]) => void;
+diff --git a/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx b/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx
+index e5fac2065dd61f..a938986caa1e7a 100644
+--- a/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx
++++ b/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx
+@@ -45,6 +45,7 @@ type Props = {
+       | 'tableResults'
+       | 'timeseriesResults'
+       | 'timeseriesResultsTypes'
++      | 'timeseriesResultsUnits'
+       | 'totalIssuesCount'
+       | 'confidence'
+       | 'sampleCount'

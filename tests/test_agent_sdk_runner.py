@@ -113,6 +113,16 @@ class TestRunAgentSdkSuccess:
         assert result.model == "claude-haiku-4-5"
 
 
+def test_agent_sdk_accepts_context_level() -> None:
+    """run_agent_sdk must accept a context_level parameter for tool gating."""
+    import inspect
+
+    from bugeval.agent_sdk_runner import run_agent_sdk
+
+    sig = inspect.signature(run_agent_sdk)
+    assert "context_level" in sig.parameters, "run_agent_sdk must accept context_level"
+
+
 class TestRunAgentSdkOptions:
     async def test_passes_cwd_to_query(self, tmp_path: Path) -> None:
         from bugeval.agent_sdk_runner import run_agent_sdk

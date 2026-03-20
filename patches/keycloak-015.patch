@@ -1,24 +1,918 @@
-diff --git a/js/apps/admin-ui/src/utils/useSetTimeout.ts b/js/apps/admin-ui/src/utils/useSetTimeout.ts
-index 0c605fd8ab..502075f0de 100644
---- a/js/apps/admin-ui/src/utils/useSetTimeout.ts
-+++ b/js/apps/admin-ui/src/utils/useSetTimeout.ts
-@@ -4,13 +4,14 @@ export default function useSetTimeout() {
-   const didUnmountRef = useRef(false);
-   const { current: scheduledTimers } = useRef(new Set<number>());
+diff --git a/docs/documentation/release_notes/topics/26_6_0.adoc b/docs/documentation/release_notes/topics/26_6_0.adoc
+index 45f54cf175b0..f41857bda721 100644
+--- a/docs/documentation/release_notes/topics/26_6_0.adoc
++++ b/docs/documentation/release_notes/topics/26_6_0.adoc
+@@ -114,3 +114,10 @@ bin/kc.sh start --log="console,file" --log-file-rotation-enabled=false
+ ----
  
--  useEffect(
--    () => () => {
-+  useEffect(() => {
-+    didUnmountRef.current = false;
+ For more information, see the https://www.keycloak.org/server/logging/file[File logging] guide.
 +
-+    return () => {
-       didUnmountRef.current = true;
-       clearAll();
--    },
--    [],
--  );
-+    };
-+  }, []);
++= Fine-Grained Admin Permissions new Groups scope for user membership changes
++
++Fine-Grained Admin Permissions (FGAP) now includes a new `Groups` scope: `manage-membership-of-members`.
++
++This scope is now used as the group-side bridge for evaluating user-side `manage-group-membership` permissions based on a user's current group memberships.
++The existing `manage-membership` scope keeps its current behavior for target group membership management operations.
+diff --git a/docs/documentation/server_admin/topics/admin-console-permissions/fine-grain-v2.adoc b/docs/documentation/server_admin/topics/admin-console-permissions/fine-grain-v2.adoc
+index 1924ad6c45bd..2d4c1a4c29f3 100644
+--- a/docs/documentation/server_admin/topics/admin-console-permissions/fine-grain-v2.adoc
++++ b/docs/documentation/server_admin/topics/admin-console-permissions/fine-grain-v2.adoc
+@@ -86,7 +86,7 @@ set of scopes:
  
-   function clearAll() {
-     scheduledTimers.forEach((timer) => clearTimeout(timer));
+ | *view*                    | Defines if a realm administrator can view users. This scope should be set whenever you want to make users available from queries. | `view-members`
+ | *manage*                  | Defines if a realm administrator can manage users.                                           | `manage-members`
+-| *manage-group-membership* | Defines if a realm administrator can assign or unassign users to/from groups.                | None
++| *manage-group-membership* | Defines if a realm administrator can assign or unassign users to/from groups.                | `manage-membership-of-members`
+ | *map-roles*               | Defines if a realm administrator can assign or unassign roles to/from users.                 | None
+ | *impersonate*             | Defines if a realm administrator can impersonate other users.                                | `impersonate-members`
+ | *reset-password*          | Defines if a realm administrator can reset user passwords. If no permission with `reset-password` is found, it falls back to check `manage` scope. | None
+@@ -97,6 +97,11 @@ The user resource type has a strong relationship with some of the permissions yo
+ users are members of groups and granting access to `view-members` or `manage-members` of a group should also allow
+ a realm administrator to `view` and `manage` members of that group.
+ 
++To assign or unassign a specific user to or from a group, both sides of the relationship are required: `manage-group-membership`
++on the user and `manage-membership` on the target group.
++The `manage-membership-of-members` scope can be used to grant or deny `manage-group-membership` based on the groups that
++the target user currently belongs to.
++
+ [NOTE]
+ ====
+ This feature does not support enforcing access to federated resource, however, this limitation is being considered
+@@ -125,6 +130,7 @@ set of management operations:
+                               This operation applies to any child group in the group hierarchy.
+                               This can be prevented by explicitly denying permission for specific subgroups.
+ | *manage-membership*       | Defines if a realm administrator can add or remove members from groups.
++| *manage-membership-of-members* | Defines if a realm administrator can grant or deny `manage-group-membership` for members of a group.
+ |===
+ 
+ ===== Clients Resource Type
+@@ -374,7 +380,7 @@ if a respective admin role is assigned to a realm administrator, permission eval
+                              It does not grant the ability to *view* clients.
+ | *view-users*             | A realm administrator can *view* all users and groups in the realm.
+ | *manage-users*           | A realm administrator can *view*, *map-roles*, *manage-group-membership* and *manage* all users in the realm,
+-                             as well as *view*, *manage-membership* and *manage* groups in the realm.
++                             as well as *view*, *manage-membership*, *manage-membership-of-members* and *manage* groups in the realm.
+ | *impersonation*          | A realm administrator can *impersonate* all users in the realm.
+ | *view-clients*           | A realm administrator can *view* all clients in the realm.
+ | *manage-clients*         | A realm administrator can *view* and *manage* all clients and client scopes in the realm.
+diff --git a/server-spi-private/src/main/java/org/keycloak/authorization/fgap/AdminPermissionsSchema.java b/server-spi-private/src/main/java/org/keycloak/authorization/fgap/AdminPermissionsSchema.java
+index 81e7e7dd4074..67a7dae00466 100644
+--- a/server-spi-private/src/main/java/org/keycloak/authorization/fgap/AdminPermissionsSchema.java
++++ b/server-spi-private/src/main/java/org/keycloak/authorization/fgap/AdminPermissionsSchema.java
+@@ -85,6 +85,7 @@ public class AdminPermissionsSchema extends AuthorizationSchema {
+ 
+     // group specific scopes
+     public static final String MANAGE_MEMBERSHIP = "manage-membership";
++    public static final String MANAGE_MEMBERSHIP_OF_MEMBERS = "manage-membership-of-members";
+     public static final String MANAGE_MEMBERS = "manage-members";
+     public static final String VIEW_MEMBERS = "view-members";
+     public static final String IMPERSONATE_MEMBERS = "impersonate-members";
+@@ -101,9 +102,9 @@ public class AdminPermissionsSchema extends AuthorizationSchema {
+     public static final String MANAGE_GROUP_MEMBERSHIP = "manage-group-membership";
+ 
+     public static final ResourceType CLIENTS = new ResourceType(CLIENTS_RESOURCE_TYPE, Set.of(MANAGE, MAP_ROLES, MAP_ROLES_CLIENT_SCOPE, MAP_ROLES_COMPOSITE, VIEW));
+-    public static final ResourceType GROUPS = new ResourceType(GROUPS_RESOURCE_TYPE, Set.of(MANAGE, VIEW, MANAGE_MEMBERSHIP, MANAGE_MEMBERS, VIEW_MEMBERS, IMPERSONATE_MEMBERS));
++    public static final ResourceType GROUPS = new ResourceType(GROUPS_RESOURCE_TYPE, Set.of(MANAGE, VIEW, MANAGE_MEMBERSHIP, MANAGE_MEMBERSHIP_OF_MEMBERS, MANAGE_MEMBERS, VIEW_MEMBERS, IMPERSONATE_MEMBERS));
+     public static final ResourceType ROLES = new ResourceType(ROLES_RESOURCE_TYPE, Set.of(MAP_ROLE, MAP_ROLE_CLIENT_SCOPE, MAP_ROLE_COMPOSITE));
+-    public static final ResourceType USERS = new ResourceType(USERS_RESOURCE_TYPE, Set.of(MANAGE, VIEW, IMPERSONATE, MAP_ROLES, MANAGE_GROUP_MEMBERSHIP, RESET_PASSWORD), Map.of(VIEW, Set.of(VIEW_MEMBERS), MANAGE, Set.of(MANAGE_MEMBERS), IMPERSONATE, Set.of(IMPERSONATE_MEMBERS)), GROUPS.getType());
++    public static final ResourceType USERS = new ResourceType(USERS_RESOURCE_TYPE, Set.of(MANAGE, VIEW, IMPERSONATE, MAP_ROLES, MANAGE_GROUP_MEMBERSHIP, RESET_PASSWORD), Map.of(VIEW, Set.of(VIEW_MEMBERS), MANAGE, Set.of(MANAGE_MEMBERS), IMPERSONATE, Set.of(IMPERSONATE_MEMBERS), MANAGE_GROUP_MEMBERSHIP, Set.of(MANAGE_MEMBERSHIP_OF_MEMBERS)), GROUPS.getType());
+     private static final String SKIP_EVALUATION = "kc.authz.fgap.skip";
+     public static final AdminPermissionsSchema SCHEMA = new AdminPermissionsSchema();
+ 
+@@ -533,4 +534,4 @@ public static boolean isSkipEvaluation(KeycloakSession session) {
+ 
+         return Boolean.parseBoolean(session.getAttributeOrDefault(SKIP_EVALUATION, Boolean.FALSE.toString()));
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/server-spi-private/src/main/java/org/keycloak/models/oid4vci/CredentialScopeModel.java b/server-spi-private/src/main/java/org/keycloak/models/oid4vci/CredentialScopeModel.java
+index 4eacc9d9f97c..983ec795ab2d 100644
+--- a/server-spi-private/src/main/java/org/keycloak/models/oid4vci/CredentialScopeModel.java
++++ b/server-spi-private/src/main/java/org/keycloak/models/oid4vci/CredentialScopeModel.java
+@@ -136,19 +136,6 @@ public class CredentialScopeModel implements ClientScopeModel {
+      */
+     public static final String VC_KEY_ATTESTATION_REQUIRED_USER_AUTH = "vc.key_attestations_required.user_authentication";
+ 
+-    // [TODO] Remove deprecated constants used in the old testsuite
+-    @Deprecated public static final String CONFIGURATION_ID = VC_CONFIGURATION_ID;
+-    @Deprecated public static final String CREDENTIAL_IDENTIFIER = VC_IDENTIFIER;
+-    @Deprecated public static final String CONTEXTS = VC_CONTEXTS;
+-    @Deprecated public static final String EXPIRY_IN_SECONDS = VC_EXPIRY_IN_SECONDS;
+-    @Deprecated public static final Integer EXPIRY_IN_SECONDS_DEFAULT = VC_EXPIRY_IN_SECONDS_DEFAULT;
+-    @Deprecated public static final String FORMAT = VC_FORMAT;
+-    @Deprecated public static final String ISSUER_DID = VC_ISSUER_DID;
+-    @Deprecated public static final String KEY_ATTESTATION_REQUIRED = VC_KEY_ATTESTATION_REQUIRED;
+-    @Deprecated public static final String KEY_ATTESTATION_REQUIRED_KEY_STORAGE = VC_KEY_ATTESTATION_REQUIRED_KEY_STORAGE;
+-    @Deprecated public static final String KEY_ATTESTATION_REQUIRED_USER_AUTH = VC_KEY_ATTESTATION_REQUIRED_USER_AUTH;
+-    @Deprecated public static final String TYPES = VC_SUPPORTED_TYPES;
+-
+     /**
+      * the actual object that is represented by this scope
+      */
+diff --git a/services/src/main/java/org/keycloak/services/resources/SessionCodeChecks.java b/services/src/main/java/org/keycloak/services/resources/SessionCodeChecks.java
+index b99626aa6389..8195c198749f 100644
+--- a/services/src/main/java/org/keycloak/services/resources/SessionCodeChecks.java
++++ b/services/src/main/java/org/keycloak/services/resources/SessionCodeChecks.java
+@@ -261,7 +261,7 @@ public boolean initialVerify() {
+             event.error(Errors.CLIENT_NOT_FOUND);
+             session.getProvider(LoginFormsProvider.class).setDetachedAuthSession();
+             response = ErrorPage.error(session, authSession, Response.Status.BAD_REQUEST, Messages.UNKNOWN_LOGIN_REQUESTER);
+-            clientCode.removeExpiredClientSession();
++            removeAuthenticationSession(authSession);
+             return false;
+         }
+ 
+@@ -272,7 +272,7 @@ public boolean initialVerify() {
+             event.error(Errors.CLIENT_DISABLED);
+             session.getProvider(LoginFormsProvider.class).setDetachedAuthSession();
+             response = ErrorPage.error(session, authSession, Response.Status.BAD_REQUEST, Messages.LOGIN_REQUESTER_NOT_ENABLED);
+-            clientCode.removeExpiredClientSession();
++            removeAuthenticationSession(authSession);
+             return false;
+         }
+ 
+@@ -513,6 +513,13 @@ protected EventBuilder getEvent() {
+         return event;
+     }
+ 
++    private void removeAuthenticationSession(AuthenticationSessionModel authSession) {
++        ClientSessionCode<AuthenticationSessionModel> codeToRemove = clientCode != null
++                ? clientCode
++                : new ClientSessionCode<>(session, realm, authSession);
++        codeToRemove.removeExpiredClientSession();
++    }
++
+     protected boolean checkClientDisabled(ClientModel client) {
+         return !client.isEnabled();
+     }
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/authz/fgap/UserResourceTypeEvaluationTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/authz/fgap/UserResourceTypeEvaluationTest.java
+index cc23e9877529..98ae5650302c 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/admin/authz/fgap/UserResourceTypeEvaluationTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/authz/fgap/UserResourceTypeEvaluationTest.java
+@@ -54,6 +54,8 @@
+ import static org.keycloak.authorization.fgap.AdminPermissionsSchema.IMPERSONATE;
+ import static org.keycloak.authorization.fgap.AdminPermissionsSchema.MANAGE;
+ import static org.keycloak.authorization.fgap.AdminPermissionsSchema.MANAGE_GROUP_MEMBERSHIP;
++import static org.keycloak.authorization.fgap.AdminPermissionsSchema.MANAGE_MEMBERSHIP;
++import static org.keycloak.authorization.fgap.AdminPermissionsSchema.MANAGE_MEMBERSHIP_OF_MEMBERS;
+ import static org.keycloak.authorization.fgap.AdminPermissionsSchema.MAP_ROLES;
+ import static org.keycloak.authorization.fgap.AdminPermissionsSchema.RESET_PASSWORD;
+ import static org.keycloak.authorization.fgap.AdminPermissionsSchema.VIEW;
+@@ -309,50 +311,60 @@ public void testMapRoles() {
+ 
+     @Test
+     public void testManageGroupMembership() {
++        UserRepresentation myadmin = realm.admin().users().search("myadmin").get(0);
++        UserPolicyRepresentation allowMyAdminPermission = createUserPolicy(realm, client, "Only My Admin User Policy", myadmin.getId());
++        GroupRepresentation target = createGroup("target");
++        UserRepresentation userBob = createUser("bob");
++
+         // myadmin shouldn't be able to manage group membership of the user just yet
+         try {
+-            realmAdminClient.realm(realm.getName()).users().get(userAlice.getId()).joinGroup("no-such");
++            realmAdminClient.realm(realm.getName()).users().get(userBob.getId()).joinGroup(target.getId());
+             fail("Expected Exception wasn't thrown.");
+         } catch (Exception ex) {
+             assertThat(ex, instanceOf(ForbiddenException.class));
+         }
+ 
+-        //create all-users permission for "myadmin" (so that myadmin can add users into a group)
+-        UserPolicyRepresentation policy = createUserPolicy(realm, client,"Only My Admin User Policy", realm.admin().users().search("myadmin").get(0).getId());
+-        ScopePermissionRepresentation allUsersPermission = createAllPermission(client, usersType, policy, Set.of(MANAGE_GROUP_MEMBERSHIP));
+-
+-        //check myadmin can manage membership using all-users permission
++        // only the user-side permission is not enough
++        createAllPermission(client, usersType, allowMyAdminPermission, Set.of(MANAGE_GROUP_MEMBERSHIP));
+         try {
+-            realmAdminClient.realm(realm.getName()).users().get(userAlice.getId()).joinGroup("no-such");
++            realmAdminClient.realm(realm.getName()).users().get(userBob.getId()).joinGroup(target.getId());
+             fail("Expected Exception wasn't thrown.");
+         } catch (Exception ex) {
+-            // expecting here NotFoundException: https://github.com/keycloak/keycloak/blob/b5c95e9f1c58bc500316dd5c0f2d3bb5e197ca99/services/src/main/java/org/keycloak/services/resources/admin/UserResource.java#L1060
+-            assertThat(ex, instanceOf(NotFoundException.class));
++            assertThat(ex, instanceOf(ForbiddenException.class));
+         }
+ 
+-        // remove all-users permissions to test user-permission
+-        allUsersPermission = getScopePermissionsResource(client).findByName(allUsersPermission.getName());
+-        getScopePermissionsResource(client).findById(allUsersPermission.getId()).remove();
++        // target group must allow membership changes
++        createAllPermission(client, AdminPermissionsSchema.GROUPS_RESOURCE_TYPE, allowMyAdminPermission, Set.of(MANAGE_MEMBERSHIP));
++        realmAdminClient.realm(realm.getName()).users().get(userBob.getId()).joinGroup(target.getId());
++        assertTrue(realm.admin().users().get(userBob.getId()).groups().stream().anyMatch(group -> target.getId().equals(group.getId())));
++    }
+ 
+-        // now myadmin cannot manage membership
+-        try {
+-            realmAdminClient.realm(realm.getName()).users().get(userAlice.getId()).joinGroup("no-such");
+-            fail("Expected Exception wasn't thrown.");
+-        } catch (Exception ex) {
+-            assertThat(ex, instanceOf(ForbiddenException.class));
+-        }
++    @Test
++    public void testManageGroupMembershipDeniedForProtectedGroupMembers() {
++        UserRepresentation myadmin = realm.admin().users().search("myadmin").get(0);
++        UserPolicyRepresentation allowMyAdminPermission = createUserPolicy(realm, client, "Only My Admin User Policy", myadmin.getId());
++        UserPolicyRepresentation denyMyAdminPermission = createUserPolicy(Logic.NEGATIVE, realm, client, "Not My Admin User Policy", myadmin.getId());
++        GroupRepresentation vault = createGroup("vault");
++        GroupRepresentation target = createGroup("target");
++        UserRepresentation userBob = createUser("bob");
+ 
+-        // create userPermission
+-        createPermission(client, userAlice.getId(), usersType, Set.of(MANAGE_GROUP_MEMBERSHIP), policy);
++        realm.admin().users().get(userAlice.getId()).joinGroup(vault.getId());
++
++        createAllPermission(client, usersType, allowMyAdminPermission, Set.of(MANAGE_GROUP_MEMBERSHIP));
++        createAllPermission(client, AdminPermissionsSchema.GROUPS_RESOURCE_TYPE, allowMyAdminPermission, Set.of(MANAGE_MEMBERSHIP));
++        createAllPermission(client, AdminPermissionsSchema.GROUPS_RESOURCE_TYPE, allowMyAdminPermission, Set.of(MANAGE_MEMBERSHIP_OF_MEMBERS));
++        createPermission(client, vault.getId(), AdminPermissionsSchema.GROUPS_RESOURCE_TYPE, Set.of(MANAGE_MEMBERSHIP_OF_MEMBERS), denyMyAdminPermission);
++
++        realmAdminClient.realm(realm.getName()).users().get(userBob.getId()).joinGroup(target.getId());
++        assertTrue(realm.admin().users().get(userBob.getId()).groups().stream().anyMatch(group -> target.getId().equals(group.getId())));
+ 
+-        //check myadmin can manage membership using individual permission
+         try {
+-            realmAdminClient.realm(realm.getName()).users().get(userAlice.getId()).joinGroup("no-such");
++            realmAdminClient.realm(realm.getName()).users().get(userAlice.getId()).joinGroup(target.getId());
+             fail("Expected Exception wasn't thrown.");
+-        } catch (Exception ex) {
+-            // expecting here NotFoundException: https://github.com/keycloak/keycloak/blob/b5c95e9f1c58bc500316dd5c0f2d3bb5e197ca99/services/src/main/java/org/keycloak/services/resources/admin/UserResource.java#L1060
+-            assertThat(ex, instanceOf(NotFoundException.class));
++        } catch (ForbiddenException expected) {
+         }
++
++        assertFalse(realm.admin().users().get(userAlice.getId()).groups().stream().anyMatch(group -> target.getId().equals(group.getId())));
+     }
+ 
+     @Test
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/forms/LoginTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/forms/LoginTest.java
+index 9f5f6c90191d..a3d02c63b2d6 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/forms/LoginTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/forms/LoginTest.java
+@@ -909,6 +909,36 @@ public void loginWithDisabledCookies() {
+         errorPage.assertCurrent();
+     }
+ 
++    @Test
++    public void loginWithClientDisabledInActiveAuthenticationSession() {
++        ClientResource clientResource = findClientByClientId(adminClient.realm("test"), "test-app");
++        ClientRepresentation clientRepresentation = clientResource.toRepresentation();
++        boolean wasEnabled = clientRepresentation.isEnabled();
++
++        try {
++            oauth.clientId("test-app");
++            oauth.openLoginForm();
++            loginPage.assertCurrent();
++
++            clientRepresentation.setEnabled(false);
++            clientResource.update(clientRepresentation);
++
++            loginPage.login("test-user@localhost", getPassword("test-user@localhost"));
++
++            errorPage.assertCurrent();
++            assertEquals("Login requester not enabled", errorPage.getError());
++            events.expect(EventType.LOGIN)
++                    .client("test-app")
++                    .user((String) null)
++                    .session((String) null)
++                    .error(Errors.CLIENT_DISABLED)
++                    .assertEvent();
++        } finally {
++            clientRepresentation.setEnabled(wasEnabled);
++            clientResource.update(clientRepresentation);
++        }
++    }
++
+     @Test
+     public void openLoginFormWithDifferentApplication() throws Exception {
+         oauth.clientId("root-url-client");
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAttestationProofTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAttestationProofTest.java
+index 6df88079c3bf..af060fb93e8d 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAttestationProofTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAttestationProofTest.java
+@@ -142,7 +142,7 @@ public void testAttestationProofWithMultipleTrustedKeys() {
+     @Test
+     public void testCredentialIssuanceWithAttestationProof() {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+-        String configIdFromScope = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String configIdFromScope = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         final String credConfigId = configIdFromScope != null ? configIdFromScope : scopeName;
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java
+index 33bfded4b9d4..83498b48a4fa 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java
+@@ -194,7 +194,7 @@ public void testCompleteFlowWithClaimsValidationAuthorizationCode_credentialRequ
+ 
+         // Perform authorization code flow to get authorization code (includes authorization_details)
+         AccessTokenResponse tokenResponse = authzCodeFlow(ctx);
+-        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // Clear events before credential request
+         events.clear();
+@@ -293,7 +293,7 @@ public void testCompleteFlow_mandatoryClaimsInAuthzDetailsParameter() throws Exc
+             // Perform authorization code flow to get authorization code
+             AccessTokenResponse tokenResponse = authzCodeFlow(ctx);
+             String credentialIdentifier = assertTokenResponse(tokenResponse);
+-            String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++            String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+             // Clear events before credential request
+             events.clear();
+@@ -351,7 +351,7 @@ public void testCorrectAccessTokenUsed() throws Exception {
+ 
+             // Request with mandatory lastName will fail as user does not have "lastName"
+             String credentialIdentifier = assertTokenResponse(tokenResponseWithMandatoryLastName);
+-            String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++            String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+             Oid4vcCredentialRequest credentialRequest = getCredentialRequest(ctx, credRequestSupplier, tokenResponseWithMandatoryLastName, credentialConfigurationId, credentialIdentifier);
+             Oid4vcCredentialResponse credentialResponse = credentialRequest.send();
+@@ -410,7 +410,7 @@ public void testCompleteFlow_mandatoryClaimsInAuthzDetailsParameterAndProtocolMa
+             // Perform authorization code flow to get authorization code
+             AccessTokenResponse tokenResponse = authzCodeFlow(ctx);
+             String credentialIdentifier = assertTokenResponse(tokenResponse);
+-            String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++            String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+             // Clear events before credential request
+             events.clear();
+@@ -573,7 +573,7 @@ public void testTokenExchangeWithoutAuthorizationDetails() throws Exception {
+         assertNotNull("authorization_details should be derived from requested OID4VC scope", authDetailsResponse);
+         assertFalse("authorization_details should not be empty", authDetailsResponse.isEmpty());
+         assertEquals("credential_configuration_id should match requested scope",
+-                getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID),
++                getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID),
+                 authDetailsResponse.get(0).getCredentialConfigurationId());
+         assertNotNull("credential_identifiers should be present", authDetailsResponse.get(0).getCredentialIdentifiers());
+         assertFalse("credential_identifiers should not be empty", authDetailsResponse.get(0).getCredentialIdentifiers().isEmpty());
+@@ -927,7 +927,7 @@ private void testCompleteFlowWithClaimsValidationAuthorizationCode(BiFunction<St
+         // Perform authorization code flow to get authorization code
+         AccessTokenResponse tokenResponse = authzCodeFlow(ctx);
+         String credentialIdentifier = assertTokenResponse(tokenResponse);
+-        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // Request the actual credential using the identifier
+         Oid4vcCredentialRequest credentialRequest = getCredentialRequest(ctx, credentialRequestSupplier, tokenResponse, credentialConfigurationId, credentialIdentifier);
+@@ -972,7 +972,7 @@ private AccessTokenResponse authzCodeFlow(Oid4vcTestContext ctx, List<ClaimsDesc
+ 
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setClaims(claimsForAuthorizationDetailsParameter);
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+ 
+@@ -1070,7 +1070,7 @@ protected OID4VCAuthorizationDetail createAuthorizationDetail(Oid4vcTestContext
+         authDetail.setType(OPENID_CREDENTIAL);
+         authDetail.setCredentialConfigurationId(credentialConfigurationId != null
+                 ? credentialConfigurationId
+-                : getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++                : getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+         return authDetail;
+     }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java
+index 90f94a68486e..3bf82b053914 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java
+@@ -106,7 +106,7 @@ public void testAuthorizationCodeFlowWithPARAndAuthorizationDetails() throws Exc
+         Oid4vcTestContext ctx = prepareOid4vcTestContext();
+ 
+         // Step 1: Create PAR request with authorization_details
+-        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // Create authorization details with claims
+         ClaimsDescription claim = new ClaimsDescription();
+@@ -290,7 +290,7 @@ public void testAuthorizationCodeFlowWithPARButNoAuthorizationDetailsInTokenRequ
+         assertFalse("authorization_details should not be empty", authDetailsResponse.isEmpty());
+         OID4VCAuthorizationDetail firstAuthorizationDetail = authDetailsResponse.get(0);
+         assertEquals("credential_configuration_id should match requested scope",
+-                getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID),
++                getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID),
+                 firstAuthorizationDetail.getCredentialConfigurationId());
+         assertNotNull("credential_identifiers should be present", firstAuthorizationDetail.getCredentialIdentifiers());
+         assertFalse("credential_identifiers should not be empty", firstAuthorizationDetail.getCredentialIdentifiers().isEmpty());
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java
+index 7c748f1f973f..8128f91bf3be 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java
+@@ -117,7 +117,7 @@ protected static class Oid4vcTestContext {
+     protected Oid4vcTestContext prepareOid4vcTestContext(String token) throws Exception {
+         Oid4vcTestContext ctx = new Oid4vcTestContext();
+ 
+-        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credentialConfigurationId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // Clear events before credential offer URI request
+         events.clear();
+@@ -182,7 +182,7 @@ public void testAuthorizationCodeFlowWithAuthorizationDetails() throws Exception
+ 
+         // Get credential_configuration_id
+         ClientScopeRepresentation credClientScope = getCredentialClientScope();
+-        String credConfigId = credClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = credClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // Build authorization_details
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+@@ -297,7 +297,7 @@ public void testPreAuthorizedCodeWithAuthorizationDetailsCredentialConfiguration
+ 
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+ 
+         List<OID4VCAuthorizationDetail> authDetails = List.of(authDetail);
+@@ -322,7 +322,7 @@ public void testPreAuthorizedCodeWithAuthorizationDetailsCredentialConfiguration
+         assertEquals(1, authDetailsResponse.size());
+         OID4VCAuthorizationDetail authDetailResponse = authDetailsResponse.get(0);
+         assertEquals(OPENID_CREDENTIAL, authDetailResponse.getType());
+-        assertEquals(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID), authDetailResponse.getCredentialConfigurationId());
++        assertEquals(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID), authDetailResponse.getCredentialConfigurationId());
+         assertNotNull(authDetailResponse.getCredentialIdentifiers());
+         assertEquals(1, authDetailResponse.getCredentialIdentifiers().size());
+         String firstIdentifier = authDetailResponse.getCredentialIdentifiers().get(0);
+@@ -357,7 +357,7 @@ public void testPreAuthorizedCodeWithAuthorizationDetailsAndClaims() throws Exce
+ 
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setClaims(Arrays.asList(claim));
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+ 
+@@ -375,7 +375,7 @@ public void testPreAuthorizedCodeWithAuthorizationDetailsAndClaims() throws Exce
+         assertEquals(1, authDetailsResponse.size());
+         OID4VCAuthorizationDetail authDetailResponse = authDetailsResponse.get(0);
+         assertEquals(OPENID_CREDENTIAL, authDetailResponse.getType());
+-        assertEquals(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID), authDetailResponse.getCredentialConfigurationId());
++        assertEquals(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID), authDetailResponse.getCredentialConfigurationId());
+         assertNotNull(authDetailResponse.getClaims());
+         assertEquals(1, authDetailResponse.getClaims().size());
+         ClaimsDescription responseClaim = authDetailResponse.getClaims().get(0);
+@@ -407,7 +407,7 @@ public void testPreAuthorizedCodeWithUnsupportedClaims() throws Exception {
+ 
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setClaims(Arrays.asList(claim));
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+ 
+@@ -438,7 +438,7 @@ public void testPreAuthorizedCodeWithMandatoryClaimMissing() throws Exception {
+ 
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setClaims(Arrays.asList(claim));
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+ 
+@@ -469,7 +469,7 @@ public void testPreAuthorizedCodeWithComplexClaimsPath() throws Exception {
+ 
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setClaims(Arrays.asList(claim));
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+ 
+@@ -533,7 +533,7 @@ public void testPreAuthorizedCodeWithInvalidClaims() throws Exception {
+ 
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID));
++        authDetail.setCredentialConfigurationId(getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID));
+         authDetail.setClaims(Arrays.asList(claim));
+         authDetail.setLocations(Collections.singletonList(ctx.credentialIssuer.getCredentialIssuer()));
+ 
+@@ -846,7 +846,7 @@ public void testMultipleCredentialConfigurationsFromOffer() throws Exception {
+     @Test
+     public void testCompleteFlowWithClaimsValidation() throws Exception {
+         String token = getBearerToken(oauth, client, getCredentialClientScope().getName());
+-        String credConfigId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = getCredentialClientScope().getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         Oid4vcTestContext ctx = prepareOid4vcTestContext(token);
+ 
+         // Step 1: Request token with authorization details containing specific claims
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointEncryptionTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointEncryptionTest.java
+index 46018f82e9a9..6748b156ad64 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointEncryptionTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointEncryptionTest.java
+@@ -81,7 +81,7 @@ public class OID4VCIssuerEndpointEncryptionTest extends OID4VCIssuerEndpointTest
+     @Test
+     public void testRequestCredentialWithEncryption() {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -190,7 +190,7 @@ public void testUnencryptedRequestWhenEncryptionRequired() {
+     @Test
+     public void testEncryptedCredentialRequest() {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -270,7 +270,7 @@ public void testEncryptedCredentialRequest() {
+     @Test
+     public void testEncryptedCredentialRequestWithCompression() {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -389,7 +389,7 @@ public void testRequestCredentialWithIncompleteEncryptionParams() throws Throwab
+     public void testCredentialIssuanceWithEncryption() throws Exception {
+         // Integration test for the full credential issuance flow with encryption
+         String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+ 
+         testCredentialIssuanceWithAuthZCodeFlow(jwtTypeCredentialClientScope,
+@@ -536,7 +536,7 @@ public void testRequestCredentialWithUnsupportedResponseCompression() {
+     @Test
+     public void testRequestCredentialWithInvalidJWK() throws Throwable {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java
+index 2343e60fad7c..cb6d8d0f54c8 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java
+@@ -341,16 +341,16 @@ protected ClientScopeRepresentation createOptionalClientScope(String scopeName,
+         clientScope.setProtocol(OID4VCIConstants.OID4VC_PROTOCOL);
+         Map<String, String> attributes =
+                 new HashMap<>(Map.of(ClientScopeModel.INCLUDE_IN_TOKEN_SCOPE, "true",
+-                        CredentialScopeModel.EXPIRY_IN_SECONDS, "15"));
++                        CredentialScopeModel.VC_EXPIRY_IN_SECONDS, "15"));
+         BiConsumer<String, String> addAttribute = (attributeName, value) -> {
+             if (value != null) {
+                 attributes.put(attributeName, value);
+             }
+         };
+-        addAttribute.accept(CredentialScopeModel.ISSUER_DID, issuerDid);
+-        addAttribute.accept(CredentialScopeModel.CONFIGURATION_ID, credentialConfigurationId);
+-        addAttribute.accept(CredentialScopeModel.CREDENTIAL_IDENTIFIER, credentialIdentifier);
+-        addAttribute.accept(CredentialScopeModel.FORMAT, format);
++        addAttribute.accept(CredentialScopeModel.VC_ISSUER_DID, issuerDid);
++        addAttribute.accept(CredentialScopeModel.VC_CONFIGURATION_ID, credentialConfigurationId);
++        addAttribute.accept(CredentialScopeModel.VC_IDENTIFIER, credentialIdentifier);
++        addAttribute.accept(CredentialScopeModel.VC_FORMAT, format);
+         addAttribute.accept(CredentialScopeModel.VCT, Optional.ofNullable(vct).orElse(credentialIdentifier));
+         if (credentialConfigurationId != null) {
+             String vcDisplay;
+@@ -365,11 +365,11 @@ protected ClientScopeRepresentation createOptionalClientScope(String scopeName,
+             addAttribute.accept(CredentialScopeModel.VC_DISPLAY, vcDisplay);
+         }
+         if (acceptedKeyAttestationValues != null) {
+-            attributes.put(CredentialScopeModel.KEY_ATTESTATION_REQUIRED, "true");
++            attributes.put(CredentialScopeModel.VC_KEY_ATTESTATION_REQUIRED, "true");
+             if (!acceptedKeyAttestationValues.isEmpty()) {
+-                attributes.put(CredentialScopeModel.KEY_ATTESTATION_REQUIRED_KEY_STORAGE,
++                attributes.put(CredentialScopeModel.VC_KEY_ATTESTATION_REQUIRED_KEY_STORAGE,
+                         String.join(",", acceptedKeyAttestationValues));
+-                attributes.put(CredentialScopeModel.KEY_ATTESTATION_REQUIRED_USER_AUTH,
++                attributes.put(CredentialScopeModel.VC_KEY_ATTESTATION_REQUIRED_USER_AUTH,
+                         String.join(",", acceptedKeyAttestationValues));
+             }
+         }
+@@ -558,8 +558,8 @@ protected void testCredentialIssuanceWithAuthZCodeFlow(ClientScopeRepresentation
+                                                            BiFunction<String, String, String> f,
+                                                            Consumer<Map<String, Object>> c) {
+         String testScope = clientScope.getName();
+-        String testFormat = clientScope.getAttributes().get(CredentialScopeModel.FORMAT);
+-        String testCredentialConfigurationId = clientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String testFormat = clientScope.getAttributes().get(CredentialScopeModel.VC_FORMAT);
++        String testCredentialConfigurationId = clientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         try (Client client = AdminClientUtil.createResteasyClient()) {
+             String metadataUrl = getRealmMetadataPath(TEST_REALM_NAME);
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerWellKnownProviderTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerWellKnownProviderTest.java
+index b4f05ec7472c..ade8d6cdce27 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerWellKnownProviderTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerWellKnownProviderTest.java
+@@ -527,7 +527,7 @@ public void testIssuerMetadataIncludesEncryptionSupport() throws IOException {
+ 
+     private void compareMetadataToClientScope(CredentialIssuer credentialIssuer, ClientScopeRepresentation clientScope) {
+         String credentialConfigurationId = Optional.ofNullable(clientScope.getAttributes()
+-                        .get(CredentialScopeModel.CONFIGURATION_ID))
++                        .get(CredentialScopeModel.VC_CONFIGURATION_ID))
+                 .orElse(clientScope.getName());
+         SupportedCredentialConfiguration supportedConfig = credentialIssuer.getCredentialsSupported()
+                 .get(credentialConfigurationId);
+@@ -535,7 +535,7 @@ private void compareMetadataToClientScope(CredentialIssuer credentialIssuer, Cli
+                 supportedConfig);
+         assertEquals(credentialConfigurationId, supportedConfig.getId());
+ 
+-        String expectedFormat = Optional.ofNullable(clientScope.getAttributes().get(CredentialScopeModel.FORMAT))
++        String expectedFormat = Optional.ofNullable(clientScope.getAttributes().get(CredentialScopeModel.VC_FORMAT))
+                 .orElse(SD_JWT_VC);
+         assertEquals(expectedFormat, supportedConfig.getFormat());
+ 
+@@ -559,7 +559,7 @@ private void compareMetadataToClientScope(CredentialIssuer credentialIssuer, Cli
+             assertNotNull(supportedConfig.getCredentialDefinition());
+             assertNotNull(supportedConfig.getCredentialDefinition().getType());
+             List<String> credentialDefinitionTypes = Optional.ofNullable(clientScope.getAttributes()
+-                            .get(CredentialScopeModel.TYPES))
++                            .get(CredentialScopeModel.VC_SUPPORTED_TYPES))
+                     .map(s -> s.split(","))
+                     .map(Arrays::asList)
+                     .orElseGet(() -> List.of(clientScope.getName()));
+@@ -569,7 +569,7 @@ private void compareMetadataToClientScope(CredentialIssuer credentialIssuer, Cli
+             MatcherAssert.assertThat(supportedConfig.getCredentialDefinition().getContext(),
+                     Matchers.containsInAnyOrder(credentialDefinitionTypes.toArray()));
+             List<String> credentialDefinitionContexts = Optional.ofNullable(clientScope.getAttributes()
+-                            .get(CredentialScopeModel.CONTEXTS))
++                            .get(CredentialScopeModel.VC_CONTEXTS))
+                     .map(s -> s.split(","))
+                     .map(Arrays::asList)
+                     .orElseGet(() -> List.of(clientScope.getName()));
+@@ -589,16 +589,16 @@ private void compareMetadataToClientScope(CredentialIssuer credentialIssuer, Cli
+         List<String> expectedProofSigningAlgs = getAllAsymmetricAlgorithms();
+ 
+         KeyAttestationsRequired expectedKeyAttestationsRequired;
+-        if (Boolean.parseBoolean(clientScope.getAttributes().get(CredentialScopeModel.KEY_ATTESTATION_REQUIRED))) {
++        if (Boolean.parseBoolean(clientScope.getAttributes().get(CredentialScopeModel.VC_KEY_ATTESTATION_REQUIRED))) {
+             expectedKeyAttestationsRequired = new KeyAttestationsRequired();
+             expectedKeyAttestationsRequired.setKeyStorage(
+                     Optional.ofNullable(clientScope.getAttributes()
+-                                    .get(CredentialScopeModel.KEY_ATTESTATION_REQUIRED_KEY_STORAGE))
++                                    .get(CredentialScopeModel.VC_KEY_ATTESTATION_REQUIRED_KEY_STORAGE))
+                             .map(s -> Arrays.asList(s.split(",")))
+                             .orElse(null));
+             expectedKeyAttestationsRequired.setUserAuthentication(
+                     Optional.ofNullable(clientScope.getAttributes()
+-                                    .get(CredentialScopeModel.KEY_ATTESTATION_REQUIRED_USER_AUTH))
++                                    .get(CredentialScopeModel.VC_KEY_ATTESTATION_REQUIRED_USER_AUTH))
+                             .map(s -> Arrays.asList(s.split(",")))
+                             .orElse(null));
+         } else {
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
+index 34d88f631bcb..96c9fabd3d98 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
+@@ -141,7 +141,7 @@ public void testGetCredentialOfferUriInvalidToken() {
+     public void testGetCredentialOfferURI() {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         String token = getBearerToken(oauth, client, scopeName);
+ 
+         testingClient.server(TEST_REALM_NAME).run((session) -> {
+@@ -301,7 +301,7 @@ public void testRequestCredentialInvalidToken() {
+     @Test
+     public void testRequestCredentialNoMatchingCredentialBuilder() throws Throwable {
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+ 
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+@@ -361,7 +361,7 @@ public void testRequestCredentialUnsupportedCredential() throws Throwable {
+     @Test
+     public void testRequestCredential() {
+         String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -447,7 +447,7 @@ public void testCredentialIssuance() throws Exception {
+ 
+         // 1. Retrieving the credential-offer-uri
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialOfferURI credOfferUri = oauth.oid4vc()
+                 .credentialOfferUriRequest(credentialConfigurationId)
+                 .preAuthorized(true)
+@@ -522,7 +522,7 @@ public void testCredentialIssuance() throws Exception {
+     @Test
+     public void testCredentialIssuanceWithAuthZCodeWithScopeMatched() throws Exception {
+         String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         String authCode = getAuthorizationCode(oauth, client, "john", scopeName);
+ 
+@@ -625,7 +625,7 @@ public void testCredentialIssuanceWithScopeUnmatched() {
+     @Test
+     public void testRequestMultipleCredentialsWithProofs() {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+@@ -712,7 +712,7 @@ public void testRequestMultipleCredentialsWithProofs() {
+     public void testGetJwtVcConfigFromMetadata() {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         final String verifiableCredentialType = jwtTypeCredentialClientScope.getAttributes()
+                 .get(CredentialScopeModel.VCT);
+         String expectedIssuer = suiteContext.getAuthServerInfo().getContextRoot().toString() + "/auth/realms/" + TEST_REALM_NAME;
+@@ -934,7 +934,7 @@ public void testRequestCredentialWithUnknownCredentialConfigurationId() {
+     @Test
+     public void testRequestCredentialWhenNoCredentialBuilderForFormat() {
+         String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -980,7 +980,7 @@ public void testRequestCredentialWhenNoCredentialBuilderForFormat() {
+     public void testProofToProofsConversion() throws Exception {
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+@@ -1066,7 +1066,7 @@ public void testCredentialRequestWithOptionalClientScope() {
+ 
+         // Extract serializable data before lambda
+         final String scopeName = optionalScope.getName();
+-        final String configId = optionalScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        final String configId = optionalScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+@@ -1198,7 +1198,7 @@ public void testCannotAssignOid4vciScopeWhenRealmDisabled() {
+     public void testCredentialOfferReplayProtection() {
+         String token = getBearerToken(oauth, client, jwtTypeCredentialClientScope.getName());
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // 1. Retrieving the create-credential-offer
+         CredentialOfferURI credentialOfferURI = oauth.oid4vc()
+@@ -1246,7 +1246,7 @@ public void testCredentialOfferReplayProtection() {
+     public void testCredentialOfferDifferentNoncesIndependent() {
+         String token = getBearerToken(oauth, client, jwtTypeCredentialClientScope.getName());
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // 1. Create first credential offer
+         CredentialOfferURI credentialOfferURI1 = oauth.oid4vc()
+@@ -1323,7 +1323,7 @@ public void testCredentialOfferDifferentNoncesIndependent() {
+     public void testPreAuthorizedCodeValidAfterOfferConsumed() {
+         String token = getBearerToken(oauth, client, jwtTypeCredentialClientScope.getName());
+         final String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+ 
+         // 1. Fetch the Offer URI
+         CredentialOfferURI credentialOfferURI = oauth.oid4vc()
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java
+index a72f2ca08a73..f40d899470e8 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java
+@@ -92,7 +92,7 @@ public class OID4VCSdJwtIssuingEndpointTest extends OID4VCIssuerEndpointTest {
+     @Test
+     public void testRequestTestCredential() {
+         String scopeName = sdJwtTypeCredentialClientScope.getName();
+-        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -120,7 +120,7 @@ public void testRequestTestCredential() {
+     public void testRequestTestCredentialWithKeybinding() {
+         String cNonce = getCNonce();
+         String scopeName = sdJwtTypeCredentialClientScope.getName();
+-        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -153,7 +153,7 @@ public void testRequestTestCredentialWithKeybinding() {
+     public void testRequestTestCredentialWithInvalidKeybinding() throws Throwable {
+         String cNonce = getCNonce();
+         String scopeName = sdJwtTypeCredentialClientScope.getName();
+-        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+@@ -190,7 +190,7 @@ public void testRequestTestCredentialWithInvalidKeybinding() throws Throwable {
+     public void testProofOfPossessionWithMissingAudience() throws Throwable {
+         try {
+             String scopeName = sdJwtTypeCredentialClientScope.getName();
+-            String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++            String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+             CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+             OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+             authDetail.setType(OPENID_CREDENTIAL);
+@@ -235,7 +235,7 @@ public void testProofOfPossessionWithMissingAudience() throws Throwable {
+     public void testProofOfPossessionWithIllegalSourceEndpoint() throws Throwable {
+         try {
+             String scopeName = sdJwtTypeCredentialClientScope.getName();
+-            String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++            String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+             CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+             OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+             authDetail.setType(OPENID_CREDENTIAL);
+@@ -279,7 +279,7 @@ public void testProofOfPossessionWithIllegalSourceEndpoint() throws Throwable {
+     public void testProofOfPossessionWithExpiredState() throws Throwable {
+         try {
+             String scopeName = sdJwtTypeCredentialClientScope.getName();
+-            String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++            String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+             CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+             OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+             authDetail.setType(OPENID_CREDENTIAL);
+@@ -373,7 +373,7 @@ public void testCredentialIssuance() throws Exception {
+         String token = getBearerToken(oauth, client, clientScope.getName());
+ 
+         // 1. Retrieving the credential-offer-uri
+-        final String credentialConfigurationId = clientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        final String credentialConfigurationId = clientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialOfferURI credOfferUri = oauth.oid4vc()
+                 .credentialOfferUriRequest(credentialConfigurationId)
+                 .preAuthorized(true)
+@@ -454,7 +454,7 @@ public void testCredentialIssuance() throws Exception {
+     public void testGetSdJwtConfigFromMetadata() {
+         final String scopeName = sdJwtTypeCredentialClientScope.getName();
+         final String credentialConfigurationId = sdJwtTypeCredentialClientScope.getAttributes()
+-                .get(CredentialScopeModel.CONFIGURATION_ID);
++                .get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         final String verifiableCredentialType = sdJwtTypeCredentialClientScope.getAttributes()
+                 .get(CredentialScopeModel.VCT);
+         String expectedIssuer = suiteContext.getAuthServerInfo().getContextRoot().toString() + "/auth/realms/" + TEST_REALM_NAME;
+@@ -625,7 +625,7 @@ public static ClientScopeModel createCredentialScope(KeycloakSession session) {
+         RealmModel realmModel = session.getContext().getRealm();
+         ClientScopeModel credentialScope = session.clientScopes()
+                 .addClientScope(realmModel, jwtTypeCredentialScopeName);
+-        credentialScope.setAttribute(CredentialScopeModel.CREDENTIAL_IDENTIFIER,
++        credentialScope.setAttribute(CredentialScopeModel.VC_IDENTIFIER,
+                 jwtTypeCredentialScopeName);
+         credentialScope.setProtocol(OID4VCIConstants.OID4VC_PROTOCOL);
+         return credentialScope;
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtPreInstalledNaturalPersonTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtPreInstalledNaturalPersonTest.java
+index 3342a4cf918e..13f44494d6d4 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtPreInstalledNaturalPersonTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtPreInstalledNaturalPersonTest.java
+@@ -27,7 +27,7 @@
+ import org.junit.Test;
+ import org.slf4j.LoggerFactory;
+ 
+-import static org.keycloak.models.oid4vci.CredentialScopeModel.CONFIGURATION_ID;
++import static org.keycloak.models.oid4vci.CredentialScopeModel.VC_CONFIGURATION_ID;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+@@ -46,7 +46,7 @@ public class OID4VCSdJwtPreInstalledNaturalPersonTest extends OID4VCIssuerEndpoi
+     public void testGetSdJwtConfigFromMetadata() {
+         String scopeName = sdJwtTypeNaturalPersonScopeName;
+         ClientScopeRepresentation clientScope = requireExistingClientScope(scopeName);
+-        String credentialConfigurationId = clientScope.getAttributes().get(CONFIGURATION_ID);
++        String credentialConfigurationId = clientScope.getAttributes().get(VC_CONFIGURATION_ID);
+         String expectedIssuer = suiteContext.getAuthServerInfo().getContextRoot() + "/auth/realms/" + TEST_REALM_NAME;
+         testingClient
+                 .server(TEST_REALM_NAME)
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationSdJwtTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationSdJwtTest.java
+index aa00ff27386a..98a1007be36b 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationSdJwtTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationSdJwtTest.java
+@@ -65,7 +65,7 @@ public void testSdJwtIatRoundedViaRealmNormalizedIssuanceDate() {
+         });
+ 
+         String scopeName = sdJwtTypeCredentialClientScope.getName();
+-        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = sdJwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationTest.java
+index a14559c4ac76..54d48105f379 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCTimeNormalizationTest.java
+@@ -61,7 +61,7 @@ public void testJwtVcNbfRoundedToStartOfDayUtc() {
+         });
+ 
+         final String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.VC_CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+         OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+         authDetail.setType(OPENID_CREDENTIAL);

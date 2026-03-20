@@ -1,12 +1,215 @@
-diff --git a/synthesizer/program/src/lib.rs b/synthesizer/program/src/lib.rs
-index 26f9b7c2b..6e32c776f 100644
---- a/synthesizer/program/src/lib.rs
-+++ b/synthesizer/program/src/lib.rs
-@@ -575,6 +575,7 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> Pro
-         "u64",
-         "u128",
-         "scalar",
-+        "signature",
-         "string",
-         // Boolean
-         "true",
+diff --git a/Cargo.lock b/Cargo.lock
+index 931fef787..fb8b2b038 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3921,6 +3921,7 @@ dependencies = [
+  "anyhow",
+  "bincode",
+  "colored 3.1.1",
++ "criterion",
+  "num-bigint",
+  "num_cpus",
+  "rand 0.8.5",
+diff --git a/ledger/store/src/program/finalize.rs b/ledger/store/src/program/finalize.rs
+index 767624e6f..9a77c6e36 100644
+--- a/ledger/store/src/program/finalize.rs
++++ b/ledger/store/src/program/finalize.rs
+@@ -387,6 +387,25 @@ pub trait FinalizeStorage<N: Network>: 'static + Clone + Send + Sync {
+ 
+             // Insert the new key-value entries.
+             for (key, value) in entries {
++                // Update the historical maps.
++                #[cfg(feature = "history")]
++                {
++                    let current_height = self.current_block_height().load(Ordering::SeqCst);
++
++                    // Register the updated value at the current height.
++                    self.mapping_update_map()
++                        .insert((program_id, mapping_name, key.clone(), current_height), value.clone())?;
++
++                    // Obtain the list of past update heights.
++                    let key = (program_id, mapping_name, key.clone());
++                    let update_heights =
++                        self.mapping_update_heights_map().get_confirmed(&key)?.map(|list| list.into_owned());
++                    let mut update_heights = update_heights.unwrap_or_default();
++                    // Extend the historical update heights with the current height.
++                    update_heights.push(current_height);
++                    self.mapping_update_heights_map().insert(key, update_heights)?;
++                }
++
+                 // Insert the key-value entry.
+                 self.key_value_map().insert((program_id, mapping_name), key, value)?;
+             }
+diff --git a/utilities/Cargo.toml b/utilities/Cargo.toml
+index ee868ef69..9c6e3ef86 100644
+--- a/utilities/Cargo.toml
++++ b/utilities/Cargo.toml
+@@ -23,6 +23,11 @@ include = [ "Cargo.toml", "src", "README.md", "LICENSE.md" ]
+ license = "Apache-2.0"
+ edition = "2024"
+ 
++[[bench]]
++name = "bigint"
++path = "benches/bigint.rs"
++harness = false
++
+ [dependencies.snarkvm-utilities-derives]
+ workspace = true
+ optional = true
+@@ -78,6 +83,9 @@ default-features = false
+ workspace = true
+ features = [ "derive" ]
+ 
++[dev-dependencies.criterion]
++workspace = true
++
+ [dev-dependencies.tracing-test]
+ workspace = true
+ 
+diff --git a/utilities/benches/bigint.rs b/utilities/benches/bigint.rs
+new file mode 100644
+index 000000000..64afc084d
+--- /dev/null
++++ b/utilities/benches/bigint.rs
+@@ -0,0 +1,67 @@
++// Copyright (c) 2019-2026 Provable Inc.
++// This file is part of the snarkVM library.
++
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at:
++
++// http://www.apache.org/licenses/LICENSE-2.0
++
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Silences the false positives caused by black_box.
++#![allow(clippy::unit_arg)]
++
++use snarkvm_utilities::{BigInteger256, BigInteger384, TestRng};
++
++use criterion::*;
++use rand::Rng;
++use std::hint::black_box;
++
++fn bigint_256(c: &mut Criterion) {
++    let rng = &mut TestRng::default();
++
++    let n = 900_000;
++    let values: Vec<BigInteger256> = (0..n).map(|_| rng.r#gen()).collect();
++
++    c.bench_function("bigint_256_cmp", |b| {
++        b.iter_batched(
++            || values.clone(),
++            |mut data_to_sort| {
++                data_to_sort.sort_unstable();
++                black_box(data_to_sort)
++            },
++            criterion::BatchSize::LargeInput,
++        )
++    });
++}
++
++fn bigint_384(c: &mut Criterion) {
++    let rng = &mut TestRng::default();
++
++    let n = 500_000;
++    let values: Vec<BigInteger384> = (0..n).map(|_| rng.r#gen()).collect();
++
++    c.bench_function("bigint_384_cmp", |b| {
++        b.iter_batched(
++            || values.clone(),
++            |mut data_to_sort| {
++                data_to_sort.sort_unstable();
++                black_box(data_to_sort)
++            },
++            criterion::BatchSize::LargeInput,
++        )
++    });
++}
++
++criterion_group! {
++    name = bigint;
++    config = Criterion::default();
++    targets = bigint_256, bigint_384
++}
++
++criterion_main!(bigint);
+diff --git a/utilities/src/biginteger/bigint_256.rs b/utilities/src/biginteger/bigint_256.rs
+index e6ce55dca..b06203509 100644
+--- a/utilities/src/biginteger/bigint_256.rs
++++ b/utilities/src/biginteger/bigint_256.rs
+@@ -13,7 +13,10 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-use std::io::{Read, Result as IoResult, Write};
++use std::{
++    cmp,
++    io::{Read, Result as IoResult, Write},
++};
+ 
+ use crate::{
+     FromBits,
+@@ -311,16 +314,15 @@ impl Display for BigInteger256 {
+ 
+ impl Ord for BigInteger256 {
+     #[inline]
+-    #[allow(clippy::comparison_chain)]
+-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
++    fn cmp(&self, other: &Self) -> cmp::Ordering {
+         for (a, b) in self.0.iter().rev().zip(other.0.iter().rev()) {
+-            if a < b {
+-                return std::cmp::Ordering::Less;
+-            } else if a > b {
+-                return std::cmp::Ordering::Greater;
++            match a.cmp(b) {
++                cmp::Ordering::Less => return cmp::Ordering::Less,
++                cmp::Ordering::Greater => return cmp::Ordering::Greater,
++                _ => continue,
+             }
+         }
+-        std::cmp::Ordering::Equal
++        cmp::Ordering::Equal
+     }
+ }
+ 
+diff --git a/utilities/src/biginteger/bigint_384.rs b/utilities/src/biginteger/bigint_384.rs
+index 408dde379..38343fab0 100644
+--- a/utilities/src/biginteger/bigint_384.rs
++++ b/utilities/src/biginteger/bigint_384.rs
+@@ -14,6 +14,7 @@
+ // limitations under the License.
+ 
+ use std::{
++    cmp,
+     fmt::{Debug, Display},
+     io::{Read, Result as IoResult, Write},
+ };
+@@ -309,16 +310,15 @@ impl Display for BigInteger384 {
+ }
+ impl Ord for BigInteger384 {
+     #[inline]
+-    #[allow(clippy::comparison_chain)]
+-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
++    fn cmp(&self, other: &Self) -> cmp::Ordering {
+         for (a, b) in self.0.iter().rev().zip(other.0.iter().rev()) {
+-            if a < b {
+-                return std::cmp::Ordering::Less;
+-            } else if a > b {
+-                return std::cmp::Ordering::Greater;
++            match a.cmp(b) {
++                cmp::Ordering::Less => return cmp::Ordering::Less,
++                cmp::Ordering::Greater => return cmp::Ordering::Greater,
++                _ => continue,
+             }
+         }
+-        std::cmp::Ordering::Equal
++        cmp::Ordering::Equal
+     }
+ }
+ impl PartialOrd for BigInteger384 {

@@ -1,38 +1,1440 @@
-diff --git a/node/bft/src/primary.rs b/node/bft/src/primary.rs
-index 047a6f423..c936fbad7 100644
---- a/node/bft/src/primary.rs
-+++ b/node/bft/src/primary.rs
-@@ -1359,24 +1359,27 @@ impl<N: Network> Primary<N> {
-                     continue;
-                 }
-                 // Attempt to increment to the next round.
--                let next_round = self_.current_round().saturating_add(1);
-+                let current_round = self_.current_round();
-+                let next_round = current_round.saturating_add(1);
-                 // Determine if the quorum threshold is reached for the current round.
-                 let is_quorum_threshold_reached = {
--                    // Retrieve the certificate authors for the next round.
--                    let authors = self_.storage.get_certificate_authors_for_round(next_round);
-+                    // Retrieve the certificate authors for the current round.
-+                    let authors = self_.storage.get_certificate_authors_for_round(current_round);
-                     // If there are no certificates, then skip this check.
-                     if authors.is_empty() {
-                         continue;
-                     }
--                    let Ok(committee_lookback) = self_.ledger.get_committee_lookback_for_round(next_round) else {
--                        warn!("Failed to retrieve the committee lookback for round {next_round}");
-+                    // Retrieve the committee lookback for the current round.
-+                    let Ok(committee_lookback) = self_.ledger.get_committee_lookback_for_round(current_round) else {
-+                        warn!("Failed to retrieve the committee lookback for round {current_round}");
-                         continue;
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index 0268050a1..ccbc4fb3e 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -165,6 +165,42 @@ commands:
+       - clear_environment:
+           cache_key: << parameters.cache_key >>
+ 
++  run_devnet:
++    description: "Run devnet for integration testing"
++    parameters:
++      workspace_member:
++        type: string
++      cache_key:
++        type: string
++      validators:
++        type: integer
++        default: 4
++      clients:
++        type: integer
++        default: 2
++      network_id:
++        type: integer
++        default: 0
++      min_height:
++        type: integer
++        default: 45
++    steps:
++      - checkout
++      - setup_environment:
++          cache_key: << parameters.cache_key >>
++      - run:
++          name: "Install snarkos"
++          command: |
++            cargo install --locked --path .
++      - run:
++          name: "Run devnet test"
++          no_output_timeout: 20m  # Allow 20 minutes total
++          command: |
++            chmod +x .circleci/devnet_ci.sh
++            ./.circleci/devnet_ci.sh << parameters.validators >> << parameters.clients >> << parameters.network_id >> << parameters.min_height >>
++      - clear_environment:
++          cache_key: << parameters.cache_key >>
++
+   install_rust_nightly:
+     description: "Install Rust nightly toolchain"
+     steps:
+@@ -342,6 +378,15 @@ jobs:
+           workspace_member: node/tcp
+           cache_key: v3.3.1-rust-1.83.0-node-tcp-cache
+ 
++  devnet-test:
++    docker:
++      - image: cimg/rust:1.83.0 # Attention - Change the MSRV in Cargo.toml and rust-toolchain as well
++    resource_class: << pipeline.parameters.large >>
++    steps:
++      - run_devnet:
++          workspace_member: .
++          cache_key: v3.3.1-rust-1.83.0-devnet-test-cache
++
+   check-fmt:
+     docker:
+       - image: cimg/rust:1.83.0 # Attention - Change the MSRV in Cargo.toml and rust-toolchain as well
+@@ -413,6 +458,7 @@ workflows:
+       - node-tcp
+       - check-fmt
+       - check-clippy
++      - devnet-test
+ 
+   windows-workflow:
+     jobs:
+diff --git a/.circleci/devnet_ci.sh b/.circleci/devnet_ci.sh
+new file mode 100644
+index 000000000..ef3160a00
+--- /dev/null
++++ b/.circleci/devnet_ci.sh
+@@ -0,0 +1,129 @@
++#!/bin/bash
++
++# Set parameters directly
++total_validators=$1
++total_clients=$2
++network_id=$3
++min_height=$4
++
++# Default values if not provided
++: "${total_validators:=4}"
++: "${total_clients:=2}"
++: "${network_id:=0}"
++: "${min_height:=45}"
++
++# Determine network name based on network_id
++case $network_id in
++  0)
++    network_name="mainnet"
++    ;;
++  1)
++    network_name="testnet"
++    ;;
++  2)
++    network_name="canary"
++    ;;
++  *)
++    echo "Unknown network ID: $network_id, defaulting to mainnet"
++    network_name="mainnet"
++    ;;
++esac
++
++echo "Using network: $network_name (ID: $network_id)"
++
++# Create log directory
++log_dir=".logs-$(date +"%Y%m%d%H%M%S")"
++mkdir -p "$log_dir"
++
++# Array to store PIDs of all processes
++declare -a PIDS
++
++# Start all validator nodes in the background
++for ((validator_index = 0; validator_index < $total_validators; validator_index++)); do
++  log_file="$log_dir/validator-$validator_index.log"
++  if [ "$validator_index" -eq 0 ]; then
++    snarkos start --nodisplay --network $network_id --dev $validator_index --allow-external-peers --dev-num-validators $total_validators --validator --logfile $log_file --metrics &
++  else
++    snarkos start --nodisplay --network $network_id --dev $validator_index --allow-external-peers --dev-num-validators $total_validators --validator --logfile $log_file &
++  fi
++  PIDS[$validator_index]=$!
++  echo "Started validator $validator_index with PID ${PIDS[$validator_index]}"
++done
++
++# Start all client nodes in the background
++for ((client_index = 0; client_index < $total_clients; client_index++)); do
++  node_index=$((client_index + total_validators))
++  log_file="$log_dir/client-$client_index.log"
++  snarkos start --nodisplay --network $network_id --dev $node_index --dev-num-validators $total_validators --client --logfile $log_file &
++  PIDS[$node_index]=$!
++  echo "Started client $client_index with PID ${PIDS[$node_index]}"
++done
++
++# Function to check block heights
++check_heights() {
++  echo "Checking block heights on all nodes..."
++  all_reached=true
++  highest_height=0
++  for ((node_index = 0; node_index < $((total_validators + total_clients)); node_index++)); do
++    port=$((3030 + node_index))
++    height=$(curl -s "http://127.0.0.1:$port/$network_name/block/height/latest" || echo "0")
++    echo "Node $node_index block height: $height"
++    
++    # Track highest height for reporting
++    if [[ "$height" =~ ^[0-9]+$ ]] && [ $height -gt $highest_height ]; then
++      highest_height=$height
++    fi
++    
++    if ! [[ "$height" =~ ^[0-9]+$ ]] || [ $height -lt $min_height ]; then
++      all_reached=false
++    fi
++  done
++  
++  if $all_reached; then
++    echo "✅ SUCCESS: All nodes reached minimum height of $min_height"
++    return 0
++  else
++    echo "⏳ WAITING: Not all nodes reached minimum height of $min_height (highest so far: $highest_height)"
++    return 1
++  fi
++}
++
++# Wait for 60 seconds to let the network start up
++echo "Waiting 60 seconds for network to start up..."
++sleep 60
++
++# Check heights periodically with a timeout
++total_wait=0
++while [ $total_wait -lt 900 ]; do  # 15 minutes max
++  if check_heights; then
++    echo "🎉 Test passed! All nodes reached minimum height."
++    
++    # Cleanup: kill all processes
++    for pid in "${PIDS[@]}"; do
++      kill -9 $pid 2>/dev/null || true
++    done
++    
++    exit 0
++  fi
++  
++  # Continue waiting
++  sleep 60
++  total_wait=$((total_wait + 60))
++  echo "Waited $total_wait seconds so far..."
++done
++
++echo "❌ Test failed! Not all nodes reached minimum height within 15 minutes."
++
++# Print logs for debugging
++echo "Last 20 lines of validator logs:"
++for ((validator_index = 0; validator_index < $total_validators; validator_index++)); do
++  echo "=== Validator $validator_index logs ==="
++  tail -n 20 "$log_dir/validator-$validator_index.log"
++done
++
++# Cleanup: kill all processes
++for pid in "${PIDS[@]}"; do
++  kill -9 $pid 2>/dev/null || true
++done
++
++exit 1
+\ No newline at end of file
+diff --git a/Cargo.lock b/Cargo.lock
+index b228ce124..0669e1bbc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3591,7 +3591,6 @@ version = "3.3.2"
+ dependencies = [
+  "async-trait",
+  "indexmap 2.7.1",
+- "lru",
+  "parking_lot",
+  "rand",
+  "rayon",
+@@ -3811,7 +3810,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "anstyle",
+  "anyhow",
+@@ -3842,7 +3841,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-algorithms"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+@@ -3872,7 +3871,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-account",
+  "snarkvm-circuit-algorithms",
+@@ -3886,7 +3885,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-account"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-algorithms",
+  "snarkvm-circuit-network",
+@@ -3897,7 +3896,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-algorithms"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-types",
+  "snarkvm-console-algorithms",
+@@ -3907,7 +3906,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-collections"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-algorithms",
+  "snarkvm-circuit-types",
+@@ -3917,13 +3916,14 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-environment"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "indexmap 2.7.1",
+  "itertools 0.11.0",
+  "nom",
+  "num-traits",
+  "once_cell",
++ "smallvec",
+  "snarkvm-algorithms",
+  "snarkvm-circuit-environment-witness",
+  "snarkvm-console-network",
+@@ -3935,12 +3935,12 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-environment-witness"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ 
+ [[package]]
+ name = "snarkvm-circuit-network"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-algorithms",
+  "snarkvm-circuit-collections",
+@@ -3951,7 +3951,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-program"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "paste",
+  "snarkvm-circuit-account",
+@@ -3966,7 +3966,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-circuit-types-address",
+@@ -3981,7 +3981,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types-address"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-circuit-types-boolean",
+@@ -3994,7 +3994,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types-boolean"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-console-types-boolean",
+@@ -4003,7 +4003,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types-field"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-circuit-types-boolean",
+@@ -4013,7 +4013,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types-group"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-circuit-types-boolean",
+@@ -4025,7 +4025,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types-integers"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-circuit-types-boolean",
+@@ -4037,7 +4037,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types-scalar"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-circuit-types-boolean",
+@@ -4048,7 +4048,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-circuit-types-string"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-circuit-environment",
+  "snarkvm-circuit-types-boolean",
+@@ -4060,7 +4060,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-account",
+  "snarkvm-console-algorithms",
+@@ -4073,7 +4073,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-account"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "bs58",
+  "snarkvm-console-network",
+@@ -4084,7 +4084,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-algorithms"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "blake2s_simd",
+  "smallvec",
+@@ -4097,7 +4097,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-collections"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "rayon",
+@@ -4108,7 +4108,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-network"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "anyhow",
+  "indexmap 2.7.1",
+@@ -4131,7 +4131,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-network-environment"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "anyhow",
+  "bech32",
+@@ -4149,7 +4149,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-program"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "enum-iterator",
+  "enum_index",
+@@ -4171,7 +4171,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+  "snarkvm-console-types-address",
+@@ -4186,7 +4186,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types-address"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+  "snarkvm-console-types-boolean",
+@@ -4197,7 +4197,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types-boolean"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+ ]
+@@ -4205,7 +4205,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types-field"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+  "snarkvm-console-types-boolean",
+@@ -4215,7 +4215,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types-group"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+  "snarkvm-console-types-boolean",
+@@ -4226,7 +4226,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types-integers"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+  "snarkvm-console-types-boolean",
+@@ -4237,7 +4237,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types-scalar"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+  "snarkvm-console-types-boolean",
+@@ -4248,7 +4248,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-console-types-string"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console-network-environment",
+  "snarkvm-console-types-boolean",
+@@ -4259,7 +4259,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-curves"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "rand",
+  "rayon",
+@@ -4273,7 +4273,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-fields"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+@@ -4290,11 +4290,12 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+  "indexmap 2.7.1",
++ "lru",
+  "parking_lot",
+  "rand",
+  "rayon",
+@@ -4315,7 +4316,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-authority"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "anyhow",
+  "rand",
+@@ -4327,7 +4328,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-block"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "indexmap 2.7.1",
+  "rayon",
+@@ -4347,7 +4348,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-committee"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "anyhow",
+  "indexmap 2.7.1",
+@@ -4366,7 +4367,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-narwhal"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-ledger-narwhal-batch-certificate",
+  "snarkvm-ledger-narwhal-batch-header",
+@@ -4379,7 +4380,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-narwhal-batch-certificate"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "indexmap 2.7.1",
+  "rayon",
+@@ -4392,7 +4393,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-narwhal-batch-header"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "indexmap 2.7.1",
+  "rayon",
+@@ -4405,7 +4406,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-narwhal-data"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "bytes",
+  "serde_json",
+@@ -4416,7 +4417,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-narwhal-subdag"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "indexmap 2.7.1",
+  "rayon",
+@@ -4431,7 +4432,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-narwhal-transmission"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "bytes",
+  "serde_json",
+@@ -4444,7 +4445,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-narwhal-transmission-id"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "snarkvm-console",
+  "snarkvm-ledger-puzzle",
+@@ -4453,7 +4454,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-puzzle"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+@@ -4473,7 +4474,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-puzzle-epoch"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+@@ -4494,7 +4495,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-query"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "async-trait",
+  "reqwest 0.11.27",
+@@ -4507,7 +4508,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-store"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std-storage",
+  "anyhow",
+@@ -4534,7 +4535,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-ledger-test-helpers"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "once_cell",
+  "snarkvm-circuit",
+@@ -4549,7 +4550,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-metrics"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "metrics",
+  "metrics-exporter-prometheus",
+@@ -4558,7 +4559,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-parameters"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+@@ -4583,7 +4584,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-synthesizer"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+@@ -4615,7 +4616,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-synthesizer-process"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "colored",
+@@ -4639,7 +4640,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-synthesizer-program"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "indexmap 2.7.1",
+  "paste",
+@@ -4654,7 +4655,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-synthesizer-snark"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "bincode",
+  "once_cell",
+@@ -4667,7 +4668,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-utilities"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+@@ -4688,7 +4689,7 @@ dependencies = [
+ [[package]]
+ name = "snarkvm-utilities-derives"
+ version = "1.3.0"
+-source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=3ced248#3ced248d4015c929f5240ce8fa5693ac3ae3b51b"
++source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=c6558fb#c6558fb9c15da28b7455db0a6a903d1fc09ffa3c"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.38",
+diff --git a/Cargo.toml b/Cargo.toml
+index 6ff474a34..f98c8b85e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -45,9 +45,9 @@ version = "=0.1.24"
+ default-features = false
+ 
+ [workspace.dependencies.snarkvm] # If this is updated, the rev in `node/rest/Cargo.toml` must be updated as well.
+-#path = "../snarkVM"
++# path = "../snarkVM"
+ git = "https://github.com/ProvableHQ/snarkVM.git"
+-rev = "3ced248"
++rev = "c6558fb"
+ #version = "=1.3.0"
+ features = [ "circuit", "console", "rocks" ]
+ 
+diff --git a/cli/src/helpers/logger.rs b/cli/src/helpers/logger.rs
+index 9b98fa6ca..69882770d 100644
+--- a/cli/src/helpers/logger.rs
++++ b/cli/src/helpers/logger.rs
+@@ -60,7 +60,7 @@ pub fn initialize_logger<P: AsRef<Path>>(
+             .add_directive("hyper=off".parse().unwrap())
+             .add_directive("reqwest=off".parse().unwrap())
+             .add_directive("want=off".parse().unwrap())
+-            .add_directive("warp=off".parse().unwrap());
++            .add_directive("h2=off".parse().unwrap());
+ 
+         let filter = if verbosity >= 2 {
+             filter.add_directive("snarkos_node_sync=trace".parse().unwrap())
+diff --git a/node/bft/examples/simple_node.rs b/node/bft/examples/simple_node.rs
+index f648a0d41..d0e993f8a 100644
+--- a/node/bft/examples/simple_node.rs
++++ b/node/bft/examples/simple_node.rs
+@@ -87,7 +87,7 @@ pub fn initialize_logger(verbosity: u8) {
+             .add_directive("hyper=off".parse().unwrap())
+             .add_directive("reqwest=off".parse().unwrap())
+             .add_directive("want=off".parse().unwrap())
+-            .add_directive("warp=off".parse().unwrap());
++            .add_directive("h2=off".parse().unwrap());
+ 
+         let filter = if verbosity > 3 {
+             filter.add_directive("snarkos_node_bft::gateway=trace".parse().unwrap())
+diff --git a/node/bft/ledger-service/Cargo.toml b/node/bft/ledger-service/Cargo.toml
+index cc74025eb..29b101e6c 100644
+--- a/node/bft/ledger-service/Cargo.toml
++++ b/node/bft/ledger-service/Cargo.toml
+@@ -18,7 +18,7 @@ edition = "2021"
+ 
+ [features]
+ default = [ ]
+-ledger = [ "lru", "parking_lot", "rand", "rayon", "tokio", "tracing" ]
++ledger = [ "parking_lot", "rand", "rayon", "tokio", "tracing" ]
+ ledger-write = [ ]
+ metrics = [ "dep:metrics", "snarkvm/metrics" ]
+ mock = [ "parking_lot", "tracing" ]
+@@ -34,10 +34,6 @@ version = "0.1"
+ version = "2.1"
+ features = [ "serde", "rayon" ]
+ 
+-[dependencies.lru]
+-version = "0.12"
+-optional = true
+-
+ [dependencies.metrics]
+ package = "snarkos-node-metrics"
+ path = "../../metrics"
+diff --git a/node/bft/ledger-service/src/ledger.rs b/node/bft/ledger-service/src/ledger.rs
+index 355fa8441..3ac81fdb6 100644
+--- a/node/bft/ledger-service/src/ledger.rs
++++ b/node/bft/ledger-service/src/ledger.rs
+@@ -27,8 +27,7 @@ use snarkvm::{
+ };
+ 
+ use indexmap::IndexMap;
+-use lru::LruCache;
+-use parking_lot::{Mutex, RwLock};
++use parking_lot::RwLock;
+ use rayon::prelude::*;
+ use std::{
+     collections::BTreeMap,
+@@ -41,8 +40,6 @@ use std::{
+     },
+ };
+ 
+-/// The capacity of the LRU holding the recently queried committees.
+-const COMMITTEE_CACHE_SIZE: usize = 16;
+ /// The capacity of the cache holding the highest blocks.
+ const BLOCK_CACHE_SIZE: usize = 10;
+ 
+@@ -50,7 +47,6 @@ const BLOCK_CACHE_SIZE: usize = 10;
+ #[allow(clippy::type_complexity)]
+ pub struct CoreLedgerService<N: Network, C: ConsensusStorage<N>> {
+     ledger: Ledger<N, C>,
+-    committee_cache: Arc<Mutex<LruCache<u64, Committee<N>>>>,
+     block_cache: Arc<RwLock<BTreeMap<u32, Block<N>>>>,
+     latest_leader: Arc<RwLock<Option<(u64, Address<N>)>>>,
+     shutdown: Arc<AtomicBool>,
+@@ -59,9 +55,8 @@ pub struct CoreLedgerService<N: Network, C: ConsensusStorage<N>> {
+ impl<N: Network, C: ConsensusStorage<N>> CoreLedgerService<N, C> {
+     /// Initializes a new core ledger service.
+     pub fn new(ledger: Ledger<N, C>, shutdown: Arc<AtomicBool>) -> Self {
+-        let committee_cache = Arc::new(Mutex::new(LruCache::new(COMMITTEE_CACHE_SIZE.try_into().unwrap())));
+         let block_cache = Arc::new(RwLock::new(BTreeMap::new()));
+-        Self { ledger, committee_cache, block_cache, latest_leader: Default::default(), shutdown }
++        Self { ledger, block_cache, latest_leader: Default::default(), shutdown }
+     }
+ }
+ 
+@@ -169,29 +164,9 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
+ 
+     /// Returns the committee for the given round.
+     fn get_committee_for_round(&self, round: u64) -> Result<Committee<N>> {
+-        // Check if the committee is already in the cache.
+-        if let Some(committee) = self.committee_cache.lock().get(&round) {
+-            return Ok(committee.clone());
+-        }
+-
+         match self.ledger.get_committee_for_round(round)? {
+-            // Return the committee if it exists.
+-            Some(committee) => {
+-                // Insert the committee into the cache.
+-                self.committee_cache.lock().push(round, committee.clone());
+-                // Return the committee.
+-                Ok(committee)
+-            }
+-            // Return the current committee if the round is equivalent.
+-            None => {
+-                // Retrieve the current committee.
+-                let current_committee = self.current_committee()?;
+-                // Return the current committee if the round is equivalent.
+-                match current_committee.starting_round() == round {
+-                    true => Ok(current_committee),
+-                    false => bail!("No committee found for round {round} in the ledger"),
+-                }
+-            }
++            Some(committee) => Ok(committee),
++            None => bail!("No committee found for round {round} in the ledger"),
+         }
+     }
+ 
+diff --git a/node/bft/src/sync/mod.rs b/node/bft/src/sync/mod.rs
+index 7ac23656c..d3eb6b564 100644
+--- a/node/bft/src/sync/mod.rs
++++ b/node/bft/src/sync/mod.rs
+@@ -61,6 +61,9 @@ pub struct Sync<N: Network> {
+     /// The sync lock.
+     sync_lock: Arc<TMutex<()>>,
+     /// The latest block responses.
++    ///
++    /// This is used in [`Sync::sync_storage_with_block()`] to accumulate blocks
++    /// whose addition to the ledger is deferred until certain checks pass.
+     latest_block_responses: Arc<TMutex<HashMap<u32, Block<N>>>>,
+ }
+ 
+@@ -414,6 +417,15 @@ impl<N: Network> Sync<N> {
+     }
+ 
+     /// Syncs the storage with the given block.
++    ///
++    /// This also updates the DAG, and uses the DAG to ensure that the block's leader certificate
++    /// meets the voter availability threshold (i.e. > f voting stake)
++    /// or is reachable via a DAG path from a later leader certificate that does.
++    /// Since performing this check requires DAG certificates from later blocks,
++    /// the block is stored in `Sync::latest_block_responses`,
++    /// and its addition to the ledger is deferred until the check passes.
++    /// Several blocks may be stored in `Sync::latest_block_responses`
++    /// before they can be all checked and added to the ledger.
+     pub async fn sync_storage_with_block(&self, block: Block<N>) -> Result<()> {
+         // Acquire the sync lock.
+         let _lock = self.sync_lock.lock().await;
+@@ -471,10 +483,15 @@ impl<N: Network> Sync<N> {
+             .filter_map(|k| latest_block_responses.get(&k).cloned())
+             .collect();
+ 
+-        // Check if the block response is ready to be added to the ledger.
+-        // Ensure that the previous block's leader certificate meets the availability threshold
+-        // based on the certificates in the current block.
+-        // If the availability threshold is not met, process the next block and check if it is linked to the current block.
++        // Check if each block response, from the contiguous sequence just constructed,
++        // is ready to be added to the ledger.
++        // Ensure that the block's leader certificate meets the availability threshold
++        // based on the certificates in the DAG just after the block's round.
++        // If the availability threshold is not met,
++        // process the next block and check if it is linked to the current block,
++        // in the sense that there is a path in the DAG
++        // from the next block's leader certificate
++        // to the current block's leader certificate.
+         // Note: We do not advance to the most recent block response because we would be unable to
+         // validate if the leader certificate in the block has been certified properly.
+         for next_block in contiguous_blocks.into_iter() {
+@@ -516,7 +533,7 @@ impl<N: Network> Sync<N> {
+                     let Some(previous_block) = latest_block_responses.get(&height) else {
+                         bail!("Block {height} is missing from the latest block responses.");
                      };
-+                    // Check if the quorum threshold is reached for the current round.
-                     committee_lookback.is_quorum_threshold_reached(&authors)
-                 };
-                 // Attempt to increment to the next round if the quorum threshold is reached.
-                 if is_quorum_threshold_reached {
--                    debug!("Quorum threshold reached for round {}", next_round);
-+                    debug!("Quorum threshold reached for round {}", current_round);
-                     if let Err(e) = self_.try_increment_to_the_next_round(next_round).await {
-                         warn!("Failed to increment to the next round - {e}");
-                     }
+-                    // Retrieve the previous certificate.
++                    // Retrieve the previous block's leader certificate.
+                     let previous_certificate = match previous_block.authority() {
+                         Authority::Quorum(subdag) => subdag.leader_certificate().clone(),
+                         _ => bail!("Received a block with an unexpected authority type."),
+diff --git a/node/bft/tests/common/utils.rs b/node/bft/tests/common/utils.rs
+index 855d297f6..09f5c6ff5 100644
+--- a/node/bft/tests/common/utils.rs
++++ b/node/bft/tests/common/utils.rs
+@@ -71,7 +71,7 @@ pub fn initialize_logger(verbosity: u8) {
+             .add_directive("hyper=off".parse().unwrap())
+             .add_directive("reqwest=off".parse().unwrap())
+             .add_directive("want=off".parse().unwrap())
+-            .add_directive("warp=off".parse().unwrap());
++            .add_directive("h2=off".parse().unwrap());
+ 
+         if verbosity > 3 {
+             filter.add_directive("snarkos_node_tcp=trace".parse().unwrap())
+diff --git a/node/cdn/src/blocks.rs b/node/cdn/src/blocks.rs
+index c55d58eed..53fe70dec 100644
+--- a/node/cdn/src/blocks.rs
++++ b/node/cdn/src/blocks.rs
+@@ -195,32 +195,37 @@ pub async fn load_blocks<N: Network>(
+         let next_blocks = std::mem::replace(&mut *candidate_blocks, retained_blocks);
+         drop(candidate_blocks);
+ 
++        // Initialize a temporary threadpool that can use the full CPU.
++        let threadpool = rayon::ThreadPoolBuilder::new().build().unwrap();
++
+         // Attempt to advance the ledger using the CDN block bundle.
+         let mut process_clone = process.clone();
+         let shutdown_clone = shutdown.clone();
+         current_height = tokio::task::spawn_blocking(move || {
+-            for block in next_blocks.into_iter().filter(|b| (start_height..end_height).contains(&b.height())) {
+-                // If we are instructed to shut down, abort.
+-                if shutdown_clone.load(Ordering::Relaxed) {
+-                    info!("Stopping block sync at {} - the node is shutting down", current_height);
+-                    // We can shut down cleanly from here, as the node hasn't been started yet.
+-                    std::process::exit(0);
+-                }
++            threadpool.install(|| {
++                for block in next_blocks.into_iter().filter(|b| (start_height..end_height).contains(&b.height())) {
++                    // If we are instructed to shut down, abort.
++                    if shutdown_clone.load(Ordering::Relaxed) {
++                        info!("Stopping block sync at {} - the node is shutting down", current_height);
++                        // We can shut down cleanly from here, as the node hasn't been started yet.
++                        std::process::exit(0);
++                    }
+ 
+-                // Register the next block's height, as the block gets consumed next.
+-                let block_height = block.height();
++                    // Register the next block's height, as the block gets consumed next.
++                    let block_height = block.height();
+ 
+-                // Insert the block into the ledger.
+-                process_clone(block)?;
++                    // Insert the block into the ledger.
++                    process_clone(block)?;
+ 
+-                // Update the current height.
+-                current_height = block_height;
++                    // Update the current height.
++                    current_height = block_height;
+ 
+-                // Log the progress.
+-                log_progress::<BLOCKS_PER_FILE>(timer, current_height, cdn_start, cdn_end, "block");
+-            }
++                    // Log the progress.
++                    log_progress::<BLOCKS_PER_FILE>(timer, current_height, cdn_start, cdn_end, "block");
++                }
+ 
+-            Ok(current_height)
++                Ok(current_height)
++            })
+         })
+         .await
+         .map_err(|e| (current_height, e.into()))?
+diff --git a/node/rest/Cargo.toml b/node/rest/Cargo.toml
+index 71f6e9def..d7d84be51 100644
+--- a/node/rest/Cargo.toml
++++ b/node/rest/Cargo.toml
+@@ -66,9 +66,9 @@ path = "../router"
+ version = "=3.3.2"
+ 
+ [dependencies.snarkvm-synthesizer]
+-#path = "../../../snarkVM/synthesizer"
++# path = "../../../snarkVM/synthesizer"
+ git = "https://github.com/ProvableHQ/snarkVM.git"
+-rev = "3ced248"
++rev = "c6558fb"
+ #version = "=1.3.0"
+ default-features = false
+ optional = true
+diff --git a/node/router/src/heartbeat.rs b/node/router/src/heartbeat.rs
+index 8ad0152ae..032171ef8 100644
+--- a/node/router/src/heartbeat.rs
++++ b/node/router/src/heartbeat.rs
+@@ -15,6 +15,7 @@
+ 
+ use crate::{
+     Outbound,
++    Peer,
+     Router,
+     messages::{DisconnectReason, Message, PeerRequest},
+ };
+@@ -104,8 +105,44 @@ pub trait Heartbeat<N: Network>: Outbound<N> {
+         }
+     }
+ 
+-    /// This function removes the oldest connected peer, to keep the connections fresh.
+-    /// This function only triggers if the router is above the minimum number of connected peers.
++    /// Returns a sorted vector of network addresess of all removable connected peers
++    /// where the first entry has the lowest priority andthe last one the highest.
++    ///
++    /// Rules:
++    ///     - Trusted peers and bootstrap nodes are not removable.
++    ///     - Peers that we are currently syncing with are not remeovable.
++    ///     - Validators are considered higher priority than provers or clients.
++    ///     - Connections that have not been seen in a while are considered lower priority.
++    fn get_removable_peers(&self) -> Vec<Peer<N>> {
++        // The trusted peers (specified at runtime).
++        let trusted = self.router().trusted_peers();
++        // The hardcoded bootstrap nodes.
++        let bootstrap = self.router().bootstrap_peers();
++        // Are we synced already? (cache this here, so it does not need to be recomputed)
++        let is_block_synced = self.is_block_synced();
++
++        // Sort by priority, where lowest priority will be at the beginning
++        // of the vector.
++        // Note, that this gives equal priority to clients and provers, which
++        // we might want to change in the future.
++        let mut peers = self.router().get_connected_peers();
++        peers.sort_by_key(|peer| (peer.is_validator(), peer.last_seen()));
++
++        // Deterimine which of the peers can be removed.
++        peers
++            .into_iter()
++            .filter(|peer| {
++                !trusted.contains(&peer.ip()) // Always keep trusted nodes.
++                  && !bootstrap.contains(&peer.ip()) // Always keep bootstrap nodes.
++                  && !self.router().cache.contains_inbound_block_request(&peer.ip()) // This peer is currently syncing from us.
++                  && (is_block_synced || self.router().cache.num_outbound_block_requests(&peer.ip()) == 0) // We are currently syncing from this peer.
++            })
++            .collect()
++    }
++
++    /// This function removes the peer that we have not heard from the longest,
++    /// to keep the connections fresh.
++    /// It only triggers if the router is above the minimum number of connected peers.
+     fn remove_oldest_connected_peer(&self) {
+         // Skip if the router is at or below the minimum number of connected peers.
+         if self.router().number_of_connected_peers() <= Self::MINIMUM_NUMBER_OF_PEERS {
+@@ -117,32 +154,16 @@ pub trait Heartbeat<N: Network>: Outbound<N> {
+             return;
+         }
+ 
+-        // Retrieve the trusted peers.
+-        let trusted = self.router().trusted_peers();
+-        // Retrieve the bootstrap peers.
+-        let bootstrap = self.router().bootstrap_peers();
+-
+-        // Find the oldest connected peer, that is neither trusted nor a bootstrap peer.
+-        let oldest_peer = self
+-            .router()
+-            .get_connected_peers()
+-            .iter()
+-            .filter(|peer| !trusted.contains(&peer.ip()) && !bootstrap.contains(&peer.ip()))
+-            .filter(|peer| !self.router().cache.contains_inbound_block_request(&peer.ip())) // Skip if the peer is syncing.
+-            .filter(|peer| self.is_block_synced() || self.router().cache.num_outbound_block_requests(&peer.ip()) == 0) // Skip if you are syncing from this peer.
+-            .min_by_key(|peer| peer.last_seen())
+-            .map(|peer| peer.ip());
+-
+-        // Disconnect from the oldest connected peer, if one exists.
+-        if let Some(oldest) = oldest_peer {
++        // Disconnect from the oldest connected peer, which is the first entry in the list
++        // of removable peers.
++        // Do nothing, if the list is empty.
++        if let Some(oldest) = self.get_removable_peers().first().map(|peer| peer.ip()) {
+             info!("Disconnecting from '{oldest}' (periodic refresh of peers)");
+             let _ = self.send(oldest, Message::Disconnect(DisconnectReason::PeerRefresh.into()));
+-            // Disconnect from this peer.
+             self.router().disconnect(oldest);
+         }
+     }
+ 
+-    /// TODO (howardwu): If the node is a validator, keep the validator.
+     /// This function keeps the number of connected peers within the allowed range.
+     fn handle_connected_peers(&self) {
+         // Initialize an RNG.
+@@ -182,37 +203,23 @@ pub trait Heartbeat<N: Network>: Outbound<N> {
+             let bootstrap = self.router().bootstrap_peers();
+ 
+             // Determine the provers to disconnect from.
+-            let prover_ips_to_disconnect = self
++            let provers_to_disconnect = self
+                 .router()
+                 .connected_provers()
+                 .into_iter()
+                 .filter(|peer_ip| !trusted.contains(peer_ip) && !bootstrap.contains(peer_ip))
+                 .choose_multiple(rng, num_surplus_provers);
+ 
+-            // TODO (howardwu): As a validator, prioritize disconnecting from clients.
+-            //  Remove RNG, pick the `n` oldest nodes.
+             // Determine the clients and validators to disconnect from.
+-            let peer_ips_to_disconnect = self
+-                .router()
+-                .get_connected_peers()
++            let peers_to_disconnect = self
++                .get_removable_peers()
+                 .into_iter()
+-                .filter_map(|peer| {
+-                    let peer_ip = peer.ip();
+-                    if !peer.is_prover() && // Skip if the peer is a prover.
+-                       !trusted.contains(&peer_ip) && // Skip if the peer is trusted.
+-                       !bootstrap.contains(&peer_ip) && // Skip if the peer is a bootstrap peer.
+-                       // Skip if you are syncing from this peer.
+-                       (self.is_block_synced() || (!self.is_block_synced() && self.router().cache.num_outbound_block_requests(&peer.ip()) == 0))
+-                    {
+-                        Some(peer_ip)
+-                    } else {
+-                        None
+-                    }
+-                })
+-                .choose_multiple(rng, num_surplus_clients_validators);
++                .filter(|peer| !peer.is_prover()) // remove provers as those are handled seperately
++                .map(|p| p.ip())
++                .take(num_surplus_clients_validators);
+ 
+             // Proceed to send disconnect requests to these peers.
+-            for peer_ip in peer_ips_to_disconnect.into_iter().chain(prover_ips_to_disconnect) {
++            for peer_ip in peers_to_disconnect.chain(provers_to_disconnect) {
+                 // TODO (howardwu): Remove this after specializing this function.
+                 if self.router().node_type().is_prover() {
+                     if let Some(peer) = self.router().get_connected_peer(&peer_ip) {
+@@ -293,7 +300,7 @@ pub trait Heartbeat<N: Network>: Outbound<N> {
+         for peer_ip in self.router().trusted_peers() {
+             // If the peer is not connected, attempt to connect to it.
+             if !self.router().is_connected(peer_ip) {
+-                // Attempt to connect to the trusted peer.
++                debug!("Attempting to (re-)connect to trusted peer `{peer_ip}`");
+                 self.router().connect(*peer_ip);
+             }
+         }
+diff --git a/node/router/src/helpers/cache.rs b/node/router/src/helpers/cache.rs
+index 289b287b9..0589b0100 100644
+--- a/node/router/src/helpers/cache.rs
++++ b/node/router/src/helpers/cache.rs
+@@ -125,7 +125,7 @@ impl<N: Network> Cache<N> {
+ }
+ 
+ impl<N: Network> Cache<N> {
+-    /// Returns `true` if the cache contains the block request for the given peer.
++    /// Returns `true` if the cache contains any inbound block requests for the given peer.
+     pub fn contains_inbound_block_request(&self, peer_ip: &SocketAddr) -> bool {
+         Self::retain(&self.seen_inbound_block_requests, *peer_ip, Self::INBOUND_BLOCK_REQUEST_INTERVAL) > 0
+     }
+@@ -135,7 +135,7 @@ impl<N: Network> Cache<N> {
+         self.seen_outbound_block_requests.read().get(peer_ip).map(|r| r.len()).unwrap_or(0)
+     }
+ 
+-    /// Returns `true` if the cache contains the block request for the given peer.
++    /// Returns `true` if the cache contains the given block request for the specified peer.
+     pub fn contains_outbound_block_request(&self, peer_ip: &SocketAddr, request: &BlockRequest) -> bool {
+         self.seen_outbound_block_requests.read().get(peer_ip).map(|r| r.contains(request)).unwrap_or(false)
+     }
+diff --git a/node/router/src/lib.rs b/node/router/src/lib.rs
+index 844b40594..82c512e70 100644
+--- a/node/router/src/lib.rs
++++ b/node/router/src/lib.rs
+@@ -476,11 +476,16 @@ impl<N: Network> Router<N> {
+     /// Inserts the given peer into the connected peers.
+     pub fn insert_connected_peer(&self, peer_ip: SocketAddr) {
+         // Move the peer from "connecting" to "connected".
+-        let peer = if let Some(Some(peer)) = self.connecting_peers.lock().remove(&peer_ip) {
+-            peer
+-        } else {
+-            warn!("Couldn't promote {peer_ip} from \"connecting\" to \"connected\"");
+-            return;
++        let peer = match self.connecting_peers.lock().remove(&peer_ip) {
++            Some(Some(peer)) => peer,
++            Some(None) => {
++                warn!("Couldn't promote {peer_ip} from \"connecting\" to \"connected\": Handshake not completed");
++                return;
++            }
++            None => {
++                warn!("Couldn't promote {peer_ip} from \"connecting\" to \"connected\": Public/listen address unkown");
++                return;
++            }
+         };
+         // Add an entry for this `Peer` in the connected peers.
+         self.connected_peers.write().insert(peer_ip, peer);
+diff --git a/node/router/tests/heartbeat.rs b/node/router/tests/heartbeat.rs
+new file mode 100644
+index 000000000..c64737016
+--- /dev/null
++++ b/node/router/tests/heartbeat.rs
+@@ -0,0 +1,175 @@
++// Copyright 2024-2025 Aleo Network Foundation
++// This file is part of the snarkOS library.
++
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at:
++
++// http://www.apache.org/licenses/LICENSE-2.0
++
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++mod common;
++use common::*;
++
++use snarkos_node_router::{
++    Heartbeat,
++    Outbound,
++    Router,
++    Routing,
++    messages::{Message, MessageCodec},
++};
++use snarkos_node_tcp::{
++    ConnectionSide,
++    P2P,
++    protocols::{Handshake, OnConnect, Writing},
++};
++use snarkvm::prelude::MainnetV0 as Network;
++
++use async_trait::async_trait;
++use std::{net::SocketAddr, time::Duration};
++use tokio::time::sleep;
++
++#[derive(Clone)]
++struct HeartbeatTest {
++    router: TestRouter<Network>,
++}
++
++impl P2P for HeartbeatTest {
++    fn tcp(&self) -> &snarkos_node_tcp::Tcp {
++        self.router.tcp()
++    }
++}
++
++#[async_trait]
++impl Writing for HeartbeatTest {
++    type Codec = MessageCodec<Network>;
++    type Message = Message<Network>;
++
++    fn codec(&self, _addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
++        Default::default()
++    }
++}
++
++impl Outbound<Network> for HeartbeatTest {
++    fn router(&self) -> &Router<Network> {
++        &self.router
++    }
++
++    fn is_block_synced(&self) -> bool {
++        true
++    }
++
++    fn num_blocks_behind(&self) -> u32 {
++        0
++    }
++}
++
++impl Heartbeat<Network> for HeartbeatTest {
++    // This number does not actually affect any of the test, because
++    // we only test get_removable_peers so far.
++    const MAXIMUM_NUMBER_OF_PEERS: usize = 2;
++}
++
++/// Initiate connection to peer and wait until it is fully established
++async fn connect_to(router: &TestRouter<Network>, other: &TestRouter<Network>) {
++    let success = router.connect(other.local_ip()).unwrap().await.unwrap();
++    assert!(success, "Connection failed");
++
++    while !router.is_connected(&other.local_ip()) {
++        sleep(Duration::from_millis(10)).await;
++    }
++}
++
++/// Checks that clients are ordered before nodes and that ordering is based on when a peer was last seen.
++#[tokio::test]
++async fn peer_priority_ordering() {
++    let router = client(0, 10).await;
++    router.enable_listener().await;
++    router.enable_handshake().await;
++    router.enable_on_connect().await;
++
++    let validator_peer1 = validator(0, 5, &[], true).await;
++    validator_peer1.enable_listener().await;
++    validator_peer1.enable_handshake().await;
++
++    let validator_peer2 = validator(0, 5, &[], true).await;
++    validator_peer2.enable_listener().await;
++    validator_peer2.enable_handshake().await;
++
++    let client_peer = client(0, 5).await;
++    client_peer.enable_listener().await;
++    client_peer.enable_handshake().await;
++
++    connect_to(&router, &validator_peer1).await;
++    connect_to(&router, &client_peer).await;
++    connect_to(&router, &validator_peer2).await;
++
++    // Update last seen to affect priority.
++    router.update_last_seen_for_connected_peer(validator_peer1.local_ip());
++    tokio::time::sleep(Duration::from_millis(500)).await;
++    router.update_last_seen_for_connected_peer(validator_peer2.local_ip());
++
++    let heartbeat = HeartbeatTest { router };
++
++    let removable_peers = heartbeat.get_removable_peers();
++
++    // Ensure connections were established.
++    assert_eq!(heartbeat.router().get_connected_peers().len(), 3);
++
++    // There are no trusted or bootstrap peers, so everything should be removable.
++    assert_eq!(removable_peers.len(), 3);
++
++    let mut removable_peers = removable_peers.into_iter();
++
++    // Client should be lowest priority.
++    assert_eq!(removable_peers.next().unwrap().ip(), client_peer.local_ip());
++
++    // Validator 1 has lower priority now because it was seen last.
++    assert_eq!(removable_peers.next().unwrap().ip(), validator_peer1.local_ip());
++
++    // Validator 2 has highest priority.
++    assert_eq!(removable_peers.next().unwrap().ip(), validator_peer2.local_ip());
++
++    // Update last seen again to check that priorities get updated correctly.
++    heartbeat.router.update_last_seen_for_connected_peer(validator_peer1.local_ip());
++
++    // Validator 1 must have higher priority now.
++    let mut removable_peers = heartbeat.get_removable_peers().into_iter();
++    assert_eq!(removable_peers.next().unwrap().ip(), client_peer.local_ip());
++    assert_eq!(removable_peers.next().unwrap().ip(), validator_peer2.local_ip());
++    assert_eq!(removable_peers.next().unwrap().ip(), validator_peer1.local_ip());
++}
++
++/// Checks that trusted peers are never marked as removable.
++#[tokio::test]
++async fn peer_priority_trusted_peers() {
++    let validator_peer = validator(0, 5, &[], true).await;
++    validator_peer.enable_listener().await;
++    validator_peer.enable_handshake().await;
++
++    let client_peer = client(0, 5).await;
++    client_peer.enable_listener().await;
++    client_peer.enable_handshake().await;
++
++    let router = validator(0, 5, &[validator_peer.local_ip(), client_peer.local_ip()], false).await;
++    router.enable_listener().await;
++    router.enable_handshake().await;
++    router.enable_on_connect().await;
++
++    connect_to(&router, &client_peer).await;
++    connect_to(&router, &validator_peer).await;
++
++    let heartbeat = HeartbeatTest { router };
++
++    let removable_peers = heartbeat.get_removable_peers();
++
++    // Ensure connections were established.
++    assert_eq!(heartbeat.router().get_connected_peers().len(), 2);
++    // All peers are trusted and cannot be removed.
++    assert_eq!(removable_peers.len(), 0);
++}
+diff --git a/node/sync/src/block_sync.rs b/node/sync/src/block_sync.rs
+index 1727ad6fa..5a73bcb60 100644
+--- a/node/sync/src/block_sync.rs
++++ b/node/sync/src/block_sync.rs
+@@ -1518,7 +1518,9 @@ mod tests {
+         }
+ 
+         // Duplicate a new sync module with a different height to simulate block advancement.
+-        let ledger_height = rng.gen_range(0..locator_height);
++        // This range needs to be inclusive, so that the range is never empty,
++        // even with a locator height of 0.
++        let ledger_height = rng.gen_range(0..=locator_height);
+         let new_sync = duplicate_sync_at_new_height(&sync, ledger_height);
+ 
+         // Check that the number of requests is the same.

@@ -1,201 +1,2696 @@
-diff --git a/services/src/main/java/org/keycloak/services/clientpolicy/condition/ClientAccessTypeCondition.java b/services/src/main/java/org/keycloak/services/clientpolicy/condition/ClientAccessTypeCondition.java
-index c7812c0e26..854328e37d 100644
---- a/services/src/main/java/org/keycloak/services/clientpolicy/condition/ClientAccessTypeCondition.java
-+++ b/services/src/main/java/org/keycloak/services/clientpolicy/condition/ClientAccessTypeCondition.java
-@@ -70,6 +70,7 @@ public class ClientAccessTypeCondition extends AbstractClientPolicyConditionProv
-     public ClientPolicyVote applyPolicy(ClientPolicyContext context) throws ClientPolicyException {
-         switch (context.getEvent()) {
-             case AUTHORIZATION_REQUEST:
-+            case RESOURCE_OWNER_PASSWORD_CREDENTIALS_REQUEST:
-             case TOKEN_REQUEST:
-             case TOKEN_RESPONSE:
-             case SERVICE_ACCOUNT_TOKEN_REQUEST:
-diff --git a/services/src/main/resources/keycloak-lax-client-policies.json b/services/src/main/resources/keycloak-lax-client-policies.json
-new file mode 100644
-index 0000000000..4cea0950b7
---- /dev/null
-+++ b/services/src/main/resources/keycloak-lax-client-policies.json
-@@ -0,0 +1,44 @@
-+{
-+    "policies": [
-+        {
-+           "name": "Openid-connect OAuth 2.1 confidential client",
-+           "description": "Openid-connect confidential client policy to ensure OAuth 2.1 specification.",
-+           "enabled": true,
-+           "conditions": [
-+               {
-+                   "condition": "client-type",
-+                   "configuration": {
-+                       "protocol": "openid-connect"
-+                   }
-+               },
-+               {
-+                   "condition": "client-access-type",
-+                   "configuration": {
-+                       "type": [
-+                           "confidential"
-+                       ]
-+                   }
-+               }
-+           ],
-+           "profiles": [
-+               "oauth-2-1-for-confidential-client"
-+           ]
-+       },
-+       {
-+           "name": "Saml secure client (signatures, post, https)",
-+           "description": "Saml policy to ensure signatures, POST binding and https URLs.",
-+           "enabled": true,
-+           "conditions": [
-+               {
-+                   "condition": "client-type",
-+                   "configuration": {
-+                       "protocol": "saml"
-+                   }
-+               }
-+           ],
-+           "profiles": [
-+               "saml-security-profile"
-+           ]
-+       }
-+   ]
-+}
-diff --git a/services/src/main/resources/lax-security-profile.json b/services/src/main/resources/lax-security-profile.json
-index 45ba6fc397..ab9affaf8a 100644
---- a/services/src/main/resources/lax-security-profile.json
-+++ b/services/src/main/resources/lax-security-profile.json
-@@ -1,5 +1,5 @@
- {
-   "name":"lax",
-   "client-profiles":"keycloak-default-client-profiles",
--  "client-policies":null
-+  "client-policies":"keycloak-lax-client-policies"
+diff --git a/js/apps/admin-ui/src/groups/GroupsModal.tsx b/js/apps/admin-ui/src/groups/GroupsModal.tsx
+index 4f128526fd9f..5dd4d7bdc7f6 100644
+--- a/js/apps/admin-ui/src/groups/GroupsModal.tsx
++++ b/js/apps/admin-ui/src/groups/GroupsModal.tsx
+@@ -110,15 +110,13 @@ export const GroupsModal = ({
+ 
+   const duplicateGroup = async (
+     sourceGroup: GroupRepresentation,
++    newName?: string,
+     parentId?: string,
+-    isSubGroup: boolean = false,
+   ) => {
+     try {
+       const newGroup: GroupRepresentation = {
+         ...sourceGroup,
+-        name: isSubGroup
+-          ? sourceGroup.name
+-          : t("copyOf", { name: sourceGroup.name }),
++        name: newName ?? sourceGroup.name!,
+         ...(parentId ? {} : { attributes: duplicateGroupDetails?.attributes }),
+       };
+ 
+@@ -133,13 +131,23 @@ export const GroupsModal = ({
+       });
+ 
+       for (const member of members) {
+-        await adminClient.users.addToGroup({
+-          id: member.id!,
+-          groupId: createdGroup.id,
+-        });
++        if (!groups.isOrgGroups()) {
++          await adminClient.users.addToGroup({
++            id: member.id!,
++            groupId: createdGroup.id,
++          });
++        } else {
++          await groups.addMemberToOrgGroup({
++            groupId: createdGroup.id,
++            userId: member.id!,
++          });
++        }
+       }
+ 
+-      if (isFeatureEnabled(Feature.AdminFineGrainedAuthz)) {
++      if (
++        !groups.isOrgGroups() &&
++        isFeatureEnabled(Feature.AdminFineGrainedAuthz)
++      ) {
+         const permissions = await groups.listPermissions({
+           id: sourceGroup.id!,
+         });
+@@ -149,43 +157,42 @@ export const GroupsModal = ({
+         }
+       }
+ 
+-      const realmRoles = await groups.listRealmRoleMappings({
+-        id: sourceGroup.id!,
+-      });
+-
+-      const realmRolesPayload: RoleMappingPayload[] = realmRoles.map(
+-        (role) => ({ id: role.id!, name: role.name! }),
+-      );
+-
+-      const clientRoleMappings = await fetchClientRoleMappings(sourceGroup.id!);
++      if (!groups.isOrgGroups()) {
++        const realmRoles = await groups.listRealmRoleMappings({
++          id: sourceGroup.id!,
++        });
+ 
+-      const clientRolesPayload: RoleMappingPayload[] =
+-        clientRoleMappings?.flatMap((clientRoleMapping) =>
+-          clientRoleMapping.roles.map((role) => ({
+-            id: role.id!,
+-            name: role.name!,
+-            clientUniqueId: clientRoleMapping.clientId,
+-          })),
++        const realmRolesPayload: RoleMappingPayload[] = realmRoles.map(
++          (role) => ({ id: role.id!, name: role.name! }),
+         );
+ 
+-      const rolesToAssign: RoleMappingPayload[] = [
+-        ...realmRolesPayload,
+-        ...clientRolesPayload,
+-      ];
++        const clientRoleMappings = await fetchClientRoleMappings(
++          sourceGroup.id!,
++        );
+ 
+-      await assignRoles(rolesToAssign, createdGroup.id);
++        const clientRolesPayload: RoleMappingPayload[] =
++          clientRoleMappings?.flatMap((clientRoleMapping) =>
++            clientRoleMapping.roles.map((role) => ({
++              id: role.id!,
++              name: role.name!,
++              clientUniqueId: clientRoleMapping.clientId,
++            })),
++          );
++
++        const rolesToAssign: RoleMappingPayload[] = [
++          ...realmRolesPayload,
++          ...clientRolesPayload,
++        ];
++
++        await assignRoles(rolesToAssign, createdGroup.id);
++      }
+ 
+       const subGroups = await groups.listSubGroups({
+         parentId: sourceGroup.id!,
+       });
+ 
+       for (const childGroup of subGroups) {
+-        const childAttributes = childGroup.attributes;
+-        await duplicateGroup(
+-          { ...childGroup, attributes: childAttributes },
+-          createdGroup.id,
+-          true,
+-        );
++        await duplicateGroup(childGroup, undefined, createdGroup.id);
+       }
+ 
+       return createdGroup;
+@@ -231,7 +238,7 @@ export const GroupsModal = ({
+ 
+     try {
+       if (duplicateId && duplicateGroupDetails) {
+-        await duplicateGroup(duplicateGroupDetails);
++        await duplicateGroup(duplicateGroupDetails, group.name);
+       } else if (!id) {
+         await groups.create(group);
+       } else if (rename) {
+diff --git a/js/apps/admin-ui/src/groups/GroupsSection.css b/js/apps/admin-ui/src/groups/GroupsSection.css
+index 7ba543dbb1a8..087b9e1d5b28 100644
+--- a/js/apps/admin-ui/src/groups/GroupsSection.css
++++ b/js/apps/admin-ui/src/groups/GroupsSection.css
+@@ -8,3 +8,10 @@
+   font-size: var(--pf-v5-global--FontSize--md);
+   margin-right: var(--pf-v5-global--spacer--sm);
  }
-diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/LightWeightAccessTokenTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/LightWeightAccessTokenTest.java
-index 053e072ed1..cb2d4faeb8 100644
---- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/LightWeightAccessTokenTest.java
-+++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oidc/LightWeightAccessTokenTest.java
-@@ -56,6 +56,7 @@ import org.keycloak.representations.idm.ProtocolMapperRepresentation;
- import org.keycloak.representations.idm.RealmRepresentation;
- import org.keycloak.representations.idm.UserRepresentation;
- import org.keycloak.services.clientpolicy.condition.AnyClientConditionFactory;
-+import org.keycloak.services.clientpolicy.condition.ClientAccessTypeConditionFactory;
- import org.keycloak.services.clientpolicy.executor.UseLightweightAccessTokenExecutorFactory;
- import org.keycloak.testsuite.admin.ApiUtil;
- import org.keycloak.testsuite.arquillian.annotation.EnableFeature;
-@@ -608,6 +609,43 @@ public class LightWeightAccessTokenTest extends AbstractClientPoliciesTest {
-         setScopeProtocolMapper("master", OIDCLoginProtocolFactory.BASIC_SCOPE, "sub", true, false, false);
++
++.keycloak-admin--groups__section {
++  display: flex;
++  flex-direction: column;
++  flex: 1 1 0%;
++  height: 100vh;
++}
+diff --git a/js/apps/admin-ui/src/groups/GroupsSection.tsx b/js/apps/admin-ui/src/groups/GroupsSection.tsx
+index cc256cfea2d0..75fecc9a4378 100644
+--- a/js/apps/admin-ui/src/groups/GroupsSection.tsx
++++ b/js/apps/admin-ui/src/groups/GroupsSection.tsx
+@@ -137,7 +137,10 @@ export default function GroupsSection({ orgId }: { orgId?: string } = {}) {
+           handleModalToggle={() => setRename(undefined)}
+         />
+       )}
+-      <PageSection variant={PageSectionVariants.light} className="pf-v5-u-p-0">
++      <PageSection
++        variant={PageSectionVariants.light}
++        className="pf-v5-u-p-0 keycloak-admin--groups__section"
++      >
+         <Drawer isInline isExpanded={open} key={key} position="left">
+           <DrawerContent
+             panelContent={
+diff --git a/scim/client/src/main/java/org/keycloak/scim/client/AbstractScimResourceClient.java b/scim/client/src/main/java/org/keycloak/scim/client/AbstractScimResourceClient.java
+index b68dfca60071..5e6d90b6063a 100644
+--- a/scim/client/src/main/java/org/keycloak/scim/client/AbstractScimResourceClient.java
++++ b/scim/client/src/main/java/org/keycloak/scim/client/AbstractScimResourceClient.java
+@@ -3,6 +3,7 @@
+ 
+ import org.keycloak.http.simple.SimpleHttpRequest;
+ import org.keycloak.scim.protocol.request.PatchRequest;
++import org.keycloak.scim.protocol.request.SearchRequest;
+ import org.keycloak.scim.protocol.response.ErrorResponse;
+ import org.keycloak.scim.protocol.response.ListResponse;
+ import org.keycloak.scim.resource.ResourceTypeRepresentation;
+@@ -81,6 +82,26 @@ protected SimpleHttpRequest doGet(String path) {
+         return client.doGet(resourceTypeClass, path);
      }
  
-+    @Test
-+    public void testPublicClientWithLightweightAccessTokenViaDirectGrant() throws Exception {
-+        // Setup client policy with client-access-type=public + lightweight token executor
-+        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-+                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Lightweight Token for Public Clients")
-+                        .addExecutor(UseLightweightAccessTokenExecutorFactory.PROVIDER_ID, null)
-+                        .toRepresentation()
-+        ).toString();
-+        updateProfiles(json);
-+
-+        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-+                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "Public Client Policy", Boolean.TRUE)
-+                        .addCondition(ClientAccessTypeConditionFactory.PROVIDER_ID,
-+                                ClientPoliciesUtil.createClientAccessTypeConditionConfig(List.of(ClientAccessTypeConditionFactory.TYPE_PUBLIC)))
-+                        .addProfile(PROFILE_NAME)
-+                        .toRepresentation()
-+        ).toString();
-+        updatePolicies(json);
-+
-+        // Create public client with direct access grants
-+        String publicClientId = generateSuffixedName("public-direct-grant-client");
-+        createClientByAdmin(publicClientId, (ClientRepresentation clientRep) -> {
-+            clientRep.setPublicClient(Boolean.TRUE);
-+            clientRep.setDirectAccessGrantsEnabled(Boolean.TRUE);
-+        });
-+
-+        // Perform direct access grant (POST with username/password)
-+        oauth.client(publicClientId);
-+        AccessTokenResponse response = oauth.doPasswordGrantRequest(TEST_USER_NAME, TEST_USER_PASSWORD);
-+
-+        // Verify lightweight token
-+        AccessToken token = oauth.verifyToken(response.getAccessToken());
-+        AccessTokenContext ctx = testingClient.testing(REALM_NAME).getTokenContext(token.getId());
-+        Assert.assertEquals(AccessTokenContext.TokenType.LIGHTWEIGHT, ctx.getTokenType());
-+        Assert.assertEquals(TEST_USER_PASSWORD, ctx.getGrantType());
++    /**
++     * Search for resources using the POST /.search endpoint.
++     * This is useful for complex filters that may exceed URL length limits.
++     *
++     * @param filterExpression SCIM filter expression (e.g., "userName eq \"john\"")
++     * @param startIndex      optional index of the first result to return (for pagination)
++     *                        if null, the server will use its default value (usually 1)
++     * @param count           optional maximum number of results to return (for pagination)
++     *                        if null, the server will use its default value
++     * @return list response containing matching resources
++     */
++    @SuppressWarnings("unchecked")
++    public ListResponse<R> doPost(String filterExpression, Integer startIndex, Integer count) {
++        SearchRequest searchRequest = SearchRequest.builder()
++                .withFilter(filterExpression)
++                .withStartIndex(startIndex)
++                .withCount(count).build();
++        return client.execute(client.doPost(resourceTypeClass, "/.search").json(searchRequest), ListResponse.class);
 +    }
 +
-     private void removeSession(final String sessionId) {
-         testingClient.testing().removeExpired(REALM_NAME);
-         try {
-diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/securityprofile/StrictSecurityProfileTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/securityprofile/LaxSecurityProfileTest.java
-similarity index 82%
-rename from testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/securityprofile/StrictSecurityProfileTest.java
-rename to testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/securityprofile/LaxSecurityProfileTest.java
-index b57c0671a7..54b2c9f744 100644
---- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/securityprofile/StrictSecurityProfileTest.java
-+++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/securityprofile/LaxSecurityProfileTest.java
-@@ -49,8 +49,8 @@ import org.junit.Test;
- import static org.junit.Assert.assertEquals;
- import static org.junit.Assert.fail;
+     @Override
+     public void close() throws Exception {
+         client.close();
+diff --git a/scim/client/src/main/java/org/keycloak/scim/client/ResourceFilter.java b/scim/client/src/main/java/org/keycloak/scim/client/ResourceFilter.java
+index b61148c8fe75..050289952c07 100644
+--- a/scim/client/src/main/java/org/keycloak/scim/client/ResourceFilter.java
++++ b/scim/client/src/main/java/org/keycloak/scim/client/ResourceFilter.java
+@@ -41,21 +41,33 @@ public ResourceFilter ew(String property, String value) {
+     }
  
--@SetDefaultProvider(spi = "security-profile", providerId = "default", config = {"name", "strict-security-profile"})
--public class StrictSecurityProfileTest extends AbstractTestRealmKeycloakTest {
-+@SetDefaultProvider(spi = "security-profile", providerId = "default", config = {"name", "lax-security-profile"})
-+public class LaxSecurityProfileTest extends AbstractTestRealmKeycloakTest {
+     public ResourceFilter gt(String property, Object value) {
++        if (value instanceof String) {
++            value = quote((String) value);
++        }
+         append(property + " gt " + value);
+         return this;
+     }
+ 
+     public ResourceFilter ge(String property, Object value) {
++        if (value instanceof String) {
++            value = quote((String) value);
++        }
+         append(property + " ge " + value);
+         return this;
+     }
+ 
+     public ResourceFilter lt(String property, Object value) {
++        if (value instanceof String) {
++            value = quote((String) value);
++        }
+         append(property + " lt " + value);
+         return this;
+     }
+ 
+     public ResourceFilter le(String property, Object value) {
++        if (value instanceof String) {
++            value = quote((String) value);
++        }
+         append(property + " le " + value);
+         return this;
+     }
+diff --git a/scim/client/src/main/java/org/keycloak/scim/client/ScimGroupsClient.java b/scim/client/src/main/java/org/keycloak/scim/client/ScimGroupsClient.java
+index 6b3ba28d3c3b..d242ae3c5295 100644
+--- a/scim/client/src/main/java/org/keycloak/scim/client/ScimGroupsClient.java
++++ b/scim/client/src/main/java/org/keycloak/scim/client/ScimGroupsClient.java
+@@ -27,6 +27,23 @@ public String build() {
+         });
+     }
+ 
++    /**
++     * Search for groups using the POST /.search endpoint.
++     * This is useful for complex filters that may exceed URL length limits.
++     *
++     * @param filterExpression SCIM filter expression (e.g., "displayName eq \"Engineering\"")
++     * @param startIndex      optional index of the first result to return (for pagination)
++     *                        if null, the server will use its default value (usually 1)
++     * @param count           optional maximum number of results to return (for pagination)
++     *                        if null, the server will use its default value
++     * @return list response containing matching users
++     */
++    @SuppressWarnings("unchecked")
++    public ListResponse<Group> search(String filterExpression, Integer startIndex, Integer count) {
++        return doPost(filterExpression, startIndex, count);
++    }
++
++
+     @Override
+     public void close() {
+     }
+diff --git a/scim/client/src/main/java/org/keycloak/scim/client/ScimUsersClient.java b/scim/client/src/main/java/org/keycloak/scim/client/ScimUsersClient.java
+index fc261e8e2884..1413ce701b88 100644
+--- a/scim/client/src/main/java/org/keycloak/scim/client/ScimUsersClient.java
++++ b/scim/client/src/main/java/org/keycloak/scim/client/ScimUsersClient.java
+@@ -1,8 +1,5 @@
+ package org.keycloak.scim.client;
+ 
+-import java.util.List;
+-
+-import org.keycloak.scim.protocol.request.SearchRequest;
+ import org.keycloak.scim.protocol.response.ListResponse;
+ import org.keycloak.scim.resource.user.User;
+ 
+@@ -22,7 +19,7 @@ public ScimUsersClient(ScimClient client) {
+      * @return list response containing all users
+      */
+     public ListResponse<User> getAll() {
+-        return doFilter(filter().pr("userName"));
++        return doFilter(filter());
+     }
+ 
+     /**
+@@ -65,30 +62,7 @@ public ListResponse<User> search(String filterExpression) {
+      */
+     @SuppressWarnings("unchecked")
+     public ListResponse<User> search(String filterExpression, Integer startIndex, Integer count) {
+-        requireNonNull(filterExpression, "filterExpression must not be null");
+-        SearchRequest searchRequest = SearchRequest.builder()
+-                .withFilter(filterExpression)
+-                .withStartIndex(startIndex)
+-                .withCount(count).build();
+-        return client.execute(client.doPost(User.class, "/.search").json(searchRequest), ListResponse.class);
+-    }
+-
+-
+-    public User getByUsername(String userName) {
+-        requireNonNull(userName, "userName must not be null");
+-
+-        ListResponse<User> r = doFilter(filter().eq("userName", userName));
+-        List<User> resources = r.getResources();
+-
+-        if (resources.isEmpty()) {
+-            return null;
+-        }
+-
+-        if (resources.size() > 1) {
+-            throw new IllegalStateException("More than one user with username " + userName + " found");
+-        }
+-
+-        return resources.get(0);
++        return doPost(filterExpression, startIndex, count);
+     }
  
      @Override
-     public void configureTestRealm(RealmRepresentation testRealm) {
-@@ -65,7 +65,6 @@ public class StrictSecurityProfileTest extends AbstractTestRealmKeycloakTest {
-         Assert.assertNotNull(policies.getGlobalPolicies());
-         MatcherAssert.assertThat(policies.getGlobalPolicies().stream().map(ClientPolicyRepresentation::getName).collect(Collectors.toList()),
-                 Matchers.containsInAnyOrder("Openid-connect OAuth 2.1 confidential client",
--                        "Openid-connect OAuth 2.1 public client",
-                         "Saml secure client (signatures, post, https)"));
-         // try creating a global policy fails
-         ClientPoliciesRepresentation policiesRep = new ClientPoliciesRepresentation();
-@@ -120,45 +119,6 @@ public class StrictSecurityProfileTest extends AbstractTestRealmKeycloakTest {
-         org.keycloak.testsuite.Assert.assertEquals(origGlobalPolicies, clientPoliciesRep.getGlobalPolicies());
+diff --git a/scim/core/src/main/java/org/keycloak/scim/resource/schema/AbstractModelSchema.java b/scim/core/src/main/java/org/keycloak/scim/resource/schema/AbstractModelSchema.java
+index c5864b680678..58bc5c2a8168 100644
+--- a/scim/core/src/main/java/org/keycloak/scim/resource/schema/AbstractModelSchema.java
++++ b/scim/core/src/main/java/org/keycloak/scim/resource/schema/AbstractModelSchema.java
+@@ -253,17 +253,7 @@ private Map<Attribute<M,R>, JsonNode> resolveAttributes(String path, JsonNode va
+         if (attribute == null) {
+             for (Entry<String, Attribute<M, R>> entry : getAttributes().entrySet()) {
+                 Attribute<M, R> attr = entry.getValue();
+-                List<String> paths = new ArrayList<>();
+-
+-                String parent = attr.getParentName();
+-
+-                if (parent != null) {
+-                    paths.add(getName() + entry.getKey().replace(parent + ".", ":"));
+-                }
+-
+-                if (attr.getAlias() != null) {
+-                    paths.add(getName() + ":" + attr.getAlias());
+-                }
++                List<String> paths = getPaths(attr);
+ 
+                 if (paths.contains(path)) {
+                     return Map.of(attr, resolveAttributeValue(attr.getName(), valueJson));
+@@ -372,4 +362,25 @@ public Attribute<M, R> resolveAttribute(String name) {
+ 
+         return attributes.keySet().iterator().next();
+     }
++
++    public List<String> getPaths(Attribute<M, R> attr) {
++        List<String> paths = new ArrayList<>();
++
++        String parent = attr.getParentName();
++
++        if (parent != null && !isCore()) {
++            paths.add(getName() + attr.getName().replace(parent + ".", ":"));
++        }
++
++        if (attr.getAlias() != null) {
++            if(!isCore()) {
++                paths.add(getName() + ":" + attr.getAlias());
++            }
++            paths.add(attr.getParentName());
++        }
++
++        paths.add(attr.getName());
++
++        return paths;
++    }
+ }
+diff --git a/scim/core/src/main/java/org/keycloak/scim/resource/spi/ScimResourceTypeProvider.java b/scim/core/src/main/java/org/keycloak/scim/resource/spi/ScimResourceTypeProvider.java
+index f0137441cb0d..d400513041eb 100644
+--- a/scim/core/src/main/java/org/keycloak/scim/resource/spi/ScimResourceTypeProvider.java
++++ b/scim/core/src/main/java/org/keycloak/scim/resource/spi/ScimResourceTypeProvider.java
+@@ -21,6 +21,8 @@
+  */
+ public interface ScimResourceTypeProvider<R extends ResourceTypeRepresentation> extends Provider {
+ 
++    public static final int DEFAULT_MAX_RESULTS = 100;
++
+     /**
+      * Returns the name of the resource type managed by this provider.
+      *
+@@ -87,12 +89,20 @@ default List<String> getSchemaExtensions() {
+      * Retrieves all resources of this type. This method is invoked when a client requests a list of resources,
+      * and should return a stream of all resources of this type.
+      *
+-     * TODO: this method should support pagination, filtering, and sorting in the future, but for now it returns all resources.
+-     *
++     * @param searchRequest the search request containing the filter and other parameters to retrieve the matching resources
+      * @return a stream of all resources of this type
+      */
+     Stream<R> getAll(SearchRequest searchRequest);
+ 
++    /**
++     * Counts the total number of resources of this type that match the given search request. This method is invoked when
++     * a client requests a list of resources,
++     *
++     * @param searchRequest the search request containing the filter and other parameters to count the matching resources
++     * @return the total number of resources of this type that match the given search request
++     */
++    Long count(SearchRequest searchRequest);
++
+     /**
+      * Deletes a resource of this type by its identifier. This method is invoked when a client requests the deletion of a specific resource,
+      *
+diff --git a/scim/core/src/main/java/org/keycloak/scim/resource/spi/SingletonResourceTypeProvider.java b/scim/core/src/main/java/org/keycloak/scim/resource/spi/SingletonResourceTypeProvider.java
+index 69ecea7b55e3..0aad0243adf3 100644
+--- a/scim/core/src/main/java/org/keycloak/scim/resource/spi/SingletonResourceTypeProvider.java
++++ b/scim/core/src/main/java/org/keycloak/scim/resource/spi/SingletonResourceTypeProvider.java
+@@ -41,6 +41,11 @@ default Stream<R> getAll(SearchRequest searchRequest) {
+         return Stream.of(getSingleton());
+     }
+ 
++    @Override
++    default Long count(SearchRequest searchRequest) {
++        return 1L;
++    }
++
+     @Override
+     default boolean delete(String id) {
+         throw unsupportedOperation();
+diff --git a/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateEvaluator.java b/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateEvaluator.java
+index 58715c8f61b5..75730c7c8512 100644
+--- a/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateEvaluator.java
++++ b/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateEvaluator.java
+@@ -3,7 +3,6 @@
+ import java.util.List;
+ 
+ import jakarta.persistence.criteria.CriteriaBuilder;
+-import jakarta.persistence.criteria.CriteriaQuery;
+ import jakarta.persistence.criteria.Root;
+ 
+ import org.keycloak.models.KeycloakSession;
+@@ -20,9 +19,10 @@ public class ScimJPAPredicateEvaluator extends ScimFilterParserBaseVisitor<JPAFi
+     private final CriteriaBuilder cb;
+     private final ScimJPAPredicateProvider predicateProvider;
+ 
+-    public ScimJPAPredicateEvaluator(KeycloakSession session, List schemas, CriteriaBuilder cb, CriteriaQuery<?> query, Root<?> root) {
++    @SuppressWarnings("unchecked,rawtypes")
++    public ScimJPAPredicateEvaluator(KeycloakSession session, List schemas, CriteriaBuilder cb, Root<?> root) {
+         this.cb = cb;
+-        this.predicateProvider = new ScimJPAPredicateProvider(session, schemas, cb, query, root);
++        this.predicateProvider = new ScimJPAPredicateProvider(session, schemas, cb, root);
+     }
+ 
+     @Override
+diff --git a/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateProvider.java b/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateProvider.java
+index ba2f1202b437..dfc82f5ea6c0 100644
+--- a/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateProvider.java
++++ b/scim/model/src/main/java/org/keycloak/scim/model/filter/ScimJPAPredicateProvider.java
+@@ -3,14 +3,16 @@
+ import java.time.Instant;
+ import java.time.format.DateTimeParseException;
+ import java.util.List;
++import java.util.Map;
+ 
+ import jakarta.persistence.criteria.CriteriaBuilder;
+-import jakarta.persistence.criteria.CriteriaQuery;
+ import jakarta.persistence.criteria.Expression;
+ import jakarta.persistence.criteria.Join;
+ import jakarta.persistence.criteria.JoinType;
++import jakarta.persistence.criteria.Predicate;
+ import jakarta.persistence.criteria.Root;
+ 
++import org.keycloak.common.util.TriFunction;
+ import org.keycloak.models.KeycloakSession;
+ import org.keycloak.scim.filter.ScimFilterException;
+ import org.keycloak.scim.resource.schema.ModelSchema;
+@@ -28,32 +30,51 @@ public class ScimJPAPredicateProvider {
+     private final KeycloakSession session;
+     private final List<ModelSchema<?, ?>> schemas;
+     private final CriteriaBuilder cb;
+-    private final CriteriaQuery<?> query;
+     private final Root<?> root;
+ 
+-    // Cache joins to avoid creating duplicate joins for the same filter
++    @SuppressWarnings("rawtypes,unchecked")
++    private final Map<String, TriFunction<CriteriaBuilder, Expression, Object, Predicate>> operatorMap = Map.of(
++            "eq", CriteriaBuilder::equal,
++            "ne", CriteriaBuilder::notEqual,
++            "gt", (cb, exp, val) -> cb.greaterThan(exp, asComparable(val)),
++            "ge", (cb, exp, val) -> cb.greaterThanOrEqualTo(exp, asComparable(val)),
++            "lt", (cb, exp, val) -> cb.lessThan(exp, asComparable(val)),
++            "le", (cb, exp, val) -> cb.lessThanOrEqualTo(exp, asComparable(val)),
++            "co", (cb, exp, val) -> cb.like(exp.as(String.class), "%" + escapeLike(val.toString()) + "%", '\\'),
++            "sw", (cb, exp, val) -> cb.like(exp.as(String.class), escapeLike(val.toString()) + "%", '\\'),
++            "ew", (cb, exp, val) -> cb.like(exp.as(String.class), "%" + escapeLike(val.toString()), '\\')
++    );
++
++    // cache joins to avoid creating duplicate joins for the same filter
+     private Join<?, ?> attributeJoin;
+ 
+-    public ScimJPAPredicateProvider(KeycloakSession session, List<ModelSchema<?, ?>> schemas, CriteriaBuilder cb, CriteriaQuery<?> query, Root<?> root) {
++    public ScimJPAPredicateProvider(KeycloakSession session, List<ModelSchema<?, ?>> schemas, CriteriaBuilder cb, Root<?> root) {
+         this.session = session;
+         this.schemas = schemas;
+         this.cb = cb;
+-        this.query = query;
+         this.root = root;
+     }
+ 
++    /**
++     * Create a predicate for "presence" operator (pr). For direct fields, this checks that the field is not null. For custom attributes,
++     * this checks that there is an entry in the attributes collection with the given name and a non-null value.
++     *
++     * @param path the SCIM attribute path to check for presence
++     * @return a {@link JPAFilterResult} containing the presence predicate if the attribute is known and mapped, or an unsupported
++     * result if the attribute is unknown
++     */
+     public JPAFilterResult createPresentPredicate(String path) {
+-        Attribute attrInfo = resolve(path);
++        Attribute<?,?> attrInfo = resolve(path);
+         if (attrInfo == null) {
+             return JPAFilterResult.unsupported(cb.disjunction());
+         }
+         KeycloakSession session = KeycloakSessionUtil.getKeycloakSession();
+         String modelAttributeName = attrInfo.getModelAttributeName(session);
+         if (attrInfo.isPrimary()) {
+-            // Direct field: check not null
++            // direct field: check not null
+             return JPAFilterResult.valid(cb.isNotNull(root.get(modelAttributeName)));
+         } else {
+-            // Custom attribute: must exist in attributes collection with non-null value
++            // custom attribute: must exist in attributes collection with non-null value
+             Join<?, ?> join = getOrCreateAttributeJoin();
+             return JPAFilterResult.valid(cb.and(
+                 cb.equal(join.get("name"), modelAttributeName),
+@@ -62,147 +83,212 @@ public JPAFilterResult createPresentPredicate(String path) {
+         }
+     }
+ 
++    /**
++     * Create a predicate for comparison operators (eq, ne, gt, ge, lt, le, co, sw, ew). This method first resolves the SCIM
++     * attribute path to get the corresponding metadata, then validates that the operator is supported for the attribute type,
++     * normalizes the value to the correct type, and finally builds the appropriate predicate based on whether the attribute
++     * is a direct field or a custom attribute.
++     *
++     * @param path the SCIM attribute path to compare
++     * @param operator the comparison operator (eq, ne, gt, ge, lt, le, co, sw, ew)
++     * @param value the value to compare against, as a string (will be normalized to the correct type based on the attribute metadata)
++     * @return a {@link JPAFilterResult} containing the comparison predicate if the attribute is known and mapped, or an unsupported
++     * result if the attribute is unknown
++     */
+     public JPAFilterResult createComparisonPredicate(String path, String operator, String value) {
+-        Attribute attrInfo = resolve(path);
+-        if (attrInfo == null) {
+-            return JPAFilterResult.unsupported(cb.disjunction());
+-        }
+-        KeycloakSession session = KeycloakSessionUtil.getKeycloakSession();
+-        // Determine if this is a temporal (timestamp) field that needs date conversion
+-        boolean isTimestampField = attrInfo.isTimestamp();
+-        boolean isBooleanField = attrInfo.isBoolean();
++        Attribute<?,?> attrInfo = resolve(path);
++        if (attrInfo == null) return JPAFilterResult.unsupported(cb.disjunction());
++
++        String op = operator.toLowerCase();
++        // validate operator before normalization or predicate building
++        validateOperator(attrInfo, path, op);
++
++        // normalize the value (String -> Long, Boolean, etc.)
++        Object normalizedValue = normalizeValue(attrInfo, value);
++
++        // build the predicate
++        return JPAFilterResult.valid(getAttributePredicate(attrInfo, op, normalizedValue));
++    }
++
++    /**
++     * Normalize the string value from the filter expression to the correct type based on the attribute metadata. For timestamp attributes,
++     * this converts the ISO 8601 date/time string to a Long timestamp. For boolean attributes, this converts "true"/"false" strings to Boolean.
++     * For other types, it returns the original string value (no normalization needed).
++     *
++     * @param attrInfo the attribute metadata to determine the type for normalization
++     * @param value the original string value from the filter expression
++     * @return the normalized value, converted to the appropriate type based on the attribute metadata, or the original string if no normalization is needed
++     */
++    private Object normalizeValue(Attribute<?,?> attrInfo, String value) {
++        if (value == null) return null;
++        if (attrInfo.isTimestamp()) return parseDateTime(value);
++        if (attrInfo.isBoolean()) return parseBoolean(value);
++        return value;
++    }
++
++    /**
++     * Build a JPA predicate for the given attribute, operator, and value. This method handles both direct fields (primary attributes) and custom attributes
++     * stored in the "attributes" collection. For direct fields, it applies the operator directly to the root entity field. For custom attributes, it creates a join
++     * to the "attributes" collection, adds a condition to match the attribute name, and then applies the operator to the "value" field of the joined entity.
++     *
++     * @param attrInfo the attribute metadata to determine how to build the predicate
++     * @param operation the comparison operator (eq, ne, gt, ge, lt, le, co, sw, ew)
++     * @param value the value to compare against, already normalized to the correct type
++     * @return the JPA {@link Predicate} representing the comparison for the given attribute, operator, and value
++     */
++    private Predicate getAttributePredicate(Attribute<?,?> attrInfo, String operation, Object value) {
++        Expression<?> path;
++        Predicate basePredicate = null;
+         String modelAttributeName = attrInfo.getModelAttributeName(session);
+ 
+-        switch (operator.toLowerCase()) {
+-            case "eq":
+-                if (isTimestampField) {
+-                    Long timestamp = parseDateTime(value);
+-                    return JPAFilterResult.valid(cb.equal(root.get(modelAttributeName), timestamp));
+-                } else if (isBooleanField) {
+-                    Boolean boolValue = Boolean.parseBoolean(value);
+-                    return JPAFilterResult.valid(cb.equal(root.get(modelAttributeName), boolValue));
+-                } else {
+-                    Expression<String> attrExpr = getAttributeExpression(session, modelAttributeName, attrInfo);
+-                    return JPAFilterResult.valid(cb.equal(attrExpr, value));
+-                }
+-            case "ne":
+-                if (isTimestampField) {
+-                    Long timestamp = parseDateTime(value);
+-                    return JPAFilterResult.valid(cb.notEqual(root.get(modelAttributeName), timestamp));
+-                } else if (isBooleanField) {
+-                    Boolean boolValue = Boolean.parseBoolean(value);
+-                    return JPAFilterResult.valid(cb.notEqual(root.get(modelAttributeName), boolValue));
+-                } else {
+-                    Expression<String> attrExpr = getAttributeExpression(session, modelAttributeName, attrInfo);
+-                    return JPAFilterResult.valid(cb.notEqual(attrExpr, value));
+-                }
+-            case "co":
+-                return JPAFilterResult.valid(cb.like(getAttributeExpression(session, modelAttributeName, attrInfo), "%" + escapeLike(value) + "%", '\\'));
+-            case "sw":
+-                return JPAFilterResult.valid(cb.like(getAttributeExpression(session, modelAttributeName, attrInfo), escapeLike(value) + "%", '\\'));
+-            case "ew":
+-                return JPAFilterResult.valid(cb.like(getAttributeExpression(session, modelAttributeName, attrInfo), "%" + escapeLike(value), '\\'));
+-            case "gt":
+-                if (isTimestampField) {
+-                    Long timestamp = parseDateTime(value);
+-                    return JPAFilterResult.valid(cb.greaterThan(root.get(modelAttributeName), timestamp));
+-                } else {
+-                    return JPAFilterResult.valid(cb.greaterThan(getAttributeExpression(session, modelAttributeName, attrInfo), value));
+-                }
+-            case "ge":
+-                if (isTimestampField) {
+-                    Long timestamp = parseDateTime(value);
+-                    return JPAFilterResult.valid(cb.greaterThanOrEqualTo(root.get(modelAttributeName), timestamp));
+-                } else {
+-                    return JPAFilterResult.valid(cb.greaterThanOrEqualTo(getAttributeExpression(session, modelAttributeName, attrInfo), value));
+-                }
+-            case "lt":
+-                if (isTimestampField) {
+-                    Long timestamp = parseDateTime(value);
+-                    return JPAFilterResult.valid(cb.lessThan(root.get(modelAttributeName), timestamp));
+-                } else {
+-                    return JPAFilterResult.valid(cb.lessThan(getAttributeExpression(session, modelAttributeName, attrInfo), value));
+-                }
+-            case "le":
+-                if (isTimestampField) {
+-                    Long timestamp = parseDateTime(value);
+-                    return JPAFilterResult.valid(cb.lessThanOrEqualTo(root.get(modelAttributeName), timestamp));
+-                } else {
+-                    return JPAFilterResult.valid(cb.lessThanOrEqualTo(getAttributeExpression(session, modelAttributeName, attrInfo), value));
+-                }
+-            default:
+-                throw new ScimFilterException("Unknown operator: " + operator);
++        if (attrInfo.isPrimary()) {
++            path = root.get(modelAttributeName);
++        } else {
++            Join<?, ?> join = getOrCreateAttributeJoin();
++            path = join.get("value");
++            basePredicate = cb.equal(join.get("name"), modelAttributeName);
+         }
++
++        Predicate comparison = operatorMap.get(operation).apply(cb, path, value);
++        return (basePredicate != null) ? cb.and(basePredicate, comparison) : comparison;
+     }
+ 
+     /**
+-     * Parse ISO 8601 date/time string to Long timestamp (milliseconds since epoch).
+-     * SCIM uses ISO 8601 format (e.g., "2011-05-13T04:42:34Z") while Keycloak stores
+-     * timestamps as Long (milliseconds).
++     * Helper method to get or create a join to the "attributes" collection. This method checks if the join has already been created
++     * and cached in the {@code attributeJoin} field.
++     *
++     * @return the existing or newly created join to the "attributes" collection
++     */
++    private Join<?, ?> getOrCreateAttributeJoin() {
++        if (attributeJoin == null) {
++            attributeJoin = root.join("attributes", JoinType.LEFT);
++        }
++        return attributeJoin;
++    }
++
++    /**
++     * Validate that the operator is supported for the attribute type. For example, boolean attributes only support "eq" and "ne",
++     * while timestamp attributes do not support string-specific operators like "co", "sw", or "ew". If the operator is not valid for the attribute type,
++     * this method throws a {@link ScimFilterException} with a descriptive error message.
++     *
++     * @param attrInfo the attribute metadata to validate against
++     * @param scimAttribute the original SCIM attribute path (used for error messages)
++     * @param operator the operator to validate
++     * @throws ScimFilterException if the operator is not supported for the attribute type
++     */
++    private void validateOperator(Attribute<?,?> attrInfo, String scimAttribute, String operator) {
++        String op = operator.toLowerCase();
++
++        // boolean validation: only allows equality
++        if (attrInfo.isBoolean()) {
++            if (!op.equals("eq") && !op.equals("ne")) {
++                throw new ScimFilterException(
++                        "Operator '" + operator + "' is not supported for boolean attribute: " + scimAttribute);
++            }
++        }
++
++        // timestamp/numeric validation: block string-specific operators
++        if (attrInfo.isTimestamp()) {
++            if (op.equals("co") || op.equals("sw") || op.equals("ew")) {
++                throw new ScimFilterException(
++                        "String operators (co, sw, ew) are not supported for timestamp attribute: " + scimAttribute);
++            }
++        }
++    }
++
++    /**
++     * Parse ISO 8601 date/time string to {@link Long} timestamp (milliseconds since epoch). SCIM uses ISO 8601 format
++     * (e.g., "2011-05-13T04:42:34Z") while Keycloak stores timestamps as Long (milliseconds).
++     *
++     * @param dateTimeString the date/time string to parse
++     * @return the parsed timestamp as {@link Long}
++     * @throws ScimFilterException if the input string is not a valid ISO 8601 date/time format or a valid numeric timestamp
+      */
+     private Long parseDateTime(String dateTimeString) {
+         try {
+             Instant instant = Instant.parse(dateTimeString);
+             return instant.toEpochMilli();
+         } catch (DateTimeParseException e) {
+-            // If not a valid ISO 8601 date, try parsing as number (might be timestamp already)
++            // If not a valid ISO 8601 date, try parsing as number (might be a timestamp already)
+             try {
+                 return Long.parseLong(dateTimeString);
+             } catch (NumberFormatException nfe) {
+                 throw new ScimFilterException(
+-                    "Invalid date/time format: " + dateTimeString +
+-                    ". Expected ISO 8601 format (e.g., 2011-05-13T04:42:34Z) or timestamp");
++                        "Invalid date/time format: " + dateTimeString +
++                                ". Expected ISO 8601 format (e.g., 2011-05-13T04:42:34Z) or timestamp");
+             }
+         }
+     }
+ 
+-    private Expression<String> getAttributeExpression(KeycloakSession session, String modelAttributeName, Attribute attrInfo) {
+-        if (attrInfo.isPrimary()) {
+-            return root.get(modelAttributeName);
+-        } else {
+-            Join<?, ?> join = getOrCreateAttributeJoin();
+-            // Add name filter to join
+-            query.where(cb.equal(join.get("name"), modelAttributeName));
+-            return join.get("value");
++    /**
++     * Parse boolean string ("true"/"false") to {@link Boolean}. This method also validates that the value is a valid boolean string.
++     *
++     * @param value the string to parse as boolean
++     * @return the parsed {@link Boolean} value
++     * @throws ScimFilterException if the value is not a valid boolean string
++     */
++    private Boolean parseBoolean(String value) {
++        if ("true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
++            return Boolean.parseBoolean(value);
+         }
++        throw new ScimFilterException("Invalid boolean value found in boolean expression: " + value);
+     }
+ 
+-    private Join<?, ?> getOrCreateAttributeJoin() {
+-        if (attributeJoin == null) {
+-            attributeJoin = root.join("attributes", JoinType.LEFT);
++    /**
++     * Helper method to cast an object to {@link Comparable}. This is used for comparison operators (gt, ge, lt, le) which
++     * require the value to be comparable.
++     *
++      * @param val the object to cast
++     * @return the object cast to {@link Comparable}
++     * @throws ScimFilterException if the object is not an instance of {@link Comparable}
++     */
++    @SuppressWarnings("unchecked")
++    private Comparable<Object> asComparable(Object val) {
++        if (val instanceof Comparable) {
++            return (Comparable<Object>) val;
+         }
+-        return attributeJoin;
+-    }
+-
+-    private String escapeLike(String value) {
+-        // Escape SQL LIKE special characters
+-        return value.replace("\\", "\\\\")
+-                   .replace("%", "\\%")
+-                   .replace("_", "\\_");
++        throw new ScimFilterException("Value is not comparable: " + val);
+     }
+ 
++    /**
++     * Resolve the SCIM attribute path to the corresponding {@link Attribute} metadata. This method checks all registered schemas
++     * to find the attribute. If the attribute is found but does not have a model attribute name (i.e., it is not mapped to a model field),
++     * it returns {@code null} to indicate that this is an unknown attribute for filtering purposes. If the attribute is not found in any schema,
++     * it also returns {@code null}.
++     *
++     * @param path the SCIM attribute path to resolve
++     * @return the corresponding {@link Attribute} metadata if found and mapped to a model field, or {@code null} if not found or not mapped
++     */
+     public Attribute<?, ?> resolve(String path) {
+         Attribute<?, ?> metadata = null;
+ 
+         for (ModelSchema<?, ?> schema : schemas) {
+             metadata = schema.resolveAttribute(path);
+-
+             if (metadata != null    ) {
+                 break;
+             }
+-
+-        }
+-        if (metadata == null) {
+-            return null;
+         }
+-
+-        String modelAttributeName = metadata.getModelAttributeName(session);
+-
+-        if (modelAttributeName != null) {
+-            return metadata;
++        if (metadata != null) {
++            String modelAttributeName = metadata.getModelAttributeName(session);
++            if (modelAttributeName != null) {
++                return metadata;
++            }
+         }
+-
+-        // haven't found the attribute in the user profile, so return null to indicate that this is an unknown attribute.
++        // haven't found the attribute - return null to indicate that this is an unknown attribute.
+         return null;
+     }
++
++    /**
++     * Escape special characters in a string for use in SQL LIKE expressions. This method escapes the backslash, percent,
++     * and underscore characters, which are special in SQL LIKE patterns.
++     *
++     * @param value the string value to escape
++     * @return the escaped string, safe for use in SQL LIKE expressions
++     */
++    private String escapeLike(String value) {
++        // Escape SQL LIKE special characters
++        return value.replace("\\", "\\\\")
++                .replace("%", "\\%")
++                .replace("_", "\\_");
++    }
+ }
+diff --git a/scim/model/src/main/java/org/keycloak/scim/model/group/GroupResourceTypeProvider.java b/scim/model/src/main/java/org/keycloak/scim/model/group/GroupResourceTypeProvider.java
+index acfd42398886..6a9285a0b8fb 100644
+--- a/scim/model/src/main/java/org/keycloak/scim/model/group/GroupResourceTypeProvider.java
++++ b/scim/model/src/main/java/org/keycloak/scim/model/group/GroupResourceTypeProvider.java
+@@ -10,6 +10,8 @@
+ 
+ package org.keycloak.scim.model.group;
+ 
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.stream.Stream;
+ 
+ import jakarta.persistence.EntityManager;
+@@ -71,28 +73,23 @@ protected Stream<GroupModel> getModels(SearchRequest searchRequest) {
+         RealmModel realm = session.getContext().getRealm();
+         Integer firstResult = searchRequest.getStartIndex() != null ? searchRequest.getStartIndex() - 1 : null;
+         Integer maxResults = searchRequest.getCount();
++        maxResults = maxResults != null ? Math.min(maxResults, DEFAULT_MAX_RESULTS) : DEFAULT_MAX_RESULTS;
+ 
+         if (StringUtil.isNotBlank(searchRequest.getFilter())) {
+-            // Parse filter into AST
++            // parse filter into AST
+             ScimFilterParser.FilterContext filterContext = FilterUtils.parseFilter(searchRequest.getFilter());
+ 
+-            // Execute JPA query with filter
++            // execute JPA query with filter
+             EntityManager em = session.getProvider(JpaConnectionProvider.class).getEntityManager();
+             CriteriaBuilder cb = em.getCriteriaBuilder();
+             CriteriaQuery<GroupEntity> query = cb.createQuery(GroupEntity.class);
+             Root<GroupEntity> root = query.from(GroupEntity.class);
++            List<Predicate> predicates = getGroupPredicates(filterContext, cb, root);
+ 
+-            // Create filter predicate using the same query and root that will be used for execution
+-            ScimJPAPredicateEvaluator evaluator = new ScimJPAPredicateEvaluator(session, getSchemas(), cb, query, root);
+-            Predicate filterPredicate = evaluator.visit(filterContext).predicate();
++            // apply distinct and order by name to ensure consistency with no-filter case
++            query.where(predicates).distinct(true).orderBy(cb.asc(root.get("name")));
+ 
+-            // Apply realm restriction
+-            Predicate realmPredicate = cb.equal(root.get("realm"), realm.getId());
+-
+-            // Combine with filter predicate
+-            query.where(cb.and(realmPredicate, filterPredicate));
+-
+-            // Execute query and convert to UserModel stream
++            // execute query and convert to UserModel stream
+             return closing(paginateQuery(em.createQuery(query), firstResult, maxResults).getResultStream()
+                     .map(entity -> new GroupAdapter(session, realm, em, entity)));
+         } else {
+@@ -100,6 +97,27 @@ protected Stream<GroupModel> getModels(SearchRequest searchRequest) {
+         }
+     }
+ 
++    @Override
++    public Long count(SearchRequest searchRequest) {
++        RealmModel realm = session.getContext().getRealm();
++        if (StringUtil.isNotBlank(searchRequest.getFilter())) {
++            // parse filter into AST
++            ScimFilterParser.FilterContext filterContext = FilterUtils.parseFilter(searchRequest.getFilter());
++
++            // execute JPA query with filter
++            EntityManager em = session.getProvider(JpaConnectionProvider.class).getEntityManager();
++            CriteriaBuilder cb = em.getCriteriaBuilder();
++            CriteriaQuery<Long> query = cb.createQuery(Long.class);
++            Root<GroupEntity> root = query.from(GroupEntity.class);
++
++            List<Predicate> predicates = this.getGroupPredicates(filterContext, cb, root);
++            query.select(cb.countDistinct(root)).where(predicates);
++            return em.createQuery(query).getSingleResult();
++        } else {
++            return session.groups().getGroupsCount(realm, true);
++        }
++    }
++
+     @Override
+     public boolean onDelete(String id) {
+         RealmModel realm = session.getContext().getRealm();
+@@ -113,6 +131,19 @@ public Class<Group> getResourceType() {
+ 
+     @Override
+     public void close() {
++    }
++
++    private List<Predicate> getGroupPredicates(ScimFilterParser.FilterContext filterContext, CriteriaBuilder cb, Root<GroupEntity> root) {
++        List<Predicate> predicates = new ArrayList<>();
++
++        // create filter predicate using the same query and root that will be used for execution
++        ScimJPAPredicateEvaluator evaluator = new ScimJPAPredicateEvaluator(session, getSchemas(), cb, root);
++        predicates.add(evaluator.visit(filterContext).predicate());
+ 
++        // apply realm restriction and group type restrictions
++        predicates.add(cb.equal(root.get("realm"), session.getContext().getRealm().getId()));
++        predicates.add(cb.equal(root.get("type"), GroupModel.Type.REALM.intValue()));
++        predicates.add(cb.equal(root.get("parentId"), GroupEntity.TOP_PARENT_ID));
++        return predicates;
+     }
+ }
+diff --git a/scim/model/src/main/java/org/keycloak/scim/model/resourcetype/ResourceTypeProvider.java b/scim/model/src/main/java/org/keycloak/scim/model/resourcetype/ResourceTypeProvider.java
+index e02561ddd0d6..02f6bf4c5279 100644
+--- a/scim/model/src/main/java/org/keycloak/scim/model/resourcetype/ResourceTypeProvider.java
++++ b/scim/model/src/main/java/org/keycloak/scim/model/resourcetype/ResourceTypeProvider.java
+@@ -55,6 +55,11 @@ public Stream<ResourceType> getAll(SearchRequest searchRequest) {
+                 .filter(Objects::nonNull);
+     }
+ 
++    @Override
++    public Long count(SearchRequest searchRequest) {
++        return getAll(searchRequest).count();
++    }
++
+     private ResourceType toRepresentation(ScimResourceTypeProviderFactory<? extends ScimResourceTypeProvider<? extends ResourceTypeRepresentation>> factory) {
+         ScimResourceTypeProvider<? extends ResourceTypeRepresentation> provider = factory.create(session);
+ 
+diff --git a/scim/model/src/main/java/org/keycloak/scim/model/user/AbstractUserModelSchema.java b/scim/model/src/main/java/org/keycloak/scim/model/user/AbstractUserModelSchema.java
+index 6d01c503890f..c0c08e591b6a 100644
+--- a/scim/model/src/main/java/org/keycloak/scim/model/user/AbstractUserModelSchema.java
++++ b/scim/model/src/main/java/org/keycloak/scim/model/user/AbstractUserModelSchema.java
+@@ -80,9 +80,12 @@ protected String createModelAttributeResolver(KeycloakSession session, Attribute
+                 continue;
+             }
+ 
+-            Object scimName = annotations.get(ANNOTATION_SCIM_SCHEMA_ATTRIBUTE);
++            String scimName = (String) annotations.get(ANNOTATION_SCIM_SCHEMA_ATTRIBUTE);
++            if (scimName != null && scimName.startsWith(this.getName()) && !isCore()) {
++                 scimName = scimName.replace(this.getName() + ".", this.getName() + ":");
++            }
+ 
+-            if (attribute.getName().equals(scimName) || ofNullable(attribute.getAlias()).orElse("").equals(scimName)) {
++            if (getPaths(attribute).contains(scimName)) {
+                 return name;
+             }
+         }
+diff --git a/scim/model/src/main/java/org/keycloak/scim/model/user/UserResourceTypeProvider.java b/scim/model/src/main/java/org/keycloak/scim/model/user/UserResourceTypeProvider.java
+index 037f77ea42c3..e0990046c2f4 100644
+--- a/scim/model/src/main/java/org/keycloak/scim/model/user/UserResourceTypeProvider.java
++++ b/scim/model/src/main/java/org/keycloak/scim/model/user/UserResourceTypeProvider.java
+@@ -1,5 +1,6 @@
+ package org.keycloak.scim.model.user;
+ 
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.stream.Stream;
+@@ -87,32 +88,49 @@ protected Stream<UserModel> getModels(SearchRequest searchRequest) {
+         RealmModel realm = session.getContext().getRealm();
+         Integer firstResult = searchRequest.getStartIndex() != null ? searchRequest.getStartIndex() - 1 : null;
+         Integer maxResults = searchRequest.getCount();
++        maxResults = maxResults != null ? Math.min(maxResults, DEFAULT_MAX_RESULTS) : DEFAULT_MAX_RESULTS;
+ 
+         if (StringUtil.isNotBlank(searchRequest.getFilter())) {
+-            // Parse filter into AST
++            // parse filter into AST
+             ScimFilterParser.FilterContext filterContext = FilterUtils.parseFilter(searchRequest.getFilter());
+ 
+-            // Execute JPA query with filter
++            // execute JPA query with filter
+             EntityManager em = session.getProvider(JpaConnectionProvider.class).getEntityManager();
+             CriteriaBuilder cb = em.getCriteriaBuilder();
+             CriteriaQuery<UserEntity> query = cb.createQuery(UserEntity.class);
+             Root<UserEntity> root = query.from(UserEntity.class);
+ 
+-            // Create filter predicate using the same query and root that will be used for execution
+-            ScimJPAPredicateEvaluator evaluator = new ScimJPAPredicateEvaluator(session, getSchemas(), cb, query, root);
+-            Predicate filterPredicate = evaluator.visit(filterContext).predicate();
++            List<Predicate> predicates = this.getUserPredicates(filterContext, cb, root);
+ 
+-            // Apply realm restriction
+-            Predicate realmPredicate = cb.equal(root.get("realmId"), realm.getId());
++            // apply distinct and order by username to ensure consistency with no-filter case
++            query.where(predicates).distinct(true).orderBy(cb.asc(root.get("username")));
+ 
+-            // Combine with filter predicate
+-            query.where(cb.and(realmPredicate, filterPredicate));
+-
+-            // Execute query and convert to UserModel stream
++            // execute query and convert to UserModel stream
+             return closing(paginateQuery(em.createQuery(query), firstResult, maxResults).getResultStream()
+                     .map(entity -> new UserAdapter(session, realm, em, entity)));
+         } else {
+-            return session.users().searchForUserStream(realm, Map.of(), firstResult, maxResults);
++            return session.users().searchForUserStream(realm, Map.of(UserModel.INCLUDE_SERVICE_ACCOUNT, "false"), firstResult, maxResults);
++        }
++    }
++
++    @Override
++    public Long count(SearchRequest searchRequest) {
++        RealmModel realm = session.getContext().getRealm();
++        if (StringUtil.isNotBlank(searchRequest.getFilter())) {
++            // parse filter into AST
++            ScimFilterParser.FilterContext filterContext = FilterUtils.parseFilter(searchRequest.getFilter());
++
++            // execute JPA count query with filter
++            EntityManager em = session.getProvider(JpaConnectionProvider.class).getEntityManager();
++            CriteriaBuilder cb = em.getCriteriaBuilder();
++            CriteriaQuery<Long> query = cb.createQuery(Long.class);
++            Root<UserEntity> root = query.from(UserEntity.class);
++
++            List<Predicate> predicates = this.getUserPredicates(filterContext, cb, root);
++            query.select(cb.countDistinct(root)).where(predicates);
++            return em.createQuery(query).getSingleResult();
++        } else {
++            return (long) session.users().getUsersCount(realm, false);
+         }
+     }
+ 
+@@ -146,4 +164,20 @@ private ModelValidationException handleValidationException(ValidationException v
+ 
+         return exception;
+     }
++
++    private List<Predicate> getUserPredicates(ScimFilterParser.FilterContext filterContext, CriteriaBuilder cb, Root<UserEntity> root) {
++        List<Predicate> predicates = new ArrayList<>();
++
++        // create filter predicate using the same query and root that will be used for execution
++        ScimJPAPredicateEvaluator evaluator = new ScimJPAPredicateEvaluator(session, getSchemas(), cb, root);
++        predicates.add(evaluator.visit(filterContext).predicate());
++
++        // apply service account restriction
++        predicates.add(root.get("serviceAccountClientLink").isNull());
++
++        // apply realm restriction
++        predicates.add(cb.equal(root.get("realmId"), session.getContext().getRealm().getId()));
++
++        return predicates;
++    }
+ }
+diff --git a/scim/services/src/main/java/org/keycloak/scim/services/ScimResourceTypeResource.java b/scim/services/src/main/java/org/keycloak/scim/services/ScimResourceTypeResource.java
+index c87284ceb2a6..add92ceb5aa4 100644
+--- a/scim/services/src/main/java/org/keycloak/scim/services/ScimResourceTypeResource.java
++++ b/scim/services/src/main/java/org/keycloak/scim/services/ScimResourceTypeResource.java
+@@ -127,9 +127,13 @@ public Response search(SearchRequest searchRequest) {
+         }
+ 
+         List<R> resources = stream.toList();
++        Long totalResults = resourceTypeProvider.count(searchRequest);
++
+         ListResponse<R> response = new ListResponse<>();
+         response.setResources(resources);
+-        response.setTotalResults(response.getResources().size());
++        response.setTotalResults(totalResults.intValue());
++        response.setStartIndex(searchRequest.getStartIndex() != null ? searchRequest.getStartIndex() : 1);
++        response.setItemsPerPage(resources.size());
+ 
+         return Response.ok().entity(response).build();
+     }
+diff --git a/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/FilterTest.java b/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/FilterTest.java
+index 3ce756b760df..54c4c8ef17ee 100644
+--- a/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/FilterTest.java
++++ b/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/FilterTest.java
+@@ -1,30 +1,40 @@
+ package org.keycloak.tests.scim.tck;
+ 
++import java.time.Instant;
++import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Set;
+ 
+ import org.keycloak.models.UserModel;
+ import org.keycloak.models.utils.KeycloakModelUtils;
++import org.keycloak.representations.idm.UserRepresentation;
+ import org.keycloak.representations.userprofile.config.UPAttribute;
+ import org.keycloak.representations.userprofile.config.UPConfig;
+ import org.keycloak.scim.client.ResourceFilter;
++import org.keycloak.scim.client.ScimClientException;
+ import org.keycloak.scim.protocol.response.ListResponse;
+-import org.keycloak.scim.resource.common.Email;
+-import org.keycloak.scim.resource.common.Name;
+ import org.keycloak.scim.resource.group.Group;
++import org.keycloak.scim.resource.user.EnterpriseUser;
+ import org.keycloak.scim.resource.user.User;
+ import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
+ 
++import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ 
++import static org.keycloak.scim.model.user.AbstractUserModelSchema.ANNOTATION_SCIM_SCHEMA_ATTRIBUTE;
++import static org.keycloak.scim.resource.Scim.ENTERPRISE_USER_SCHEMA;
++
+ import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.containsInAnyOrder;
+ import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+ import static org.hamcrest.Matchers.is;
+ import static org.hamcrest.Matchers.not;
+ import static org.hamcrest.Matchers.nullValue;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
+ 
+ /**
+  * Comprehensive integration tests for SCIM filter functionality covering all operators and complex combinations.
+@@ -34,6 +44,8 @@
+ @KeycloakIntegrationTest(config = ScimServerConfig.class)
+ public class FilterTest extends AbstractScimTest {
+ 
++    private final List<String> idsToRemove = new ArrayList<>();
++
+     @BeforeEach
+     public void onBefore() {
+         UPConfig upConfig = realm.admin().users().userProfile().getConfiguration();
+@@ -49,24 +61,22 @@ public void onBefore() {
+             iterator.remove();
+         }
+         realm.admin().users().userProfile().update(upConfig);
++        idsToRemove.clear();
      }
  
 -    @Test
--    public void testCreatePublicOpenIdConnectClientSecure() {
--        RealmResource realm = testRealm();
--        ClientRepresentation clientRep = ClientBuilder.create()
--                .name("test-client-policy-app")
--                .clientId("test-client-policy-app")
--                .publicClient()
--                .protocol(OIDCLogin.OIDC)
--                .baseUrl("https://www.keycloak.org")
--                .redirectUris("https://www.keycloak.org")
--                .build();
--        clientRep.setImplicitFlowEnabled(true);
--        OIDCAdvancedConfigWrapper wrapper = OIDCAdvancedConfigWrapper.fromClientRepresentation(clientRep);
--        wrapper.setPostLogoutRedirectUris(Collections.singletonList("https://www.keycloak.org"));
--        wrapper.setPkceCodeChallengeMethod(OIDCLoginProtocol.PKCE_METHOD_PLAIN);
+-    public void testEqualityFilter() {
+-        User john = new User();
+-        john.setUserName("john_" + KeycloakModelUtils.generateId());
+-        john = client.users().create(john);
++    @AfterEach
++    public void onAfter() {
++        idsToRemove.forEach(id -> realm.admin().users().delete(id).close());
++    }
+ 
+-        User jane = new User();
+-        jane.setUserName("jane_" + KeycloakModelUtils.generateId());
+-        jane = client.users().create(jane);
++    @Test
++    public void testEqualFilter() {
++        User bob = createUser("bob");
++        createUser("alice");
+ 
+-        String filter = ResourceFilter.filter().eq("userName", john.getUserName()).build();
++        String filter = ResourceFilter.filter().eq("userName", bob.getUserName()).build();
+         ListResponse<User> response = client.users().getAll(filter);
 -
--        // set the redirect uri to unsecure http
--        clientRep.setRedirectUris(Collections.singletonList("http://www.keycloak.org"));
--        Response resp = realm.clients().create(clientRep);
--        Assert.assertEquals(Response.Status.BAD_REQUEST.getStatusCode(), resp.getStatus());
--        OAuth2ErrorRepresentation error = resp.readEntity(OAuth2ErrorRepresentation.class);
--        Assert.assertEquals(OAuthErrorException.INVALID_REQUEST, error.getError());
--        Assert.assertEquals("Invalid Redirect Uri: invalid uri", error.getErrorDescription());
--        clientRep.setRedirectUris(Collections.singletonList("https://www.keycloak.org"));
--
--        // create OK
--        resp = realm.clients().create(clientRep);
--        Assert.assertEquals(Response.Status.CREATED.getStatusCode(), resp.getStatus());
--        String id = ApiUtil.getCreatedId(resp);
--        getCleanup().addClientUuid(id);
--
--        // check everything is auto-configure for security as the policy has auto-configure
--        clientRep = realm.clients().get(id).toRepresentation();
--        wrapper = OIDCAdvancedConfigWrapper.fromClientRepresentation(clientRep);
--        Assert.assertEquals(OIDCLoginProtocol.PKCE_METHOD_S256, wrapper.getPkceCodeChallengeMethod());
--        Assert.assertFalse(clientRep.isImplicitFlowEnabled());
--        Assert.assertFalse(clientRep.isDirectAccessGrantsEnabled());
--    }
--
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), is(1));
+-        assertThat(response.getResources().get(0).getUserName(), is(john.getUserName()));
++        assertSingleResult(response, bob.getUserName());
+ 
+         // create a couple of groups to test group filtering as well
+         Group groupA = new Group();
+@@ -88,145 +98,172 @@ public void testEqualityFilter() {
+ 
      @Test
-     public void testCreateConfidentialOpenIdConnectClientSecure() {
-         RealmResource realm = testRealm();
+     public void testNotEqualFilter() {
+-        User user1 = new User();
+-        user1.setUserName("testne1_" + KeycloakModelUtils.generateId());
+-        user1 = client.users().create(user1);
+-        final String user1Name = user1.getUserName();
++        User bob = createUser("bob");
++        User alice = createUser("alice");
+ 
+-        User user2 = new User();
+-        user2.setUserName("testne2_" + KeycloakModelUtils.generateId());
+-        user2 = client.users().create(user2);
+-        final String user2Name = user2.getUserName();
+-
+-        String filter = ResourceFilter.filter().ne("userName", user1Name).build();
++        String filter = ResourceFilter.filter().ne("userName", bob.getUserName()).build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+         assertThat(response, is(not(nullValue())));
+         assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().noneMatch(u -> u.getUserName().equals(user1Name)), is(true));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(user2Name)), is(true));
++        assertThat(response.getResources().stream().noneMatch(u -> u.getUserName().equals(bob.getUserName())), is(true));
++        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(alice.getUserName())), is(true));
+     }
+ 
+     @Test
+-    public void testStartsWithFilter() {
+-        User user = new User();
+-        user.setUserName("testswuser_" + KeycloakModelUtils.generateId());
+-        user = client.users().create(user);
++    public void testGreaterThanFilters() {
++        User user = createUser("bob");
++
++        // fetch the user representation to get the start date
++        UserRepresentation userRep = realm.admin().users().get(user.getId()).toRepresentation();
++        long createdDate = userRep.getCreatedTimestamp();
++        String createdDateStr = Instant.ofEpochMilli(createdDate).toString();
++
++        // filtering with greater-than on the user's createdTimestamp should return no user
++        String filter = ResourceFilter.filter().gt("meta.created", createdDateStr).build();
++        ListResponse<User> response = client.users().getAll(filter);
++        assertNoResults(response);
++
++        // filtering with greater-than-or-equal on the user's createdTimestamp should get the new user
++        filter = ResourceFilter.filter().ge("meta.created", createdDateStr).build();
++        response = client.users().getAll(filter);
++        assertSingleResult(response, user.getUserName());
++
++        // filtering with greater-than on the user's (createdTimestamp - 1) should now get the new user
++        createdDateStr = Instant.ofEpochMilli(createdDate - 1).toString();
++        filter = ResourceFilter.filter().gt("meta.created", createdDateStr).build();
++        response = client.users().getAll(filter);
++        assertSingleResult(response, user.getUserName());
++
++        // fetching with greater-than-or-equal on the user's (createdTimestamp + 1) should yield no results
++        createdDateStr = Instant.ofEpochMilli(createdDate + 1).toString();
++        filter = ResourceFilter.filter().ge("meta.created", createdDateStr).build();
++        response = client.users().getAll(filter);
++        assertNoResults(response);
++    }
++
++    @Test
++    public void testLessThanFilters() {
++        User user = createUser("bob");
+         final String expectedUsername = user.getUserName();
+ 
+-        String filter = ResourceFilter.filter().sw("userName", "testswuser_").build();
++        // fetch the user representation to get the start date
++        UserRepresentation userRep = realm.admin().users().get(user.getId()).toRepresentation();
++        long createdDate = userRep.getCreatedTimestamp();
++        String createdDateStr = Instant.ofEpochMilli(createdDate).toString();
++
++        // filtering with less-than on the user's createdTimestamp should not return the new user
++        String filter = ResourceFilter.filter().lt("meta.created", createdDateStr).build();
+         ListResponse<User> response = client.users().getAll(filter);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getResources().stream().noneMatch(u -> u.getUserName().equals(expectedUsername)), is(true));
++
++        // filtering with less-than-or-equal on the user's createdTimestamp should get the new user
++        filter = ResourceFilter.filter().le("meta.created", createdDateStr).build();
++        response = client.users().getAll(filter);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(expectedUsername)), is(true));
+ 
++        // filtering with less-than on the user's (createdTimestamp + 1) should now get the new user
++        createdDateStr = Instant.ofEpochMilli(createdDate + 1).toString();
++        filter = ResourceFilter.filter().lt("meta.created", createdDateStr).build();
++        response = client.users().getAll(filter);
+         assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+         assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(expectedUsername)), is(true));
++
++        // fetching with less-than-or-equal on the user's (createdTimestamp - 1) should not get the new user
++        createdDateStr = Instant.ofEpochMilli(createdDate - 1).toString();
++        filter = ResourceFilter.filter().le("meta.created", createdDateStr).build();
++        response = client.users().getAll(filter);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getResources().stream().noneMatch(u -> u.getUserName().equals(expectedUsername)), is(true));
++    }
++
++    @Test
++    public void testStartsWithFilter() {
++        User user = createUser("bob");
++        createUser("alice_user");
++        final String expectedUsername = user.getUserName();
++
++        String filter = ResourceFilter.filter().sw("userName", "bob").build();
++        ListResponse<User> response = client.users().getAll(filter);
++
++        assertSingleResult(response, user.getUserName());
+     }
+ 
+     @Test
+     public void testContainsFilter() {
+-        User user = new User();
+-        user.setUserName("test_contains_xyz_" + KeycloakModelUtils.generateId());
+-        user = client.users().create(user);
++        User user = createUser("bob-the-builder");
++        createUser("alice-not-builder");
+         final String expectedUsername = user.getUserName();
+ 
+-        String filter = ResourceFilter.filter().co("userName", "contains_xyz").build();
++        String filter = ResourceFilter.filter().co("userName", "the").build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(expectedUsername)), is(true));
++        assertSingleResult(response, expectedUsername);
+     }
+ 
+     @Test
+     public void testEndsWithFilter() {
+-        String suffix = "_endstest_" + KeycloakModelUtils.generateId();
+-        User user = new User();
+-        user.setUserName("user" + suffix);
+-        user = client.users().create(user);
++        User user = createUser("bob-the-builder");
++        createUser("alice-the-tester");
+         final String expectedUsername = user.getUserName();
+ 
+-        String filter = ResourceFilter.filter().ew("userName", suffix).build();
++        String filter = ResourceFilter.filter().ew("userName", "builder").build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(expectedUsername)), is(true));
++        assertSingleResult(response, expectedUsername);
+     }
+ 
+     @Test
+     public void testPresentFilter() {
+-        User user = new User();
+-        user.setUserName("test_pr_" + KeycloakModelUtils.generateId());
+-        user = client.users().create(user);
++        User user = createUser("bob", "bob@keycloak.org");
++        createUser("alice");
+         final String expectedUsername = user.getUserName();
+ 
+-        String filter = ResourceFilter.filter().pr("userName").build();
++        String filter = ResourceFilter.filter().pr("emails.value").build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(expectedUsername)), is(true));
++        assertSingleResult(response, expectedUsername);
+     }
+ 
+     @Test
+     public void testBooleanFilter() {
+-        User activeUser = new User();
+-        activeUser.setUserName("activetrue_" + KeycloakModelUtils.generateId());
+-        activeUser.setActive(true);
+-        activeUser = client.users().create(activeUser);
+-
+-        User inactiveUser = new User();
+-        inactiveUser.setUserName("activefalse_" + KeycloakModelUtils.generateId());
+-        inactiveUser.setActive(false);
+-        inactiveUser = client.users().create(inactiveUser);
++        User bob = createUser("bob", true);
++        User alice = createUser("alice", false);
+ 
+         String filter = ResourceFilter.filter().eq("active", "true").build();
+         ListResponse<User> response = client.users().getAll(filter);
+-
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getResources().stream().allMatch(User::getActive), is(true));
++        assertSingleResult(response, bob.getUserName());
++        assertThat(response.getResources().get(0).getActive(), is(true));
+ 
+         filter = ResourceFilter.filter().eq("active", "false").build();
+         response = client.users().getAll(filter);
+-
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getResources().stream().noneMatch(User::getActive), is(true));
++        assertSingleResult(response, alice.getUserName());
++        assertThat(response.getResources().get(0).getActive(), is(false));
+     }
+ 
+     @Test
+     public void testLogicalAndFilter() {
+-        User user = new User();
+-        user.setUserName("testuser_and_" + KeycloakModelUtils.generateId());
+-        user.setActive(true);
+-        user = client.users().create(user);
++        User user = createUser("bob", true);
+ 
+         String filter = ResourceFilter.filter()
+             .eq("userName", user.getUserName())
+             .and()
+-            .eq("active", "true")
++            .ne("active", "false")
+             .build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), is(1));
+-        assertThat(response.getResources().get(0).getUserName(), is(user.getUserName()));
++        assertSingleResult(response, user.getUserName());
+     }
+ 
+     @Test
+     public void testLogicalOrFilter() {
+-        User user1 = new User();
+-        user1.setUserName("testor1_" + KeycloakModelUtils.generateId());
+-        user1 = client.users().create(user1);
++        User user1 = createUser("bob");
+         final String user1Name = user1.getUserName();
+-
+-        User user2 = new User();
+-        user2.setUserName("testor2_" + KeycloakModelUtils.generateId());
+-        user2 = client.users().create(user2);
++        User user2 = createUser("alice");
+         final String user2Name = user2.getUserName();
+-
+-        User user3 = new User();
+-        user3.setUserName("testor3_" + KeycloakModelUtils.generateId());
+-        user3 = client.users().create(user3);
++        User user3 = createUser("jane");
+         final String user3Name = user3.getUserName();
+ 
+         String filter = ResourceFilter.filter()
+@@ -244,44 +281,30 @@ public void testLogicalOrFilter() {
+     }
+ 
+     @Test
+-    public void testNotOperator() {
+-        User user = new User();
+-        user.setUserName("testnot_" + KeycloakModelUtils.generateId());
+-        user = client.users().create(user);
+-        final String userName = user.getUserName();
++    public void testLogicalNotFilter() {
++        User bob = createUser("bob");
++        User alice = createUser("alice");
+ 
+         String filter = ResourceFilter.filter()
+             .not()
+             .lparen()
+-            .eq("userName", userName)
++            .eq("userName", bob.getUserName())
+             .rparen()
+             .build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getResources().stream().noneMatch(u -> u.getUserName().equals(userName)), is(true));
++        assertSingleResult(response, alice.getUserName());
+     }
+ 
+     @Test
+     public void testComplexAndOrCombination() {
+-        String prefix = "complex_" + KeycloakModelUtils.generateId() + "_";
++        String prefix = "prefix-";
+ 
+-        User user1 = new User();
+-        user1.setUserName(prefix + "active");
+-        user1.setActive(true);
+-        user1 = client.users().create(user1);
++        User user1 = createUser(prefix + "bob", true);
+         final String user1Name = user1.getUserName();
+-
+-        User user2 = new User();
+-        user2.setUserName(prefix + "inactive");
+-        user2.setActive(false);
+-        user2 = client.users().create(user2);
++        User user2 = createUser(prefix + "alice", false);
+         final String user2Name = user2.getUserName();
+-
+-        User user3 = new User();
+-        user3.setUserName("other_" + KeycloakModelUtils.generateId());
+-        user3.setActive(true);
+-        user3 = client.users().create(user3);
++        createUser("other-jane", true);
+ 
+         String filter = ResourceFilter.filter()
+             .lparen()
+@@ -306,17 +329,10 @@ public void testComplexAndOrCombination() {
+ 
+     @Test
+     public void testNotWithAndCombination() {
+-        String prefix = "notand_" + KeycloakModelUtils.generateId() + "_";
+-
+-        User user1 = new User();
+-        user1.setUserName(prefix + "user1");
+-        user1.setActive(true);
+-        user1 = client.users().create(user1);
++        String prefix = "prefix-";
+ 
+-        User user2 = new User();
+-        user2.setUserName(prefix + "user2");
+-        user2.setActive(false);
+-        user2 = client.users().create(user2);
++        createUser(prefix + "bob");
++        User alice = createUser(prefix + "alice", false);
+ 
+         String filter = ResourceFilter.filter()
+             .sw("userName", prefix)
+@@ -328,22 +344,16 @@ public void testNotWithAndCombination() {
+             .build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), is(1));
+-        assertThat(response.getResources().get(0).getUserName(), is(user2.getUserName()));
++        assertSingleResult(response, alice.getUserName());
+     }
+ 
+     @Test
+     public void testMultipleAndConditions() {
+         String uniqueId = KeycloakModelUtils.generateId();
+-        User user = new User();
+-        user.setUserName("multiand_" + uniqueId);
+-        user.setActive(true);
+-        user = client.users().create(user);
+-        final String userName = user.getUserName();
++        User bob = createUser("bob-" + uniqueId, true);
+ 
+         String filter = ResourceFilter.filter()
+-            .sw("userName", "multiand_")
++            .sw("userName", "bob-")
+             .and()
+             .co("userName", uniqueId.substring(0, 8))
+             .and()
+@@ -351,32 +361,19 @@ public void testMultipleAndConditions() {
+             .build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(userName)), is(true));
++        assertSingleResult(response, bob.getUserName());
+     }
+ 
+     @Test
+     public void testNestedParentheses() {
+-        String prefix1 = "nested1_" + KeycloakModelUtils.generateId() + "_";
+-        String prefix2 = "nested2_" + KeycloakModelUtils.generateId() + "_";
++        String prefix1 = "prefix1-";
++        String prefix2 = "prefix2-";
+ 
+-        User user1 = new User();
+-        user1.setUserName(prefix1 + "active");
+-        user1.setActive(true);
+-        user1 = client.users().create(user1);
++        User user1 = createUser(prefix1 + "bob", true);
+         final String user1Name = user1.getUserName();
+-
+-        User user2 = new User();
+-        user2.setUserName(prefix2 + "active");
+-        user2.setActive(true);
+-        user2 = client.users().create(user2);
++        User user2 = createUser(prefix2 + "alice", true);
+         final String user2Name = user2.getUserName();
+-
+-        User user3 = new User();
+-        user3.setUserName(prefix1 + "inactive");
+-        user3.setActive(false);
+-        user3 = client.users().create(user3);
++        createUser(prefix1 + "other-jane", false);
+ 
+         String filter = ResourceFilter.filter()
+             .lparen()
+@@ -395,84 +392,86 @@ public void testNestedParentheses() {
+         assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(user2Name)), is(true));
+     }
+ 
++    @Test
++    public void testInvalidFilters() {
++        createUser("bob");
++
++        // using a non-boolean value in a boolean expression should not be allowed
++        ScimClientException ce = assertThrows(ScimClientException.class,
++                () -> client.users().getAll(ResourceFilter.filter().eq("active", "abcde").build()));
++        assertThat(ce.getError(), is(not(nullValue())));
++        assertThat(ce.getError().getScimType(), is("invalidFilter"));
++
++        // using an invalid operator should not be allowed
++        ce = assertThrows(ScimClientException.class,
++                () -> client.users().getAll("userName invalid \"invalid\""));
++        assertThat(ce.getError(), is(not(nullValue())));
++        assertThat(ce.getError().getScimType(), is("invalidFilter"));
++
++        // using a filter with mismatched parentheses should not be allowed
++        ce = assertThrows(ScimClientException.class,
++                () -> client.users().getAll(ResourceFilter.filter().lparen().eq("userName", "invalid").build()));
++        assertThat(ce.getError(), is(not(nullValue())));
++        assertThat(ce.getError().getScimType(), is("invalidFilter"));
++
++        // using a filter with an operator that is not valid for the type should not be allowed (e.g. greater-than on a boolean attribute)
++        // or starts-with on a date attribute
++        ce = assertThrows(ScimClientException.class,
++                () -> client.users().getAll(ResourceFilter.filter().gt("active", "invalid").build()));
++        assertThat(ce.getError(), is(not(nullValue())));
++        assertThat(ce.getError().getScimType(), is("invalidFilter"));
++
++        ce = assertThrows(ScimClientException.class,
++                () -> client.users().getAll(ResourceFilter.filter().sw("meta.created", "2026-10").build()));
++        assertThat(ce.getError(), is(not(nullValue())));
++        assertThat(ce.getError().getScimType(), is("invalidFilter"));
++    }
++
+     // Tests with rich user objects
+ 
+     @Test
+     public void testFilterByGivenName() {
+-        User user = new User();
+-        user.setUserName("nametest_" + KeycloakModelUtils.generateId());
+-        Name name = new Name();
+-        name.setGivenName("Alice");
+-        name.setFamilyName("Smith");
+-        user.setName(name);
+-        user = client.users().create(user);
+-        final String userName = user.getUserName();
++        User bob = createUser("bob", "Robert", "Johnson", "bob@keycloak.org", true);
++        createUser("alice", "Alice", "Smith", "alice@keycloak.org", true);
+ 
+-        String filter = ResourceFilter.filter().eq("name.givenName", "Alice").build();
++        String filter = ResourceFilter.filter().eq("name.givenName", "Robert").build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(userName)), is(true));
++        assertSingleResult(response, bob.getUserName());
+     }
+ 
+     @Test
+     public void testFilterByFamilyName() {
+-        User user = new User();
+-        user.setUserName("familytest_" + KeycloakModelUtils.generateId());
+-        Name name = new Name();
+-        name.setGivenName("Bob");
+-        name.setFamilyName("Johnson");
+-        user.setName(name);
+-        user = client.users().create(user);
+-        final String userName = user.getUserName();
++        User bob = createUser("bob", "Robert", "Johnson", "bob@keycloak.org", true);
++        createUser("alice", "Alice", "Smith", "alice@keycloak.org", true);
+ 
+         String filter = ResourceFilter.filter().eq("name.familyName", "Johnson").build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(userName)), is(true));
++        assertSingleResult(response, bob.getUserName());
+     }
+ 
+     @Test
+     public void testFilterByEmail() {
+-        String emailValue = "test." + KeycloakModelUtils.generateId() + "@example.com";
+-        User user = new User();
+-        user.setUserName("emailtest_" + KeycloakModelUtils.generateId());
+-        Email email = new Email();
+-        email.setValue(emailValue);
+-        email.setPrimary(true);
+-        user.setEmails(List.of(email));
+-        user = client.users().create(user);
+-        final String userName = user.getUserName();
++        User bob = createUser("bob", "Robert", "Johnson", "bob@keycloak.org", true);
++        User alice = createUser("alice", "Alice", "Smith", "alice@keycloak.org", true);
+ 
+-        String filter = ResourceFilter.filter().eq("emails", emailValue).build();
++        String filter = ResourceFilter.filter().eq("emails", "bob@keycloak.org").build();
+         ListResponse<User> response = client.users().getAll(filter);
++        assertSingleResult(response, bob.getUserName());
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(userName)), is(true));
+-
+-        filter = ResourceFilter.filter().eq("emails.value", emailValue).build();
++        filter = ResourceFilter.filter().eq("emails.value", "alice@keycloak.org").build();
+         response = client.users().getAll(filter);
++        assertSingleResult(response, alice.getUserName());
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(userName)), is(true));
++        filter = ResourceFilter.filter().co("emails", "keycloak").build();
++        response = client.users().getAll(filter);
++        assertThat(response.getTotalResults(), is(2));
+     }
+ 
+     @Test
+     public void testFilterByUnknownAttribute() {
+-        String emailValue = "test@example.com";
+-        User user = new User();
+-        user.setUserName("testuser");
+-        Email email = new Email();
+-        email.setValue(emailValue);
+-        email.setPrimary(true);
+-        user.setEmails(List.of(email));
+-        user = client.users().create(user);
+-        final String userName = user.getUserName();
++        final String userName = createUser("bob").getUserName();
+ 
+         // using a filter with an unknown attribute should not match any users if combined with 'and' since the unknown attribute condition cannot be satisfied
+         String filter = ResourceFilter.filter().eq("userName", userName).and().pr("unkonwn").build();
+@@ -497,122 +496,194 @@ public void testFilterByUnknownAttribute() {
+ 
+     @Test
+     public void testComplexFilterWithNames() {
+-        String uniqueId = KeycloakModelUtils.generateId();
+ 
+-        User alice = new User();
+-        alice.setUserName("alice_" + uniqueId);
+-        Name aliceName = new Name();
+-        aliceName.setGivenName("Alice");
+-        aliceName.setFamilyName("Anderson");
+-        alice.setName(aliceName);
+-        alice.setActive(true);
+-        alice = client.users().create(alice);
+-        final String aliceName1 = alice.getUserName();
+-
+-        User bob = new User();
+-        bob.setUserName("bob_" + uniqueId);
+-        Name bobName = new Name();
+-        bobName.setGivenName("Bob");
+-        bobName.setFamilyName("Anderson");
+-        bob.setName(bobName);
+-        bob.setActive(false);
+-        bob = client.users().create(bob);
+-
+-        // Filter: name.familyName eq "Anderson" AND active eq true
+-        // Should match Alice but not Bob
++        User bob = createUser("bob", "Robert", "Anderson", "bob@keycloak.org", false);
++        User alice = createUser("alice", "Alice", "Anderson", "alice@keycloak.org", true);
++
++        // filter: name.familyName eq "Anderson" AND active eq true  - should match alice but not bob
+         String filter = ResourceFilter.filter()
+-            .eq("name.familyName", "Anderson")
+-            .and()
+-            .eq("active", "true")
+-            .build();
++                .eq("name.familyName", "Anderson")
++                .and()
++                .eq("active", "true")
++                .build();
+         ListResponse<User> response = client.users().getAll(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(aliceName1)), is(true));
++        assertSingleResult(response, alice.getUserName());
+     }
+ 
+     // Tests for POST /.search endpoint
+ 
+     @Test
+     public void testPostSearchEndpointEq() {
+-        User user = new User();
+-        user.setUserName("postsearch_" + KeycloakModelUtils.generateId());
+-        user = client.users().create(user);
++        User user = createUser("bob");
+         final String userName = user.getUserName();
+ 
+         // Use search() which calls POST /.search
+         String filter = ResourceFilter.filter().eq("userName", userName).build();
+         ListResponse<User> response = client.users().search(filter);
+ 
+-        assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), is(1));
+-        assertThat(response.getResources().get(0).getUserName(), is(userName));
++        assertSingleResult(response, userName);
+     }
+ 
+     @Test
+     public void testPostSearchEndpointComplex() {
+-        String prefix = "postcomplex_" + KeycloakModelUtils.generateId() + "_";
+-
+-        User user1 = new User();
+-        user1.setUserName(prefix + "user1");
+-        Name name1 = new Name();
+-        name1.setGivenName("Charlie");
+-        name1.setFamilyName("Davis");
+-        user1.setName(name1);
+-        user1.setActive(true);
+-        user1 = client.users().create(user1);
+-        final String user1Name = user1.getUserName();
+ 
+-        User user2 = new User();
+-        user2.setUserName(prefix + "user2");
+-        Name name2 = new Name();
+-        name2.setGivenName("David");
+-        name2.setFamilyName("Davis");
+-        user2.setName(name2);
+-        user2.setActive(false);
+-        user2 = client.users().create(user2);
+-        final String user2Name = user2.getUserName();
++        User bob = createUser("user-bob", "Robert", "Johnson", "bob@keycloak.org", true);
++        User alice = createUser("user-alice", "Alice", "Smith", "alice@keycloak.org", false);
+ 
+-        // Complex filter: (userName sw prefix AND active eq true) OR (name.givenName eq "David")
++        // Complex filter: (userName sw prefix AND active eq true) OR (name.givenName eq "Alice")
+         // Should match both users
+         String filter = ResourceFilter.filter()
+             .lparen()
+-            .sw("userName", prefix)
++            .sw("userName", "user-")
+             .and()
+             .eq("active", "true")
+             .rparen()
+             .or()
+             .lparen()
+-            .eq("name.givenName", "David")
++            .eq("name.givenName", "Alice")
+             .rparen()
+             .build();
+         ListResponse<User> response = client.users().search(filter);
+ 
+         assertThat(response, is(not(nullValue())));
+         assertThat(response.getTotalResults(), is(2));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(user1Name)), is(true));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(user2Name)), is(true));
++        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(bob.getUserName())), is(true));
++        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(alice.getUserName())), is(true));
+     }
+ 
+     @Test
+     public void testPostSearchWithEmailFilter() {
+-        String emailValue = "postemailtest." + KeycloakModelUtils.generateId() + "@example.com";
+-        User user = new User();
+-        user.setUserName("postemailuser_" + KeycloakModelUtils.generateId());
+-        Email email = new Email();
+-        email.setValue(emailValue);
+-        email.setPrimary(true);
+-        user.setEmails(List.of(email));
+-        user = client.users().create(user);
+-        final String userName = user.getUserName();
++
++        createUser("user-bob", "Robert", "Johnson", "bob@keycloak.org", true);
++        User alice = createUser("user-alice", "Alice", "Smith", "alice@keycloak-corp.org", true);
+ 
+         // Test POST search with email contains filter
+-        String filter = ResourceFilter.filter().co("emails", "postemailtest").build();
++        String filter = ResourceFilter.filter().co("emails", "corp").build();
+         ListResponse<User> response = client.users().search(filter);
+ 
++        assertSingleResult(response, alice.getUserName());
++    }
++
++    // Tests for enterprise user searches
++
++    @Test
++    public void testSearchEnterpriseUsers() {
++        UPConfig configuration = realm.admin().users().userProfile().getConfiguration();
++
++        // update user profile configuration
++        configuration.addOrReplaceAttribute(new UPAttribute("department", Map.of(
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".department")));
++        configuration.addOrReplaceAttribute(new UPAttribute("division", Map.of(
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".division")));
++        configuration.addOrReplaceAttribute(new UPAttribute("costCenter", Map.of(
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".costCenter")));
++        configuration.addOrReplaceAttribute(new UPAttribute("employeeNumber", Map.of(
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".employeeNumber")));
++        configuration.addOrReplaceAttribute(new UPAttribute("organization", Map.of(
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".organization")));
++        configuration.addOrReplaceAttribute(new UPAttribute("manager", Map.of(
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".manager.value")));
++        configuration.addOrReplaceAttribute(new UPAttribute("managerName", Map.of(
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".manager.displayName")));
++        realm.admin().users().userProfile().update(configuration);
++
++        User user1 = createEnterpriseUser("user1", "Engineering", "E1234", "Bruce Wayne");
++        User user2 = createEnterpriseUser("user2", "QE", "E7763", "Lucius Fox");
++
++        // now search by the various enterprise user attributes to verify that the filtering works for them
++        String filter = ResourceFilter.filter().eq(ENTERPRISE_USER_SCHEMA + ":department", "QE").build();
++        ListResponse<User> response = client.users().getAll(filter);
+         assertThat(response, is(not(nullValue())));
+-        assertThat(response.getTotalResults(), greaterThanOrEqualTo(1));
+-        assertThat(response.getResources().stream().anyMatch(u -> u.getUserName().equals(userName)), is(true));
++        assertThat(response.getTotalResults(), is(1));
++        assertThat(response.getResources().get(0).getUserName(), is(user2.getUserName()));
++
++        // search by cost center using starts-with filter
++        filter = ResourceFilter.filter().sw(ENTERPRISE_USER_SCHEMA + ":costCenter", "AMER").build();
++        response = client.users().getAll(filter);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(2));
++        assertThat(response.getResources().stream().map(User::getUserName).toList(), containsInAnyOrder(user1.getUserName(), user2.getUserName()));
++
++        // search by organization using contains filter
++        filter = ResourceFilter.filter().co(ENTERPRISE_USER_SCHEMA + ":organization", "ganiza").build();
++        response = client.users().getAll(filter);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(2));
++        assertThat(response.getResources().stream().map(User::getUserName).toList(), containsInAnyOrder(user1.getUserName(), user2.getUserName()));
++
++        // search by manager's display name using ends-with filter
++        filter = ResourceFilter.filter().ew(ENTERPRISE_USER_SCHEMA + ":manager.displayName", "Technical Manager").build();
++        response = client.users().getAll(filter);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(2));
++        assertThat(response.getResources().stream().map(User::getUserName).toList(), containsInAnyOrder(user1.getUserName(), user2.getUserName()));
++
++        // search by manager's name
++        filter = ResourceFilter.filter().eq(ENTERPRISE_USER_SCHEMA + ":manager", "Bruce Wayne").build();
++        response = client.users().getAll(filter);
++        assertThat(response.getTotalResults(), is(1));
++        assertThat(response.getResources().get(0).getUserName(), is(user1.getUserName()));
++    }
++
++    private void assertNoResults(ListResponse<User> response) {
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(0));
++    }
++
++    private void assertSingleResult(ListResponse<User> response, String expectedUsername) {
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(1));
++        assertThat(response.getResources().get(0).getUserName(), is(expectedUsername));
++
++    }
++
++    public User createUser(String username) {
++        return this.createUser(username, null);
++    }
++
++    public User createUser(String username, String email) {
++        return this.createUser(username, null, null, email, true);
++    }
++
++    public User createUser(String username, boolean active) {
++        return this.createUser(username, null, null, null, active);
++    }
++
++    private User createUser(String username, String givenName, String familyName, String email, boolean active) {
++        User user = new User();
++        user.setUserName(username);
++        user.setEmail(email);
++        user.setActive(active);
++        user.setFirstName(givenName);
++        user.setLastName(familyName);
++        user = client.users().create(user);
++        idsToRemove.add(user.getId());
++        return user;
++    }
++
++    private User createEnterpriseUser(String username, String department, String employeeNumber, String managerName) {
++        User user = new User();
++        user.setUserName(username);
++        user.setEmail(username + "@keycloak.org");
++        user.setActive(true);
++
++        EnterpriseUser enterpriseUser = new EnterpriseUser();
++        enterpriseUser.setDepartment(department);
++        enterpriseUser.setEmployeeNumber(employeeNumber);
++        user.setEnterpriseUser(enterpriseUser);
++        enterpriseUser.setCostCenter("AMER-4015");
++        enterpriseUser.setDivision("Open Source");
++        enterpriseUser.setOrganization("Organization");
++        user.setEnterpriseUser(enterpriseUser);
++
++        EnterpriseUser.Manager manager = new EnterpriseUser.Manager();
++        manager.setValue(managerName);
++        manager.setDisplayName(managerName + ", Technical Manager");
++        enterpriseUser.setManager(manager);
++
++        user = client.users().create(user);
++        idsToRemove.add(user.getId());
++        return user;
+     }
+ }
+diff --git a/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/PaginationTest.java b/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/PaginationTest.java
+new file mode 100644
+index 000000000000..62736ced6c86
+--- /dev/null
++++ b/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/PaginationTest.java
+@@ -0,0 +1,262 @@
++package org.keycloak.tests.scim.tck;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import org.keycloak.scim.client.ResourceFilter;
++import org.keycloak.scim.protocol.response.ListResponse;
++import org.keycloak.scim.resource.group.Group;
++import org.keycloak.scim.resource.user.User;
++import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Test;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.hamcrest.Matchers.not;
++import static org.hamcrest.Matchers.nullValue;
++
++@KeycloakIntegrationTest(config = ScimServerConfig.class)
++public class PaginationTest extends AbstractScimTest {
++
++    private final List<String> userIdsToRemove = new ArrayList<>();
++    private final List<String> groupIdsToRemove = new ArrayList<>();
++
++    @AfterEach
++    public void onAfter() {
++        userIdsToRemove.forEach(id -> realm.admin().users().delete(id).close());
++        userIdsToRemove.clear();
++        groupIdsToRemove.forEach(id -> realm.admin().groups().group(id).remove());
++        groupIdsToRemove.clear();
++    }
++
++    @Test
++    public void testUserSearchWithPaginationAndNoFilter() {
++
++        // create a few users to test pagination
++        for (int i = 0; i < 10; i++) {
++            createUser("user-" + i, "User " + i, "Test", "user" + i + "@keycloak.org", true);
++        }
++
++        // using a page size of 3, we should have 4 pages of results (3 + 3 + 3 + 1)
++        int pageSize = 3;
++        ListResponse<User> response = client.users().search(null, 1, pageSize);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(3));
++        assertThat(response.getStartIndex(), is(1));
++
++        // first page should have users 0, 1, 2
++        for (int i = 0; i <= 2; i++) {
++            assertThat(response.getResources().get(i).getUserName(), is("user-" + i));
++        }
++
++        // fetch the second page
++        response = client.users().search(null, 4, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(3));
++        assertThat(response.getStartIndex(), is(4));
++
++        // second page should have users 3, 4, 5
++        for (int i = 3; i <= 5; i++) {
++            assertThat(response.getResources().get(i - pageSize).getUserName(), is("user-" + i));
++        }
++
++        // fetch the third page
++        response = client.users().search(null, 7, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(3));
++        assertThat(response.getStartIndex(), is(7));
++
++        // third page should have users 6, 7, 8
++        for (int i = 6; i <= 8; i++) {
++            assertThat(response.getResources().get(i - pageSize * 2).getUserName(), is("user-" + i));
++        }
++
++        // fetch the fourth and final page
++        response = client.users().search(null, 10, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(1));
++        assertThat(response.getStartIndex(), is(10));
++
++        assertThat(response.getResources().get(0).getUserName(), is("user-9"));
++    }
++
++    @Test
++    public void testUserSearchWithPaginationAndFilter() {
++        // create a few users to test pagination
++        for (int i = 0; i < 10; i++) {
++            createUser("user-" + i, "User " + i, "Smith", "user" + i + "@keycloak.org", true);
++        }
++        for (int i = 10; i < 20; i++) {
++            createUser("user-" + i, "User " + i, "Johnson", "user" + i + "@keycloak.org", true);
++        }
++
++        // filter by family name and page size of 4, we should have 3 pages of results (4 + 4 + 2)
++        int pageSize = 4;
++        String filter = ResourceFilter.filter().eq("name.familyName", "Smith").build();
++        ListResponse<User> response = client.users().search(filter, 1, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(4));
++        assertThat(response.getStartIndex(), is(1));
++
++        // first page should have users 0, 1, 2, 3
++        for (int i = 0; i <= 3; i++) {
++            assertThat(response.getResources().get(i).getUserName(), is("user-" + i));
++        }
++
++        // fetch the second page
++        response = client.users().search(filter, 5, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(4));
++        assertThat(response.getStartIndex(), is(5));
++
++        // second page should have users 4, 5, 6, 7
++        for (int i = 4; i <= 7; i++) {
++            assertThat(response.getResources().get(i - pageSize).getUserName(), is("user-" + i));
++        }
++
++        // fetch the last page
++        response = client.users().search(filter, 9, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(2));
++        assertThat(response.getStartIndex(), is(9));
++
++        // last page should have users 8, 9
++        assertThat(response.getResources().get(0).getUserName(), is("user-8"));
++        assertThat(response.getResources().get(1).getUserName(), is("user-9"));
++    }
++
++    @Test
++    public void testUserSearchRespectsMaxResults() {
++        // create more users so we have more than the default max results of 100
++        for (int i = 0; i < 120; i++) {
++            createUser("user-" + i, "User " + i, "Test", "user" + i + "@keycloak.org", true);
++        }
++
++        // if we send an unbounded request (count = null), we should get back only the default max results of 100
++        ListResponse<User> response = client.users().getAll();
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(120));
++        assertThat(response.getItemsPerPage(), is(100));
++        assertThat(response.getStartIndex(), is(1));
++
++        // if we send a request with a count higher than the default max results, we should still get back only the default max results of 100
++        response = client.users().search(null, 1, 150);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(120));
++        assertThat(response.getItemsPerPage(), is(100));
++        assertThat(response.getStartIndex(), is(1));
++    }
++
++    @Test
++    public void testGroupSearchWithPaginationAndNoFilter() {
++        // create a few test groups
++        for (int i = 0; i < 10; i++) {
++            createGroup("group-" + i);
++        }
++
++        // using a page size of 6, we should have 2 pages of results (6 + 4)
++        int pageSize = 6;
++        ListResponse<Group> response = client.groups().search(null, 1, pageSize);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(6));
++        assertThat(response.getStartIndex(), is(1));
++
++        // first page should have groups 0, 1, 2, 3, 4, 5
++        for (int i = 0; i < 6; i++) {
++            assertThat(response.getResources().get(i).getDisplayName(), is("group-" + i));
++        }
++
++        // fetch the second page
++        response = client.groups().search(null, 7, pageSize);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(4));
++        assertThat(response.getStartIndex(), is(7));
++
++        // second page should have groups 6, 7, 8, 9
++        for (int i = 6; i < 10; i++) {
++            assertThat(response.getResources().get(i - pageSize).getDisplayName(), is("group-" + i));
++        }
++    }
++
++    @Test
++    public void testGroupSearchWithPaginationAndFilter() {
++        // create a few test groups
++        for (int i = 0; i < 10; i++) {
++            createGroup("group-" + i);
++        }
++        for (int i = 10; i < 20; i++) {
++            createGroup("team-" + i);
++        }
++
++        // filter by display name and page size of 5, we should have 2 pages of results (5 + 5)
++        int pageSize = 5;
++        String filter = ResourceFilter.filter().sw("displayName", "team-").build();
++        ListResponse<Group> response = client.groups().search(filter, 1, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(5));
++        assertThat(response.getStartIndex(), is(1));
++
++        // first page should have groups 10, 11, 12, 13, 14
++        for (int i = 10; i <= 14; i++) {
++            assertThat(response.getResources().get(i - 10).getDisplayName(), is("team-" + i));
++        }
++
++        // fetch the second page
++        response = client.groups().search(filter, 6, pageSize);
++        assertThat(response.getTotalResults(), is(10));
++        assertThat(response.getItemsPerPage(), is(5));
++        assertThat(response.getStartIndex(), is(6));
++
++        // second page should have groups 15, 16, 17, 18, 19
++        for (int i = 15; i <= 19; i++) {
++            assertThat(response.getResources().get(i - 15).getDisplayName(), is("team-" + i));
++        }
++    }
++
++    @Test
++    public void testGroupSearchRespectsMaxResults() {
++        // create more groups than the default max results of 100
++        for (int i = 0; i < 120; i++) {
++            createGroup("group-" + i);
++        }
++
++        // if we send an unbounded request (count = null), we should get back only the default max results of 100
++        ListResponse<Group> response = client.groups().search(null, null, null);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(120));
++        assertThat(response.getItemsPerPage(), is(100));
++        assertThat(response.getStartIndex(), is(1));
++
++        // if we send a request with a count higher than the default max results, we should still get back only the default max results of 100
++        response = client.groups().search(null, 1, 150);
++        assertThat(response, is(not(nullValue())));
++        assertThat(response.getTotalResults(), is(120));
++        assertThat(response.getItemsPerPage(), is(100));
++        assertThat(response.getStartIndex(), is(1));
++    }
++
++    private User createUser(String username, String givenName, String familyName, String email, boolean active) {
++        User user = new User();
++        user.setUserName(username);
++        user.setEmail(email);
++        user.setActive(active);
++        user.setFirstName(givenName);
++        user.setLastName(familyName);
++        user = client.users().create(user);
++        userIdsToRemove.add(user.getId());
++        return user;
++    }
++
++    private Group createGroup(String name) {
++        Group group = new Group();
++        group.setDisplayName(name);
++        group = client.groups().create(group);
++        groupIdsToRemove.add(group.getId());
++        return group;
++    }
++}
+diff --git a/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/UserTest.java b/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/UserTest.java
+index e3da7f53f46d..0b1e6c5e6758 100644
+--- a/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/UserTest.java
++++ b/scim/tests/base/src/test/java/org/keycloak/tests/scim/tck/UserTest.java
+@@ -195,7 +195,7 @@ public void testCreateEnterpriseUser() {
+         configuration.addOrReplaceAttribute(new UPAttribute("manager", Map.of(
+                 ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".manager.value")));
+         configuration.addOrReplaceAttribute(new UPAttribute("managerName", Map.of(
+-                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".manager.dispayName")));
++                ANNOTATION_SCIM_SCHEMA_ATTRIBUTE, ENTERPRISE_USER_SCHEMA + ".manager.displayName")));
+         realm.admin().users().userProfile().update(configuration);
+ 
+         User expected = createUser();
+diff --git a/services/src/main/java/org/keycloak/organization/admin/resource/OrganizationGroupResource.java b/services/src/main/java/org/keycloak/organization/admin/resource/OrganizationGroupResource.java
+index 59ed43a5cea4..b131602a5ebb 100644
+--- a/services/src/main/java/org/keycloak/organization/admin/resource/OrganizationGroupResource.java
++++ b/services/src/main/java/org/keycloak/organization/admin/resource/OrganizationGroupResource.java
+@@ -17,6 +17,7 @@
+ 
+ package org.keycloak.organization.admin.resource;
+ 
++import java.net.URI;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+@@ -244,7 +245,9 @@ public Response addSubGroup(GroupRepresentation rep) {
+             } else {
+                 // CREATE new subgroup
+                 child = organizationProvider.createGroup(organization, groupName, group);
+-                builder.status(201);
++                URI uri = session.getContext().getUri().getAbsolutePathBuilder()
++                        .path(child.getId()).build();
++                builder.status(201).location(uri);
+                 rep.setId(child.getId());
+                 adminEvent.operation(OperationType.CREATE);
+             }
+diff --git a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCAuthorizationDetailsProcessor.java b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCAuthorizationDetailsProcessor.java
+index 35b7e6f24dc3..e8f77452952d 100644
+--- a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCAuthorizationDetailsProcessor.java
++++ b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCAuthorizationDetailsProcessor.java
+@@ -20,6 +20,7 @@
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.Set;
+ import java.util.UUID;
+ import java.util.stream.Collectors;
+@@ -31,6 +32,8 @@
+ import org.keycloak.models.KeycloakSession;
+ import org.keycloak.models.UserModel;
+ import org.keycloak.models.UserSessionModel;
++import org.keycloak.models.oid4vci.CredentialScopeModel;
++import org.keycloak.protocol.oid4vc.OID4VCLoginProtocolFactory;
+ import org.keycloak.protocol.oid4vc.issuance.credentialoffer.CredentialOfferState;
+ import org.keycloak.protocol.oid4vc.issuance.credentialoffer.CredentialOfferStorage;
+ import org.keycloak.protocol.oid4vc.model.Claim;
+@@ -44,7 +47,6 @@
+ import org.keycloak.protocol.oidc.rar.AuthorizationDetailsProcessor;
+ import org.keycloak.protocol.oidc.rar.InvalidAuthorizationDetailsException;
+ import org.keycloak.representations.AuthorizationDetailsJSONRepresentation;
+-import org.keycloak.util.JsonSerialization;
+ 
+ import org.jboss.logging.Logger;
+ 
+@@ -288,27 +290,28 @@ private OID4VCAuthorizationDetail buildAuthorizationDetail(OID4VCAuthorizationDe
+ 
+ 
+     /**
+-     * Generate authorization_details from the credential offer when authorization_details parameter is not present in the token request.
+-     * This method generates authorization_details based on the credential_configuration_ids from the credential offer.
++     * Generate authorization_details when authorization_details parameter is not present in the token request.
++     * This method derives authorization_details from credential scopes in current request context.
+      *
+-     * @param clientSession the client session that contains the credential offer information
++     * @param userSession      the current user session
++     * @param clientSessionCtx the client session context from current token request
+      * @return the authorization details response if generation was successful, null otherwise
+      */
+-    private List<OID4VCAuthorizationDetail> generateAuthorizationDetailsFromCredentialOffer(AuthenticatedClientSessionModel clientSession) {
+-        logger.debug("Processing authorization_details from credential offer");
++    private List<OID4VCAuthorizationDetail> generateAuthorizationDetailsFromCredentialOffer(UserSessionModel userSession, ClientSessionContext clientSessionCtx) {
++        logger.debug("Processing authorization_details from current request scopes");
+ 
+         // Get supported credentials
+         Map<String, SupportedCredentialConfiguration> supportedCredentials = OID4VCIssuerWellKnownProvider.getSupportedCredentials(session);
+         if (supportedCredentials == null || supportedCredentials.isEmpty()) {
+-            logger.debug("No supported credentials found, cannot generate authorization_details from credential offer");
++            logger.debug("No supported credentials found, cannot generate authorization_details from current request scopes");
+             return null;
+         }
+ 
+-        // Extract credential_configuration_ids from the credential offer
+-        List<String> credentialConfigurationIds = extractCredentialConfigurationIds(clientSession);
++        // Derive credential_configuration_ids from the current request client scopes
++        List<String> credentialConfigurationIds = deriveCredentialConfigurationIds(clientSessionCtx);
+ 
+         if (credentialConfigurationIds == null || credentialConfigurationIds.isEmpty()) {
+-            logger.debug("No credential_configuration_ids found in credential offer, cannot generate authorization_details");
++            logger.debug("No credential_configuration_ids found in current request scopes, cannot generate authorization_details");
+             return null;
+         }
+ 
+@@ -332,6 +335,9 @@ private List<OID4VCAuthorizationDetail> generateAuthorizationDetailsFromCredenti
+             authDetail.setCredentialIdentifiers(List.of(credentialIdentifier));
+ 
+             authorizationDetailsList.add(authDetail);
++
++            // Ensure generated credential_identifier can be resolved during credential request.
++            createOfferStateForAuthorizationCodeFlow(userSession, clientSessionCtx, authDetail);
+         }
+ 
+         if (authorizationDetailsList.isEmpty()) {
+@@ -343,39 +349,21 @@ private List<OID4VCAuthorizationDetail> generateAuthorizationDetailsFromCredenti
+     }
+ 
+     /**
+-     * Extract credential_configuration_ids from the credential offer stored in client session
++     * Derive credential_configuration_ids from client scopes in current request context.
+      */
+-    private List<String> extractCredentialConfigurationIds(AuthenticatedClientSessionModel clientSession) {
+-        // Get credential configuration IDs from the predictable location
+-        // This is stored when the credential offer is created in getCredentialOfferURI
+-        String credentialConfigIdsJson = clientSession.getNote(OID4VCIssuerEndpoint.CREDENTIAL_CONFIGURATION_IDS_NOTE);
+-        if (credentialConfigIdsJson != null) {
+-            logger.debugf("Found credential configuration IDs in predictable location");
+-            try {
+-                List<String> configIds = JsonSerialization.readValue(credentialConfigIdsJson, List.class);
+-                logger.debugf("Successfully parsed credential configuration IDs: %s", configIds);
+-                return configIds;
+-            } catch (Exception e) {
+-                logger.warnf("Failed to parse credential configuration IDs from predictable location: %s", e.getMessage());
+-            }
+-        }
+-
+-        logger.debugf("No credential_configuration_ids found in predictable location");
+-        return null;
++    private List<String> deriveCredentialConfigurationIds(ClientSessionContext clientSessionCtx) {
++        List<String> configIds = clientSessionCtx.getClientScopesStream()
++                .filter(clientScope -> OID4VCLoginProtocolFactory.PROTOCOL_ID.equals(clientScope.getProtocol()))
++                .map(clientScope -> clientScope.getAttribute(CredentialScopeModel.VC_CONFIGURATION_ID))
++                .filter(Objects::nonNull)
++                .toList();
++        logger.debugf("Resolved credential configuration IDs from current request client scopes: %s", configIds);
++        return configIds;
+     }
+ 
+     @Override
+     public List<OID4VCAuthorizationDetail> handleMissingAuthorizationDetails(UserSessionModel userSession, ClientSessionContext clientSessionCtx) {
+-        // Only generate authorization_details from credential offer if:
+-        // 1. No authorization_details were processed yet, AND
+-        // 2. There's a credential offer note in the client session (indicating this is a credential offer flow)
+-        // This prevents generating authorization_details for regular SSO logins that don't request OID4VCI - Not 100% sure the check for CREDENTIAL_CONFIGURATION_IDS_NOTE is needed and sufficient
+-        if (clientSessionCtx.getClientSession().getNote(OID4VCIssuerEndpoint.CREDENTIAL_CONFIGURATION_IDS_NOTE) != null) {
+-            AuthenticatedClientSessionModel clientSession = clientSessionCtx.getClientSession();
+-            return generateAuthorizationDetailsFromCredentialOffer(clientSession);
+-        } else {
+-            return null;
+-        }
++        return generateAuthorizationDetailsFromCredentialOffer(userSession, clientSessionCtx);
+     }
+ 
+     @Override
+diff --git a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerEndpoint.java b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerEndpoint.java
+index d75b05cf236b..0d2967d2d52e 100644
+--- a/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerEndpoint.java
++++ b/services/src/main/java/org/keycloak/protocol/oid4vc/issuance/OID4VCIssuerEndpoint.java
+@@ -155,13 +155,6 @@ public class OID4VCIssuerEndpoint {
+ 
+     private static final Logger LOGGER = Logger.getLogger(OID4VCIssuerEndpoint.class);
+ 
+-    /**
+-     * Session note key for storing credential configuration IDs from credential offer.
+-     * This allows the authorization details processor to easily retrieve the configuration IDs
+-     * without having to search through all session notes or parse the full credential offer.
+-     */
+-    public static final String CREDENTIAL_CONFIGURATION_IDS_NOTE = "CREDENTIAL_CONFIGURATION_IDS";
+-
+     private Cors cors;
+ 
+     /**
+@@ -567,13 +560,6 @@ public Response createCredentialOffer(
+         LOGGER.debugf("Stored credential offer state: [ids=%s, cid=%s, uid=%s, nonce=%s]",
+                 credOffer.getCredentialConfigurationIds(), offerState.getClientId(), offerState.getUserId(), offerState.getNonce());
+ 
+-        // Store the credential configuration Ids in a predictable location for token processing
+-        // This allows the authorization details processor to easily retrieve the configuration Ids
+-        // without having to search through all session notes or parse the full credential offer
+-        String credentialConfigIdsJson = JsonSerialization.valueAsString(credOffer.getCredentialConfigurationIds());
+-        clientSession.setNote(CREDENTIAL_CONFIGURATION_IDS_NOTE, credentialConfigIdsJson);
+-        LOGGER.debugf("Stored credential configuration IDs for token processing: %s", credentialConfigIdsJson);
+-
+         // Add event details
+         eventBuilder.detail(Details.VERIFIABLE_CREDENTIAL_PRE_AUTHORIZED, String.valueOf(preAuthorized))
+                 .detail(Details.RESPONSE_TYPE, responseType.toString())
+diff --git a/services/src/main/java/org/keycloak/protocol/oidc/grants/PreAuthorizedCodeGrantType.java b/services/src/main/java/org/keycloak/protocol/oidc/grants/PreAuthorizedCodeGrantType.java
+index 37f89fb4ddb9..5984ee925a49 100644
+--- a/services/src/main/java/org/keycloak/protocol/oidc/grants/PreAuthorizedCodeGrantType.java
++++ b/services/src/main/java/org/keycloak/protocol/oidc/grants/PreAuthorizedCodeGrantType.java
+@@ -18,8 +18,11 @@
+ package org.keycloak.protocol.oidc.grants;
+ 
+ import java.security.MessageDigest;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Optional;
++import java.util.Set;
++import java.util.stream.Collectors;
+ 
+ import jakarta.ws.rs.core.Response;
+ 
+@@ -41,12 +44,12 @@
+ import org.keycloak.protocol.oid4vc.model.OID4VCAuthorizationDetail;
+ import org.keycloak.protocol.oid4vc.utils.OID4VCUtil;
+ import org.keycloak.protocol.oidc.OIDCLoginProtocol;
++import org.keycloak.protocol.oidc.TokenManager;
+ import org.keycloak.protocol.oidc.TokenManager.AccessTokenResponseBuilder;
+ import org.keycloak.representations.AccessToken;
+ import org.keycloak.representations.AccessTokenResponse;
+ import org.keycloak.representations.AuthorizationDetailsJSONRepresentation;
+ import org.keycloak.services.CorsErrorResponseException;
+-import org.keycloak.util.JsonSerialization;
+ import org.keycloak.util.Strings;
+ import org.keycloak.utils.MediaType;
+ 
+@@ -54,7 +57,7 @@
+ 
+ import static org.keycloak.events.Details.REASON;
+ import static org.keycloak.protocol.oid4vc.model.ErrorType.UNKNOWN_CREDENTIAL_CONFIGURATION;
+-import static org.keycloak.services.util.DefaultClientSessionContext.fromClientSessionAndScopeParameter;
++import static org.keycloak.services.util.DefaultClientSessionContext.fromClientSessionAndClientScopes;
+ 
+ public class PreAuthorizedCodeGrantType extends OAuth2GrantTypeBase {
+ 
+@@ -149,12 +152,15 @@ public Response process(Context context) {
+                 null, UserSessionModel.SessionPersistenceState.TRANSIENT);
+ 
+         AuthenticatedClientSessionModel clientSession = session.sessions().createClientSession(realm, clientModel, userSession);
+-        String credentialConfigurationIds = JsonSerialization.valueAsString(credOffer.getCredentialConfigurationIds());
+-        clientSession.setNote(OID4VCIssuerEndpoint.CREDENTIAL_CONFIGURATION_IDS_NOTE, credentialConfigurationIds);
+         clientSession.setNote(OIDCLoginProtocol.ISSUER, credOffer.getCredentialIssuer());
+         clientSession.setNote(VC_ISSUANCE_FLOW, PreAuthorizedCodeGrantTypeFactory.GRANT_TYPE);
+ 
+-        ClientSessionContext sessionContext = fromClientSessionAndScopeParameter(clientSession, OAuth2Constants.SCOPE_OPENID, session);
++        List<ClientScopeModel> credentialScopes = resolveCredentialScopesForCredentialOffer(credOffer.getCredentialConfigurationIds());
++        Set<ClientScopeModel> requestedScopes = TokenManager.getRequestedClientScopes(session, OAuth2Constants.SCOPE_OPENID, clientModel, targetUserModel)
++                .collect(Collectors.toCollection(LinkedHashSet::new));
++        requestedScopes.addAll(credentialScopes);
++
++        ClientSessionContext sessionContext = fromClientSessionAndClientScopes(clientSession, requestedScopes, null, session);
+         sessionContext.setAttribute(Constants.GRANT_TYPE, PreAuthorizedCodeGrantTypeFactory.GRANT_TYPE);
+ 
+         // set the client as retrieved from the pre-authorized session
+@@ -251,6 +257,38 @@ public Response process(Context context) {
+         return cors.allowAllOrigins().add(Response.ok(tokenResponse).type(MediaType.APPLICATION_JSON_TYPE));
+     }
+ 
++    private List<ClientScopeModel> resolveCredentialScopesForCredentialOffer(List<String> credentialConfigurationIds) {
++        if (credentialConfigurationIds == null || credentialConfigurationIds.isEmpty()) {
++            String errorMessage = "No credential_configuration_ids found in credential offer";
++            event.detail(REASON, errorMessage).error(Errors.INVALID_CODE);
++            throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST,
++                    errorMessage, Response.Status.BAD_REQUEST);
++        }
++
++        List<ClientScopeModel> credentialScopes = credentialConfigurationIds.stream()
++                .map(credentialConfigurationId -> {
++                    ClientScopeModel clientScope = OID4VCUtil.getClientScopeByCredentialConfigId(session, realm, credentialConfigurationId);
++                    if (clientScope == null) {
++                        String errorMessage = "Client scope was not found for credential configuration ID: " + credentialConfigurationId;
++                        event.detail(Details.CREDENTIAL_TYPE, credentialConfigurationId);
++                        event.detail(REASON, errorMessage).error(UNKNOWN_CREDENTIAL_CONFIGURATION.getValue());
++                        throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST,
++                                errorMessage, Response.Status.BAD_REQUEST);
++                    }
++                    return clientScope;
++                })
++                .collect(Collectors.collectingAndThen(Collectors.toCollection(LinkedHashSet::new), List::copyOf));
++
++        if (credentialScopes.isEmpty()) {
++            String errorMessage = "No credential scopes resolved from credential offer";
++            event.detail(REASON, errorMessage).error(Errors.INVALID_CODE);
++            throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST,
++                    errorMessage, Response.Status.BAD_REQUEST);
++        }
++
++        return credentialScopes;
++    }
++
+     @Override
+     public EventType getEventType() {
+         return EventType.CODE_TO_TOKEN;
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java
+index 36d723aee953..33bfded4b9d4 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowTestBase.java
+@@ -69,6 +69,7 @@
+ import static org.keycloak.OID4VCConstants.OPENID_CREDENTIAL;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+@@ -567,8 +568,15 @@ public void testTokenExchangeWithoutAuthorizationDetails() throws Exception {
+         assertEquals("Token exchange should succeed without authorization_details (it's optional)",
+                 HttpStatus.SC_OK, tokenResponse.getStatusCode());
+         assertNotNull("Access token should be present", tokenResponse.getAccessToken());
+-        assertNull("Response should not contain authorization_details when not provided in request",
+-                tokenResponse.getAuthorizationDetails());
++
++        List<OID4VCAuthorizationDetail> authDetailsResponse = tokenResponse.getOID4VCAuthorizationDetails();
++        assertNotNull("authorization_details should be derived from requested OID4VC scope", authDetailsResponse);
++        assertFalse("authorization_details should not be empty", authDetailsResponse.isEmpty());
++        assertEquals("credential_configuration_id should match requested scope",
++                getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID),
++                authDetailsResponse.get(0).getCredentialConfigurationId());
++        assertNotNull("credential_identifiers should be present", authDetailsResponse.get(0).getCredentialIdentifiers());
++        assertFalse("credential_identifiers should not be empty", authDetailsResponse.get(0).getCredentialIdentifiers().isEmpty());
+     }
+ 
+     /**
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java
+index f827e1d47d39..90f94a68486e 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationCodeFlowWithPARTest.java
+@@ -284,10 +284,16 @@ public void testAuthorizationCodeFlowWithPARButNoAuthorizationDetailsInTokenRequ
+                 .send();
+         assertEquals(HttpStatus.SC_OK, tokenResponse.getStatusCode());
+ 
+-        // Step 4: Verify NO authorization_details in token response (since none was in PAR request)
++        // Step 4: Verify authorization_details are derived from requested OID4VC scope
+         List<OID4VCAuthorizationDetail> authDetailsResponse = tokenResponse.getOID4VCAuthorizationDetails();
+-        assertTrue("authorization_details should NOT be present in the response when not used in PAR request",
+-                authDetailsResponse == null || authDetailsResponse.isEmpty());
++        assertNotNull("authorization_details should be present in the token response", authDetailsResponse);
++        assertFalse("authorization_details should not be empty", authDetailsResponse.isEmpty());
++        OID4VCAuthorizationDetail firstAuthorizationDetail = authDetailsResponse.get(0);
++        assertEquals("credential_configuration_id should match requested scope",
++                getCredentialClientScope().getAttributes().get(CredentialScopeModel.CONFIGURATION_ID),
++                firstAuthorizationDetail.getCredentialConfigurationId());
++        assertNotNull("credential_identifiers should be present", firstAuthorizationDetail.getCredentialIdentifiers());
++        assertFalse("credential_identifiers should not be empty", firstAuthorizationDetail.getCredentialIdentifiers().isEmpty());
+     }
+ 
+     /**
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
+index c8deb3156357..f60ad2d178bd 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
+@@ -524,44 +524,31 @@ public void testCredentialIssuance() throws Exception {
+     @Test
+     public void testCredentialIssuanceWithAuthZCodeWithScopeMatched() throws Exception {
+         String scopeName = jwtTypeCredentialClientScope.getName();
+-        String credConfigId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
++        String credentialConfigurationId = jwtTypeCredentialClientScope.getAttributes().get(CredentialScopeModel.CONFIGURATION_ID);
+         CredentialIssuer credentialIssuer = getCredentialIssuerMetadata();
+-        OID4VCAuthorizationDetail authDetail = new OID4VCAuthorizationDetail();
+-        authDetail.setType(OPENID_CREDENTIAL);
+-        authDetail.setCredentialConfigurationId(credConfigId);
+-        authDetail.setLocations(List.of(credentialIssuer.getCredentialIssuer()));
++        String authCode = getAuthorizationCode(oauth, client, "john", scopeName);
+ 
+-        testCredentialIssuanceWithAuthZCodeFlow(jwtTypeCredentialClientScope,
+-                (testClientId, testScope) -> {
+-                    String authCode = getAuthorizationCode(oauth, client, "john", scopeName);
+-                    return getBearerToken(oauth, authCode, authDetail).getAccessToken();
+-                },
+-                m -> {
+-                    String accessToken = (String) m.get("accessToken");
+-                    WebTarget credentialTarget = (WebTarget) m.get("credentialTarget");
+-                    CredentialRequest credentialRequest = (CredentialRequest) m.get("credentialRequest");
++        AccessTokenResponse accessTokenResponse = oauth.accessTokenRequest(authCode).send();
++        assertTrue("Access token request should succeed", accessTokenResponse.isSuccess());
++        assertNotNull("Access token should be present", accessTokenResponse.getAccessToken());
+ 
+-                    try (Response response = credentialTarget.request()
+-                            .header(HttpHeaders.AUTHORIZATION, "bearer " + accessToken)
+-                            .post(Entity.json(credentialRequest))) {
+-                        assertEquals(200, response.getStatus());
+-                        CredentialResponse credentialResponse = JsonSerialization.readValue(response.readEntity(String.class),
+-                                CredentialResponse.class);
+-
+-                        JsonWebToken jsonWebToken = TokenVerifier.create((String) credentialResponse.getCredentials().get(0).getCredential(),
+-                                JsonWebToken.class).getToken();
+-                        assertEquals(TEST_DID.toString(), jsonWebToken.getIssuer());
+-
+-                        VerifiableCredential credential = JsonSerialization.mapper.convertValue(jsonWebToken.getOtherClaims()
+-                                        .get("vc"),
+-                                VerifiableCredential.class);
+-                        assertEquals(List.of(jwtTypeCredentialClientScope.getName()), credential.getType());
+-                        assertEquals(TEST_DID, credential.getIssuer());
+-                        assertEquals("john@email.cz", credential.getCredentialSubject().getClaims().get("email"));
+-                    } catch (VerificationException | IOException e) {
+-                        throw new RuntimeException(e);
+-                    }
+-                });
++        List<OID4VCAuthorizationDetail> authDetailsResponse = accessTokenResponse.getOID4VCAuthorizationDetails();
++        assertNotNull("authorization_details should be present in the token response", authDetailsResponse);
++        assertFalse("authorization_details should not be empty", authDetailsResponse.isEmpty());
++        OID4VCAuthorizationDetail firstAuthorizationDetail = authDetailsResponse.get(0);
++        assertEquals("credential_configuration_id should match requested scope",
++                credentialConfigurationId, firstAuthorizationDetail.getCredentialConfigurationId());
++        assertNotNull("credential_identifiers should be present", firstAuthorizationDetail.getCredentialIdentifiers());
++        assertFalse("credential_identifiers should not be empty", firstAuthorizationDetail.getCredentialIdentifiers().isEmpty());
++        String credentialIdentifier = firstAuthorizationDetail.getCredentialIdentifiers().get(0);
++
++        requestCredentialWithIdentifier(
++                accessTokenResponse.getAccessToken(),
++                credentialIssuer.getCredentialEndpoint(),
++                credentialIdentifier,
++                new CredentialResponseHandler(),
++                jwtTypeCredentialClientScope
++        );
+     }
+ 
+     @Test
+@@ -595,8 +582,8 @@ public void testCredentialIssuanceWithAuthZCodeSWithoutScope() throws Exception
+     }
+ 
+     /**
+-     * The accessToken references the scope "test-credential" but we ask for the credential "VerifiableCredential"
+-     * in the CredentialRequest
++     * When the token contains authorization_details, the credential_identifier from that token determines
++     * which credential is issued.
+      */
+     @Test
+     public void testCredentialIssuanceWithScopeUnmatched() {
+@@ -612,11 +599,22 @@ public void testCredentialIssuanceWithScopeUnmatched() {
+             try (Response response = credentialTarget.request()
+                     .header(HttpHeaders.AUTHORIZATION, "bearer " + accessToken)
+                     .post(Entity.json(credentialRequest))) {
+-                assertEquals(400, response.getStatus());
+-                String errorJson = response.readEntity(String.class);
+-                assertNotNull("Error response should not be null", errorJson);
+-                assertTrue("Error response should mention invalid_credential_request or scope",
+-                        errorJson.contains(ErrorType.INVALID_CREDENTIAL_REQUEST.getValue()) || errorJson.contains("scope"));
++                assertEquals(200, response.getStatus());
++                CredentialResponse credentialResponse = JsonSerialization.readValue(response.readEntity(String.class),
++                        CredentialResponse.class);
++
++                JsonWebToken jsonWebToken = TokenVerifier.create((String) credentialResponse.getCredentials().get(0).getCredential(),
++                        JsonWebToken.class).getToken();
++                assertEquals(TEST_DID.toString(), jsonWebToken.getIssuer());
++
++                VerifiableCredential credential = JsonSerialization.mapper.convertValue(jsonWebToken.getOtherClaims()
++                                .get("vc"),
++                        VerifiableCredential.class);
++                assertEquals(List.of(jwtTypeCredentialClientScope.getName()), credential.getType());
++                assertEquals(TEST_DID, credential.getIssuer());
++                assertEquals("john@email.cz", credential.getCredentialSubject().getClaims().get("email"));
++            } catch (VerificationException | IOException e) {
++                throw new RuntimeException(e);
+             }
+         };
+ 

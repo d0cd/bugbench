@@ -1,78 +1,459 @@
-diff --git a/compiler/src/definition/definitions.rs b/compiler/src/definition/definitions.rs
-index cf377444bc..9925340ec4 100644
---- a/compiler/src/definition/definitions.rs
-+++ b/compiler/src/definition/definitions.rs
-@@ -13,24 +13,24 @@ use snarkos_models::curves::{Field, PrimeField};
+diff --git a/Cargo.lock b/Cargo.lock
+index aaa3a5529d..d8284567b7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2335,18 +2335,18 @@ checksum = "bebd363326d05ec3e2f532ab7660680f3b02130d780c299bca73469d521bc0ed"
  
- impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
-     pub fn store_definitions(&mut self, program: Program, imported_programs: &ImportParser) -> Result<(), ImportError> {
--        let program_name = program.name.clone();
-+        let program_name = program.name.trim_end_matches(".leo");
+ [[package]]
+ name = "serde"
+-version = "1.0.159"
++version = "1.0.160"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3c04e8343c3daeec41f58990b9d77068df31209f2af111e059e9fe9646693065"
++checksum = "bb2f3770c8bce3bcda7e149193a069a0f4365bda1fa5cd88e03bca26afc1216c"
+ dependencies = [
+  "serde_derive",
+ ]
  
-         // evaluate all import statements and store imported definitions
-         program
-             .imports
-             .iter()
--            .map(|import| self.store_import(program_name.clone(), import, imported_programs))
-+            .map(|import| self.store_import(program_name.to_owned(), import, imported_programs))
-             .collect::<Result<Vec<_>, ImportError>>()?;
+ [[package]]
+ name = "serde_derive"
+-version = "1.0.159"
++version = "1.0.160"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4c614d17805b093df4b147b51339e7e44bf05ef59fba1e45d83500bcfb4d8585"
++checksum = "291a097c63d8497e00160b166a967a4a79c64f3facdd01cbd7502231688d77df"
+ dependencies = [
+  "proc-macro2 1.0.54",
+  "quote 1.0.26",
+diff --git a/compiler/compiler/Cargo.toml b/compiler/compiler/Cargo.toml
+index 34383bba3a..5cc3a23c3e 100644
+--- a/compiler/compiler/Cargo.toml
++++ b/compiler/compiler/Cargo.toml
+@@ -58,7 +58,7 @@ features = [ "aleo-cli", "circuit", "console", "parallel" ]
+ version = "1.7.3"
  
-         // evaluate and store all circuit definitions
-         program.circuits.into_iter().for_each(|(identifier, circuit)| {
--            let resolved_circuit_name = new_scope(program_name.clone(), identifier.to_string());
-+            let resolved_circuit_name = new_scope(program_name.to_owned(), identifier.to_string());
-             self.store(resolved_circuit_name, ConstrainedValue::CircuitDefinition(circuit));
-         });
+ [dev-dependencies.serde]
+-version = "1.0.159"
++version = "1.0.160"
+ features = [ "derive" ]
  
-         // evaluate and store all function definitions
-         program.functions.into_iter().for_each(|(function_name, function)| {
--            let resolved_function_name = new_scope(program_name.clone(), function_name.to_string());
-+            let resolved_function_name = new_scope(program_name.to_owned(), function_name.to_string());
-             self.store(resolved_function_name, ConstrainedValue::Function(None, function));
-         });
- 
-diff --git a/compiler/src/import/store/import.rs b/compiler/src/import/store/import.rs
-index c13454f3be..9833330b5e 100644
---- a/compiler/src/import/store/import.rs
-+++ b/compiler/src/import/store/import.rs
-@@ -10,23 +10,19 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
-         import: &Import,
-         imported_programs: &ImportParser,
-     ) -> Result<(), ImportError> {
--        // get imported program name from import
--        // get imported symbols from from import
-+        // fetch dependencies for the current import
-         let imported_symbols = ImportedSymbols::from(import);
- 
-         for (package, symbol) in imported_symbols.symbols {
--            // get imported program from hashmap
-+            // find imported program
-             let program = imported_programs
-                 .get(&package)
-                 .ok_or(ImportError::unknown_package(import.package.name.clone()))?;
- 
--            // resolve imported program's import statements
--            program
--                .imports
--                .iter()
--                .map(|import| self.store_import(package.clone(), import, imported_programs))
--                .collect::<Result<Vec<()>, ImportError>>()?;
-+            // parse imported program
-+            self.store_definitions(program.clone(), imported_programs)?;
- 
-+            // store the imported symbol
-             self.store_symbol(scope.clone(), package, &symbol, program)?;
+ [dev-dependencies.serde_yaml]
+diff --git a/compiler/parser/src/parser/expression.rs b/compiler/parser/src/parser/expression.rs
+index a6890db78f..3ff80c3165 100644
+--- a/compiler/parser/src/parser/expression.rs
++++ b/compiler/parser/src/parser/expression.rs
+@@ -248,24 +248,52 @@ impl ParserContext<'_> {
+             ops.push((operation, self.prev_token.span));
          }
  
-diff --git a/compiler/src/import/store/symbol.rs b/compiler/src/import/store/symbol.rs
-index c618c6f6b5..dd20022607 100644
---- a/compiler/src/import/store/symbol.rs
-+++ b/compiler/src/import/store/symbol.rs
-@@ -11,6 +11,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
-         symbol: &ImportSymbol,
-         program: &Program,
-     ) -> Result<(), ImportError> {
-+        // Store the symbol that was imported by another file
-         if symbol.is_star() {
-             // evaluate and store all circuit definitions
-             program.circuits.iter().for_each(|(identifier, circuit)| {
+-        // This is needed to ensure that only the token sequence `-`, `Token::Integer(..)` is parsed as a negative integer literal.
+-        let inner_is_integer = matches!(self.token.token, Token::Integer(..));
+-
+         let mut inner = self.parse_postfix_expression()?;
+-        for (op, op_span) in ops.into_iter().rev() {
+-            inner = match inner {
+-                // If the unary operation is a negate, and the inner expression is a signed integer literal,
+-                // then produce a negative integer literal.
+-                // This helps handle a special case where -128i8, treated as a unary expression, overflows, but -128i8, treated as an integer literal doesn't.
+-                Expression::Literal(Literal::Integer(integer_type, string, span))
+-                    if op == UnaryOperation::Negate && inner_is_integer =>
+-                {
+-                    Expression::Literal(Literal::Integer(integer_type, format!("-{string}"), op_span + span))
++
++        // If the last operation is a negation and the inner expression is a literal, then construct a negative literal.
++        if let Some((UnaryOperation::Negate, _)) = ops.last() {
++            match inner {
++                Expression::Literal(Literal::Integer(integer_type, string, span)) => {
++                    // Remove the negation from the operations.
++                    // Note that this unwrap is safe because there is at least one operation in `ops`.
++                    let (_, op_span) = ops.pop().unwrap();
++                    // Construct a negative integer literal.
++                    inner = Expression::Literal(Literal::Integer(integer_type, format!("-{string}"), op_span + span));
+                 }
+-                // Otherwise, produce a unary expression.
+-                _ => Expression::Unary(UnaryExpression { span: op_span + inner.span(), op, receiver: Box::new(inner) }),
+-            };
++                Expression::Literal(Literal::Field(string, span)) => {
++                    // Remove the negation from the operations.
++                    // Note that
++                    let (_, op_span) = ops.pop().unwrap();
++                    // Construct a negative field literal.
++                    inner = Expression::Literal(Literal::Field(format!("-{string}"), op_span + span));
++                }
++                Expression::Literal(Literal::Group(group_literal)) => {
++                    // Remove the negation from the operations.
++                    let (_, op_span) = ops.pop().unwrap();
++                    // Construct a negative group literal.
++                    // Note that we only handle the case where the group literal is a single integral value.
++                    inner = Expression::Literal(Literal::Group(Box::new(match *group_literal {
++                        GroupLiteral::Single(string, span) => {
++                            GroupLiteral::Single(format!("-{string}"), op_span + span)
++                        }
++                        GroupLiteral::Tuple(tuple) => GroupLiteral::Tuple(tuple),
++                    })));
++                }
++                Expression::Literal(Literal::Scalar(string, span)) => {
++                    // Remove the negation from the operations.
++                    let (_, op_span) = ops.pop().unwrap();
++                    // Construct a negative scalar literal.
++                    inner = Expression::Literal(Literal::Scalar(format!("-{string}"), op_span + span));
++                }
++                _ => (), // Do nothing.
++            }
++        }
++
++        // Apply the operations in reverse order, constructing a unary expression.
++        for (op, op_span) in ops.into_iter().rev() {
++            inner = Expression::Unary(UnaryExpression { span: op_span + inner.span(), op, receiver: Box::new(inner) });
+         }
++
+         Ok(inner)
+     }
+ 
+diff --git a/compiler/passes/src/function_inlining/inline_expression.rs b/compiler/passes/src/function_inlining/inline_expression.rs
+index 60e0673365..b83c2d6505 100644
+--- a/compiler/passes/src/function_inlining/inline_expression.rs
++++ b/compiler/passes/src/function_inlining/inline_expression.rs
+@@ -58,7 +58,7 @@ impl ExpressionReconstructor for FunctionInliner<'_> {
+                 let parameter_to_argument = callee
+                     .input
+                     .iter()
+-                    .map(|input| input.identifier())
++                    .map(|input| input.identifier().name)
+                     .zip_eq(input.arguments.into_iter())
+                     .collect::<IndexMap<_, _>>();
+ 
+@@ -74,7 +74,7 @@ impl ExpressionReconstructor for FunctionInliner<'_> {
+                 self.assignment_renamer.clear();
+ 
+                 // Replace each input variable with the appropriate parameter.
+-                let replace = |identifier: &Identifier| match parameter_to_argument.get(identifier) {
++                let replace = |identifier: &Identifier| match parameter_to_argument.get(&identifier.name) {
+                     Some(expression) => expression.clone(),
+                     None => Expression::Identifier(*identifier),
+                 };
+diff --git a/compiler/span/Cargo.toml b/compiler/span/Cargo.toml
+index 61cae2526e..0c4a1ca7b4 100644
+--- a/compiler/span/Cargo.toml
++++ b/compiler/span/Cargo.toml
+@@ -29,5 +29,5 @@ version = "0.2.1"
+ version = "1.0.1"
+ 
+ [dependencies.serde]
+-version = "1.0.159"
++version = "1.0.160"
+ features = [ "derive", "rc" ]
+diff --git a/errors/Cargo.toml b/errors/Cargo.toml
+index 4b75f025c6..31f7fd86c3 100644
+--- a/errors/Cargo.toml
++++ b/errors/Cargo.toml
+@@ -38,7 +38,7 @@ version = "0.5.1"
+ version = "2.2.0"
+ 
+ [dependencies.serde]
+-version = "1.0.159"
++version = "1.0.160"
+ features = [ "derive", "rc" ]
+ 
+ [dependencies.thiserror]
+diff --git a/tests/expectations/compiler/core/algorithms/bhp512_commit.out b/tests/expectations/compiler/core/algorithms/bhp512_commit.out
+index 97cde26927..001fde3219 100644
+--- a/tests/expectations/compiler/core/algorithms/bhp512_commit.out
++++ b/tests/expectations/compiler/core/algorithms/bhp512_commit.out
+@@ -2,10 +2,10 @@
+ namespace: Compile
+ expectation: Pass
+ outputs:
+-  - initial_ast: c4a71c6a0f72897bfd540fc6bbf6d440d1f827746cecabd5094a9eba1ba249c0
+-    unrolled_ast: c4a71c6a0f72897bfd540fc6bbf6d440d1f827746cecabd5094a9eba1ba249c0
+-    ssa_ast: 7118572de7aef8ba01b0211cfa1e40d92c5d856256f91e5ffddd5621b935e2b8
+-    flattened_ast: de6afb7703d3e89ab7a00c33683a690bdc401e58278bd27164b623088835570d
+-    inlined_ast: de6afb7703d3e89ab7a00c33683a690bdc401e58278bd27164b623088835570d
+-    dce_ast: 5a3c26e31d0810f8bccf1efe46988141b50f5d8c37e15b585accb74c3514bdb8
++  - initial_ast: ddc90f881ec1f45741301812d26aabd1901d0d471d6448e96737b5c9e3851ab3
++    unrolled_ast: ddc90f881ec1f45741301812d26aabd1901d0d471d6448e96737b5c9e3851ab3
++    ssa_ast: 7dccc1dc94e6b05557cdf294945513116856f6dd7c6e0c8b46b1089d453188bd
++    flattened_ast: ff3db8d357defae10ab07f35aa1df3b84dddad1453da60463c97cf1f61492147
++    inlined_ast: ff3db8d357defae10ab07f35aa1df3b84dddad1453da60463c97cf1f61492147
++    dce_ast: f86eaa7fc6bf849868a5f9f0279889c7429c98413ff38d2f8667f74a55d9ebb9
+     bytecode: 12b55db95d5f6e760a8ebb0604264fb1b09b771d247d093eaed4dec8c28a579b
+diff --git a/tests/expectations/compiler/field/field.out b/tests/expectations/compiler/field/field.out
+index 29358957f2..18ff6a98b7 100644
+--- a/tests/expectations/compiler/field/field.out
++++ b/tests/expectations/compiler/field/field.out
+@@ -2,10 +2,10 @@
+ namespace: Compile
+ expectation: Pass
+ outputs:
+-  - initial_ast: 39173e607485c0706438ee8f9d8ffeac0e21c3ed08df932d9edaba8b15334ca9
+-    unrolled_ast: 39173e607485c0706438ee8f9d8ffeac0e21c3ed08df932d9edaba8b15334ca9
+-    ssa_ast: c6231cc87d5244b147045a8958342a3f9aae2a7108215b265c517fccab0ae697
+-    flattened_ast: eb4b8640cee5f68e7a358638a4f2dd80fa9f5e12df485cb41af7f041042c4495
+-    inlined_ast: eb4b8640cee5f68e7a358638a4f2dd80fa9f5e12df485cb41af7f041042c4495
+-    dce_ast: eb4b8640cee5f68e7a358638a4f2dd80fa9f5e12df485cb41af7f041042c4495
+-    bytecode: eeb44a4faf22686de577f93db551bd83246583158dcecb35d2dc454e0693e419
++  - initial_ast: a0a3f4d71f6a8515eec27eee97abf5cbaeadbddb1a3b45e80e544ccadb1acaf0
++    unrolled_ast: a0a3f4d71f6a8515eec27eee97abf5cbaeadbddb1a3b45e80e544ccadb1acaf0
++    ssa_ast: bb33a4fa86326a22060f8413b1d1a2c8f5531669e120091aa6cfd52189dcc8d9
++    flattened_ast: 81d3e2a9873213fa638e27f44b3b038c69bbe349c35b5356a772a7f68a485216
++    inlined_ast: 81d3e2a9873213fa638e27f44b3b038c69bbe349c35b5356a772a7f68a485216
++    dce_ast: da90f747cda7a8d74b4abbf06fb2220a0fb3420409befa188d8c812bffacee64
++    bytecode: bf4397cd5bc3498d05f1d6582c3b4a868579aaa6b8f6f484f1c2ce9dd03a13a2
+diff --git a/tests/expectations/compiler/field/pow.out b/tests/expectations/compiler/field/pow.out
+index e98a660b96..894d2390bf 100644
+--- a/tests/expectations/compiler/field/pow.out
++++ b/tests/expectations/compiler/field/pow.out
+@@ -2,10 +2,10 @@
+ namespace: Compile
+ expectation: Pass
+ outputs:
+-  - initial_ast: 999b1553693e9c919a3a12b6fe2d9aefa0f7414eb294e9277585b8fa9d771c36
+-    unrolled_ast: 999b1553693e9c919a3a12b6fe2d9aefa0f7414eb294e9277585b8fa9d771c36
+-    ssa_ast: e2884225fe46a4d894ee2561635254b1079c889b26dc382128a590a40f3fe5d6
+-    flattened_ast: e36bb3f053c14fea5b6be293c43d32da60b06324b6cfe29a84ea2c1ce0d10015
+-    inlined_ast: e36bb3f053c14fea5b6be293c43d32da60b06324b6cfe29a84ea2c1ce0d10015
+-    dce_ast: e36bb3f053c14fea5b6be293c43d32da60b06324b6cfe29a84ea2c1ce0d10015
+-    bytecode: 7540a269502febfe91bebfc15030891bde7667f921d5d8d9d22efbcf16410543
++  - initial_ast: 46a92aaca66affbf50b74324dbce4736483379633f17f61ea0cf37e605c7532c
++    unrolled_ast: 46a92aaca66affbf50b74324dbce4736483379633f17f61ea0cf37e605c7532c
++    ssa_ast: 0b8ade69614164174dc9ec432d4b817ff866f645e288e2bdab24c6ce4941d9f9
++    flattened_ast: 29589d9c50c3654f9002ba09ee2354a4e073c7e6f7eb788df42ff77ea5f36a07
++    inlined_ast: 29589d9c50c3654f9002ba09ee2354a4e073c7e6f7eb788df42ff77ea5f36a07
++    dce_ast: 29589d9c50c3654f9002ba09ee2354a4e073c7e6f7eb788df42ff77ea5f36a07
++    bytecode: b6438347d546b70daea75dda80a96df95c782793c3e40c92f1931903604c41bf
+diff --git a/tests/expectations/compiler/finalize/inline_in_finalize.out b/tests/expectations/compiler/finalize/inline_in_finalize.out
+index 700c103a80..88396e0a28 100644
+--- a/tests/expectations/compiler/finalize/inline_in_finalize.out
++++ b/tests/expectations/compiler/finalize/inline_in_finalize.out
+@@ -6,6 +6,6 @@ outputs:
+     unrolled_ast: 66c08e3fa6b22b7663e949d6ea72455bca2c26a573ba094f084310a086a4cf0b
+     ssa_ast: b86f0471ac1a09039a4ce147e87b0c41b9c3378dba0cb560b4a2fe41533781c2
+     flattened_ast: 52f744a6cf805739c77995f73c2f626ad2403301c5dc6e007b9c2092869f5224
+-    inlined_ast: b7ef966c924c7fd055476fd974079af70e235aed43d8cbff30c7eadad8e342c7
+-    dce_ast: b7ef966c924c7fd055476fd974079af70e235aed43d8cbff30c7eadad8e342c7
++    inlined_ast: 7624599cd1c4e1dbd47fd1a649f1451e94fe0c38b1796f0a88d0061d160dcf3a
++    dce_ast: 7624599cd1c4e1dbd47fd1a649f1451e94fe0c38b1796f0a88d0061d160dcf3a
+     bytecode: cc321ba26e486e2c153e774573e880a340d698f08c7d24602f883aef1c900b73
+diff --git a/tests/expectations/compiler/function/dead_code_elimination.out b/tests/expectations/compiler/function/dead_code_elimination.out
+index 838bae428c..928c7cee87 100644
+--- a/tests/expectations/compiler/function/dead_code_elimination.out
++++ b/tests/expectations/compiler/function/dead_code_elimination.out
+@@ -6,6 +6,6 @@ outputs:
+     unrolled_ast: d7414ef76b5d83ba8daed6e65487425048596937d5a6f783a313d3264d5db267
+     ssa_ast: 6722ef50ccdf19eaaa57f68a249a6eb01ba78ec8ec60da0d8d664613324287aa
+     flattened_ast: 58ed29011b87aad89fe50f62402f441c9aa53fc2e18c3a188d94d0a88734236d
+-    inlined_ast: 1c57a7047a0523c5f576e5df33fa9b70cf2baedfb8149266686837ba2827c44e
++    inlined_ast: 7ce8d6b0f22068cd9cf428040b3b55f08f7f890b09ed77c5f35d4ce10ed9232b
+     dce_ast: 48e52aa4ba7d5f4c5126ec93a14ec29772f80c73cc2d6ab5c77001f920b4c65b
+     bytecode: bc387336869a1d12a90c9fb923466f737bad08d04a165a8b611256868f960201
+diff --git a/tests/expectations/compiler/function/flatten_inlined_tuples_of_structs.out b/tests/expectations/compiler/function/flatten_inlined_tuples_of_structs.out
+index 71c16ec631..474e1e0b7e 100644
+--- a/tests/expectations/compiler/function/flatten_inlined_tuples_of_structs.out
++++ b/tests/expectations/compiler/function/flatten_inlined_tuples_of_structs.out
+@@ -6,6 +6,6 @@ outputs:
+     unrolled_ast: 4635467db62681996e855b4233873bf65abd26ae9659332c67a1d28dfdcd3a88
+     ssa_ast: 478e60c54d2fcb05625042228bb467278257e7392d846fd49ccd5c43fcbcbd5e
+     flattened_ast: 12157cdc9233e60a00d749cc033465d3aeafa625fb769223717e0e87c5cdf9d6
+-    inlined_ast: 11c63116821757047efeec64483fbc8b22edff09ddc745d80670bf02895dd62e
+-    dce_ast: d531e3256e104e13c05125353b768cf9aa2bc3913f3ba0edb4f04b25ae8dd18c
+-    bytecode: f0b23d05369e0db4f6f4cf1b10923caea289d78e911ed7250c13b828b2ae68d5
++    inlined_ast: 083fd4b542fb73d805267040a0c739e69b7b22e9249678c7fce949cad666c419
++    dce_ast: 083fd4b542fb73d805267040a0c739e69b7b22e9249678c7fce949cad666c419
++    bytecode: 4365132fcfe7e243d3a3eeee1691feef89afe6cc03e20ce84e625008ddfec367
+diff --git a/tests/expectations/compiler/function/function_call_inline.out b/tests/expectations/compiler/function/function_call_inline.out
+index 9b12818c6f..74129df80d 100644
+--- a/tests/expectations/compiler/function/function_call_inline.out
++++ b/tests/expectations/compiler/function/function_call_inline.out
+@@ -6,6 +6,6 @@ outputs:
+     unrolled_ast: 42426e586a4fe69f06466e4621a8cf4547408ad38c108a85bf0beaf812859a66
+     ssa_ast: 4b33649beef6673aafce25c35c16c034fb41ec33fdf562751b7e51d712caf309
+     flattened_ast: e2ee2ee7c6e1c187de5977f44b0a39e11d946243990eb48df92b3a3e939b3906
+-    inlined_ast: aae0684cc29719b75d1af553fae21f9cafd04d15fd211eeb4d8cebbf913bcd6c
+-    dce_ast: aae0684cc29719b75d1af553fae21f9cafd04d15fd211eeb4d8cebbf913bcd6c
++    inlined_ast: af95979bf9d2d37a6cad26389cc5e63122148741a14a6780913fcc87861b1587
++    dce_ast: af95979bf9d2d37a6cad26389cc5e63122148741a14a6780913fcc87861b1587
+     bytecode: 6c18f3614147617dbd01fb1404fc8c75c0a788872cec905ad5566a443f7f2e91
+diff --git a/tests/expectations/compiler/function/inline_twice.out b/tests/expectations/compiler/function/inline_twice.out
+new file mode 100644
+index 0000000000..6e600377fd
+--- /dev/null
++++ b/tests/expectations/compiler/function/inline_twice.out
+@@ -0,0 +1,11 @@
++---
++namespace: Compile
++expectation: Pass
++outputs:
++  - initial_ast: 663841cf97b446530937f0487ba3bc8aeae2857418ea566be8faf6740e3b1b0f
++    unrolled_ast: 663841cf97b446530937f0487ba3bc8aeae2857418ea566be8faf6740e3b1b0f
++    ssa_ast: 048763c7b3734825b8f07e2ad2b20fd5fcc4b9835bd83fd03872c10e17e92a65
++    flattened_ast: 32fb09e1a7a1277e20d9bbc57760e2ae9725929eb7f91ebbdab19cd2506eb46a
++    inlined_ast: 7728d3d1819783b0e50b7ec3ffc9ee249e826279fd0c82964b4c7e6a4e57a1ce
++    dce_ast: 7728d3d1819783b0e50b7ec3ffc9ee249e826279fd0c82964b4c7e6a4e57a1ce
++    bytecode: 3fd4db4753c6aa17cbd64612c47547344c2a06eb22218407c1bf490080ce7ae4
+diff --git a/tests/expectations/compiler/group/negate.out b/tests/expectations/compiler/group/negate.out
+index ade84bb62b..201eeab1e4 100644
+--- a/tests/expectations/compiler/group/negate.out
++++ b/tests/expectations/compiler/group/negate.out
+@@ -2,10 +2,10 @@
+ namespace: Compile
+ expectation: Pass
+ outputs:
+-  - initial_ast: 1f2eb7c4e5443c57cf49ce470cfa8229fb67e162c041c6fb7fe9ecd46b5a3546
+-    unrolled_ast: 1f2eb7c4e5443c57cf49ce470cfa8229fb67e162c041c6fb7fe9ecd46b5a3546
+-    ssa_ast: 41032ad876b2160b388f01d716655ddd073b8cd7d185faa01002eeac19840597
+-    flattened_ast: 98d83fec655c25d2889cb6405068c46de336976f1468efb7e9bc30d434a5cb56
+-    inlined_ast: 98d83fec655c25d2889cb6405068c46de336976f1468efb7e9bc30d434a5cb56
+-    dce_ast: 98d83fec655c25d2889cb6405068c46de336976f1468efb7e9bc30d434a5cb56
+-    bytecode: 96c9838c6cd113e26c1cb3abcb9aebb52e622fec38cab2a13ebaad1683a1c15d
++  - initial_ast: c1b1b7c0ce432d5ba810075cc7162357ecce82e6e5c9903a8d1f7464dc6b1018
++    unrolled_ast: c1b1b7c0ce432d5ba810075cc7162357ecce82e6e5c9903a8d1f7464dc6b1018
++    ssa_ast: 809813c98bef149a0da8d00cfb186c4579d9318a8c030278bc66f3feeb2a95cf
++    flattened_ast: e78c54476d0f2744d56e8e84d153b15c5ef7ec3edea3e0c8998474fbec6c78c7
++    inlined_ast: e78c54476d0f2744d56e8e84d153b15c5ef7ec3edea3e0c8998474fbec6c78c7
++    dce_ast: e78c54476d0f2744d56e8e84d153b15c5ef7ec3edea3e0c8998474fbec6c78c7
++    bytecode: cca4e6a4f6a893c6424f798ff45aa916ec68bc87a03ee43e8f12c8f4bec0b86d
+diff --git a/tests/expectations/execution/flattened_function_and_inline_matches.out b/tests/expectations/execution/flattened_function_and_inline_matches.out
+index 32d508e989..08ada30ab1 100644
+--- a/tests/expectations/execution/flattened_function_and_inline_matches.out
++++ b/tests/expectations/execution/flattened_function_and_inline_matches.out
+@@ -6,9 +6,9 @@ outputs:
+     unrolled_ast: fe735d4b87fc695a7a68a059af8d769a3b1d257a924c08e7490f61575d843230
+     ssa_ast: 24bb584afbee563be7c24228473fd4e0d83cb76197f66b4c4a9ddb9c1c2c5c2e
+     flattened_ast: 4352bd983b2778643e78bb8efc4b2ab9a728dc52f9bff605875d82b82b72a0fb
+-    inlined_ast: 87236ec1e5020ccdaec371ece97cac3d3c5873649ea7b8ac5df8390e46ff7405
+-    dce_ast: a5706593c11da3c7b703dc111b365cb18f3bdba093f04547babf5959410391f4
+-    bytecode: 39c8353dc4af7a70a8156ada8b429104819e5291f8847de9560eeb752ba3b6a4
++    inlined_ast: c719c0c8b4d1904caf8526e56434f8824153c9a5aceab2e8d0dd3729687114f0
++    dce_ast: c719c0c8b4d1904caf8526e56434f8824153c9a5aceab2e8d0dd3729687114f0
++    bytecode: 134abb1ec51eefe80a4a7f4303572abfec238a5adb6a9b5aad1e73ea66860eac
+     results:
+       bar:
+         - input: "[true, true, 1u8, 0u8]"
+@@ -16,7 +16,7 @@ outputs:
+         - input: "[true, false, 1u8, 1u8]"
+           output: "[1u8, 1u8, {\n  a: 1u8,\n  b: 1u8,\n  c: {\n    c: 1u8\n  }\n}]"
+         - input: "[false, true, 2u8, 1u8]"
+-          output: "[3u8, 1u8, {\n  a: 2u8,\n  b: 1u8,\n  c: {\n    c: 2u8\n  }\n}]"
++          output: "[1u8, 1u8, {\n  a: 2u8,\n  b: 1u8,\n  c: {\n    c: 2u8\n  }\n}]"
+         - input: "[false, false, 2u8, 2u8]"
+           output: "[2u8, 2u8, {\n  a: 2u8,\n  b: 2u8,\n  c: {\n    c: 2u8\n  }\n}]"
+       blar:
+diff --git a/tests/expectations/parser/expression/literal/group.out b/tests/expectations/parser/expression/literal/group.out
+index 6573e4ac8f..ff879985c4 100644
+--- a/tests/expectations/parser/expression/literal/group.out
++++ b/tests/expectations/parser/expression/literal/group.out
+@@ -427,16 +427,10 @@ outputs:
+           - span:
+               lo: 0
+               hi: 6
+-  - Unary:
+-      receiver:
+-        Literal:
+-          Group:
+-            Single:
+-              - "1"
+-              - span:
+-                  lo: 1
+-                  hi: 7
+-      op: Negate
+-      span:
+-        lo: 0
+-        hi: 7
++  - Literal:
++      Group:
++        Single:
++          - "-1"
++          - span:
++              lo: 0
++              hi: 7
+diff --git a/tests/expectations/parser/expression/unary/neg.out b/tests/expectations/parser/expression/unary/neg.out
+index 9d58bf243e..03c293f260 100644
+--- a/tests/expectations/parser/expression/unary/neg.out
++++ b/tests/expectations/parser/expression/unary/neg.out
+@@ -63,19 +63,13 @@ outputs:
+         - span:
+             lo: 0
+             hi: 6
+-  - Unary:
+-      receiver:
+-        Literal:
+-          Integer:
+-            - I8
+-            - "128"
+-            - span:
+-                lo: 2
+-                hi: 7
+-      op: Negate
+-      span:
+-        lo: 0
+-        hi: 7
++  - Literal:
++      Integer:
++        - I8
++        - "-128"
++        - span:
++            lo: 0
++            hi: 7
+   - Unary:
+       receiver:
+         Identifier: "{\"name\":\"x\",\"span\":\"{\\\"lo\\\":0,\\\"hi\\\":1}\"}"
+diff --git a/tests/tests/compiler/core/algorithms/bhp512_commit.leo b/tests/tests/compiler/core/algorithms/bhp512_commit.leo
+index 0e1cd34e61..9ac719aed2 100644
+--- a/tests/tests/compiler/core/algorithms/bhp512_commit.leo
++++ b/tests/tests/compiler/core/algorithms/bhp512_commit.leo
+@@ -46,6 +46,7 @@ program test.aleo {
+         let o: field = BHP512::commit(scalar_value, 1scalar);
+         // let p: field = BHP512::commit(string_value, 1scalar);
+         let q: field = BHP512::commit(Foo { a: 1u128, b: 2u128 }, 1scalar);
++        let r: field = BHP512::commit(Foo { a: 1u128, b: 2u128 }, -1scalar);
+     
+         return a + o;
+     }}
+diff --git a/tests/tests/compiler/field/field.leo b/tests/tests/compiler/field/field.leo
+index 9119adc035..098a68415d 100644
+--- a/tests/tests/compiler/field/field.leo
++++ b/tests/tests/compiler/field/field.leo
+@@ -6,5 +6,6 @@ expectation: Pass
+ program test.aleo {    
+     transition main(a: field) -> bool {
+         let negOneField: field = -1field;
++        let negnegnegOneField: field = 0field - - - 1field;
+         return negOneField + a == 0field;
+     }}
+diff --git a/tests/tests/compiler/function/inline_twice.leo b/tests/tests/compiler/function/inline_twice.leo
+new file mode 100644
+index 0000000000..73236dcca3
+--- /dev/null
++++ b/tests/tests/compiler/function/inline_twice.leo
+@@ -0,0 +1,19 @@
++/*
++namespace: Compile
++expectation: Pass
++*/
++
++program test.aleo {
++    inline get_bit(number: u32, i: u8) -> bool {
++        let mask: u32 = 1u32 << i;
++        return number.and(mask) > 0u32;
++    }
++
++    inline get_cell_occupant(board: u32, i: u8) -> u8 {
++        return get_bit(board, i) ? 2u8 : 1u8;
++    }
++
++    transition make_move(board: u32, i: u8) -> u8 {
++        return get_cell_occupant(board, i);
++    }
++}
+diff --git a/tests/tests/compiler/group/negate.leo b/tests/tests/compiler/group/negate.leo
+index 1e345a9150..e83100e8d1 100644
+--- a/tests/tests/compiler/group/negate.leo
++++ b/tests/tests/compiler/group/negate.leo
+@@ -6,6 +6,7 @@ expectation: Pass
+ program test.aleo {    
+     transition main(a: group, b: group) -> bool {
+         assert(-a == b);
++        assert(a != -2group);
+     
+         return -a == b;
+     }}

@@ -1,13 +1,3267 @@
-diff --git a/storage/src/storage/storage.rs b/storage/src/storage/storage.rs
-index 3c8318e89..006dfa656 100644
---- a/storage/src/storage/storage.rs
-+++ b/storage/src/storage/storage.rs
-@@ -48,7 +48,7 @@ pub struct ForkPath {
-     /// Set of digests from `base_index`'s corresponding block to the target block
-     pub path: Vec<Digest>,
-     /// Tree of all descendent blocks to the target block
--    pub tail: DigestTree,
-+    // pub tail: DigestTree,
+diff --git a/.crawler/Cargo.toml b/.crawler/Cargo.toml
+index b916a34fc..317441d88 100644
+--- a/.crawler/Cargo.toml
++++ b/.crawler/Cargo.toml
+@@ -16,38 +16,19 @@ categories = [ "cryptography", "operating-systems" ]
+ license = "GPL-3.0"
+ edition = "2021"
+ 
+-[features]
+-postgres = [ "tokio-postgres" ]
+-postgres-tls = [ "native-tls", "postgres", "postgres-native-tls" ]
+-
+ # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+ 
+-[dependencies.anyhow]
+-version = "1"
+-
+ [dependencies.async-trait]
+ version = "0.1"
+ 
+-[dependencies.bincode]
+-version = "1"
+-
+-[dependencies.native-tls]
+-version = "0.2"
+-optional = true
+-
+ [dependencies.parking_lot]
+ version = "0.12"
+ 
+ [dependencies.pea2pea]
+-version = "0.34"
+-
+-[dependencies.postgres-native-tls]
+-version = "0.5"
+-optional = true
++version = "0.33"
+ 
+ [dependencies.rand]
+ version = "0.8"
+-features = [ "small_rng" ]
+ 
+ [dependencies.snarkos-environment]
+ path = "../environment"
+@@ -83,17 +64,5 @@ features = ["local-offset"]
+ [dependencies.tokio]
+ version = "1"
+ 
+-[dependencies.tokio-postgres]
+-version = "0.7"
+-features = [ "with-time-0_3" ]
+-optional = true
+-
+ [dependencies.tracing]
+ version = "0.1"
+-
+-[dev-dependencies.snarkos-integration]
+-path = "../.integration"
+-version = "2.0.2"
+-
+-[dev-dependencies.tracing-subscriber]
+-version = "0.3"
+diff --git a/.crawler/src/connection.rs b/.crawler/src/connection.rs
+index ea5be66b5..39b0d43f5 100644
+--- a/.crawler/src/connection.rs
++++ b/.crawler/src/connection.rs
+@@ -28,11 +28,11 @@ use time::OffsetDateTime;
+ /// (since connections are directionless). The timestamp is also not included in the comparison.
+ #[derive(Debug, Eq, Copy, Clone)]
+ pub struct Connection {
+-    /// The listening address of one side of the connection.
++    /// One side of the connection.
+     pub source: SocketAddr,
+-    /// The listening address of the other side of the connection.
++    /// The other side of the connection.
+     pub target: SocketAddr,
+-    /// The last time this connection was seen by the crawler (used to determine which connections are
++    /// The last time this peer was seen by the crawler (used determine which connections are
+     /// likely stale).
+     pub last_seen: OffsetDateTime,
+ }
+diff --git a/.crawler/src/constants.rs b/.crawler/src/constants.rs
+index 1b0506c1d..5a028ac3e 100644
+--- a/.crawler/src/constants.rs
++++ b/.crawler/src/constants.rs
+@@ -14,40 +14,15 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use snarkos_environment::{ClientTrial, CurrentNetwork, Environment};
++use snarkos_environment::{Client, ClientTrial, CurrentNetwork, Environment};
+ 
+-/// The IDs of messages that are accepted by the crawler.
+-// note: ChallengeRequest and ChallengeResponse are only expected during the handshake.
+-pub const ACCEPTED_MESSAGE_IDS: &'static [u16] = &[
+-    4, // Disconnect
+-    5, // PeerRequest
+-    6, // PeerResponse
+-    7, // Ping
+-];
+-/// The interval for revisiting successfully crawled nodes.
+-pub const CRAWL_INTERVAL_MINS: i64 = 10;
+-/// The amount of time (in seconds) between database writes containing crawling information.
+-pub const DB_WRITE_INTERVAL_SECS: u8 = 10;
+-/// The amount of time (in seconds) between crawling logs.
+-pub const LOG_INTERVAL_SECS: u64 = 10;
+-/// The maximum number of peers the crawler can have at a time.
++// The interval for revisiting connections.
++pub const CRAWL_INTERVAL_MINS: i64 = 3;
++pub const LOG_INTERVAL_SECS: u64 = 12;
+ pub const MAXIMUM_NUMBER_OF_PEERS: usize = 1000;
+-/// The amount of time (in seconds) between peer updates.
+-pub const PEER_UPDATE_INTERVAL_SECS: u64 = 10;
+-/// The list of sync nodes to begin crawling with.
++pub const MESSAGE_VERSION: u32 = <Client<CurrentNetwork>>::MESSAGE_VERSION;
++pub const PING_INTERVAL_SECS: u64 = 5;
++pub const PEER_INTERVAL_SECS: u64 = 10;
+ pub const SYNC_NODES: &'static [&'static str] = <ClientTrial<CurrentNetwork>>::SYNC_NODES;
+-/// Connections that haven't been seen within this time (in hours) are forgotten.
++// Purges connections that haven't been seen within this time (in hours).
+ pub const STALE_CONNECTION_CUTOFF_TIME_HRS: i64 = 4;
+-/// The number of lists of peers that a single peer needs to provide before it's disconnected from.
+-pub const DESIRED_PEER_SET_COUNT: u8 = 3;
+-/// The maximum number of connections to attempt to initiate when updating peers.
+-pub const NUM_CONCURRENT_CONNECTION_ATTEMPTS: u8 = 20;
+-/// The maximum time (in milliseconds) a handshake can take; doesn't have to match the one in the snarkOS node.
+-pub const MAX_HANDSHAKE_TIME_MS: u64 = 10_000;
+-/// The size of the per-connection read buffer.
+-// TODO: double-check maximum message length
+-pub const READ_BUFFER_SIZE: usize = 16 * 1024;
+-/// The number of peers shared with the crawled nodes when requested.
+-pub const SHARED_PEER_COUNT: usize = 15;
+-/// The number of connection failures after which a node is removed from the list of known nodes.
+-pub const MAX_CONNECTION_FAILURE_COUNT: u8 = 10;
+diff --git a/.crawler/src/crawler.rs b/.crawler/src/crawler.rs
+index 150df2861..441fb5278 100644
+--- a/.crawler/src/crawler.rs
++++ b/.crawler/src/crawler.rs
+@@ -15,13 +15,10 @@
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use crate::{constants::*, known_network::KnownNetwork};
+-use snarkos_environment::{
+-    helpers::{NodeType, State},
+-    CurrentNetwork,
+-};
++use snarkos_environment::CurrentNetwork;
+ use snarkos_network::Data;
+ use snarkos_storage::BlockLocators;
+-use snarkos_synthetic_node::{ClientMessage, SynthNode, MESSAGE_LENGTH_PREFIX_SIZE};
++use snarkos_synthetic_node::{ClientMessage, SynthNode, MAXIMUM_FORK_DEPTH, MESSAGE_LENGTH_PREFIX_SIZE, MESSAGE_VERSION};
+ use snarkvm::traits::Network;
+ 
+ use pea2pea::{
+@@ -30,27 +27,12 @@ use pea2pea::{
+     Node as Pea2PeaNode,
+     Pea2Pea,
+ };
+-use rand::{rngs::SmallRng, seq::IteratorRandom, SeedableRng};
+-#[cfg(feature = "postgres-tls")]
+-use std::path::PathBuf;
+-use std::{
+-    convert::TryInto,
+-    io::{self, Read},
+-    net::SocketAddr,
+-    ops::Deref,
+-    sync::Arc,
+-    time::Duration,
+-};
++use rand::seq::IteratorRandom;
++use std::{convert::TryInto, io, net::SocketAddr, ops::Deref, sync::Arc, time::Duration};
+ use structopt::StructOpt;
+-use time::OffsetDateTime;
+-use tokio::{sync::Mutex, task};
+-#[cfg(feature = "postgres")]
+-use tokio_postgres::Client as StorageClient;
++use tokio::task;
+ use tracing::*;
+ 
+-#[cfg(not(feature = "postgres"))]
+-pub struct StorageClient;
+-
+ // CLI
+ // TODO: investigate using clap instead.
+ #[derive(Debug, StructOpt)]
+@@ -59,42 +41,12 @@ pub struct Opts {
+     /// Naming and defaults kept consistent with snarkOS.
+     #[structopt(parse(try_from_str), default_value = "0.0.0.0:4132", long = "node")]
+     pub node: SocketAddr,
+-    /// The path to a certificate file to be used for a TLS connection with the postgres instance.
+-    #[cfg(feature = "postgres-tls")]
+-    #[structopt(long = "postgres-cert-path")]
+-    pub postgres_cert_path: PathBuf,
+-    /// The hostname of the postgres instance (defaults to "localhost").
+-    #[cfg(feature = "postgres")]
+-    #[structopt(long = "postgres-host", default_value = "localhost")]
+-    pub postgres_host: String,
+-    /// The port of the postgres instance (defaults to 5432).
+-    #[cfg(feature = "postgres")]
+-    #[structopt(long = "postgres-port", default_value = "5432")]
+-    pub postgres_port: u16,
+-    /// The user of the postgres instance (defaults to "postgres").
+-    #[cfg(feature = "postgres")]
+-    #[structopt(long = "postgres-user", default_value = "postgres")]
+-    pub postgres_user: String,
+-    /// The password for the postgres instance (defaults to nothing).
+-    #[cfg(feature = "postgres")]
+-    #[structopt(long = "postgres-pass", default_value = "")]
+-    pub postgres_pass: String,
+-    /// The hostname of the postgres instance (defaults to "postgres").
+-    #[cfg(feature = "postgres")]
+-    #[structopt(long = "postgres-dbname", default_value = "postgres")]
+-    pub postgres_dbname: String,
+-    /// If set to `true`, re-creates the crawler's database tables.
+-    #[cfg(feature = "postgres")]
+-    #[structopt(long = "postgres-clean")]
+-    pub postgres_clean: bool,
  }
  
- pub enum ForkDescription {
+-/// Represents the crawler together with network metrics it has collected.
+ #[derive(Clone)]
+ pub struct Crawler {
+     synth_node: SynthNode,
+     pub known_network: Arc<KnownNetwork>,
+-    pub storage: Option<Arc<Mutex<StorageClient>>>,
+ }
+ 
+ impl Pea2Pea for Crawler {
+@@ -112,15 +64,13 @@ impl Deref for Crawler {
+ }
+ 
+ impl Crawler {
+-    /// Creates the crawler with the given configuration.
+-    pub async fn new(opts: Opts, storage: Option<StorageClient>) -> Self {
++    /// Creates a crawler node with the most basic network protocols enabled.
++    pub async fn new(opts: Opts) -> Self {
+         let config = Config {
+-            name: Some("snarkOS crawler".into()),
+             listener_ip: Some(opts.node.ip()),
+             desired_listening_port: Some(opts.node.port()),
+             max_connections: MAXIMUM_NUMBER_OF_PEERS as u16,
+-            max_handshake_time_ms: MAX_HANDSHAKE_TIME_MS,
+-            read_buffer_size: READ_BUFFER_SIZE,
++            max_handshake_time_ms: 5_000,
+             ..Default::default()
+         };
+ 
+@@ -129,7 +79,6 @@ impl Crawler {
+         let node = Self {
+             synth_node: SynthNode::new(pea2pea_node, client_state),
+             known_network: Arc::new(KnownNetwork::default()),
+-            storage: storage.map(|s| Arc::new(Mutex::new(s))),
+         };
+ 
+         node.enable_disconnect().await;
+@@ -140,22 +89,28 @@ impl Crawler {
+         node
+     }
+ 
+-    /// Returns the randomness used by the crawler.
+-    fn rng(&self) -> SmallRng {
+-        // TODO: should be good enough, but double-check if it's not too slow
+-        SmallRng::from_entropy()
+-    }
+-
+-    /// Checks whether the crawler is already connected or connecting to the given address.
+-    pub fn is_connected(&self, addr: SocketAddr) -> bool {
+-        // Handshakes can take a while, so check connecting addresses too.
+-        // note: these take care of connected addresses
+-        if self.node().is_connecting(addr) || self.node().is_connected(addr) {
+-            return true;
+-        }
++    /// Spawns a task dedicated to broadcasting Ping messages.
++    pub fn send_pings(&self) {
++        let node = self.clone();
++        task::spawn(async move {
++            let genesis = CurrentNetwork::genesis_block();
++            let ping_msg = ClientMessage::Ping(
++                MESSAGE_VERSION,
++                MAXIMUM_FORK_DEPTH,
++                node.node_type(),
++                node.state(),
++                genesis.hash(),
++                Data::Object(genesis.header().clone()),
++            );
+ 
+-        // note: this takes care of listening addresses
+-        self.state.peers.read().contains_key(&addr)
++            loop {
++                tokio::time::sleep(Duration::from_secs(PING_INTERVAL_SECS)).await;
++                if node.node().num_connected() != 0 {
++                    debug!(parent: node.node().span(), "sending out Pings");
++                    node.send_broadcast(ping_msg.clone()).unwrap();
++                }
++            }
++        });
+     }
+ 
+     /// Spawns a task dedicated to peer maintenance.
+@@ -163,70 +118,45 @@ impl Crawler {
+         let node = self.clone();
+         task::spawn(async move {
+             loop {
+-                debug!(parent: node.node().span(), "crawling the network for more peers; asking peers for their peers");
+-                node.send_broadcast(ClientMessage::PeerRequest).unwrap();
+-
+-                // Disconnect from peers that we've collected sufficient information on or that have become stale.
+-                let addrs_to_disconnect = node.known_network.addrs_to_disconnect();
+-                for addr in &addrs_to_disconnect {
+-                    if let Some(addr) = node.get_peer_connected_addr(*addr) {
+-                        let node_clone = node.clone();
+-                        task::spawn(async move {
+-                            node_clone.node().disconnect(addr).await;
+-                        });
++                // Disconnect from peers we have just crawled.
++                for addr in node.known_network.addrs_to_disconnect() {
++                    if let Some(addr) = node.get_peer_connected_addr(addr).await {
++                        node.node().disconnect(addr).await;
+                     }
+                 }
+ 
+                 // Connect to peers we haven't crawled in a while.
+-                let addrs_to_connect = node.known_network.addrs_to_connect();
+-                for addr in addrs_to_connect
+-                    .into_iter()
+-                    // FIXME: Figure out how to get rid of this overlap.
+-                    .filter(|addr| !addrs_to_disconnect.contains(addr))
+-                    .choose_multiple(&mut node.rng(), NUM_CONCURRENT_CONNECTION_ATTEMPTS as usize)
+-                {
+-                    if !node.is_connected(addr) {
++                for addr in node.known_network.addrs_to_connect().into_iter().take(MAXIMUM_NUMBER_OF_PEERS / 10) {
++                    if !node.node().is_connected(addr)
++                        && !node
++                            .state
++                            .peers
++                            .lock()
++                            .await
++                            .iter()
++                            .any(|peer| peer.listening_addr == addr || peer.connected_addr == addr)
++                    {
+                         let node_clone = node.clone();
+                         task::spawn(async move {
+-                            let connection_init_timestamp = OffsetDateTime::now_utc();
+-                            if node_clone.node().connect(addr).await.is_ok() {
+-                                // Immediately ask for the new peer's peers.
+-                                let _ = node_clone.send_direct_message(addr, ClientMessage::PeerRequest);
+-                                node_clone.known_network.connected_to_node(addr, connection_init_timestamp, true);
+-                            } else {
+-                                node_clone.known_network.connected_to_node(addr, connection_init_timestamp, false);
+-                            }
++                            let _ = node_clone.node().connect(addr).await;
+                         });
+                     }
+                 }
+ 
+-                tokio::time::sleep(Duration::from_secs(PEER_UPDATE_INTERVAL_SECS)).await;
+-            }
+-        });
+-    }
+-
+-    /// Spawns a task periodically storing crawling information in a database.
+-    #[cfg(feature = "postgres")]
+-    fn store_known_network(&self) {
+-        let node = self.clone();
+-        tokio::spawn(async move {
+-            loop {
+-                if let Err(e) = node.write_crawling_data().await {
+-                    error!(parent: node.node().span(), "storage write error: {}", e);
+-                }
+-                tokio::time::sleep(Duration::from_secs(DB_WRITE_INTERVAL_SECS.into())).await;
++                debug!(parent: node.node().span(), "crawling the netowrk for more peers; asking peers for their peers");
++                node.send_broadcast(ClientMessage::PeerRequest).unwrap();
++                tokio::time::sleep(Duration::from_secs(PEER_INTERVAL_SECS)).await;
+             }
+         });
+     }
+ 
+-    /// Spawns a task printing the desired crawling information in the logs.
+-    #[cfg(not(feature = "postgres"))]
+     fn log_known_network(&self) {
+         let node = self.clone();
+         tokio::spawn(async move {
+             loop {
+-                info!(parent: node.node().span(), "connected peers: {}", node.node().num_connected());
+-                info!(parent: node.node().span(), "\n{:#?}", node.known_network.get_node_summary());
++                info!(parent: node.node().span(), "current peers: {}", node.node().num_connected());
++                info!(parent: node.node().span(), "known addresses: {}", node.known_network.nodes().len());
++                info!(parent: node.node().span(), "known connections: {}", node.known_network.connections().len());
+                 tokio::time::sleep(Duration::from_secs(LOG_INTERVAL_SECS)).await;
+             }
+         });
+@@ -234,75 +164,40 @@ impl Crawler {
+ 
+     /// Starts the usual periodic activities of a crawler node.
+     pub fn run_periodic_tasks(&self) {
+-        #[cfg(feature = "postgres")]
+-        self.store_known_network();
+-        #[cfg(not(feature = "postgres"))]
+         self.log_known_network();
++        //self.send_pings();
+         self.update_peers();
+     }
+ }
+ 
+-/// A wrapper type for inbound messages, allowing the crawler to immediately reject undesired ones.
+-pub enum InboundMessage {
+-    Handled(ClientMessage),
+-    Unhandled(u16),
+-}
+-
+ /// Inbound message processing logic for the crawler nodes.
+ #[async_trait::async_trait]
+ impl Reading for Crawler {
+-    type Message = InboundMessage;
++    type Message = ClientMessage;
+ 
+-    // This implementation is slightly low-level in order to discard unwanted messages without a performance penalty.
+     fn read_message<R: io::Read>(&self, source: SocketAddr, reader: &mut R) -> io::Result<Option<Self::Message>> {
+-        // The read buffer should be just enough to read the longest expected message.
+-        let mut buf = [0u8; READ_BUFFER_SIZE];
++        // FIXME: use the maximum message size allowed by the protocol or (better) use streaming deserialization.
++        let mut buf = [0u8; 64 * 1024];
+ 
+-        // Read the length of the inbound message.
+-        let read_len = reader.read(&mut buf[..MESSAGE_LENGTH_PREFIX_SIZE])?;
+-
+-        // This is unlikely, but mark the message as incomplete if too few bytes are available.
+-        if read_len < 2 {
+-            return Ok(None);
+-        }
+-
+-        // Read the message's length.
++        reader.read_exact(&mut buf[..MESSAGE_LENGTH_PREFIX_SIZE])?;
+         let len = u32::from_le_bytes(buf[..MESSAGE_LENGTH_PREFIX_SIZE].try_into().unwrap()) as usize;
+ 
+-        // Only read the message ID first.
+-        let read_len = reader.read(&mut buf[..2])?;
+-
+-        // This is unlikely, but mark the message as incomplete if too few bytes are available.
+-        if read_len < 2 {
+-            return Ok(None);
++        if len > buf.len() {
++            error!(parent: self.node().span(), "a message from {} is too large ({}B)", source, len);
++            return Err(io::ErrorKind::InvalidData.into());
+         }
+ 
+-        // Read the message ID to filter out undesirable messages.
+-        let message_id: u16 = bincode::deserialize(&buf[..2]).map_err(|_| io::ErrorKind::InvalidData)?;
+-
+-        // Discard unwanted messages and those longer than the buffer's capacity.
+-        if !ACCEPTED_MESSAGE_IDS.contains(&message_id) || len > buf.len() {
+-            // Advance the reader to discard the unwanted bytes.
+-            let read_len = io::copy(&mut reader.take(len as u64 - 2), &mut io::sink())?;
+-            if read_len != len as u64 - 2 {
+-                return Ok(None);
+-            }
+-            return Ok(Some(InboundMessage::Unhandled(message_id)));
+-        }
+-
+-        // Read the remaining number of bytes indicated by the length prefix.
+-        let read_len = reader.read(&mut buf[2..][..len - 2])?;
+-
+-        // This one is likely: mark the message as incomplete if it's lacking bytes.
+-        if read_len != len - 2 {
++        if reader.read_exact(&mut buf[..len]).is_err() {
+             return Ok(None);
+         }
+ 
+-        // Only deserialize the desired messages.
++        // TODO: only partially deserialize the client messages at first; we need to first read the
++        // message id, and immediately reject message types we're not interested in, especially
++        // blocks, txs, pongs and anything else that has deferred deserialization in the true node.
+         match ClientMessage::deserialize(&mut io::Cursor::new(&buf[..len])) {
+             Ok(msg) => {
+                 debug!(parent: self.node().span(), "received a {} from {}", msg.name(), source);
+-                Ok(Some(InboundMessage::Handled(msg)))
++                Ok(Some(msg))
+             }
+             Err(e) => {
+                 error!(parent: self.node().span(), "a message from {} failed to deserialize: {}", source, e);
+@@ -312,86 +207,78 @@ impl Reading for Crawler {
+     }
+ 
+     async fn process_message(&self, source: SocketAddr, message: Self::Message) -> io::Result<()> {
+-        if let InboundMessage::Handled(message) = message {
+-            match message {
+-                ClientMessage::Disconnect(reason) => {
+-                    debug!(parent: self.node().span(), "peer {} disconnected for the following reason: {:?}", source, reason);
+-                    Ok(())
+-                }
+-                ClientMessage::PeerRequest => {
+-                    self.process_peer_request(source)?;
+-                    Ok(())
+-                }
+-                ClientMessage::PeerResponse(peer_ips) => {
+-                    self.process_peer_response(source, peer_ips)?;
+-                    Ok(())
+-                }
+-                ClientMessage::Ping(version, _fork_depth, node_type, state, _block_hash, block_header) => {
+-                    // TODO: we should probably manually deserialize the header, as we only need the
+-                    // height, and we need to be able to quickly handle any number of such messages
+-                    let block_header = block_header.deserialize().await.map_err(|_| io::ErrorKind::InvalidData)?;
+-                    self.process_ping(source, node_type, version, state, block_header.height())
+-                }
+-                _ => {
+-                    unreachable!();
+-                }
++        match message {
++            ClientMessage::BlockRequest(_start_block_height, _end_block_height) => {}
++            ClientMessage::BlockResponse(_block) => {}
++            ClientMessage::Disconnect(reason) => {
++                debug!(parent: self.node().span(), "peer {} disconnected for the following reason: {:?}", source, reason);
+             }
+-        } else if let InboundMessage::Unhandled(id) = message {
+-            if ACCEPTED_MESSAGE_IDS.contains(&id) {
+-                warn!(parent: self.node().span(), "rejected an unexpected message (ID: {}); double-check the buffer size", id);
++            ClientMessage::PeerRequest => self.process_peer_request(source).await?,
++            ClientMessage::PeerResponse(peer_ips) => self.process_peer_response(source, peer_ips).await?,
++            ClientMessage::Ping(version, _fork_depth, _peer_type, _peer_state, _block_hash, block_header) => {
++                // TODO: we should probably manually deserialize the header, as we only need the
++                // height, and we need to be able to quickly handle any number of such messages
++                let block_header = block_header.deserialize().await.unwrap();
++                self.process_ping(source, version, block_header.height()).await?
+             }
+-
+-            Ok(())
+-        } else {
+-            unreachable!();
++            ClientMessage::Pong(_is_fork, _block_locators) => {}
++            ClientMessage::UnconfirmedBlock(_block_height, _block_hash, _block) => {}
++            ClientMessage::UnconfirmedTransaction(_transaction) => {}
++            ClientMessage::PoolRegister(_address) => {}
++            ClientMessage::PoolRequest(_share_difficulty, _block_template) => {}
++            ClientMessage::PoolResponse(_address, _nonce, _proof) => {}
++            _ => return Err(io::ErrorKind::InvalidData.into()), // Peer is not following the protocol.
+         }
++
++        Ok(())
+     }
+ }
+ 
+ // Helper methods.
+ impl Crawler {
+-    fn process_peer_request(&self, source: SocketAddr) -> io::Result<()> {
++    async fn process_peer_request(&self, source: SocketAddr) -> io::Result<()> {
+         let peers = self
+             .known_network
+             .nodes()
+             .into_iter()
+-            .filter(|(_, meta)| meta.state.is_some())
+             .map(|(addr, _)| addr)
+-            .choose_multiple(&mut self.rng(), SHARED_PEER_COUNT);
+-
++            .choose_multiple(&mut rand::thread_rng(), 10);
++        let msg = ClientMessage::PeerResponse(peers);
+         debug!(parent: self.node().span(), "sending a PeerResponse to {}", source);
+-        self.send_direct_message(source, ClientMessage::PeerResponse(peers))?;
++
++        self.send_direct_message(source, msg)?;
+ 
+         Ok(())
+     }
+ 
+-    fn process_peer_response(&self, source: SocketAddr, mut peer_addrs: Vec<SocketAddr>) -> io::Result<()> {
++    async fn process_peer_response(&self, source: SocketAddr, mut peer_ips: Vec<SocketAddr>) -> io::Result<()> {
+         let node = self.clone();
+         task::spawn(async move {
+-            peer_addrs.retain(|addr| node.node().listening_addr().unwrap() != *addr);
++            peer_ips.retain(|addr| node.node().listening_addr().unwrap() != *addr);
+ 
+             // Insert the address into the known network and update the crawl state.
+-            if let Some(listening_addr) = node.get_peer_listening_addr(source) {
+-                node.known_network.received_peers(listening_addr, peer_addrs.clone());
++            if let Some(listening_addr) = node.get_peer_listening_addr(source).await {
++                node.known_network.update_connections(listening_addr, peer_ips.clone());
++                node.known_network.received_peers(listening_addr);
+             }
+ 
+-            for addr in peer_addrs {
+-                if !node.is_connected(addr) {
+-                    debug!(parent: node.node().span(), "trying to connect to {}'s peer {}", source, addr);
++            for peer_ip in peer_ips {
++                if !node.node().is_connected(peer_ip)
++                    && !node
++                        .state
++                        .peers
++                        .lock()
++                        .await
++                        .iter()
++                        .any(|peer| peer.listening_addr == peer_ip || peer.connected_addr == peer_ip)
++                {
++                    debug!(parent: node.node().span(), "trying to connect to {}'s peer {}", source, peer_ip);
+ 
+-                    // Only connect if this address needs to be crawled.
+-                    if node.known_network.should_be_connected_to(addr) {
++                    // Only connect if this address is unknown.
++                    if !node.known_network.nodes().contains_key(&peer_ip) {
+                         let node_clone = node.clone();
+                         task::spawn(async move {
+-                            let connection_init_timestamp = OffsetDateTime::now_utc();
+-                            if node_clone.node().connect(addr).await.is_ok() {
+-                                node_clone.known_network.connected_to_node(addr, connection_init_timestamp, true);
+-
+-                                // Immediately ask for the new peer's peers.
+-                                let _ = node_clone.send_direct_message(addr, ClientMessage::PeerRequest);
+-                            } else {
+-                                node_clone.known_network.connected_to_node(addr, connection_init_timestamp, false);
+-                            }
++                            let _ = node_clone.node().connect(peer_ip).await;
+                         });
+                     }
+                 }
+@@ -401,15 +288,20 @@ impl Crawler {
+         Ok(())
+     }
+ 
+-    fn process_ping(&self, source: SocketAddr, node_type: NodeType, version: u32, state: State, block_height: u32) -> io::Result<()> {
+-        // Don't reject non-compliant peers in order to have the fullest image of the network.
++    async fn process_ping(&self, source: SocketAddr, version: u32, block_height: u32) -> io::Result<()> {
++        // Ensure the message protocol version is not outdated.
++        // TODO: we should probably maintain a detailed list of non-compliant peers so we can
++        // report their numbers and reasons for non-compliance with the protocol.
++        if version < MESSAGE_VERSION {
++            warn!(parent: self.node().span(), "dropping {} due to outdated version ({})", source, version);
++            return Err(io::ErrorKind::InvalidData.into());
++        }
+ 
+         debug!(parent: self.node().span(), "peer {} is at height {}", source, block_height);
+ 
+         // Update the known network nodes and update the crawl state.
+-        if let Some(listening_addr) = self.get_peer_listening_addr(source) {
+-            self.known_network
+-                .received_ping(listening_addr, node_type, version, state, block_height);
++        if let Some(listening_addr) = self.get_peer_listening_addr(source).await {
++            self.known_network.update_height(listening_addr, block_height);
+         }
+ 
+         let genesis = CurrentNetwork::genesis_block();
+@@ -423,6 +315,7 @@ impl Crawler {
+         );
+ 
+         debug!(parent: self.node().span(), "sending a Pong to {}", source);
++
+         self.send_direct_message(source, msg)?;
+ 
+         Ok(())
+diff --git a/.crawler/src/known_network.rs b/.crawler/src/known_network.rs
+index dc656e647..ad08b641c 100644
+--- a/.crawler/src/known_network.rs
++++ b/.crawler/src/known_network.rs
+@@ -15,124 +15,63 @@
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use parking_lot::RwLock;
+-use snarkos_environment::helpers::{NodeType, State};
+ use std::{
+     collections::{HashMap, HashSet},
+-    fmt,
+     net::SocketAddr,
+ };
+-use time::{Duration, OffsetDateTime};
++use time::OffsetDateTime;
+ 
+ use crate::{
+     connection::{nodes_from_connections, Connection},
+-    constants::*,
++    constants::{CRAWL_INTERVAL_MINS, STALE_CONNECTION_CUTOFF_TIME_HRS},
+ };
+ 
+-/// The current state of a crawled node.
+-#[derive(Debug, Clone)]
+-pub struct NodeState {
+-    pub node_type: NodeType,
+-    pub version: u32,
+-    pub height: u32,
+-    pub state: State,
+-}
+-
+-/// A summary of the state of the known nodes.
+-#[derive(Clone)]
+-#[allow(dead_code)]
+-pub struct NetworkSummary {
+-    // The number of all known nodes.
+-    num_known_nodes: usize,
+-    // The number of all known connections.
+-    num_known_connections: usize,
+-    // The number of nodes that haven't provided their state yet.
+-    nodes_pending_state: usize,
+-    // The types of nodes and their respective counts.
+-    types: HashMap<NodeType, usize>,
+-    // The versions of nodes and their respective counts.
+-    versions: HashMap<u32, usize>,
+-    // The node states of nodes and their respective counts.
+-    states: HashMap<State, usize>,
+-    // The heights of nodes and their respective counts.
+-    heights: HashMap<u32, usize>,
+-    // The average handshake time in the network.
+-    avg_handshake_time_ms: Option<i64>,
+-}
+-
+-impl fmt::Debug for NetworkSummary {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("Network summary")
+-            .field("number of known nodes", &self.num_known_nodes)
+-            .field("number of known connections", &self.num_known_connections)
+-            .field("nodes pending state", &self.nodes_pending_state)
+-            .field("types", &self.types)
+-            .field("versions", &self.versions)
+-            .field("states", &self.states)
+-            .field("average handshake time (in ms)", &self.avg_handshake_time_ms)
+-            .finish()
+-    }
+-}
+-
+ /// Node information collected while crawling.
+-#[derive(Debug, Clone, Default)]
++#[derive(Debug, Clone)]
+ pub struct NodeMeta {
+-    // The details of the node's state.
+-    pub state: Option<NodeState>,
+-    // The last interaction timestamp.
+-    pub timestamp: Option<OffsetDateTime>,
+-    // The number of lists of peers received from the node.
++    #[allow(dead_code)]
++    listening_addr: SocketAddr,
++    last_height: Option<u32>,
++    // Set on disconnect.
++    last_crawled: Option<OffsetDateTime>,
++
++    // Useful for keeping track of crawl round state.
+     received_peer_sets: u8,
+-    // The number of subsequent connection failures.
+-    connection_failures: u8,
+-    // The time it took to connect to the node.
+-    pub handshake_time: Option<Duration>,
+ }
+ 
+ impl NodeMeta {
+-    // Resets the node's values which determine whether the crawler should stay connected to it.
+-    // note: it should be called when a node is disconnected from after it's been crawled successfully
++    fn new(listening_addr: SocketAddr) -> Self {
++        Self {
++            listening_addr,
++            last_height: None,
++            last_crawled: None,
++            received_peer_sets: 0,
++        }
++    }
++
+     fn reset_crawl_state(&mut self) {
+         self.received_peer_sets = 0;
+-        self.connection_failures = 0;
+-        self.timestamp = Some(OffsetDateTime::now_utc());
+-    }
+ 
+-    // Returns `true` if the node should be connected to again.
+-    fn needs_refreshing(&self) -> bool {
+-        if let Some(timestamp) = self.timestamp {
+-            let crawl_interval = if self.state.is_some() {
+-                CRAWL_INTERVAL_MINS
+-            } else {
+-                // Delay further connection attempts to nodes that are hard to connect to.
+-                self.connection_failures as i64
+-            };
+-
+-            (OffsetDateTime::now_utc() - timestamp).whole_minutes() > crawl_interval
+-        } else {
+-            // If there is no timestamp yet, this is the very first connection attempt.
+-            true
+-        }
++        self.last_crawled = Some(OffsetDateTime::now_utc());
+     }
+ }
+ 
+ /// Keeps track of crawled peers and their connections.
+-// note: all the associated addresses are listening addresses.
+ #[derive(Debug, Default)]
+ pub struct KnownNetwork {
+-    // The information on known nodes; the keys of the map are their related listening addresses.
++    // The nodes and their information.
+     nodes: RwLock<HashMap<SocketAddr, NodeMeta>>,
+-    // The map of known connections between nodes.
++    // The connections map.
+     connections: RwLock<HashSet<Connection>>,
+ }
+ 
+ impl KnownNetwork {
+-    /// Adds a node with the given address.
+-    pub fn add_node(&self, listening_addr: SocketAddr) {
+-        self.nodes.write().insert(listening_addr, NodeMeta::default());
++    pub fn add_node(&self, addr: SocketAddr) {
++        self.nodes.write().insert(addr, NodeMeta::new(addr));
+     }
+ 
+-    // Updates the list of connections and registers new nodes based on them.
+-    fn update_connections(&self, source: SocketAddr, peers: Vec<SocketAddr>) {
++    // More convenient for testing.
++    pub fn update_connections(&self, source: SocketAddr, peers: Vec<SocketAddr>) {
+         // Rules:
+         //  - if a connecton exists already, do nothing.
+         //  - if a connection is new, add it.
+@@ -162,113 +101,70 @@ impl KnownNetwork {
+         {
+             let mut connections_g = self.connections.write();
+ 
+-            // Remove stale connections, if there are any.
+-            for addr in connections_to_remove {
+-                connections_g.remove(&addr);
+-            }
++            // Remove stale connections.
++            connections_g.retain(|connection| !connections_to_remove.contains(connection));
+ 
+-            // Insert new connections, we use `replace` so the last seen timestamp is overwritten.
++            // Insert new connections, we use replace so the last seen timestamp is overwritten.
+             for new_connection in new_connections.into_iter() {
+                 connections_g.replace(new_connection);
+             }
+         }
+ 
+-        // Obtain node addresses based on the list of known connections.
+-        let node_addrs_from_conns = nodes_from_connections(&self.connections());
+-
+         // Scope the write lock.
+         {
+             let mut nodes_g = self.nodes.write();
+ 
+-            // Create new node objects based on connection addresses.
+-            for addr in node_addrs_from_conns {
++            // Remove the nodes that no longer correspond to connections.
++            let nodes_from_connections = nodes_from_connections(&self.connections());
++            for addr in nodes_from_connections {
+                 if !nodes_g.contains_key(&addr) {
+-                    nodes_g.insert(addr, NodeMeta::default());
++                    nodes_g.insert(addr, NodeMeta::new(addr));
+                 }
+             }
+         }
+     }
+ 
+-    /// Updates the details of a node based on a Ping message received from it.
+-    pub fn received_ping(&self, source: SocketAddr, node_type: NodeType, version: u32, state: State, height: u32) {
+-        let timestamp = OffsetDateTime::now_utc();
+-
+-        let mut nodes = self.nodes.write();
+-        let mut meta = nodes.entry(source).or_default();
+-
+-        meta.state = Some(NodeState {
+-            node_type,
+-            version,
+-            height,
+-            state,
+-        });
+-        meta.timestamp = Some(timestamp);
+-    }
+-
+-    /// Updates the known connections based on a received list of a node's peers.
+-    pub fn received_peers(&self, source: SocketAddr, addrs: Vec<SocketAddr>) {
+-        let timestamp = OffsetDateTime::now_utc();
+-
+-        self.update_connections(source, addrs);
+-
+-        let mut nodes = self.nodes.write();
+-        let mut meta = nodes.entry(source).or_default();
+-
+-        meta.received_peer_sets += 1;
+-        meta.timestamp = Some(timestamp);
+-    }
+-
+-    /// Updates a node's details applicable as soon as a connection succeeds or fails.
+-    pub fn connected_to_node(&self, source: SocketAddr, connection_init_timestamp: OffsetDateTime, connection_succeeded: bool) {
+-        let mut nodes = self.nodes.write();
+-        let mut meta = nodes.entry(source).or_default();
+-
+-        // Update the node interaction timestamp.
+-        meta.timestamp = Some(connection_init_timestamp);
+-
+-        if connection_succeeded {
+-            // Reset the conn failure count when the connection succeeds.
+-            meta.connection_failures = 0;
+-            // Register the time it took to perform the handshake.
+-            meta.handshake_time = Some(OffsetDateTime::now_utc() - connection_init_timestamp);
+-        } else {
+-            meta.connection_failures += 1;
++    /// Update the height stored for this particular node.
++    pub fn update_height(&self, source: SocketAddr, height: u32) {
++        if let Some(meta) = self.nodes.write().get_mut(&source) {
++            meta.last_height = Some(height);
+         }
+     }
+ 
+-    /// Checks if the given address should be (re)connected to.
+-    pub fn should_be_connected_to(&self, addr: SocketAddr) -> bool {
+-        if let Some(meta) = self.nodes.read().get(&addr) {
+-            meta.needs_refreshing()
+-        } else {
+-            true
++    pub fn received_peers(&self, source: SocketAddr) {
++        if let Some(meta) = self.nodes.write().get_mut(&source) {
++            meta.received_peer_sets += 1;
+         }
+     }
+ 
+-    /// Returns a list of addresses the crawler should connect to.
+     pub fn addrs_to_connect(&self) -> HashSet<SocketAddr> {
+         // Snapshot is safe to use as disconnected peers won't have their state updated at the
+         // moment.
+         self.nodes()
+             .iter()
+-            .filter(|(_, meta)| meta.needs_refreshing())
++            .filter(|(_, meta)| {
++                if let Some(last_crawled) = meta.last_crawled {
++                    (OffsetDateTime::now_utc() - last_crawled).whole_minutes() > CRAWL_INTERVAL_MINS
++                } else {
++                    true
++                }
++            })
+             .map(|(&addr, _)| addr)
+             .collect()
+     }
+ 
+-    /// Returns a list of addresses the crawler should disconnect from.
+-    pub fn addrs_to_disconnect(&self) -> Vec<SocketAddr> {
+-        let mut peers = self.nodes.write();
+-
+-        // Forget nodes that can't be connected to in case they are offline.
+-        peers.retain(|_, meta| meta.connection_failures <= MAX_CONNECTION_FAILURE_COUNT);
++    pub fn addrs_to_disconnect(&self) -> HashSet<SocketAddr> {
++        let mut addrs = HashSet::new();
+ 
+-        let mut addrs = Vec::new();
+-        for (addr, meta) in peers.iter_mut() {
+-            // Disconnect from peers we have received the state and sufficient peers from.
+-            if meta.state.is_some() && meta.received_peer_sets >= DESIRED_PEER_SET_COUNT {
+-                meta.reset_crawl_state();
+-                addrs.push(*addr);
++        // Scope the write lock.
++        {
++            let mut nodes_g = self.nodes.write();
++            for (addr, meta) in nodes_g.iter_mut() {
++                // Disconnect from peers we have received a height and peers for.
++                if meta.last_height.is_some() && meta.received_peer_sets >= 3 {
++                    meta.reset_crawl_state();
++                    addrs.insert(*addr);
++                }
+             }
+         }
+ 
+@@ -294,68 +190,14 @@ impl KnownNetwork {
+     pub fn nodes(&self) -> HashMap<SocketAddr, NodeMeta> {
+         self.nodes.read().clone()
+     }
+-
+-    /// Returns the number of all the known connections.
+-    pub fn num_connections(&self) -> usize {
+-        self.connections.read().len()
+-    }
+-
+-    /// Returns the number of all the known nodes.
+-    pub fn num_nodes(&self) -> usize {
+-        self.nodes.read().len()
+-    }
+-
+-    /// Returns a state summary for the known nodes.
+-    pub fn get_node_summary(&self) -> NetworkSummary {
+-        let nodes = self.nodes();
+-
+-        let mut versions = HashMap::with_capacity(nodes.len());
+-        let mut states = HashMap::with_capacity(nodes.len());
+-        let mut types = HashMap::with_capacity(nodes.len());
+-        let mut heights = HashMap::with_capacity(nodes.len());
+-
+-        let mut handshake_times = Vec::with_capacity(nodes.len());
+-        let mut nodes_pending_state: usize = 0;
+-
+-        for meta in nodes.values() {
+-            if let Some(ref state) = meta.state {
+-                versions.entry(state.version).and_modify(|count| *count += 1).or_insert(1);
+-                states.entry(state.state).and_modify(|count| *count += 1).or_insert(1);
+-                types.entry(state.node_type).and_modify(|count| *count += 1).or_insert(1);
+-                heights.entry(state.height).and_modify(|count| *count += 1).or_insert(1);
+-            } else {
+-                nodes_pending_state += 1;
+-            }
+-            if let Some(time) = meta.handshake_time {
+-                handshake_times.push(time);
+-            }
+-        }
+-
+-        let num_known_connections = self.connections().len();
+-        let avg_handshake_time_ms = if !handshake_times.is_empty() {
+-            let avg = handshake_times.iter().sum::<Duration>().whole_milliseconds() as i64 / handshake_times.len() as i64;
+-            Some(avg)
+-        } else {
+-            None
+-        };
+-
+-        NetworkSummary {
+-            num_known_nodes: nodes.len(),
+-            num_known_connections,
+-            nodes_pending_state,
+-            versions,
+-            heights,
+-            states,
+-            types,
+-            avg_handshake_time_ms,
+-        }
+-    }
+ }
+ 
+ #[cfg(test)]
+ mod test {
+     use super::*;
+ 
++    use time::Duration;
++
+     #[test]
+     fn connections_update() {
+         let addr_a = "11.11.11.11:1000".parse().unwrap();
+diff --git a/.crawler/src/lib.rs b/.crawler/src/lib.rs
+index 4cdefe9a7..30624bbb2 100644
+--- a/.crawler/src/lib.rs
++++ b/.crawler/src/lib.rs
+@@ -18,5 +18,3 @@ mod connection;
+ pub mod constants;
+ pub mod crawler;
+ pub mod known_network;
+-#[cfg(feature = "postgres")]
+-pub mod storage;
+diff --git a/.crawler/src/main.rs b/.crawler/src/main.rs
+index b6db6d0c7..0ca1745a0 100644
+--- a/.crawler/src/main.rs
++++ b/.crawler/src/main.rs
+@@ -14,8 +14,6 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-#[cfg(feature = "postgres")]
+-use snarkos_crawler::storage::initialize_storage;
+ use snarkos_crawler::{
+     constants::SYNC_NODES,
+     crawler::{Crawler, Opts},
+@@ -25,28 +23,20 @@ use structopt::StructOpt;
+ 
+ #[tokio::main]
+ async fn main() {
+-    // Enable tracing.
+-    snarkos_synthetic_node::enable_tracing();
+-
+     // Read configuration options.
+     let opts = Opts::from_args();
+ 
+-    // Initialize the storage, if enabled.
+-    #[cfg(feature = "postgres")]
+-    let storage = Some(initialize_storage(&opts).await.expect("couldn't initialize storage"));
+-    #[cfg(not(feature = "postgres"))]
+-    let storage = None;
+-
+     // Configure and start crawler.
+-    let crawler = Crawler::new(opts, storage).await;
++    let crawler = Crawler::new(opts).await;
++
++    // Enable tracing for the crawler.
++    snarkos_synthetic_node::enable_tracing();
+ 
+-    // Register the addresses of the sync nodes.
+     for addr in SYNC_NODES {
+         let addr = addr.parse().unwrap();
+         crawler.known_network.add_node(addr);
+     }
+ 
+-    // Start crawling.
+     crawler.run_periodic_tasks();
+ 
+     std::future::pending::<()>().await;
+diff --git a/.crawler/src/storage.rs b/.crawler/src/storage.rs
+deleted file mode 100644
+index 0b5addb2a..000000000
+--- a/.crawler/src/storage.rs
++++ /dev/null
+@@ -1,154 +0,0 @@
+-// Copyright (C) 2019-2022 Aleo Systems Inc.
+-// This file is part of the snarkOS library.
+-
+-// The snarkOS library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The snarkOS library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+-
+-#[cfg(feature = "postgres-tls")]
+-use std::fs;
+-
+-#[cfg(feature = "postgres-tls")]
+-use native_tls::{Certificate, TlsConnector};
+-#[cfg(feature = "postgres-tls")]
+-use postgres_native_tls::MakeTlsConnector;
+-use time::OffsetDateTime;
+-#[cfg(not(feature = "postgres-tls"))]
+-use tokio_postgres::NoTls;
+-use tokio_postgres::{types::Type, Client, Error};
+-use tracing::*;
+-
+-use crate::crawler::{Crawler, Opts};
+-
+-/// Connects to a PostgreSQL database and creates the needed tables if they don't exist yet.
+-pub async fn initialize_storage(opts: &Opts) -> Result<Client, anyhow::Error> {
+-    // Prepare the connection config.
+-    let config = format!(
+-        "host={} port={} user={} password={} dbname={}",
+-        opts.postgres_host, opts.postgres_port, opts.postgres_user, opts.postgres_pass, opts.postgres_dbname
+-    );
+-
+-    // Connect to the PostgreSQL database.
+-    #[cfg(feature = "postgres-tls")]
+-    let (client, connection) = {
+-        let cert = fs::read(&opts.postgres_cert_path)?;
+-        let cert = Certificate::from_pem(&cert)?;
+-        let connector = TlsConnector::builder().add_root_certificate(cert).build()?;
+-        let connector = MakeTlsConnector::new(connector);
+-
+-        tokio_postgres::connect(&config, connector).await?
+-    };
+-
+-    #[cfg(not(feature = "postgres-tls"))]
+-    let (client, connection) = tokio_postgres::connect(&config, NoTls).await?;
+-
+-    // The connection object performs the actual communication with the database,
+-    // so spawn it off to run on its own.
+-    tokio::spawn(async move {
+-        if let Err(e) = connection.await {
+-            error!("Storage connection error: {}", e);
+-        }
+-    });
+-
+-    if opts.postgres_clean {
+-        client
+-            .batch_execute("DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS network;")
+-            .await?;
+-        debug!("Persistent storage was cleaned");
+-    }
+-
+-    client
+-        .batch_execute(
+-            "
+-        CREATE TABLE IF NOT EXISTS nodes (
+-            ip              INET NOT NULL,
+-            port            INTEGER NOT NULL,
+-            timestamp       TIMESTAMP WITH TIME ZONE,
+-            type            SMALLINT,
+-            version         INTEGER,
+-            state           SMALLINT,
+-            height          INTEGER,
+-            handshake_ms    INTEGER
+-        );
+-
+-        CREATE TABLE IF NOT EXISTS network (
+-            timestamp      TIMESTAMP WITH TIME ZONE NOT NULL,
+-            nodes          INTEGER NOT NULL,
+-            connections    INTEGER NOT NULL
+-        );
+-    ",
+-        )
+-        .await?;
+-
+-    debug!("Persistent storage is ready");
+-
+-    Ok(client)
+-}
+-
+-impl Crawler {
+-    pub async fn write_crawling_data(&self) -> Result<(), Error> {
+-        if let Some(ref storage) = self.storage {
+-            let nodes = self.known_network.nodes();
+-
+-            let mut storage = storage.lock().await;
+-            let transaction = storage.transaction().await?;
+-
+-            let per_node_stmt = transaction
+-                .prepare_typed("INSERT INTO nodes VALUES ($1, $2, $3, $4, $5, $6, $7, $8);", &[
+-                    Type::INET,
+-                    Type::INT4,
+-                    Type::TIMESTAMPTZ,
+-                    Type::INT2,
+-                    Type::INT4,
+-                    Type::INT2,
+-                    Type::INT8,
+-                    Type::INT4,
+-                ])
+-                .await?;
+-
+-            for (addr, meta) in nodes.into_iter().filter(|(_, meta)| meta.timestamp.is_some()) {
+-                transaction
+-                    .execute(&per_node_stmt, &[
+-                        &addr.ip(),
+-                        &(addr.port() as i32),
+-                        &meta.timestamp.unwrap(),
+-                        &meta.state.as_ref().map(|s| s.node_type as i16),
+-                        &meta.state.as_ref().map(|s| s.version as i32),
+-                        &meta.state.as_ref().map(|s| s.state as i16),
+-                        &meta.state.as_ref().map(|s| s.height as i64),
+-                        &meta.handshake_time.map(|t| t.whole_milliseconds() as i32),
+-                    ])
+-                    .await?;
+-            }
+-
+-            let network_stmt = transaction
+-                .prepare_typed("INSERT INTO network VALUES ($1, $2, $3);", &[
+-                    Type::TIMESTAMPTZ,
+-                    Type::INT4,
+-                    Type::INT4,
+-                ])
+-                .await?;
+-
+-            transaction
+-                .execute(&network_stmt, &[
+-                    &OffsetDateTime::now_utc(),
+-                    &(self.known_network.num_nodes() as i32),
+-                    &(self.known_network.num_connections() as i32),
+-                ])
+-                .await?;
+-
+-            transaction.commit().await?;
+-        }
+-
+-        Ok(())
+-    }
+-}
+diff --git a/.crawler/tests/peering.rs b/.crawler/tests/peering.rs
+deleted file mode 100644
+index 3ccebd90e..000000000
+--- a/.crawler/tests/peering.rs
++++ /dev/null
+@@ -1,78 +0,0 @@
+-// Copyright (C) 2019-2022 Aleo Systems Inc.
+-// This file is part of the snarkOS library.
+-
+-// The snarkOS library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The snarkOS library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+-
+-use pea2pea::Pea2Pea;
+-use snarkos_crawler::crawler::{Crawler, Opts};
+-use snarkos_integration::{wait_until, TestNode};
+-use structopt::StructOpt;
+-
+-const NUM_NODES: usize = 10;
+-
+-#[tokio::test]
+-async fn basics() {
+-    // tracing_subscriber::fmt::init();
+-
+-    // Prepare some collections we'll be using.
+-    let mut test_nodes = Vec::with_capacity(NUM_NODES);
+-    let mut test_node_addrs = Vec::with_capacity(NUM_NODES);
+-
+-    // Start the test nodes.
+-    for _ in 0..NUM_NODES {
+-        let test_node = TestNode::default().await;
+-        let test_node_addr = test_node.node().listening_addr().unwrap();
+-
+-        test_nodes.push(test_node);
+-        test_node_addrs.push(test_node_addr);
+-    }
+-
+-    // Connect the test nodes into a linear topology.
+-    for (node, prev_node_addr) in test_nodes.iter().skip(1).zip(&test_node_addrs) {
+-        node.node().connect(*prev_node_addr).await.unwrap();
+-    }
+-
+-    // A small delay to make sure all connections are ready.
+-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+-
+-    // Double-check the topology.
+-    for (i, node) in test_nodes.iter().enumerate() {
+-        if i == 0 || i == NUM_NODES - 1 {
+-            assert_eq!(node.node().num_connected(), 1);
+-        } else {
+-            assert_eq!(node.node().num_connected(), 2);
+-        }
+-    }
+-
+-    // Start the crawler.
+-    let opts = Opts::from_iter(&["snarkos_crawler_test", "--node", "127.0.0.1:0"]);
+-    let crawler = Crawler::new(opts, None).await;
+-
+-    // "Seed" the crawler with the address of the first node.
+-    crawler.known_network.add_node(test_node_addrs[0]);
+-
+-    // Initialize the crawler.
+-    crawler.run_periodic_tasks();
+-
+-    wait_until!(5, crawler.node().num_connected() == NUM_NODES);
+-
+-    assert_eq!(crawler.known_network.nodes().len(), NUM_NODES);
+-    assert_eq!(crawler.known_network.connections().len(), NUM_NODES - 1);
+-
+-    for test_node in test_nodes {
+-        test_node.node().shut_down().await;
+-    }
+-
+-    wait_until!(1, crawler.node().num_connected() == 0);
+-}
+diff --git a/.integration/Cargo.toml b/.integration/Cargo.toml
+index 1c11936e5..c81109725 100644
+--- a/.integration/Cargo.toml
++++ b/.integration/Cargo.toml
+@@ -26,7 +26,7 @@ version = "0.1"
+ version = "1"
+ 
+ [dependencies.pea2pea]
+-version = "0.34"
++version = "0.33"
+ 
+ [dependencies.peak_alloc]
+ version = "0.1"
+diff --git a/.integration/src/lib.rs b/.integration/src/lib.rs
+index 0589030fc..309da356c 100644
+--- a/.integration/src/lib.rs
++++ b/.integration/src/lib.rs
+@@ -21,17 +21,3 @@ pub use client_node::*;
+ 
+ pub mod test_node;
+ pub use test_node::*;
+-
+-#[macro_export]
+-macro_rules! wait_until {
+-    ($limit_secs: expr, $condition: expr) => {
+-        let now = std::time::Instant::now();
+-        loop {
+-            if $condition {
+-                break;
+-            }
+-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+-            assert!(now.elapsed() <= std::time::Duration::from_secs($limit_secs), "timed out!");
+-        }
+-    };
+-}
+diff --git a/.integration/src/test_node.rs b/.integration/src/test_node.rs
+index be7a612e1..b5a47ca17 100644
+--- a/.integration/src/test_node.rs
++++ b/.integration/src/test_node.rs
+@@ -14,12 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use snarkos_environment::{
+-    helpers::{NodeType, State},
+-    Client,
+-    CurrentNetwork,
+-    Environment,
+-};
++use snarkos_environment::{Client, CurrentNetwork, Environment};
+ use snarkos_network::Data;
+ use snarkos_storage::BlockLocators;
+ use snarkos_synthetic_node::{ClientMessage, ClientState, SynthNode, MAXIMUM_FORK_DEPTH, MESSAGE_LENGTH_PREFIX_SIZE, MESSAGE_VERSION};
+@@ -99,8 +94,8 @@ impl TestNode {
+             let ping_msg = ClientMessage::Ping(
+                 MESSAGE_VERSION,
+                 MAXIMUM_FORK_DEPTH,
+-                NodeType::Client,
+-                State::Ready,
++                node.node_type(),
++                node.state(),
+                 genesis.hash(),
+                 Data::Object(genesis.header().clone()),
+             );
+@@ -173,7 +168,7 @@ impl Reading for TestNode {
+                 debug!("Peer {} disconnected for the following reason: {:?}", source, reason);
+             }
+             ClientMessage::PeerRequest => self.process_peer_request(source).await?,
+-            ClientMessage::PeerResponse(peer_addrs) => self.process_peer_response(source, peer_addrs).await?,
++            ClientMessage::PeerResponse(peer_ips) => self.process_peer_response(source, peer_ips).await?,
+             ClientMessage::Ping(version, _fork_depth, _peer_type, _peer_state, _block_hash, block_header) => {
+                 // Deserialise the block header.
+                 let block_header = block_header.deserialize().await.unwrap();
+@@ -195,7 +190,14 @@ impl Reading for TestNode {
+ // Helper methods.
+ impl TestNode {
+     async fn process_peer_request(&self, source: SocketAddr) -> io::Result<()> {
+-        let peers = self.state.peers.read().keys().copied().collect::<Vec<_>>();
++        let peers = self
++            .state
++            .peers
++            .lock()
++            .await
++            .iter()
++            .map(|peer| peer.listening_addr)
++            .collect::<Vec<_>>();
+         let msg = ClientMessage::PeerResponse(peers);
+         info!(parent: self.node().span(), "sending a PeerResponse to {}", source);
+ 
+@@ -204,18 +206,18 @@ impl TestNode {
+         Ok(())
+     }
+ 
+-    async fn process_peer_response(&self, source: SocketAddr, peer_addrs: Vec<SocketAddr>) -> io::Result<()> {
++    async fn process_peer_response(&self, source: SocketAddr, peer_ips: Vec<SocketAddr>) -> io::Result<()> {
+         let num_connections = self.node().num_connected() + self.node().num_connecting();
+         let node = self.clone();
+         task::spawn(async move {
+-            for peer_addr in peer_addrs
++            for peer_ip in peer_ips
+                 .into_iter()
+                 .filter(|addr| node.node().listening_addr().unwrap() != *addr)
+                 .take(DESIRED_CONNECTIONS.saturating_sub(num_connections))
+             {
+-                if !node.node().is_connected(peer_addr) && !node.state.peers.read().contains_key(&peer_addr) {
+-                    info!(parent: node.node().span(), "trying to connect to {}'s peer {}", source, peer_addr);
+-                    let _ = node.node().connect(peer_addr).await;
++                if !node.node().is_connected(peer_ip) && !node.state.peers.lock().await.iter().any(|peer| peer.listening_addr == peer_ip) {
++                    info!(parent: node.node().span(), "trying to connect to {}'s peer {}", source, peer_ip);
++                    let _ = node.node().connect(peer_ip).await;
+                 }
+             }
+         });
+diff --git a/.integration/tests/common/mod.rs b/.integration/tests/common/mod.rs
+index 07a12a635..3a1052098 100644
+--- a/.integration/tests/common/mod.rs
++++ b/.integration/tests/common/mod.rs
+@@ -80,3 +80,17 @@ pub fn display_bytes(bytes: f64) -> String {
+         format!("{:.2} B", bytes)
+     }
+ }
++
++#[macro_export]
++macro_rules! wait_until {
++    ($limit_secs: expr, $condition: expr) => {
++        let now = std::time::Instant::now();
++        loop {
++            if $condition {
++                break;
++            }
++            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
++            assert!(now.elapsed() <= std::time::Duration::from_secs($limit_secs), "timed out!");
++        }
++    };
++}
+diff --git a/.integration/tests/metrics/mod.rs b/.integration/tests/metrics/mod.rs
+index 748c442e7..5650cb9d6 100644
+--- a/.integration/tests/metrics/mod.rs
++++ b/.integration/tests/metrics/mod.rs
+@@ -14,7 +14,9 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use snarkos_integration::{wait_until, ClientNode, TestNode};
++use crate::wait_until;
++
++use snarkos_integration::{ClientNode, TestNode};
+ use snarkos_metrics as metrics;
+ 
+ use pea2pea::Pea2Pea;
+diff --git a/.integration/tests/network/basic_connectivity.rs b/.integration/tests/network/basic_connectivity.rs
+index c1a995905..07c1a2a6c 100644
+--- a/.integration/tests/network/basic_connectivity.rs
++++ b/.integration/tests/network/basic_connectivity.rs
+@@ -14,18 +14,15 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::common::spawn_test_node_with_nonce;
+-use snarkos_integration::{wait_until, ClientNode, TestNode, MAXIMUM_NUMBER_OF_PEERS};
++use crate::{common::spawn_test_node_with_nonce, wait_until};
++use snarkos_integration::{ClientNode, TestNode, MAXIMUM_NUMBER_OF_PEERS};
+ 
+ use pea2pea::Pea2Pea;
+-use std::{
+-    sync::{
+-        atomic::{AtomicU8, Ordering::*},
+-        Arc,
+-    },
+-    time::Duration,
++use std::sync::{
++    atomic::{AtomicU8, Ordering::*},
++    Arc,
+ };
+-use tokio::{task, time};
++use tokio::task;
+ 
+ #[tokio::test]
+ async fn client_nodes_can_connect_to_each_other() {
+@@ -51,7 +48,7 @@ async fn test_nodes_can_connect_to_each_other() {
+     test_node1.node().connect(test_node0_addr).await.unwrap();
+ 
+     // Ensure that both nodes have an active connection now.
+-    wait_until!(1, test_node0.node().num_connected() == 1 && test_node1.node().num_connected() == 1);
++    assert!(test_node0.node().num_connected() == 1 && test_node1.node().num_connected() == 1);
+ }
+ 
+ #[tokio::test]
+@@ -84,7 +81,7 @@ async fn handshake_as_responder_works() {
+     test_node.node().connect(client_node.local_addr()).await.unwrap();
+ 
+     // Double-check with the snarkOS node.
+-    wait_until!(1, client_node.connected_peers().await.len() == 1);
++    assert!(client_node.connected_peers().await.len() == 1)
+ }
+ 
+ #[tokio::test]
+@@ -163,9 +160,6 @@ async fn connection_limits_are_obeyed() {
+         test_node.node().connect(client_node.local_addr()).await.unwrap();
+     }
+ 
+-    // A short sleep to ensure all the connections are ready.
+-    time::sleep(Duration::from_millis(10)).await;
+-
+     // Create one additional test node.
+     let extra_test_node = TestNode::default().await;
+     let extra_test_node_addr = extra_test_node.node().listening_addr().unwrap();
+diff --git a/.integration/tests/network/cleanups.rs b/.integration/tests/network/cleanups.rs
+index 6f4fe1465..507f5e8eb 100644
+--- a/.integration/tests/network/cleanups.rs
++++ b/.integration/tests/network/cleanups.rs
+@@ -14,8 +14,8 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::common::display_bytes;
+-use snarkos_integration::{wait_until, ClientNode, TestNode};
++use crate::{common::display_bytes, wait_until};
++use snarkos_integration::{ClientNode, TestNode};
+ 
+ use pea2pea::Pea2Pea;
+ use peak_alloc::PeakAlloc;
+diff --git a/.synthetic_node/Cargo.toml b/.synthetic_node/Cargo.toml
+index 0fa221d42..443e3120d 100644
+--- a/.synthetic_node/Cargo.toml
++++ b/.synthetic_node/Cargo.toml
+@@ -21,11 +21,8 @@ edition = "2021"
+ [dependencies.async-trait]
+ version = "0.1"
+ 
+-[dependencies.parking_lot]
+-version = "0.12"
+-
+ [dependencies.pea2pea]
+-version = "0.34"
++version = "0.33.0"
+ 
+ [dependencies.rand]
+ version = "0.8"
+diff --git a/.synthetic_node/src/lib.rs b/.synthetic_node/src/lib.rs
+index cb0e9ec4d..83fbd344a 100644
+--- a/.synthetic_node/src/lib.rs
++++ b/.synthetic_node/src/lib.rs
+@@ -15,7 +15,7 @@
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use snarkos_environment::{
+-    helpers::{NodeType, State},
++    helpers::{NodeType, State, Status},
+     Client,
+     CurrentNetwork,
+     Environment,
+@@ -23,7 +23,6 @@ use snarkos_environment::{
+ use snarkos_network::{Data, Message};
+ use snarkvm::traits::Network;
+ 
+-use parking_lot::RwLock;
+ use pea2pea::{
+     protocols::{Disconnect, Handshake, Writing},
+     Connection,
+@@ -31,23 +30,26 @@ use pea2pea::{
+     Pea2Pea,
+ };
+ use rand::{thread_rng, Rng};
+-use std::{collections::HashMap, convert::TryInto, io, net::SocketAddr, sync::Arc};
+-use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use std::{collections::HashSet, convert::TryInto, io, net::SocketAddr, sync::Arc};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    sync::Mutex,
++};
+ use tracing::*;
+ use tracing_subscriber::filter::LevelFilter;
+ 
+-/// The number of bytes indicating the length of network messages.
++// Consts & aliases.
+ pub const MESSAGE_LENGTH_PREFIX_SIZE: usize = 4;
+-
+-/// These 3 values are checked during the handshake.
++pub const CHALLENGE_HEIGHT: u32 = 0;
+ pub const MESSAGE_VERSION: u32 = <Client<CurrentNetwork>>::MESSAGE_VERSION;
+ pub const MAXIMUM_FORK_DEPTH: u32 = CurrentNetwork::ALEO_MAXIMUM_FORK_DEPTH;
+ 
+-// Type aliases.
++pub const MAXIMUM_NUMBER_OF_PEERS: usize = <Client<CurrentNetwork>>::MAXIMUM_NUMBER_OF_PEERS;
++
+ pub type ClientMessage = Message<CurrentNetwork, Client<CurrentNetwork>>;
+ pub type ClientNonce = u64;
+ 
+-/// The test node; it consists of a `Pea2PeaNode` that handles networking and `State`
++/// The test node; it consists of a `Node` that handles networking and `State`
+ /// that can be extended freely based on test requirements.
+ #[derive(Clone)]
+ pub struct SynthNode {
+@@ -58,24 +60,19 @@ pub struct SynthNode {
+ /// Represents a connected snarkOS client peer.
+ pub struct ClientPeer {
+     pub connected_addr: SocketAddr,
+-    pub nonce: ClientNonce,
+-    pub node_type: NodeType,
+-    pub cumulative_weight: u128,
+-    pub peer_version: u32,
++    pub listening_addr: SocketAddr,
++    nonce: ClientNonce,
+ }
+ 
+ /// snarkOS client state required for test purposes.
+ #[derive(Clone)]
+ pub struct ClientState {
+-    /// The random nonce used during the handshake.
+     pub local_nonce: ClientNonce,
+-    /// The map of listening addresses to the corresponding peers.
+-    /// `Pea2Pea` includes its own internal peer handling, but snarkOS nodes
+-    /// must discover the listening address and unique nonce of each peer; this
+-    /// collection facilitates the snarkOS peering experience to align with snarkOS logic.
+-    pub peers: Arc<RwLock<HashMap<SocketAddr, ClientPeer>>>,
+-    /// A map from connected addresses to listening addresses.
+-    pub address_map: Arc<RwLock<HashMap<SocketAddr, SocketAddr>>>,
++    /// The list of known peers; `Pea2Pea` includes its own internal peer handling,
++    /// but snarkOS nodes must discover the listening address and unique nonce of each peer;
++    /// this collection facilitates the snarkOS peering experience to align with snarkOS logic.
++    pub peers: Arc<Mutex<Vec<ClientPeer>>>,
++    pub status: Status,
+ }
+ 
+ impl Default for ClientState {
+@@ -83,7 +80,7 @@ impl Default for ClientState {
+         Self {
+             local_nonce: thread_rng().gen(),
+             peers: Default::default(),
+-            address_map: Default::default(),
++            status: Status::new(),
+         }
+     }
+ }
+@@ -95,23 +92,37 @@ impl Pea2Pea for SynthNode {
+ }
+ 
+ impl SynthNode {
+-    /// Creates a test node using the given `Pea2Pea` node and with the given `State`.
++    /// Creates a test node using the given `Pea2Pea` node.
+     pub fn new(node: Pea2PeaNode, state: ClientState) -> Self {
+         Self { node, state }
+     }
+ 
+-    /// Returns the peer's connected address when provided with the listening address.
+-    pub fn get_peer_connected_addr(&self, addr: SocketAddr) -> Option<SocketAddr> {
+-        debug_assert!(self.node().connected_addrs().contains(&addr));
++    pub fn node_type(&self) -> NodeType {
++        NodeType::Client
++    }
+ 
+-        self.state.peers.read().get(&addr).map(|peer| peer.connected_addr)
++    pub fn state(&self) -> State {
++        self.state.status.get()
+     }
+ 
+-    /// Returns the peer's listening address when provided with the connected address.
+-    pub fn get_peer_listening_addr(&self, addr: SocketAddr) -> Option<SocketAddr> {
+-        debug_assert!(self.state.peers.read().contains_key(&addr));
++    pub async fn get_peer_connected_addr(&self, addr: SocketAddr) -> Option<SocketAddr> {
++        self.state
++            .peers
++            .lock()
++            .await
++            .iter()
++            .find(|peer| peer.listening_addr == addr || peer.connected_addr == addr)
++            .map(|peer| peer.connected_addr)
++    }
+ 
+-        self.state.address_map.read().get(&addr).copied()
++    pub async fn get_peer_listening_addr(&self, addr: SocketAddr) -> Option<SocketAddr> {
++        self.state
++            .peers
++            .lock()
++            .await
++            .iter()
++            .find(|peer| peer.connected_addr == addr || peer.listening_addr == addr)
++            .map(|peer| peer.listening_addr)
+     }
+ }
+ 
+@@ -119,15 +130,12 @@ impl SynthNode {
+ #[async_trait::async_trait]
+ impl Handshake for SynthNode {
+     async fn perform_handshake(&self, mut connection: Connection) -> io::Result<Connection> {
+-        let own_ip = self.node().listening_addr()?;
+-        let peer_addr = connection.addr;
++        // Guard against double (two-sided) connections.
++        let mut locked_peers = self.state.peers.lock().await;
+ 
+-        // An immediate duplicate connection check.
+-        if self.state.address_map.read().contains_key(&peer_addr) {
+-            return Err(io::ErrorKind::AlreadyExists.into());
+-        }
++        let own_ip = self.node().listening_addr()?;
++        let peer_ip = connection.addr;
+ 
+-        // The genesis block header is used in the handshake.
+         let genesis_block_header = CurrentNetwork::genesis_block().header();
+ 
+         // Send a challenge request to the peer.
+@@ -140,14 +148,13 @@ impl Handshake for SynthNode {
+             self.state.local_nonce,
+             0,
+         );
+-        trace!(parent: self.node().span(), "sending a challenge request to {}", peer_addr);
++        trace!(parent: self.node().span(), "sending a challenge request to {}", peer_ip);
+         let mut msg = Vec::new();
+         own_request.serialize_into(&mut msg).unwrap();
+         let len = u32::to_le_bytes(msg.len() as u32);
+         connection.writer().write_all(&len).await?;
+         connection.writer().write_all(&msg).await?;
+ 
+-        // A buffer for reading handshake messages.
+         let mut buf = [0u8; 1024];
+ 
+         // Read the challenge request from the peer.
+@@ -157,38 +164,44 @@ impl Handshake for SynthNode {
+         let peer_request = ClientMessage::deserialize(&mut io::Cursor::new(&buf[..len]));
+ 
+         // Register peer's nonce.
+-        let (peer_listening_addr, peer_nonce, peer_node_type, cumulative_weight, peer_version) = if let Ok(Message::ChallengeRequest(
++        let (peer_listening_addr, peer_nonce) = if let Ok(Message::ChallengeRequest(
+             peer_version,
+             _peer_fork_depth,
+-            peer_node_type,
++            _peer_node_type,
+             _peer_status,
+             peer_listening_port,
+             peer_nonce,
+-            cumulative_weight,
++            _cumulative_weight,
+         )) = peer_request
+         {
+-            // Don't reject peers due to the client version in order to keep track of non-compliant peers.
++            if peer_version < MESSAGE_VERSION {
++                warn!(parent: self.node().span(), "dropping {} due to outdated version ({})", peer_ip, peer_version);
++                return Err(io::ErrorKind::InvalidData.into());
++            }
+ 
+-            let peer_listening_addr = SocketAddr::from((peer_addr.ip(), peer_listening_port));
++            let peer_listening_ip = SocketAddr::from((peer_ip.ip(), peer_listening_port));
+ 
+-            if self.state.peers.read().contains_key(&peer_listening_addr) {
++            if locked_peers
++                .iter()
++                .any(|peer| peer.nonce == peer_nonce || peer.listening_addr == peer_listening_ip)
++            {
+                 return Err(io::ErrorKind::AlreadyExists.into());
+             }
+ 
+-            trace!(parent: self.node().span(), "received a challenge request from {}", peer_addr);
++            trace!(parent: self.node().span(), "received a challenge request from {}", peer_ip);
+ 
+-            (peer_listening_addr, peer_nonce, peer_node_type, cumulative_weight, peer_version)
++            (peer_listening_ip, peer_nonce)
+         } else if let Ok(Message::Disconnect(reason)) = peer_request {
+-            warn!(parent: self.node().span(), "{} disconnected: {:?}", peer_addr, reason);
++            warn!(parent: self.node().span(), "{} disconnected: {:?}", peer_ip, reason);
+             return Err(io::ErrorKind::NotConnected.into());
+         } else {
+-            error!(parent: self.node().span(), "invalid challenge request from {}", peer_addr);
++            error!(parent: self.node().span(), "invalid challenge request from {}", peer_ip);
+             return Err(io::ErrorKind::InvalidData.into());
+         };
+ 
+         // Respond with own challenge request.
+         let own_response = ClientMessage::ChallengeResponse(Data::Object(genesis_block_header.clone()));
+-        trace!(parent: self.node().span(), "sending a challenge response to {}", peer_addr);
++        trace!(parent: self.node().span(), "sending a challenge response to {}", peer_ip);
+         let mut msg = Vec::new();
+         own_response.serialize_into(&mut msg).unwrap();
+         let len = u32::to_le_bytes(msg.len() as u32);
+@@ -204,41 +217,26 @@ impl Handshake for SynthNode {
+         if let Ok(Message::ChallengeResponse(block_header)) = peer_response {
+             let block_header = block_header.deserialize().await.unwrap();
+ 
+-            trace!(parent: self.node().span(), "received a challenge response from {}", peer_addr);
+-            if &block_header == genesis_block_header {
+-                let mut locked_peers = self.state.peers.write();
+-                let mut locked_addr_map = self.state.address_map.write();
+-
+-                if locked_addr_map.contains_key(&peer_addr) || locked_peers.contains_key(&peer_listening_addr) {
+-                    return Err(io::ErrorKind::AlreadyExists.into());
+-                }
+-
+-                locked_addr_map.insert(peer_addr, peer_listening_addr);
+-
++            trace!(parent: self.node().span(), "received a challenge response from {}", peer_ip);
++            if block_header.height() == CHALLENGE_HEIGHT && &block_header == genesis_block_header && block_header.is_valid() {
+                 // Register the newly connected snarkOS peer.
+-                locked_peers.insert(peer_listening_addr, ClientPeer {
+-                    connected_addr: peer_addr,
++                locked_peers.push(ClientPeer {
++                    connected_addr: peer_ip,
++                    listening_addr: peer_listening_addr,
+                     nonce: peer_nonce,
+-                    node_type: peer_node_type,
+-                    cumulative_weight,
+-                    peer_version,
+                 });
+-
+-                drop(locked_addr_map);
+-                drop(locked_peers);
+-
+-                debug!(parent: self.node().span(), "connected to {} (listening addr: {})", peer_addr, peer_listening_addr);
++                debug!(parent: self.node().span(), "connected to {} (listening addr: {})", peer_ip, peer_listening_addr);
+ 
+                 Ok(connection)
+             } else {
+-                error!(parent: self.node().span(), "invalid challenge response from {}", peer_addr);
++                error!(parent: self.node().span(), "invalid challenge response from {}", peer_ip);
+                 Err(io::ErrorKind::InvalidData.into())
+             }
+         } else if let Ok(Message::Disconnect(reason)) = peer_response {
+-            warn!(parent: self.node().span(), "{} disconnected: {:?}", peer_addr, reason);
++            warn!(parent: self.node().span(), "{} disconnected: {:?}", peer_ip, reason);
+             return Err(io::ErrorKind::NotConnected.into());
+         } else {
+-            error!(parent: self.node().span(), "invalid challenge response from {}", peer_addr);
++            error!(parent: self.node().span(), "invalid challenge response from {}", peer_ip);
+             Err(io::ErrorKind::InvalidData.into())
+         }
+     }
+@@ -262,11 +260,16 @@ impl Writing for SynthNode {
+ #[async_trait::async_trait]
+ impl Disconnect for SynthNode {
+     async fn handle_disconnect(&self, disconnecting_addr: SocketAddr) {
+-        debug_assert_eq!(self.state.address_map.read().len(), self.state.peers.read().len());
+-
+-        if let Some(listening_addr) = self.state.address_map.write().remove(&disconnecting_addr) {
+-            self.state.peers.write().remove(&listening_addr);
+-        }
++        let mut locked_peers = self.state.peers.lock().await;
++        locked_peers.retain(|peer| peer.connected_addr != disconnecting_addr);
++        assert_eq!(
++            locked_peers.len(),
++            locked_peers
++                .iter()
++                .map(|peer| (peer.listening_addr, peer.connected_addr))
++                .collect::<HashSet<_>>()
++                .len()
++        );
+     }
+ }
+ 
+diff --git a/Cargo.lock b/Cargo.lock
+index f71bc836f..382b8d445 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -105,9 +105,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "anyhow"
+-version = "1.0.56"
++version = "1.0.55"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4361135be9122e0870de935d7c439aef945b9f9ddd4199a553b5270b49c82a27"
++checksum = "159bb86af3a200e19a068f4224eae4c8bb2d0fa054c7e5d1cacd5cef95e684cd"
+ 
+ [[package]]
+ name = "arrayref"
+@@ -796,7 +796,6 @@ checksum = "f2fb860ca6fafa5552fb6d0e816a69c8e49f0908bf524e30a90d97c85892d506"
+ dependencies = [
+  "block-buffer 0.10.2",
+  "crypto-common",
+- "subtle",
+ ]
+ 
+ [[package]]
+@@ -878,12 +877,6 @@ version = "0.1.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e88a8acf291dafb59c2d96e8f59828f3838bb1a70398823ade51a84de6a6deed"
+ 
+-[[package]]
+-name = "fallible-iterator"
+-version = "0.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
+-
+ [[package]]
+ name = "fastrand"
+ version = "1.7.0"
+@@ -1169,15 +1162,6 @@ version = "0.4.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+ 
+-[[package]]
+-name = "hmac"
+-version = "0.12.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+-dependencies = [
+- "digest 0.10.3",
+-]
+-
+ [[package]]
+ name = "http"
+ version = "0.2.6"
+@@ -1309,9 +1293,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "ipnet"
+-version = "2.4.0"
++version = "2.3.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "35e70ee094dc02fd9c13fdad4940090f22dbd6ac7c9e7094a46cf0232a50bc7c"
++checksum = "68f2d64f2edebec4ce84ad108148e67e1064789bee435edc5b60ad398714a3a9"
+ 
+ [[package]]
+ name = "itertools"
+@@ -1487,9 +1471,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "libz-sys"
+-version = "1.1.5"
++version = "1.1.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6f35facd4a5673cb5a48822be2be1d4236c1c99cb4113cab7061ac720d5bf859"
++checksum = "de5435b8549c16d423ed0c03dbaafe57cf6c3344744f1242520d59c9d8ecec66"
+ dependencies = [
+  "cc",
+  "libc",
+@@ -1539,15 +1523,6 @@ version = "0.1.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a3e378b66a060d48947b590737b30a1be76706c8dd7b8ba0f2fe3989c68a853f"
+ 
+-[[package]]
+-name = "md-5"
+-version = "0.10.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "658646b21e0b72f7866c7038ab086d3d5e1cd6271f060fd37defb241949d0582"
+-dependencies = [
+- "digest 0.10.3",
+-]
+-
+ [[package]]
+ name = "memchr"
+ version = "2.4.1"
+@@ -1923,9 +1898,9 @@ checksum = "0744126afe1a6dd7f394cb50a716dbe086cb06e255e53d8d0185d82828358fb5"
+ 
+ [[package]]
+ name = "pea2pea"
+-version = "0.34.0"
++version = "0.33.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0d90feae3311b6204e24def79e34e663816bed86264bf3788de3a1c20a391f7e"
++checksum = "348fe4a211a16afef08c2c2004e903c72fa5684b8faa9934559e8058c178bd11"
+ dependencies = [
+  "async-trait",
+  "once_cell",
+@@ -1961,24 +1936,6 @@ dependencies = [
+  "ucd-trie",
+ ]
+ 
+-[[package]]
+-name = "phf"
+-version = "0.10.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fabbf1ead8a5bcbc20f5f8b939ee3f5b0f6f281b6ad3468b84656b658b455259"
+-dependencies = [
+- "phf_shared",
+-]
+-
+-[[package]]
+-name = "phf_shared"
+-version = "0.10.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b6796ad771acdc0123d2a88dc428b5e38ef24456743ddb1744ed628f9815c096"
+-dependencies = [
+- "siphasher",
+-]
+-
+ [[package]]
+ name = "pin-project-lite"
+ version = "0.2.8"
+@@ -2025,49 +1982,6 @@ dependencies = [
+  "plotters-backend",
+ ]
+ 
+-[[package]]
+-name = "postgres-native-tls"
+-version = "0.5.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "2d442770e2b1e244bb5eb03b31c79b65bb2568f413b899eaba850fa945a65954"
+-dependencies = [
+- "futures",
+- "native-tls",
+- "tokio",
+- "tokio-native-tls",
+- "tokio-postgres",
+-]
+-
+-[[package]]
+-name = "postgres-protocol"
+-version = "0.6.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "79ec03bce71f18b4a27c4c64c6ba2ddf74686d69b91d8714fb32ead3adaed713"
+-dependencies = [
+- "base64",
+- "byteorder",
+- "bytes",
+- "fallible-iterator",
+- "hmac",
+- "md-5",
+- "memchr",
+- "rand",
+- "sha2 0.10.2",
+- "stringprep",
+-]
+-
+-[[package]]
+-name = "postgres-types"
+-version = "0.2.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "04619f94ba0cc80999f4fc7073607cb825bc739a883cb6d20900fc5e009d6b0d"
+-dependencies = [
+- "bytes",
+- "fallible-iterator",
+- "postgres-protocol",
+- "time 0.3.7",
+-]
+-
+ [[package]]
+ name = "ppv-lite86"
+ version = "0.2.16"
+@@ -2253,9 +2167,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "redox_syscall"
+-version = "0.2.11"
++version = "0.2.10"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8380fe0152551244f0747b1bf41737e0f8a74f97a14ccefd1148187271634f3c"
++checksum = "8383f39639269cde97d255a32bdb68c047337295414940c68bdd30c2e13203ff"
+ dependencies = [
+  "bitflags",
+ ]
+@@ -2272,9 +2186,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "regex"
+-version = "1.5.5"
++version = "1.5.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1a11647b6b25ff05a515cb92c365cec08801e83423a235b51e231e1808747286"
++checksum = "d07a8629359eb56f1e2fb1652bb04212c072a87ba68546a04065d525673ac461"
+ dependencies = [
+  "aho-corasick",
+  "memchr",
+@@ -2703,12 +2617,6 @@ dependencies = [
+  "libc",
+ ]
+ 
+-[[package]]
+-name = "siphasher"
+-version = "0.3.10"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7bd3e3206899af3f8b12af284fafc038cc1dc2b41d1b89dd17297221c5d225de"
+-
+ [[package]]
+ name = "sketches-ddsketch"
+ version = "0.1.2"
+@@ -2758,16 +2666,11 @@ dependencies = [
+ name = "snarkos-crawler"
+ version = "2.0.2"
+ dependencies = [
+- "anyhow",
+  "async-trait",
+- "bincode",
+- "native-tls",
+  "parking_lot 0.12.0",
+  "pea2pea",
+- "postgres-native-tls",
+  "rand",
+  "snarkos-environment",
+- "snarkos-integration",
+  "snarkos-metrics",
+  "snarkos-network",
+  "snarkos-storage",
+@@ -2776,9 +2679,7 @@ dependencies = [
+  "structopt",
+  "time 0.3.7",
+  "tokio",
+- "tokio-postgres",
+  "tracing",
+- "tracing-subscriber",
+ ]
+ 
+ [[package]]
+@@ -2791,9 +2692,7 @@ dependencies = [
+  "serde",
+  "snarkvm",
+  "tokio",
+- "tokio-metrics",
+  "tracing",
+- "tracing-subscriber",
+ ]
+ 
+ [[package]]
+@@ -2905,7 +2804,6 @@ name = "snarkos-synthetic-node"
+ version = "2.0.2"
+ dependencies = [
+  "async-trait",
+- "parking_lot 0.12.0",
+  "pea2pea",
+  "rand",
+  "snarkos-environment",
+@@ -3197,16 +3095,6 @@ version = "0.5.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
+ 
+-[[package]]
+-name = "stringprep"
+-version = "0.1.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8ee348cb74b87454fff4b551cbf727025810a004f88aeacae7f85b87f4e9a1c1"
+-dependencies = [
+- "unicode-bidi",
+- "unicode-normalization",
+-]
+-
+ [[package]]
+ name = "strsim"
+ version = "0.8.0"
+@@ -3412,17 +3300,6 @@ dependencies = [
+  "syn 1.0.86",
+ ]
+ 
+-[[package]]
+-name = "tokio-metrics"
+-version = "0.1.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bcb585a0069b53171684e22d5255984ec30d1c7304fd0a4a9a603ffd8c765cdd"
+-dependencies = [
+- "futures-util",
+- "pin-project-lite",
+- "tokio",
+-]
+-
+ [[package]]
+ name = "tokio-native-tls"
+ version = "0.3.0"
+@@ -3433,29 +3310,6 @@ dependencies = [
+  "tokio",
+ ]
+ 
+-[[package]]
+-name = "tokio-postgres"
+-version = "0.7.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4b6c8b33df661b548dcd8f9bf87debb8c56c05657ed291122e1188698c2ece95"
+-dependencies = [
+- "async-trait",
+- "byteorder",
+- "bytes",
+- "fallible-iterator",
+- "futures",
+- "log",
+- "parking_lot 0.11.2",
+- "percent-encoding",
+- "phf",
+- "pin-project-lite",
+- "postgres-protocol",
+- "postgres-types",
+- "socket2",
+- "tokio",
+- "tokio-util 0.6.9",
+-]
+-
+ [[package]]
+ name = "tokio-rustls"
+ version = "0.23.2"
+diff --git a/Cargo.toml b/Cargo.toml
+index d55e24cfc..435be3eb8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -33,7 +33,6 @@ console = [ "crossterm", "tui" ]
+ cuda = [ "snarkvm/cuda" ]
+ prometheus = [ "snarkos-metrics/prometheus", "snarkos-network/prometheus" ]
+ rpc = [ "snarkos-rpc" ]
+-task-metrics = [ "snarkos-environment/task-metrics" ]
+ test = [ "snarkos-metrics/test", "snarkos-network/test" ]
+ 
+ [dependencies.aleo-std]
+diff --git a/environment/Cargo.toml b/environment/Cargo.toml
+index cf9557cce..1ee58a9d9 100644
+--- a/environment/Cargo.toml
++++ b/environment/Cargo.toml
+@@ -33,11 +33,7 @@ version = "0.8.0"
+ 
+ [dependencies.tokio]
+ version = "1"
+-features = ["sync", "rt", "time"]
+-
+-[dependencies.tokio-metrics]
+-version = "0.1"
+-optional = true
++features = ["sync", "rt"]
+ 
+ [dependencies.tracing]
+ version = "0.1"
+@@ -48,6 +44,3 @@ version = "0.3"
+ [dev-dependencies.tokio]
+ version = "1"
+ features = ["macros", "rt-multi-thread", "time"]
+-
+-[features]
+-task-metrics = [ "tokio-metrics" ]
+diff --git a/environment/src/helpers/node_type.rs b/environment/src/helpers/node_type.rs
+index 052b3f31b..688f3d15d 100644
+--- a/environment/src/helpers/node_type.rs
++++ b/environment/src/helpers/node_type.rs
+@@ -17,7 +17,7 @@
+ use serde::{Deserialize, Serialize};
+ use std::fmt;
+ 
+-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
++#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+ #[repr(u8)]
+ pub enum NodeType {
+     /// A client node is a full node, capable of sending and receiving blocks.
+diff --git a/environment/src/helpers/resources.rs b/environment/src/helpers/resources.rs
+index 9e1b4ed4a..12d37481c 100644
+--- a/environment/src/helpers/resources.rs
++++ b/environment/src/helpers/resources.rs
+@@ -20,12 +20,8 @@ use std::{
+         atomic::{AtomicUsize, Ordering},
+         Arc,
+     },
+-    time::Duration,
+-};
+-use tokio::{
+-    sync::{mpsc, oneshot},
+-    time::sleep,
+ };
++use tokio::sync::{mpsc, oneshot};
+ 
+ pub type ResourceId = usize;
+ 
+@@ -111,13 +107,8 @@ impl Resources {
+                     }
+                     ResourceRequest::Deregister(id) => {
+                         if let Some(resource) = resources.remove(&id) {
+-                            // Spawn a short-lived task that will allow some time for the
+-                            // to-be-aborted task to free its resources.
+-                            tokio::spawn(async move {
+-                                sleep(Duration::from_secs(1)).await;
+-                                trace!("Aborting resource with the id {}", id);
+-                                resource.abort().await;
+-                            });
++                            trace!("Aborting resource with the id {}", id);
++                            resource.abort().await;
+                         } else {
+                             error!("Resource with the id {} was not found", id);
+                         }
+@@ -168,51 +159,14 @@ impl Resources {
+ 
+     /// Register the given task with the resource handler and optionally
+     /// with an associated resource id.
+-    pub fn register_task(&self, id: Option<ResourceId>, handle: tokio::task::JoinHandle<()>) {
++    pub fn register_task(&self, handle: tokio::task::JoinHandle<()>, id: Option<ResourceId>) {
+         let task = Resource::Task(handle);
+         self.register(task, id);
+     }
+ 
+-    /// Register a task and instrument it with the given `name`; useful metrics on it will be logged every `interval`.
+-    #[cfg(feature = "task-metrics")]
+-    pub fn register_instrumented_task(
+-        &self,
+-        id: Option<ResourceId>,
+-        name: String,
+-        interval: std::time::Duration,
+-        handle: tokio::task::JoinHandle<()>,
+-    ) {
+-        let task_monitor = tokio_metrics::TaskMonitor::new();
+-
+-        let tm = task_monitor.clone();
+-        self.register_task(
+-            None,
+-            tokio::spawn(async move {
+-                loop {
+-                    tokio::time::sleep(interval).await;
+-                    let metrics = tm.cumulative(); // Note: the list of metrics below is not exhaustive.
+-                    debug!(
+-                        "['{}' task metrics] mean poll duration: {:?}; mean idle duration: {:?}; slow poll ratio: {:?}",
+-                        name,
+-                        metrics.mean_poll_duration(),
+-                        metrics.mean_idle_duration(),
+-                        metrics.slow_poll_ratio(),
+-                    );
+-                }
+-            }),
+-        );
+-
+-        self.register_task(
+-            id,
+-            tokio::spawn(async move {
+-                let _ = task_monitor.instrument(handle).await;
+-            }),
+-        );
+-    }
+-
+     /// Register the given thread with the resource handler and optionally
+     /// with an associated resource id.
+-    pub fn register_thread(&self, id: Option<ResourceId>, handle: std::thread::JoinHandle<()>, abort_sender: AbortSignal) {
++    pub fn register_thread(&self, handle: std::thread::JoinHandle<()>, abort_sender: AbortSignal, id: Option<ResourceId>) {
+         let thread = Resource::Thread(handle, abort_sender);
+         self.register(thread, id);
+     }
+@@ -241,8 +195,8 @@ impl Resources {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use std::thread;
+-    use tokio::sync::oneshot;
++    use std::{thread, time::Duration};
++    use tokio::{sync::oneshot, time};
+ 
+     struct DropChecker(usize);
+ 
+@@ -260,27 +214,14 @@ mod tests {
+         let resources = Resources::default();
+         resources.log_summary();
+ 
+-        let task_id0 = resources.procure_id();
+-        let task0 = tokio::task::spawn(async move {
+-            let _drop_checker = DropChecker(task_id0);
++        let task_id = resources.procure_id();
++        let task = tokio::task::spawn(async move {
++            let _drop_checker = DropChecker(task_id);
+             loop {
+-                sleep(Duration::from_millis(10)).await;
++                time::sleep(Duration::from_millis(10)).await;
+             }
+         });
+-        resources.register_task(Some(task_id0), task0);
+-
+-        resources.log_summary();
+-
+-        let resources_clone = resources.clone();
+-        let task_id1 = resources.procure_id();
+-        let task1 = tokio::task::spawn(async move {
+-            let _drop_checker = DropChecker(task_id1);
+-
+-            sleep(Duration::from_millis(1)).await;
+-
+-            resources_clone.deregister(task_id1);
+-        });
+-        resources.register_task(Some(task_id1), task1);
++        resources.register_task(task, Some(task_id));
+ 
+         resources.log_summary();
+ 
+@@ -295,18 +236,14 @@ mod tests {
+                 thread::sleep(Duration::from_millis(10));
+             }
+         });
+-        resources.register_thread(Some(thread_id), thread, tx);
+-
+-        thread::sleep(Duration::from_millis(10));
++        resources.register_thread(thread, tx, Some(thread_id));
+ 
+         resources.log_summary();
+-        resources.deregister(task_id0);
++        resources.deregister(task_id);
+         resources.log_summary();
+         resources.deregister(thread_id);
+         resources.log_summary();
+ 
+-        sleep(Duration::from_millis(100)).await;
+-
+-        resources.log_summary();
++        time::sleep(Duration::from_millis(100)).await;
+     }
+ }
+diff --git a/environment/src/helpers/status.rs b/environment/src/helpers/status.rs
+index f4b0a1d1e..d84496ba3 100644
+--- a/environment/src/helpers/status.rs
++++ b/environment/src/helpers/status.rs
+@@ -23,7 +23,7 @@ use std::{
+     },
+ };
+ 
+-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[repr(u8)]
+ pub enum State {
+     /// The ledger is ready to handle requests.
+diff --git a/network/src/ledger.rs b/network/src/ledger.rs
+index cda3d24c4..931e79ade 100644
+--- a/network/src/ledger.rs
++++ b/network/src/ledger.rs
+@@ -120,8 +120,7 @@ impl<N: Network, E: Environment> Ledger<N, E> {
+ 
+         let canon = Arc::new(LedgerState::open_writer::<S, P>(path)?);
+         let (canon_reader, reader_resource) = LedgerState::open_reader::<S, P>(path)?;
+-        // Register the thread; no need to provide an id, as it will run indefinitely.
+-        E::resources().register(reader_resource, None);
++        E::resources().register(reader_resource);
+ 
+         // Initialize the ledger.
+         let ledger = Arc::new(Self {
+@@ -142,21 +141,17 @@ impl<N: Network, E: Environment> Ledger<N, E> {
+         {
+             let ledger = ledger.clone();
+             let (router, handler) = oneshot::channel();
+-            E::resources().register_task(
+-                None, // No need to provide an id, as the task will run indefinitely.
+-                task::spawn(async move {
+-                    // Notify the outer function that the task is ready.
+-                    let _ = router.send(());
+-                    // Asynchronously wait for a ledger request.
+-                    while let Some(request) = ledger_handler.recv().await {
+-                        // Update the state of the ledger.
+-                        // Note: Do not wrap this call in a `task::spawn` as `BlockResponse` messages
+-                        // will end up being processed out of order.
+-                        ledger.update(request).await;
+-                    }
+-                }),
+-            );
+-
++            E::resources().register_task(task::spawn(async move {
++                // Notify the outer function that the task is ready.
++                let _ = router.send(());
++                // Asynchronously wait for a ledger request.
++                while let Some(request) = ledger_handler.recv().await {
++                    // Update the state of the ledger.
++                    // Note: Do not wrap this call in a `task::spawn` as `BlockResponse` messages
++                    // will end up being processed out of order.
++                    ledger.update(request).await;
++                }
++            }));
+             // Wait until the ledger handler is ready.
+             let _ = handler.await;
+         }
+diff --git a/network/src/operator.rs b/network/src/operator.rs
+index ae2f494f6..c1022f6ba 100644
+--- a/network/src/operator.rs
++++ b/network/src/operator.rs
+@@ -121,18 +121,14 @@ impl<N: Network, E: Environment> Operator<N, E> {
+             // Initialize the handler for the operator.
+             let operator_clone = operator.clone();
+             let (router, handler) = oneshot::channel();
+-            E::resources().register_task(
+-                None, // No need to provide an id, as the task will run indefinitely.
+-                task::spawn(async move {
+-                    // Notify the outer function that the task is ready.
+-                    let _ = router.send(());
+-                    // Asynchronously wait for a operator request.
+-                    while let Some(request) = operator_handler.recv().await {
+-                        operator_clone.update(request).await;
+-                    }
+-                }),
+-            );
+-
++            E::resources().register_task(task::spawn(async move {
++                // Notify the outer function that the task is ready.
++                let _ = router.send(());
++                // Asynchronously wait for a operator request.
++                while let Some(request) = operator_handler.recv().await {
++                    operator_clone.update(request).await;
++                }
++            }));
+             // Wait until the operator handler is ready.
+             let _ = handler.await;
+         }
+@@ -142,58 +138,54 @@ impl<N: Network, E: Environment> Operator<N, E> {
+                 // Initialize an update loop for the block template.
+                 let operator = operator.clone();
+                 let (router, handler) = oneshot::channel();
+-                E::resources().register_task(
+-                    None, // No need to provide an id, as the task will run indefinitely.
+-                    task::spawn(async move {
+-                        // Notify the outer function that the task is ready.
+-                        let _ = router.send(());
+-                        // TODO (julesdesmit): Add logic to the loop to retarget share difficulty.
+-                        loop {
+-                            // Determine if the current block template is stale.
+-                            let is_block_template_stale = match &*operator.block_template.read().await {
+-                                Some(template) => operator.ledger_reader.latest_block_height().saturating_add(1) != template.block_height(),
+-                                None => true,
+-                            };
+-
+-                            // Update the block template if it is stale.
+-                            if is_block_template_stale {
+-                                // Construct a new block template.
+-                                let transactions = operator.memory_pool.read().await.transactions();
+-                                let ledger_reader = operator.ledger_reader.clone();
+-                                let result = task::spawn_blocking(move || {
+-                                    E::thread_pool().install(move || {
+-                                        match ledger_reader.get_block_template(
+-                                            recipient,
+-                                            E::COINBASE_IS_PUBLIC,
+-                                            &transactions,
+-                                            &mut thread_rng(),
+-                                        ) {
+-                                            Ok(block_template) => Ok(block_template),
+-                                            Err(error) => Err(format!("Failed to produce a new block template: {}", error)),
+-                                        }
+-                                    })
+-                                })
+-                                .await;
++                E::resources().register_task(task::spawn(async move {
++                    // Notify the outer function that the task is ready.
++                    let _ = router.send(());
++                    // TODO (julesdesmit): Add logic to the loop to retarget share difficulty.
++                    loop {
++                        // Determine if the current block template is stale.
++                        let is_block_template_stale = match &*operator.block_template.read().await {
++                            Some(template) => operator.ledger_reader.latest_block_height().saturating_add(1) != template.block_height(),
++                            None => true,
++                        };
+ 
+-                                // Update the block template.
+-                                match result {
+-                                    Ok(Ok(block_template)) => {
+-                                        // Acquire the write lock to update the block template.
+-                                        *operator.block_template.write().await = Some(block_template);
+-                                        // Clear the set of known nonces.
+-                                        operator.known_nonces.write().await.clear();
++                        // Update the block template if it is stale.
++                        if is_block_template_stale {
++                            // Construct a new block template.
++                            let transactions = operator.memory_pool.read().await.transactions();
++                            let ledger_reader = operator.ledger_reader.clone();
++                            let result = task::spawn_blocking(move || {
++                                E::thread_pool().install(move || {
++                                    match ledger_reader.get_block_template(
++                                        recipient,
++                                        E::COINBASE_IS_PUBLIC,
++                                        &transactions,
++                                        &mut thread_rng(),
++                                    ) {
++                                        Ok(block_template) => Ok(block_template),
++                                        Err(error) => Err(format!("Failed to produce a new block template: {}", error)),
+                                     }
+-                                    Ok(Err(error_message)) => error!("{}", error_message),
+-                                    Err(error) => error!("{}", error),
+-                                };
+-                            }
++                                })
++                            })
++                            .await;
+ 
+-                            // Proceed to sleep for a preset amount of time.
+-                            tokio::time::sleep(HEARTBEAT_IN_SECONDS).await;
++                            // Update the block template.
++                            match result {
++                                Ok(Ok(block_template)) => {
++                                    // Acquire the write lock to update the block template.
++                                    *operator.block_template.write().await = Some(block_template);
++                                    // Clear the set of known nonces.
++                                    operator.known_nonces.write().await.clear();
++                                }
++                                Ok(Err(error_message)) => error!("{}", error_message),
++                                Err(error) => error!("{}", error),
++                            };
+                         }
+-                    }),
+-                );
+ 
++                        // Proceed to sleep for a preset amount of time.
++                        tokio::time::sleep(HEARTBEAT_IN_SECONDS).await;
++                    }
++                }));
+                 // Wait until the operator handler is ready.
+                 let _ = handler.await;
+             } else {
+diff --git a/network/src/peer.rs b/network/src/peer.rs
+index ffb7f0003..98aa6bfc2 100644
+--- a/network/src/peer.rs
++++ b/network/src/peer.rs
+@@ -333,9 +333,7 @@ impl<N: Network, E: Environment> Peer<N, E> {
+     ) {
+         let peers_router = peers_router.clone();
+ 
+-        // Procure a resource id to register the task with, as it might be terminated at any point in time.
+-        let peer_resource_id = E::resources().procure_id();
+-        E::resources().register_task(Some(peer_resource_id), task::spawn(async move {
++        task::spawn(async move {
+             // Register our peer with state which internally sets up some channels.
+             let mut peer = match Peer::new(stream, local_ip, local_nonce, &peers_router, &ledger_reader, &connected_nonces).await {
+                 Ok(peer) => {
+@@ -355,8 +353,6 @@ impl<N: Network, E: Environment> Peer<N, E> {
+                             warn!("Failed to report a failed connection");
+                         }
+                     }
+-                    E::resources().deregister(peer_resource_id);
+-
+                     return;
+                 }
+             };
+@@ -613,9 +609,7 @@ impl<N: Network, E: Environment> Peer<N, E> {
+                                     // Spawn an asynchronous task for the `Ping` request.
+                                     let peers_router = peers_router.clone();
+                                     let ledger_reader = ledger_reader.clone();
+-                                    // Procure a resource id to register the task with, as it might be terminated at any point in time.
+-                                    let ping_resource_id = E::resources().procure_id();
+-                                    E::resources().register_task(Some(ping_resource_id), task::spawn(async move {
++                                    task::spawn(async move {
+                                         // Sleep for the preset time before sending a `Ping` request.
+                                         tokio::time::sleep(Duration::from_secs(E::PING_SLEEP_IN_SECS)).await;
+ 
+@@ -628,9 +622,7 @@ impl<N: Network, E: Environment> Peer<N, E> {
+                                         if let Err(error) = peers_router.send(PeersRequest::MessageSend(peer_ip, message)).await {
+                                             warn!("[Ping] {}", error);
+                                         }
+-
+-                                        E::resources().deregister(ping_resource_id);
+-                                    }));
++                                    });
+                                 }
+                                 Message::UnconfirmedBlock(block_height, block_hash, block) => {
+                                     // Drop the peer, if they have sent more than 5 unconfirmed blocks in the last 5 seconds.
+@@ -774,8 +766,6 @@ impl<N: Network, E: Environment> Peer<N, E> {
+             {
+                 warn!("[Peer::Disconnect] {}", error);
+             }
+-
+-            E::resources().deregister(peer_resource_id);
+-        }));
++        });
+     }
+ }
+diff --git a/network/src/peers.rs b/network/src/peers.rs
+index 1710a8e4a..3a6feffc1 100644
+--- a/network/src/peers.rs
++++ b/network/src/peers.rs
+@@ -138,30 +138,19 @@ impl<N: Network, E: Environment> Peers<N, E> {
+         {
+             let peers = peers.clone();
+             let (router, handler) = oneshot::channel();
+-            E::resources().register_task(
+-                None, // No need to provide an id, as the task will run indefinitely.
+-                task::spawn(async move {
+-                    // Notify the outer function that the task is ready.
+-                    let _ = router.send(());
+-                    // Asynchronously wait for a peers request.
+-                    while let Some(request) = peers_handler.recv().await {
+-                        let peers = peers.clone();
+-                        // Procure a resource id to register the task with, as it might be terminated at any point in time.
+-                        let resource_id = E::resources().procure_id();
+-                        // Asynchronously process a peers request.
+-                        E::resources().register_task(
+-                            Some(resource_id),
+-                            task::spawn(async move {
+-                                // Update the state of the peers.
+-                                peers.update(request).await;
+-
+-                                E::resources().deregister(resource_id);
+-                            }),
+-                        );
+-                    }
+-                }),
+-            );
+-
++            E::resources().register_task(task::spawn(async move {
++                // Notify the outer function that the task is ready.
++                let _ = router.send(());
++                // Asynchronously wait for a peers request.
++                while let Some(request) = peers_handler.recv().await {
++                    let peers = peers.clone();
++                    // Asynchronously process a peers request.
++                    task::spawn(async move {
++                        // Update the state of the peers.
++                        peers.update(request).await;
++                    });
++                }
++            }));
+             // Wait until the peers router task is ready.
+             let _ = handler.await;
+         }
+@@ -413,16 +402,9 @@ impl<N: Network, E: Environment> Peers<N, E> {
+                         }
+ 
+                         // Do not wait for the result of each connection.
+-                        // Procure a resource id to register the task with, as it might be terminated at any point in time.
+-                        let resource_id = E::resources().procure_id();
+-                        E::resources().register_task(
+-                            Some(resource_id),
+-                            task::spawn(async move {
+-                                let _ = handler.await;
+-
+-                                E::resources().deregister(resource_id);
+-                            }),
+-                        );
++                        E::resources().register_task(task::spawn(async move {
++                            let _ = handler.await;
++                        }));
+                     }
+                 }
+ 
+@@ -478,16 +460,9 @@ impl<N: Network, E: Environment> Peers<N, E> {
+                             warn!("Failed to transmit the request: '{}'", error);
+                         }
+                         // Do not wait for the result of each connection.
+-                        // Procure a resource id to register the task with, as it might be terminated at any point in time.
+-                        let resource_id = E::resources().procure_id();
+-                        E::resources().register_task(
+-                            Some(resource_id),
+-                            task::spawn(async move {
+-                                let _ = handler.await;
+-
+-                                E::resources().deregister(resource_id);
+-                            }),
+-                        );
++                        task::spawn(async move {
++                            let _ = handler.await;
++                        });
+                     }
+                 }
+             }
+diff --git a/network/src/prover.rs b/network/src/prover.rs
+index cd358a348..ebe22d8c9 100644
+--- a/network/src/prover.rs
++++ b/network/src/prover.rs
+@@ -109,19 +109,15 @@ impl<N: Network, E: Environment> Prover<N, E> {
+         {
+             let prover = prover.clone();
+             let (router, handler) = oneshot::channel();
+-            E::resources().register_task(
+-                None, // No need to provide an id, as the task will run indefinitely.
+-                task::spawn(async move {
+-                    // Notify the outer function that the task is ready.
+-                    let _ = router.send(());
+-                    // Asynchronously wait for a prover request.
+-                    while let Some(request) = prover_handler.recv().await {
+-                        // Update the state of the prover.
+-                        prover.update(request).await;
+-                    }
+-                }),
+-            );
+-
++            E::resources().register_task(task::spawn(async move {
++                // Notify the outer function that the task is ready.
++                let _ = router.send(());
++                // Asynchronously wait for a prover request.
++                while let Some(request) = prover_handler.recv().await {
++                    // Update the state of the prover.
++                    prover.update(request).await;
++                }
++            }));
+             // Wait until the prover handler is ready.
+             let _ = handler.await;
+         }
+@@ -135,23 +131,20 @@ impl<N: Network, E: Environment> Prover<N, E> {
+         if E::NODE_TYPE == NodeType::Prover && prover.pool.is_some() {
+             let prover = prover.clone();
+             let (router, handler) = oneshot::channel();
+-            E::resources().register_task(
+-                None, // No need to provide an id, as the task will run indefinitely.
+-                task::spawn(async move {
+-                    // Notify the outer function that the task is ready.
+-                    let _ = router.send(());
+-                    loop {
+-                        // Sleep for `1` second.
+-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+-
+-                        // TODO (howardwu): Check that the prover is connected to the pool before proceeding.
+-                        //  Currently we use a sleep function to probabilistically ensure the peer is connected.
+-                        if !E::terminator().load(Ordering::SeqCst) && !E::status().is_peering() && !E::status().is_mining() {
+-                            prover.send_pool_register().await;
+-                        }
++            E::resources().register_task(task::spawn(async move {
++                // Notify the outer function that the task is ready.
++                let _ = router.send(());
++                loop {
++                    // Sleep for `1` second.
++                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
++
++                    // TODO (howardwu): Check that the prover is connected to the pool before proceeding.
++                    //  Currently we use a sleep function to probabilistically ensure the peer is connected.
++                    if !E::terminator().load(Ordering::SeqCst) && !E::status().is_peering() && !E::status().is_mining() {
++                        prover.send_pool_register().await;
+                     }
+-                }),
+-            );
++                }
++            }));
+ 
+             // Wait until the operator handler is ready.
+             let _ = handler.await;
+@@ -324,74 +317,63 @@ impl<N: Network, E: Environment> Prover<N, E> {
+                 // Initialize the prover process.
+                 let prover = prover.clone();
+                 let (router, handler) = oneshot::channel();
+-                E::resources().register_task(
+-                    None, // No need to provide an id, as the task will run indefinitely.
+-                    task::spawn(async move {
+-                        // Notify the outer function that the task is ready.
+-                        let _ = router.send(());
+-                        loop {
+-                            // If `terminator` is `false` and the status is not `Peering` or `Mining` already, mine the next block.
+-                            if !E::terminator().load(Ordering::SeqCst) && !E::status().is_peering() && !E::status().is_mining() {
+-                                // Set the status to `Mining`.
+-                                E::status().update(State::Mining);
+-
+-                                // Prepare the unconfirmed transactions and dependent objects.
+-                                let state = prover.state.clone();
+-                                let canon = prover.ledger_reader.clone(); // This is *safe* as the ledger only reads.
+-                                let unconfirmed_transactions = prover.memory_pool.read().await.transactions();
+-                                let ledger_router = prover.ledger_router.clone();
+-                                let prover_router = prover.prover_router.clone();
+-
+-                                // Procure a resource id to register the task with, as it might be terminated at any point in time.
+-                                let mining_task_id = E::resources().procure_id();
+-                                E::resources().register_task(
+-                                    Some(mining_task_id),
+-                                    task::spawn(async move {
+-                                        // Mine the next block.
+-                                        let result = task::spawn_blocking(move || {
+-                                            E::thread_pool().install(move || {
+-                                                canon.mine_next_block(
+-                                                    recipient,
+-                                                    E::COINBASE_IS_PUBLIC,
+-                                                    &unconfirmed_transactions,
+-                                                    E::terminator(),
+-                                                    &mut thread_rng(),
+-                                                )
+-                                            })
+-                                        })
+-                                        .await
+-                                        .map_err(|e| e.into());
+-
+-                                        // Set the status to `Ready`.
+-                                        E::status().update(State::Ready);
+-
+-                                        match result {
+-                                            Ok(Ok((block, coinbase_record))) => {
+-                                                debug!("Miner has found unconfirmed block {} ({})", block.height(), block.hash());
+-                                                // Store the coinbase record.
+-                                                if let Err(error) = state.add_coinbase_record(block.height(), coinbase_record) {
+-                                                    warn!("[Miner] Failed to store coinbase record - {}", error);
+-                                                }
+-
+-                                                // Broadcast the next block.
+-                                                let request = LedgerRequest::UnconfirmedBlock(local_ip, block, prover_router.clone());
+-                                                if let Err(error) = ledger_router.send(request).await {
+-                                                    warn!("Failed to broadcast mined block - {}", error);
+-                                                }
+-                                            }
+-                                            Ok(Err(error)) | Err(error) => trace!("{}", error),
++                E::resources().register_task(task::spawn(async move {
++                    // Notify the outer function that the task is ready.
++                    let _ = router.send(());
++                    loop {
++                        // If `terminator` is `false` and the status is not `Peering` or `Mining` already, mine the next block.
++                        if !E::terminator().load(Ordering::SeqCst) && !E::status().is_peering() && !E::status().is_mining() {
++                            // Set the status to `Mining`.
++                            E::status().update(State::Mining);
++
++                            // Prepare the unconfirmed transactions and dependent objects.
++                            let state = prover.state.clone();
++                            let canon = prover.ledger_reader.clone(); // This is *safe* as the ledger only reads.
++                            let unconfirmed_transactions = prover.memory_pool.read().await.transactions();
++                            let ledger_router = prover.ledger_router.clone();
++                            let prover_router = prover.prover_router.clone();
++
++                            task::spawn(async move {
++                                // Mine the next block.
++                                let result = task::spawn_blocking(move || {
++                                    E::thread_pool().install(move || {
++                                        canon.mine_next_block(
++                                            recipient,
++                                            E::COINBASE_IS_PUBLIC,
++                                            &unconfirmed_transactions,
++                                            E::terminator(),
++                                            &mut thread_rng(),
++                                        )
++                                    })
++                                })
++                                .await
++                                .map_err(|e| e.into());
++
++                                // Set the status to `Ready`.
++                                E::status().update(State::Ready);
++
++                                match result {
++                                    Ok(Ok((block, coinbase_record))) => {
++                                        debug!("Miner has found unconfirmed block {} ({})", block.height(), block.hash());
++                                        // Store the coinbase record.
++                                        if let Err(error) = state.add_coinbase_record(block.height(), coinbase_record) {
++                                            warn!("[Miner] Failed to store coinbase record - {}", error);
+                                         }
+ 
+-                                        E::resources().deregister(mining_task_id);
+-                                    }),
+-                                );
+-                            }
+-                            // Proceed to sleep for a preset amount of time.
+-                            tokio::time::sleep(MINER_HEARTBEAT_IN_SECONDS).await;
++                                        // Broadcast the next block.
++                                        let request = LedgerRequest::UnconfirmedBlock(local_ip, block, prover_router.clone());
++                                        if let Err(error) = ledger_router.send(request).await {
++                                            warn!("Failed to broadcast mined block - {}", error);
++                                        }
++                                    }
++                                    Ok(Err(error)) | Err(error) => trace!("{}", error),
++                                }
++                            });
+                         }
+-                    }),
+-                );
+-
++                        // Proceed to sleep for a preset amount of time.
++                        tokio::time::sleep(MINER_HEARTBEAT_IN_SECONDS).await;
++                    }
++                }));
+                 // Wait until the miner task is ready.
+                 let _ = handler.await;
+             } else {
+diff --git a/rpc/src/tests.rs b/rpc/src/tests.rs
+index 16cdfbef9..948030e5b 100644
+--- a/rpc/src/tests.rs
++++ b/rpc/src/tests.rs
+@@ -127,7 +127,7 @@ async fn new_rpc_server<N: Network, E: Environment, S: Storage>(existing_rpc_con
+     // Initialize the RPC server.
+     let (rpc_server_addr, rpc_server_handle) = initialize_rpc_server("127.0.0.1:0".parse().unwrap(), rpc_context).await;
+ 
+-    E::resources().register_task(None, rpc_server_handle);
++    E::resources().register_task(rpc_server_handle);
+ 
+     rpc_server_addr
+ }
+diff --git a/snarkos/node.rs b/snarkos/node.rs
+index 690227dc2..6a685a9b6 100644
+--- a/snarkos/node.rs
++++ b/snarkos/node.rs
+@@ -494,16 +494,13 @@ impl MinerStats {
+ // for the node to be able to intercept them and perform a clean shutdown.
+ // Note: Only Ctrl-C is supported; it should work on both Unix-family systems and Windows.
+ pub fn handle_signals<N: Network, E: Environment>(server: Server<N, E>) {
+-    E::resources().register_task(
+-        None, // No need to provide an id, as the task will run indefinitely.
+-        tokio::task::spawn(async move {
+-            match tokio::signal::ctrl_c().await {
+-                Ok(()) => {
+-                    server.shut_down().await;
+-                    std::process::exit(0);
+-                }
+-                Err(error) => error!("tokio::signal::ctrl_c encountered an error: {}", error),
++    tokio::task::spawn(async move {
++        match tokio::signal::ctrl_c().await {
++            Ok(()) => {
++                server.shut_down().await;
++                std::process::exit(0);
+             }
+-        }),
+-    );
++            Err(error) => error!("tokio::signal::ctrl_c encountered an error: {}", error),
++        }
++    });
+ }
+diff --git a/snarkos/server.rs b/snarkos/server.rs
+index 2c2153cb2..d705d2b8a 100644
+--- a/snarkos/server.rs
++++ b/snarkos/server.rs
+@@ -115,37 +115,33 @@ impl<N: Network, E: Environment> Server<N, E> {
+             let prover_router = prover.router();
+ 
+             let (router, handler) = oneshot::channel();
+-            E::resources().register_task(
+-                None, // No need to provide an id, as the task will run indefinitely.
+-                task::spawn(async move {
+-                    // Notify the outer function that the task is ready.
+-                    let _ = router.send(());
+-                    loop {
+-                        // Initialize the connection process.
+-                        let (router, handler) = oneshot::channel();
+-                        // Route a `Connect` request to the pool.
+-                        if let Err(error) = peers_router
+-                            .send(PeersRequest::Connect(
+-                                pool_ip,
+-                                ledger_reader.clone(),
+-                                ledger_router.clone(),
+-                                operator_router.clone(),
+-                                prover_router.clone(),
+-                                router,
+-                            ))
+-                            .await
+-                        {
+-                            trace!("[Connect] {}", error);
+-                        }
+-                        // Wait until the connection task is initialized.
+-                        let _ = handler.await;
+-
+-                        // Sleep for `30` seconds.
+-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
++            E::resources().register_task(task::spawn(async move {
++                // Notify the outer function that the task is ready.
++                let _ = router.send(());
++                loop {
++                    // Initialize the connection process.
++                    let (router, handler) = oneshot::channel();
++                    // Route a `Connect` request to the pool.
++                    if let Err(error) = peers_router
++                        .send(PeersRequest::Connect(
++                            pool_ip,
++                            ledger_reader.clone(),
++                            ledger_router.clone(),
++                            operator_router.clone(),
++                            prover_router.clone(),
++                            router,
++                        ))
++                        .await
++                    {
++                        trace!("[Connect] {}", error);
+                     }
+-                }),
+-            );
++                    // Wait until the connection task is initialized.
++                    let _ = handler.await;
+ 
++                    // Sleep for `30` seconds.
++                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
++                }
++            }));
+             // Wait until the prover handler is ready.
+             let _ = handler.await;
+         }
+@@ -267,43 +263,39 @@ impl<N: Network, E: Environment> Server<N, E> {
+     ) {
+         // Initialize the listener process.
+         let (router, handler) = oneshot::channel();
+-        E::resources().register_task(
+-            None, // No need to provide an id, as the task will run indefinitely.
+-            task::spawn(async move {
+-                // Notify the outer function that the task is ready.
+-                let _ = router.send(());
+-                info!("Listening for peers at {}", local_ip);
+-                loop {
+-                    // Don't accept connections if the node is breaching the configured peer limit.
+-                    if peers.number_of_connected_peers().await < E::MAXIMUM_NUMBER_OF_PEERS {
+-                        // Asynchronously wait for an inbound TcpStream.
+-                        match listener.accept().await {
+-                            // Process the inbound connection request.
+-                            Ok((stream, peer_ip)) => {
+-                                let request = PeersRequest::PeerConnecting(
+-                                    stream,
+-                                    peer_ip,
+-                                    ledger_reader.clone(),
+-                                    ledger_router.clone(),
+-                                    operator_router.clone(),
+-                                    prover_router.clone(),
+-                                );
+-                                if let Err(error) = peers.router().send(request).await {
+-                                    error!("Failed to send request to peers: {}", error)
+-                                }
++        E::resources().register_task(task::spawn(async move {
++            // Notify the outer function that the task is ready.
++            let _ = router.send(());
++            info!("Listening for peers at {}", local_ip);
++            loop {
++                // Don't accept connections if the node is breaching the configured peer limit.
++                if peers.number_of_connected_peers().await < E::MAXIMUM_NUMBER_OF_PEERS {
++                    // Asynchronously wait for an inbound TcpStream.
++                    match listener.accept().await {
++                        // Process the inbound connection request.
++                        Ok((stream, peer_ip)) => {
++                            let request = PeersRequest::PeerConnecting(
++                                stream,
++                                peer_ip,
++                                ledger_reader.clone(),
++                                ledger_router.clone(),
++                                operator_router.clone(),
++                                prover_router.clone(),
++                            );
++                            if let Err(error) = peers.router().send(request).await {
++                                error!("Failed to send request to peers: {}", error)
+                             }
+-                            Err(error) => error!("Failed to accept a connection: {}", error),
+                         }
+-                        // Add a small delay to prevent overloading the network from handshakes.
+-                        tokio::time::sleep(Duration::from_millis(150)).await;
+-                    } else {
+-                        // Add a sleep delay as the node has reached peer capacity.
+-                        tokio::time::sleep(Duration::from_secs(5)).await;
++                        Err(error) => error!("Failed to accept a connection: {}", error),
+                     }
++                    // Add a small delay to prevent overloading the network from handshakes.
++                    tokio::time::sleep(Duration::from_millis(150)).await;
++                } else {
++                    // Add a sleep delay as the node has reached peer capacity.
++                    tokio::time::sleep(Duration::from_secs(5)).await;
+                 }
+-            }),
+-        );
+-
++            }
++        }));
+         // Wait until the listener task is ready.
+         let _ = handler.await;
+     }
+@@ -321,32 +313,28 @@ impl<N: Network, E: Environment> Server<N, E> {
+     ) {
+         // Initialize the heartbeat process.
+         let (router, handler) = oneshot::channel();
+-        E::resources().register_task(
+-            None, // No need to provide an id, as the task will run indefinitely.
+-            task::spawn(async move {
+-                // Notify the outer function that the task is ready.
+-                let _ = router.send(());
+-                loop {
+-                    // Transmit a heartbeat request to the ledger.
+-                    if let Err(error) = ledger_router.send(LedgerRequest::Heartbeat(prover_router.clone())).await {
+-                        error!("Failed to send heartbeat to ledger: {}", error)
+-                    }
+-                    // Transmit a heartbeat request to the peers.
+-                    let request = PeersRequest::Heartbeat(
+-                        ledger_reader.clone(),
+-                        ledger_router.clone(),
+-                        operator_router.clone(),
+-                        prover_router.clone(),
+-                    );
+-                    if let Err(error) = peers_router.send(request).await {
+-                        error!("Failed to send heartbeat to peers: {}", error)
+-                    }
+-                    // Sleep for `E::HEARTBEAT_IN_SECS` seconds.
+-                    tokio::time::sleep(Duration::from_secs(E::HEARTBEAT_IN_SECS)).await;
++        E::resources().register_task(task::spawn(async move {
++            // Notify the outer function that the task is ready.
++            let _ = router.send(());
++            loop {
++                // Transmit a heartbeat request to the ledger.
++                if let Err(error) = ledger_router.send(LedgerRequest::Heartbeat(prover_router.clone())).await {
++                    error!("Failed to send heartbeat to ledger: {}", error)
+                 }
+-            }),
+-        );
+-
++                // Transmit a heartbeat request to the peers.
++                let request = PeersRequest::Heartbeat(
++                    ledger_reader.clone(),
++                    ledger_router.clone(),
++                    operator_router.clone(),
++                    prover_router.clone(),
++                );
++                if let Err(error) = peers_router.send(request).await {
++                    error!("Failed to send heartbeat to peers: {}", error)
++                }
++                // Sleep for `E::HEARTBEAT_IN_SECS` seconds.
++                tokio::time::sleep(Duration::from_secs(E::HEARTBEAT_IN_SECS)).await;
++            }
++        }));
+         // Wait until the heartbeat task is ready.
+         let _ = handler.await;
+     }
+@@ -381,8 +369,7 @@ impl<N: Network, E: Environment> Server<N, E> {
+ 
+             debug!("JSON-RPC server listening on {}", rpc_server_addr);
+ 
+-            // Register the task; no need to provide an id, as it will run indefinitely.
+-            E::resources().register_task(None, rpc_server_handle);
++            E::resources().register_task(rpc_server_handle);
+         }
+     }
+ 
+@@ -393,53 +380,49 @@ impl<N: Network, E: Environment> Server<N, E> {
+     async fn initialize_notification(ledger: LedgerReader<N>, prover: Arc<Prover<N, E>>, address: Option<Address<N>>) {
+         // Initialize the heartbeat process.
+         let (router, handler) = oneshot::channel();
+-        E::resources().register_task(
+-            None, // No need to provide an id, as the task will run indefinitely.
+-            task::spawn(async move {
+-                // Notify the outer function that the task is ready.
+-                let _ = router.send(());
+-                loop {
+-                    info!("{}", notification_message(address));
+-
+-                    if E::NODE_TYPE == NodeType::Miner {
+-                        if let Some(miner_address) = address {
+-                            // Retrieve the latest block height.
+-                            let latest_block_height = ledger.latest_block_height();
+-
+-                            // Prepare a list of confirmed and pending coinbase records.
+-                            let mut confirmed = vec![];
+-                            let mut pending = vec![];
+-
+-                            // Iterate through the coinbase records from storage.
+-                            for (block_height, record) in prover.to_coinbase_records() {
+-                                // Filter the coinbase records by determining if they exist on the canonical chain.
+-                                if let Ok(true) = ledger.contains_commitment(&record.commitment()) {
+-                                    // Ensure the record owner matches.
+-                                    if record.owner() == miner_address {
+-                                        // Add the block to the appropriate list.
+-                                        match block_height + 2048 < latest_block_height {
+-                                            true => confirmed.push((block_height, record)),
+-                                            false => pending.push((block_height, record)),
+-                                        }
++        E::resources().register_task(task::spawn(async move {
++            // Notify the outer function that the task is ready.
++            let _ = router.send(());
++            loop {
++                info!("{}", notification_message(address));
++
++                if E::NODE_TYPE == NodeType::Miner {
++                    if let Some(miner_address) = address {
++                        // Retrieve the latest block height.
++                        let latest_block_height = ledger.latest_block_height();
++
++                        // Prepare a list of confirmed and pending coinbase records.
++                        let mut confirmed = vec![];
++                        let mut pending = vec![];
++
++                        // Iterate through the coinbase records from storage.
++                        for (block_height, record) in prover.to_coinbase_records() {
++                            // Filter the coinbase records by determining if they exist on the canonical chain.
++                            if let Ok(true) = ledger.contains_commitment(&record.commitment()) {
++                                // Ensure the record owner matches.
++                                if record.owner() == miner_address {
++                                    // Add the block to the appropriate list.
++                                    match block_height + 2048 < latest_block_height {
++                                        true => confirmed.push((block_height, record)),
++                                        false => pending.push((block_height, record)),
+                                     }
+                                 }
+                             }
+-
+-                            info!(
+-                                "Mining Report (confirmed_blocks = {}, pending_blocks = {}, miner_address = {})",
+-                                confirmed.len(),
+-                                pending.len(),
+-                                miner_address
+-                            );
+                         }
+-                    }
+ 
+-                    // Sleep for `120` seconds.
+-                    tokio::time::sleep(Duration::from_secs(120)).await;
++                        info!(
++                            "Mining Report (confirmed_blocks = {}, pending_blocks = {}, miner_address = {})",
++                            confirmed.len(),
++                            pending.len(),
++                            miner_address
++                        );
++                    }
+                 }
+-            }),
+-        );
+ 
++                // Sleep for `120` seconds.
++                tokio::time::sleep(Duration::from_secs(120)).await;
++            }
++        }));
+         // Wait until the heartbeat task is ready.
+         let _ = handler.await;
+     }

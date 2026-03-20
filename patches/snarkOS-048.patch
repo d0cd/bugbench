@@ -1,60 +1,127 @@
-diff --git a/node/bft/src/gateway.rs b/node/bft/src/gateway.rs
-index 0e404ff63..00cc6b96e 100644
---- a/node/bft/src/gateway.rs
-+++ b/node/bft/src/gateway.rs
-@@ -1085,6 +1085,11 @@ impl<N: Network> Disconnect for Gateway<N> {
-     async fn handle_disconnect(&self, peer_addr: SocketAddr) {
-         if let Some(peer_ip) = self.resolver.get_listener(peer_addr) {
-             self.remove_connected_peer(peer_ip);
-+
-+            // We don't clear this map based on time but only on peer disconnect.
-+            // This is sufficient to avoid infinite growth as the committee has a fixed number
-+            // of members.
-+            self.cache.clear_outbound_validators_requests(peer_ip);
-         }
-     }
- }
-diff --git a/node/bft/src/helpers/cache.rs b/node/bft/src/helpers/cache.rs
-index 7e6bafc0a..49301a01f 100644
---- a/node/bft/src/helpers/cache.rs
-+++ b/node/bft/src/helpers/cache.rs
-@@ -119,6 +119,11 @@ impl<N: Network> Cache<N> {
-     pub fn decrement_outbound_validators_requests(&self, peer_ip: SocketAddr) -> u32 {
-         Self::decrement_counter(&self.seen_outbound_validators_requests, peer_ip)
-     }
-+
-+    /// Clears the the IP's number of validator requests.
-+    pub fn clear_outbound_validators_requests(&self, peer_ip: SocketAddr) {
-+        self.seen_outbound_validators_requests.write().remove(&peer_ip);
-+    }
+diff --git a/cli/src/commands/developer/scan.rs b/cli/src/commands/developer/scan.rs
+index d65fb103f..be0bde82f 100644
+--- a/cli/src/commands/developer/scan.rs
++++ b/cli/src/commands/developer/scan.rs
+@@ -16,7 +16,7 @@
+ 
+ use super::CurrentNetwork;
+ 
+-use snarkvm::prelude::{block::Block, Ciphertext, Field, Network, Plaintext, PrivateKey, Record, ViewKey};
++use snarkvm::prelude::{block::Block, Ciphertext, Field, FromBytes, Network, Plaintext, PrivateKey, Record, ViewKey};
+ 
+ use anyhow::{bail, ensure, Result};
+ use clap::Parser;
+@@ -28,6 +28,7 @@ use std::{
+ };
+ 
+ const MAX_BLOCK_RANGE: u32 = 50;
++const CDN_ENDPOINT: &str = "https://s3.us-west-1.amazonaws.com/testnet3.blocks/phase3";
+ 
+ /// Scan the snarkOS node for records.
+ #[derive(Debug, Parser)]
+@@ -55,10 +56,6 @@ pub struct Scan {
+     /// The endpoint to scan blocks from.
+     #[clap(long)]
+     endpoint: String,
+-
+-    /// Enables the node to prefetch initial blocks from a CDN
+-    #[clap(default_value = "https://s3.us-west-1.amazonaws.com/testnet3.blocks/phase3", long = "cdn")]
+-    cdn: String,
  }
  
- impl<N: Network> Cache<N> {
-@@ -293,4 +298,27 @@ mod tests {
-        outbound_certificate,
-        outbound_transmission
+ impl Scan {
+@@ -70,7 +67,7 @@ impl Scan {
+         let (start_height, end_height) = self.parse_block_range()?;
+ 
+         // Fetch the records from the network.
+-        let records = Self::fetch_records(private_key, &view_key, &self.cdn, &self.endpoint, start_height, end_height)?;
++        let records = Self::fetch_records(private_key, &view_key, &self.endpoint, start_height, end_height)?;
+ 
+         // Output the decrypted records associated with the view key.
+         if records.is_empty() {
+@@ -152,7 +149,6 @@ impl Scan {
+     fn fetch_records(
+         private_key: Option<PrivateKey<CurrentNetwork>>,
+         view_key: &ViewKey<CurrentNetwork>,
+-        cdn: &str,
+         endpoint: &str,
+         start_height: u32,
+         end_height: u32,
+@@ -175,20 +171,34 @@ impl Scan {
+         print!("\rScanning {total_blocks} blocks for records (0% complete)...");
+         stdout().flush()?;
+ 
+-        // Scan the CDN first for records.
+-        Self::scan_from_cdn(
+-            start_height,
+-            end_height,
+-            cdn.to_string(),
+-            endpoint.to_string(),
+-            private_key,
+-            *view_key,
+-            address_x_coordinate,
+-            records.clone(),
+-        )?;
++        // Fetch the genesis block from the endpoint.
++        let genesis_block: Block<CurrentNetwork> =
++            ureq::get(&format!("{endpoint}/testnet3/block/0")).call()?.into_json()?;
++        // Determine if the endpoint is on a development network.
++        let is_development_network = genesis_block != Block::from_bytes_le(CurrentNetwork::genesis_bytes())?;
++
++        // Determine the request start height.
++        let mut request_start = match is_development_network {
++            true => start_height,
++            false => {
++                // Scan the CDN first for records.
++                Self::scan_from_cdn(
++                    start_height,
++                    end_height,
++                    CDN_ENDPOINT.to_string(),
++                    endpoint.to_string(),
++                    private_key,
++                    *view_key,
++                    address_x_coordinate,
++                    records.clone(),
++                )?;
++
++                // Scan the remaining blocks from the endpoint.
++                end_height.saturating_sub(start_height % MAX_BLOCK_RANGE)
++            }
++        };
+ 
+         // Scan the endpoint for the remaining blocks.
+-        let mut request_start = end_height.saturating_sub(start_height % MAX_BLOCK_RANGE);
+         while request_start <= end_height {
+             // Log the progress.
+             let percentage_complete = request_start.saturating_sub(start_height) as f64 * 100.0 / total_blocks as f64;
+diff --git a/node/router/src/helpers/cache.rs b/node/router/src/helpers/cache.rs
+index 1d6f26c59..4039db917 100644
+--- a/node/router/src/helpers/cache.rs
++++ b/node/router/src/helpers/cache.rs
+@@ -231,8 +231,12 @@ impl<N: Network> Cache<N> {
+         map: &RwLock<LinkedHashMap<K, OffsetDateTime>>,
+         key: K,
+     ) -> Option<OffsetDateTime> {
++        // Insert the key, and return the previous timestamp if it existed.
++        let previous_timestamp = map.write().insert(key, OffsetDateTime::now_utc());
++        // Refresh the cache.
+         Self::refresh(map);
+-        map.write().insert(key, OffsetDateTime::now_utc())
++        // Return the previous timestamp.
++        previous_timestamp
      }
-+
-+    #[test]
-+    fn test_seen_outbound_validators_requests() {
-+        let cache = Cache::<CurrentNetwork>::default();
-+        let input = Input::input();
-+
-+        // Check the map is empty.
-+        assert!(!cache.contains_outbound_validators_request(input));
-+
-+        // Insert some requests.
-+        for _ in 0..3 {
-+            cache.increment_outbound_validators_requests(input);
-+            assert!(cache.contains_outbound_validators_request(input));
-+        }
-+
-+        // Remove a request.
-+        cache.decrement_outbound_validators_requests(input);
-+        assert!(cache.contains_outbound_validators_request(input));
-+
-+        // Clear all requests.
-+        cache.clear_outbound_validators_requests(input);
-+        assert!(!cache.contains_outbound_validators_request(input));
-+    }
  }
+ 
+diff --git a/node/sync/src/block_sync.rs b/node/sync/src/block_sync.rs
+index 15b8c0911..32ec87ad1 100644
+--- a/node/sync/src/block_sync.rs
++++ b/node/sync/src/block_sync.rs
+@@ -451,6 +451,8 @@ impl<N: Network> BlockSync<N> {
+             if block != existing_block {
+                 // Remove the candidate block.
+                 responses.remove(&height);
++                // Drop the write lock on the responses map.
++                drop(responses);
+                 // Remove all block requests to the peer.
+                 self.remove_block_requests_to_peer(&peer_ip);
+                 bail!("Candidate block {height} from '{peer_ip}' is malformed");

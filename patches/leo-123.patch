@@ -1,207 +1,484 @@
-diff --git a/compiler/passes/src/type_checking/check_expressions.rs b/compiler/passes/src/type_checking/check_expressions.rs
-index 1b258cf5d7..300e2e71bd 100644
---- a/compiler/passes/src/type_checking/check_expressions.rs
-+++ b/compiler/passes/src/type_checking/check_expressions.rs
-@@ -149,7 +149,7 @@ impl<'a> ExpressionVisitor<'a> for TypeChecker<'a> {
-                                 }
-                             }
-                         } else {
--                            self.emit_err(TypeCheckerError::invalid_circuit(&access.inner, access.inner.span()));
-+                            self.emit_err(TypeCheckerError::undefined_type(&access.inner, access.inner.span()));
-                         }
-                     }
-                     Some(type_) => {
-diff --git a/compiler/passes/src/type_checking/check_program.rs b/compiler/passes/src/type_checking/check_program.rs
-index 620cb16723..30f4ffc3d1 100644
---- a/compiler/passes/src/type_checking/check_program.rs
-+++ b/compiler/passes/src/type_checking/check_program.rs
-@@ -43,6 +43,8 @@ impl<'a> ProgramVisitor<'a> for TypeChecker<'a> {
-         self.has_return = false;
-         self.parent = Some(input.name());
-         input.input.iter().for_each(|input_var| {
-+            // Check that the type of input parameter is valid.
-+            self.assert_type_is_valid(input_var.span, &input_var.type_);
-             self.assert_not_tuple(input_var.span, &input_var.type_);
+diff --git a/compiler/passes/src/code_generation/expression.rs b/compiler/passes/src/code_generation/expression.rs
+index 2e5c6990a5..8323237c9b 100644
+--- a/compiler/passes/src/code_generation/expression.rs
++++ b/compiler/passes/src/code_generation/expression.rs
+@@ -306,7 +306,8 @@ impl CodeGeneratingVisitor<'_> {
+                 variable_operand
+             } else {
+                 // Push operand identifier.
+-                let (ident_operand, ident_instructions) = self.visit_path(&Path::from(member.identifier));
++                let (ident_operand, ident_instructions) =
++                    self.visit_path(&Path::from(member.identifier).into_absolute());
+                 instructions.push_str(&ident_instructions);
  
-             // If the function is not a program function, then check that the parameters do not have an associated mode.
-@@ -68,6 +70,10 @@ impl<'a> ProgramVisitor<'a> for TypeChecker<'a> {
- 
-         if !self.has_return {
-             self.emit_err(TypeCheckerError::function_has_no_return(input.name(), input.span()));
-+        } else {
-+            // Check that the return type is valid.
-+            // TODO: Span should be just for the return type.
-+            self.assert_type_is_valid(input.span, &input.output);
+                 ident_operand
+diff --git a/compiler/passes/src/dead_code_elimination/ast.rs b/compiler/passes/src/dead_code_elimination/ast.rs
+index 30f0c8b973..eec3046451 100644
+--- a/compiler/passes/src/dead_code_elimination/ast.rs
++++ b/compiler/passes/src/dead_code_elimination/ast.rs
+@@ -43,7 +43,7 @@ impl AstReconstructor for DeadCodeEliminatingVisitor<'_> {
+                 member.expression = Some(self.reconstruct_expression(expr, &()).0);
+             } else {
+                 // We're not actually going to modify it.
+-                self.reconstruct_path(Path::from(member.identifier), &());
++                self.reconstruct_path(Path::from(member.identifier).into_absolute(), &());
+             }
          }
  
-         // Ensure there are no nested tuples in the return type.
-@@ -88,7 +94,16 @@ impl<'a> ProgramVisitor<'a> for TypeChecker<'a> {
-     fn visit_circuit(&mut self, input: &'a Circuit) {
-         // Check for conflicting circuit/record member names.
-         let mut used = HashSet::new();
--        if !input.members.iter().all(|member| used.insert(member.name())) {
-+        if !input
-+            .members
-+            .iter()
-+            .all(|CircuitMember::CircuitVariable(ident, type_)| {
-+                // TODO: Better spans.
-+                // Check that the member types are valid.
-+                self.assert_type_is_valid(input.span, type_);
-+                used.insert(ident.name)
-+            })
-+        {
-             self.emit_err(if input.is_record {
-                 TypeCheckerError::duplicate_record_variable(input.name(), input.span())
-             } else {
-diff --git a/compiler/passes/src/type_checking/check_statements.rs b/compiler/passes/src/type_checking/check_statements.rs
-index 9be5bb3aa7..583bd37446 100644
---- a/compiler/passes/src/type_checking/check_statements.rs
-+++ b/compiler/passes/src/type_checking/check_statements.rs
-@@ -61,6 +61,9 @@ impl<'a> StatementVisitor<'a> for TypeChecker<'a> {
-             VariableType::Mut
+diff --git a/compiler/passes/src/destructuring/ast.rs b/compiler/passes/src/destructuring/ast.rs
+index 3439f7516e..6c3efce2cf 100644
+--- a/compiler/passes/src/destructuring/ast.rs
++++ b/compiler/passes/src/destructuring/ast.rs
+@@ -36,7 +36,7 @@ impl AstReconstructor for DestructuringVisitor<'_> {
+ 
+         // Look up the expression in the tuple map.
+         match self.tuples.get(&path.identifier().name).and_then(|tuple_names| tuple_names.get(input.index.value())) {
+-            Some(id) => (Path::from(*id).into(), Default::default()),
++            Some(id) => (Path::from(*id).into_absolute().into(), Default::default()),
+             None => {
+                 if !matches!(self.state.type_table.get(&path.id), Some(Type::Future(_))) {
+                     panic!("Type checking guarantees that all tuple accesses are declared and indices are valid.");
+@@ -96,7 +96,7 @@ impl AstReconstructor for DestructuringVisitor<'_> {
+ 
+                     self.state.type_table.insert(place.id(), Type::Boolean);
+ 
+-                    Expression::Path(Path::from(place))
++                    Expression::Path(Path::from(place).into_absolute())
+                 };
+ 
+                 // These will be the `elements` of our resulting tuple.
+@@ -131,7 +131,7 @@ impl AstReconstructor for DestructuringVisitor<'_> {
+                     );
+ 
+                     statements.push(definition);
+-                    elements.push(Path::from(identifier).into());
++                    elements.push(Path::from(identifier).into_absolute().into());
+                 }
+ 
+                 let expr: Expression =
+@@ -180,8 +180,8 @@ impl AstReconstructor for DestructuringVisitor<'_> {
+                 // Again, make an assignment for each identifier.
+                 for (&identifier, &rhs_identifier) in identifiers.iter().zip_eq(rhs_identifiers) {
+                     let stmt = AssignStatement {
+-                        place: Path::from(identifier).into(),
+-                        value: Path::from(rhs_identifier).into(),
++                        place: Path::from(identifier).into_absolute().into(),
++                        value: Path::from(rhs_identifier).into_absolute().into(),
+                         id: self.state.node_builder.next_id(),
+                         span: Default::default(),
+                     }
+@@ -215,7 +215,7 @@ impl AstReconstructor for DestructuringVisitor<'_> {
+                     // This is the corresponding variable name of the member we're assigning to.
+                     let identifier = tuple_ids[access.index.value()];
+ 
+-                    *place = Path::from(identifier).into();
++                    *place = Path::from(identifier).into_absolute().into();
+ 
+                     return (assign.into(), statements);
+                 }
+@@ -295,7 +295,7 @@ impl AstReconstructor for DestructuringVisitor<'_> {
+                     let stmt = DefinitionStatement {
+                         place: Single(*identifier),
+                         type_: Some(ty.clone()),
+-                        value: Expression::Path(Path::from(*rhs_identifier)),
++                        value: Expression::Path(Path::from(*rhs_identifier).into_absolute()),
+                         span: Default::default(),
+                         id: self.state.node_builder.next_id(),
+                     }
+@@ -379,7 +379,7 @@ impl AstReconstructor for DestructuringVisitor<'_> {
+                     let stmt = DefinitionStatement {
+                         place: Single(identifier),
+                         type_: None,
+-                        value: Expression::Path(Path::from(*rhs_identifier)),
++                        value: Expression::Path(Path::from(*rhs_identifier).into_absolute()),
+                         span: Default::default(),
+                         id: self.state.node_builder.next_id(),
+                     }
+diff --git a/compiler/passes/src/destructuring/visitor.rs b/compiler/passes/src/destructuring/visitor.rs
+index 8cdf54ddaf..b56176c176 100644
+--- a/compiler/passes/src/destructuring/visitor.rs
++++ b/compiler/passes/src/destructuring/visitor.rs
+@@ -58,7 +58,7 @@ impl DestructuringVisitor<'_> {
+                 // It's a variable name, so just get the member identifiers we've already made.
+                 let identifiers = self.tuples.get(&path.identifier().name).expect("Tuples should have been found");
+                 let elements: Vec<Expression> =
+-                    identifiers.iter().map(|identifier| Path::from(*identifier).into()).collect();
++                    identifiers.iter().map(|identifier| Path::from(*identifier).into_absolute().into()).collect();
+ 
+                 let tuple: Expression =
+                     TupleExpression { elements, span: Default::default(), id: self.state.node_builder.next_id() }
+@@ -84,7 +84,8 @@ impl DestructuringVisitor<'_> {
+                     panic!("`assign_tuple` always creates a definition with `Multiple`");
+                 };
+ 
+-                let elements = identifiers.iter().map(|identifier| Path::from(*identifier).into()).collect();
++                let elements =
++                    identifiers.iter().map(|identifier| Path::from(*identifier).into_absolute().into()).collect();
+ 
+                 let expr = Expression::Tuple(TupleExpression {
+                     elements,
+diff --git a/compiler/passes/src/flattening/ast.rs b/compiler/passes/src/flattening/ast.rs
+index 7e8de3e152..1007bf903e 100644
+--- a/compiler/passes/src/flattening/ast.rs
++++ b/compiler/passes/src/flattening/ast.rs
+@@ -199,7 +199,7 @@ impl AstReconstructor for FlatteningVisitor<'_> {
+             // that led to this assertion.
+             let not_guard = UnaryExpression {
+                 op: UnaryOperation::Not,
+-                receiver: Path::from(guard).into(),
++                receiver: Path::from(guard).into_absolute().into(),
+                 span: Default::default(),
+                 id: {
+                     // Create a new node ID for the unary expression.
+@@ -212,12 +212,12 @@ impl AstReconstructor for FlatteningVisitor<'_> {
+             .into();
+             let (identifier, statement) = self.unique_simple_definition(not_guard);
+             statements.push(statement);
+-            guards.push(Path::from(identifier).into());
++            guards.push(Path::from(identifier).into_absolute().into());
+         }
+ 
+         // We also need to guard against early returns.
+         if let Some((guard, guard_statements)) = self.construct_early_return_guard() {
+-            guards.push(Path::from(guard).into());
++            guards.push(Path::from(guard).into_absolute().into());
+             statements.extend(guard_statements);
+         }
+ 
+@@ -245,7 +245,7 @@ impl AstReconstructor for FlatteningVisitor<'_> {
+                 self.state.type_table.insert(binary.id, Type::Boolean);
+                 let (identifier, statement) = self.unique_simple_definition(binary.into());
+                 statements.push(statement);
+-                Path::from(identifier).into()
++                Path::from(identifier).into_absolute().into()
+             }
          };
  
-+        // Check that the type of the definition is valid.
-+        self.assert_type_is_valid(input.span, &input.type_);
-+
-         self.visit_expression(&input.value, &Some(input.type_.clone()));
+@@ -263,7 +263,7 @@ impl AstReconstructor for FlatteningVisitor<'_> {
+             self.state.type_table.insert(binary.id(), Type::Boolean);
+             let (identifier, statement) = self.unique_simple_definition(binary.into());
+             statements.push(statement);
+-            expression = Path::from(identifier).into();
++            expression = Path::from(identifier).into_absolute().into();
+         }
  
-         if let Err(err) = self.symbol_table.borrow_mut().insert_variable(
-diff --git a/compiler/passes/src/type_checking/checker.rs b/compiler/passes/src/type_checking/checker.rs
-index 819d5a8bd1..a4b83a44dd 100644
---- a/compiler/passes/src/type_checking/checker.rs
-+++ b/compiler/passes/src/type_checking/checker.rs
-@@ -331,6 +331,23 @@ impl<'a> TypeChecker<'a> {
-             self.emit_err(TypeCheckerError::tuple_not_allowed(span))
+         let assert_statement = AssertStatement { variant: AssertVariant::Assert(expression), ..input }.into();
+diff --git a/compiler/passes/src/flattening/program.rs b/compiler/passes/src/flattening/program.rs
+index ce0fdd4093..0de16843e4 100644
+--- a/compiler/passes/src/flattening/program.rs
++++ b/compiler/passes/src/flattening/program.rs
+@@ -64,7 +64,7 @@ impl ProgramReconstructor for FlatteningVisitor<'_> {
+             .map(|(guard, statement)| match guard {
+                 ReturnGuard::None => (None, statement),
+                 ReturnGuard::Unconstructed(plain) | ReturnGuard::Constructed { plain, .. } => {
+-                    (Some(leo_ast::Path::from(plain).into()), statement)
++                    (Some(leo_ast::Path::from(plain).into_absolute().into()), statement)
+                 }
+             })
+             .collect();
+diff --git a/compiler/passes/src/flattening/visitor.rs b/compiler/passes/src/flattening/visitor.rs
+index a425f61b0c..7e7e360ba2 100644
+--- a/compiler/passes/src/flattening/visitor.rs
++++ b/compiler/passes/src/flattening/visitor.rs
+@@ -160,8 +160,8 @@ impl FlatteningVisitor<'_> {
+             // Construct an Or of the two expressions.
+             let binary = BinaryExpression {
+                 op: BinaryOperation::Or,
+-                left: Path::from(previous_identifier).into(),
+-                right: Path::from(identifier).into(),
++                left: Path::from(previous_identifier).into_absolute().into(),
++                right: Path::from(identifier).into_absolute().into(),
+                 span: Default::default(),
+                 id: self.state.node_builder.next_id(),
+             };
+@@ -219,8 +219,8 @@ impl FlatteningVisitor<'_> {
+             // Construct an And of the two expressions.
+             let binary = BinaryExpression {
+                 op: BinaryOperation::And,
+-                left: Path::from(previous).into(),
+-                right: Path::from(identifier).into(),
++                left: Path::from(previous).into_absolute().into(),
++                right: Path::from(identifier).into_absolute().into(),
+                 span: Default::default(),
+                 id: self.state.node_builder.next_id(),
+             };
+@@ -288,7 +288,7 @@ impl FlatteningVisitor<'_> {
+                         } else {
+                             // Otherwise, assign the expression to a variable and return the variable.
+                             statements.push(self.simple_definition(place, value));
+-                            Path::from(place).into()
++                            Path::from(place).into_absolute().into()
+                         }
+                     };
+ 
+@@ -374,7 +374,7 @@ impl FlatteningVisitor<'_> {
+             Literal::integer(IntegerType::U32, i.to_string(), Default::default(), self.state.node_builder.next_id());
+         self.state.type_table.insert(index.id(), Type::Integer(IntegerType::U32));
+         let access: Expression = ArrayAccess {
+-            array: Path::from(identifier).into(),
++            array: Path::from(identifier).into_absolute().into(),
+             index: index.into(),
+             span: Default::default(),
+             id: self.state.node_builder.next_id(),
+@@ -407,9 +407,9 @@ impl FlatteningVisitor<'_> {
+                 let ternary = TernaryExpression {
+                     condition: condition.clone(),
+                     // Access the member of the first expression.
+-                    if_true: Path::from(first).into(),
++                    if_true: Path::from(first).into_absolute().into(),
+                     // Access the member of the second expression.
+-                    if_false: Path::from(second).into(),
++                    if_false: Path::from(second).into_absolute().into(),
+                     span: Default::default(),
+                     id: self.state.node_builder.next_id(),
+                 };
+@@ -448,7 +448,7 @@ impl FlatteningVisitor<'_> {
+ 
+         statements.push(statement);
+ 
+-        (Path::from(identifier).into(), statements)
++        (Path::from(identifier).into_absolute().into(), statements)
+     }
+ 
+     // For use in `ternary_struct`.
+@@ -459,7 +459,7 @@ impl FlatteningVisitor<'_> {
+         type_: Type,
+     ) -> (Identifier, Statement) {
+         let expr: Expression = MemberAccess {
+-            inner: Path::from(inner).into(),
++            inner: Path::from(inner).into_absolute().into(),
+             name,
+             span: Default::default(),
+             id: self.state.node_builder.next_id(),
+@@ -491,8 +491,8 @@ impl FlatteningVisitor<'_> {
+                 // Recursively reconstruct the ternary expression.
+                 let ternary = TernaryExpression {
+                     condition: condition.clone(),
+-                    if_true: Path::from(first).into(),
+-                    if_false: Path::from(second).into(),
++                    if_true: Path::from(first).into_absolute().into(),
++                    if_false: Path::from(second).into_absolute().into(),
+                     span: Default::default(),
+                     id: self.state.node_builder.next_id(),
+                 };
+@@ -543,7 +543,7 @@ impl FlatteningVisitor<'_> {
+ 
+         statements.push(statement);
+ 
+-        (Path::from(identifier).into(), statements)
++        (Path::from(identifier).into_absolute().into(), statements)
+     }
+ 
+     pub fn ternary_tuple(
+@@ -590,8 +590,8 @@ impl FlatteningVisitor<'_> {
+                 // Recursively reconstruct the ternary expression.
+                 let ternary = TernaryExpression {
+                     condition: condition.clone(),
+-                    if_true: Path::from(first).into(),
+-                    if_false: Path::from(second).into(),
++                    if_true: Path::from(first).into_absolute().into(),
++                    if_false: Path::from(second).into_absolute().into(),
+                     span: Default::default(),
+                     id: self.state.node_builder.next_id(),
+                 };
+@@ -628,7 +628,7 @@ impl FlatteningVisitor<'_> {
+ 
+             statements.push(statement);
+ 
+-            (Path::from(identifier).into(), statements)
++            (Path::from(identifier).into_absolute().into(), statements)
+         } else {
+             // Just use the tuple we just made.
+             (expr, statements)
+diff --git a/compiler/passes/src/processing_async/ast.rs b/compiler/passes/src/processing_async/ast.rs
+index 292e32fb25..a38ba7748c 100644
+--- a/compiler/passes/src/processing_async/ast.rs
++++ b/compiler/passes/src/processing_async/ast.rs
+@@ -155,12 +155,12 @@ impl AstReconstructor for ProcessingAsyncVisitor<'_> {
+                             id: slf.state.node_builder.next_id(),
+                         };
+ 
+-                        replacements.insert((symbol, Some(index)), Path::from(identifier).into());
++                        replacements.insert((symbol, Some(index)), Path::from(identifier).into_absolute().into());
+ 
+                         vec![(
+                             input,
+                             TupleAccess {
+-                                tuple: Path::from(make_identifier(slf, symbol)).into(),
++                                tuple: Path::from(make_identifier(slf, symbol)).into_absolute().into(),
+                                 index: index.into(),
+                                 span: Span::default(),
+                                 id: slf.state.node_builder.next_id(),
+@@ -196,14 +196,14 @@ impl AstReconstructor for ProcessingAsyncVisitor<'_> {
+                                     id: slf.state.node_builder.next_id(),
+                                 };
+ 
+-                                let expr: Expression = Path::from(identifier).into();
++                                let expr: Expression = Path::from(identifier).into_absolute().into();
+ 
+                                 replacements.insert(key, expr.clone());
+                                 tuple_elements.push(expr.clone());
+                                 inputs_and_arguments.push((
+                                     input,
+                                     TupleAccess {
+-                                        tuple: Path::from(make_identifier(slf, symbol)).into(),
++                                        tuple: Path::from(make_identifier(slf, symbol)).into_absolute().into(),
+                                         index: i.into(),
+                                         span: Span::default(),
+                                         id: slf.state.node_builder.next_id(),
+@@ -235,9 +235,9 @@ impl AstReconstructor for ProcessingAsyncVisitor<'_> {
+                                 id: slf.state.node_builder.next_id(),
+                             };
+ 
+-                            replacements.insert((symbol, None), Path::from(identifier).into());
++                            replacements.insert((symbol, None), Path::from(identifier).into_absolute().into());
+ 
+-                            let argument = Path::from(make_identifier(slf, symbol)).into();
++                            let argument = Path::from(make_identifier(slf, symbol)).into_absolute().into();
+                             vec![(input, argument)]
+                         }
+                     },
+diff --git a/compiler/passes/src/static_single_assignment/expression.rs b/compiler/passes/src/static_single_assignment/expression.rs
+index 1e7974ff0f..9e4ec039cb 100644
+--- a/compiler/passes/src/static_single_assignment/expression.rs
++++ b/compiler/passes/src/static_single_assignment/expression.rs
+@@ -54,7 +54,7 @@ impl SsaFormingVisitor<'_> {
+         } else {
+             let (place, statement) = self.unique_simple_definition(expr);
+             statements.push(statement);
+-            (Path::from(place).into(), statements)
++            (Path::from(place).into_absolute().into(), statements)
          }
      }
-+
-+    /// Emits an error if the type is not valid.
-+    pub(crate) fn assert_type_is_valid(&self, span: Span, type_: &Type) {
-+        match type_ {
-+            // Check that the named composite type has been defined.
-+            Type::Identifier(identifier) if self.symbol_table.borrow().lookup_circuit(identifier.name).is_none() => {
-+                self.emit_err(TypeCheckerError::undefined_type(identifier.name, span));
-+            }
-+            // Check that the constituent types are valid.
-+            Type::Tuple(tuple_type) => {
-+                for type_ in tuple_type.iter() {
-+                    self.assert_type_is_valid(span, type_)
-+                }
-+            }
-+            _ => {} // Do nothing.
-+        }
-+    }
  }
- 
- fn types_to_string(types: &[Type]) -> String {
-diff --git a/errors/src/errors/type_checker/type_checker_error.rs b/errors/src/errors/type_checker/type_checker_error.rs
-index 0e93e66c4b..394d2ca0f2 100644
---- a/errors/src/errors/type_checker/type_checker_error.rs
-+++ b/errors/src/errors/type_checker/type_checker_error.rs
-@@ -193,10 +193,10 @@ create_messages!(
- 
-     /// Attempted to access an invalid circuit.
-     @formatted
--    invalid_circuit {
--        args: (circuit: impl Display),
-+    undefined_type {
-+        args: (type_: impl Display),
-         msg: format!(
--            "Circuit {circuit} is not found in the current scope."
-+            "The type `{type_}` is not found in the current scope."
-         ),
-         help: None,
+@@ -159,7 +159,7 @@ impl ExpressionConsumer for SsaFormingVisitor<'_> {
+                 let (expression, mut stmts) = if let Some(expr) = arg.expression {
+                     self.consume_expression_and_define(expr)
+                 } else {
+-                    self.consume_path(Path::from(arg.identifier))
++                    self.consume_path(Path::from(arg.identifier).into_absolute())
+                 };
+                 // Accumulate any statements produced.
+                 statements.append(&mut stmts);
+diff --git a/compiler/passes/src/write_transforming/ast.rs b/compiler/passes/src/write_transforming/ast.rs
+index 775c32ccc8..6c06601979 100644
+--- a/compiler/passes/src/write_transforming/ast.rs
++++ b/compiler/passes/src/write_transforming/ast.rs
+@@ -60,13 +60,13 @@ impl WriteTransformingVisitor<'_> {
+                 id,
+             };
+             let statement = AssignStatement {
+-                place: Path::from(input).into(),
++                place: Path::from(input).into_absolute().into(),
+                 value: expr.into(),
+                 span: Default::default(),
+                 id: self.state.node_builder.next_id(),
+             };
+             statements.push(statement.into());
+-            (Path::from(input).into(), statements)
++            (Path::from(input).into_absolute().into(), statements)
+         } else if let Some(struct_members) = self.struct_members.get(&input.name) {
+             // Build the struct expression from the members.
+             let id = self.state.node_builder.next_id();
+@@ -96,16 +96,16 @@ impl WriteTransformingVisitor<'_> {
+                 id,
+             };
+             let statement = AssignStatement {
+-                place: Path::from(input).into(),
++                place: Path::from(input).into_absolute().into(),
+                 value: expr.into(),
+                 span: Default::default(),
+                 id: self.state.node_builder.next_id(),
+             };
+             statements.push(statement.into());
+-            (Path::from(input).into(), statements)
++            (Path::from(input).into_absolute().into(), statements)
+         } else {
+             // This is not a struct or array whose members are written to, so there's nothing to do.
+-            (Path::from(input).into(), Default::default())
++            (Path::from(input).into_absolute().into(), Default::default())
+         }
      }
-diff --git a/tests/compiler/circuits/unknown_member_type_fail.leo b/tests/compiler/circuits/unknown_member_type_fail.leo
-new file mode 100644
-index 0000000000..3ae7ea0a4a
---- /dev/null
-+++ b/tests/compiler/circuits/unknown_member_type_fail.leo
-@@ -0,0 +1,14 @@
-+/*
-+namespace: Compile
-+expectation: Fail
-+*/
-+
-+circuit Foo {
-+    a: u8,
-+    bar: Bar,
-+}
-+
-+@program
-+function main(a: u8) -> u8 {
-+    return a + 1u8;
-+}
-diff --git a/tests/compiler/function/unknown_parameter_type_fail.leo b/tests/compiler/function/unknown_parameter_type_fail.leo
-new file mode 100644
-index 0000000000..5f456b333e
---- /dev/null
-+++ b/tests/compiler/function/unknown_parameter_type_fail.leo
-@@ -0,0 +1,14 @@
-+/*
-+namespace: Compile
-+expectation: Fail
-+*/
-+
-+@program
-+function main(a: u8, foo: Foo) -> u8 {
-+    return a;
-+}
-+
-+@program
-+function returns_foo(a: u8) -> Foo {
-+    return a;
-+}
-\ No newline at end of file
-diff --git a/tests/compiler/statements/unknown_type_in_definition_fail.leo b/tests/compiler/statements/unknown_type_in_definition_fail.leo
-new file mode 100644
-index 0000000000..347260f11c
---- /dev/null
-+++ b/tests/compiler/statements/unknown_type_in_definition_fail.leo
-@@ -0,0 +1,11 @@
-+/*
-+namespace: Compile
-+expectation: Fail
-+input_file: inputs/dummy.in
-+*/
-+
-+@program
-+function main(k: bool) -> bool {
-+	let b: Foo = 1u8;
-+    return k == true;
-+}
-\ No newline at end of file
-diff --git a/tests/expectations/compiler/circuits/unknown_member_type_fail.out b/tests/expectations/compiler/circuits/unknown_member_type_fail.out
-new file mode 100644
-index 0000000000..620975de68
---- /dev/null
-+++ b/tests/expectations/compiler/circuits/unknown_member_type_fail.out
-@@ -0,0 +1,5 @@
-+---
-+namespace: Compile
-+expectation: Fail
-+outputs:
-+  - "Error [ETYC0372017]: The type `Bar` is not found in the current scope.\n    --> compiler-test:3:1\n     |\n   3 | circuit Foo {\n   4 |     a: u8,\n   5 |     bar: Bar,\n   6 | }\n     | ^\n"
-diff --git a/tests/expectations/compiler/function/unknown_parameter_type_fail.out b/tests/expectations/compiler/function/unknown_parameter_type_fail.out
-new file mode 100644
-index 0000000000..4ecc9aacd6
---- /dev/null
-+++ b/tests/expectations/compiler/function/unknown_parameter_type_fail.out
-@@ -0,0 +1,5 @@
-+---
-+namespace: Compile
-+expectation: Fail
-+outputs:
-+  - "Error [ETYC0372017]: The type `Foo` is not found in the current scope.\n    --> compiler-test:4:22\n     |\n   4 | function main(a: u8, foo: Foo) -> u8 {\n     |                      ^^^\nError [ETYC0372003]: Expected type `circuit Foo` but type `u8` was found\n    --> compiler-test:9:22\n     |\n   9 | function returns_foo(a: u8) -> Foo {\n     |                      ^\nError [ETYC0372017]: The type `Foo` is not found in the current scope.\n    --> compiler-test:9:1\n     |\n   9 | function returns_foo(a: u8) -> Foo {\n  10 |     return a;\n  11 | }\n     | ^\n"
-diff --git a/tests/expectations/compiler/statements/unknown_type_in_definition_fail.out b/tests/expectations/compiler/statements/unknown_type_in_definition_fail.out
-new file mode 100644
-index 0000000000..e7db4e6e49
---- /dev/null
-+++ b/tests/expectations/compiler/statements/unknown_type_in_definition_fail.out
-@@ -0,0 +1,5 @@
-+---
-+namespace: Compile
-+expectation: Fail
-+outputs:
-+  - "Error [ETYC0372017]: The type `Foo` is not found in the current scope.\n    --> compiler-test:5:2\n     |\n   5 | \tlet b: Foo = 1u8;\n     |  ^^^^^^^^^^^^^^^^\nError [ETYC0372003]: Expected type `circuit Foo` but type `u8` was found\n    --> compiler-test:5:15\n     |\n   5 | \tlet b: Foo = 1u8;\n     |               ^^^\n"
+ }
+diff --git a/compiler/passes/src/write_transforming/visitor.rs b/compiler/passes/src/write_transforming/visitor.rs
+index 2bc56d2bd2..98e4ad6772 100644
+--- a/compiler/passes/src/write_transforming/visitor.rs
++++ b/compiler/passes/src/write_transforming/visitor.rs
+@@ -88,7 +88,7 @@ impl<'a> WriteTransformingVisitor<'a> {
+                 );
+                 self.state.type_table.insert(index.id(), Type::Integer(IntegerType::U32));
+                 let access = ArrayAccess {
+-                    array: Path::from(name).into(),
++                    array: Path::from(name).into_absolute().into(),
+                     index: index.into(),
+                     span: Default::default(),
+                     id: self.state.node_builder.next_id(),
+@@ -109,7 +109,7 @@ impl<'a> WriteTransformingVisitor<'a> {
+             for (&field_name, &member) in members.clone().iter() {
+                 // Create a definition for each field.
+                 let access = MemberAccess {
+-                    inner: Path::from(name).into(),
++                    inner: Path::from(name).into_absolute().into(),
+                     name: Identifier::new(field_name, self.state.node_builder.next_id()),
+                     span: Default::default(),
+                     id: self.state.node_builder.next_id(),
+@@ -169,7 +169,7 @@ impl<'a> WriteTransformingVisitor<'a> {
+                 // Change it to this:
+                 // `arr = x; arr_0 = x[0]; arr_1 = x[1]; arr_2 = x[2];`
+                 let one_assign = AssignStatement {
+-                    place: Path::from(place).into(),
++                    place: Path::from(place).into_absolute().into(),
+                     value,
+                     span: Default::default(),
+                     id: self.state.node_builder.next_id(),
+@@ -178,7 +178,7 @@ impl<'a> WriteTransformingVisitor<'a> {
+                 accumulate.push(one_assign);
+                 for (i, &member) in array_members.iter().enumerate() {
+                     let access = ArrayAccess {
+-                        array: Path::from(place).into(),
++                        array: Path::from(place).into_absolute().into(),
+                         index: Literal::integer(
+                             IntegerType::U32,
+                             format!("{i}u32"),
+@@ -210,7 +210,7 @@ impl<'a> WriteTransformingVisitor<'a> {
+                 // Change it to this:
+                 // `struc = x; struc_field0 = x.field0; struc_field1 = x.field1;`
+                 let one_assign = AssignStatement {
+-                    place: Path::from(place).into(),
++                    place: Path::from(place).into_absolute().into(),
+                     value,
+                     span: Default::default(),
+                     id: self.state.node_builder.next_id(),
+@@ -219,7 +219,7 @@ impl<'a> WriteTransformingVisitor<'a> {
+                 accumulate.push(one_assign);
+                 for (field, member_name) in struct_members.iter() {
+                     let access = MemberAccess {
+-                        inner: Path::from(place).into(),
++                        inner: Path::from(place).into_absolute().into(),
+                         name: Identifier::new(*field, self.state.node_builder.next_id()),
+                         span: Default::default(),
+                         id: self.state.node_builder.next_id(),
+@@ -230,7 +230,7 @@ impl<'a> WriteTransformingVisitor<'a> {
+         } else {
+             let stmt = AssignStatement {
+                 value,
+-                place: Path::from(place).into(),
++                place: Path::from(place).into_absolute().into(),
+                 id: self.state.node_builder.next_id(),
+                 span: Default::default(),
+             }
+diff --git a/interpreter/src/cursor.rs b/interpreter/src/cursor.rs
+index 6be81dca8f..0d4d8189bc 100644
+--- a/interpreter/src/cursor.rs
++++ b/interpreter/src/cursor.rs
+@@ -1315,7 +1315,9 @@ impl Cursor {
+                 };
+ 
+                 if let Some(asyncs) = maybe_future.as_ref().and_then(|fut| fut.as_future()) {
+-                    self.futures.extend(asyncs.iter().cloned());
++                    if user_initiated {
++                        self.futures.extend(asyncs.iter().cloned());
++                    }
+                 }
+ 
+                 Ok(StepResult { finished, value })

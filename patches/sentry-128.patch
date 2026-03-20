@@ -1,0 +1,2534 @@
+diff --git a/migrations_lockfile.txt b/migrations_lockfile.txt
+index 49517b18c6181f..eceaaadab3891e 100644
+--- a/migrations_lockfile.txt
++++ b/migrations_lockfile.txt
+@@ -25,8 +25,6 @@ notifications: 0004_notificationmessage_group_action_date_added_idx
+ 
+ preprod: 0027_add_distribution_state_fields
+ 
+-prevent: 0004_delete_prevent_ai_configuration_table
+-
+ releases: 0004_cleanup_failed_safe_deletes
+ 
+ replays: 0007_organizationmember_replay_access
+@@ -39,6 +37,6 @@ social_auth: 0003_social_auth_json_field
+ 
+ tempest: 0003_use_encrypted_char_field
+ 
+-uptime: 0054_delete_bad_assertions
++uptime: 0055_backfill_2xx_status_assertion
+ 
+ workflow_engine: 0110_owner_team_break_fk
+diff --git a/pyproject.toml b/pyproject.toml
+index ca88f9c89ac6e1..ffe8d5d3252932 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -616,7 +616,6 @@ module = [
+     "sentry.plugins.validators.*",
+     "sentry.post_process_forwarder.*",
+     "sentry.preprod.*",
+-    "sentry.prevent.*",
+     "sentry.profiles.*",
+     "sentry.projects.*",
+     "sentry.ratelimits.*",
+diff --git a/src/sentry/api/endpoints/organization_events_trace.py b/src/sentry/api/endpoints/organization_events_trace.py
+index b42cb76b4e3f36..a3872508d03b36 100644
+--- a/src/sentry/api/endpoints/organization_events_trace.py
++++ b/src/sentry/api/endpoints/organization_events_trace.py
+@@ -530,7 +530,7 @@ def count_performance_issues(
+             snuba_params=params,
+             trace_ids=[trace_id],
+             referrer=Referrer.API_TRACE_VIEW_COUNT_PERFORMANCE_ISSUES.value,
+-            occurrence_category=OccurrenceCategory.GENERIC,
++            occurrence_category=OccurrenceCategory.ISSUE_PLATFORM,
+         ).get(trace_id, 0)
+         performance_issues_count = EAPOccurrencesComparator.check_and_choose(
+             snuba_count,
+diff --git a/src/sentry/api/endpoints/organization_traces.py b/src/sentry/api/endpoints/organization_traces.py
+index 6bef2b604c9ec3..7789cd953d0805 100644
+--- a/src/sentry/api/endpoints/organization_traces.py
++++ b/src/sentry/api/endpoints/organization_traces.py
+@@ -380,7 +380,7 @@ def enrich_eap_traces_with_extra_data(
+                 snuba_params=snuba_params,
+                 trace_ids=trace_ids,
+                 referrer=Referrer.API_TRACE_EXPLORER_TRACES_OCCURRENCES.value,
+-                occurrence_category=OccurrenceCategory.GENERIC,
++                occurrence_category=OccurrenceCategory.ISSUE_PLATFORM,
+             )
+             traces_occurrences = EAPOccurrencesComparator.check_and_choose(
+                 traces_occurrences,
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 2bee2c91d01ab5..963ef6f3fe0ccd 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -490,7 +490,6 @@ def env(
+     "sentry.insights",
+     "sentry.preprod",
+     "sentry.releases",
+-    "sentry.prevent",
+     "sentry.seer",
+     "sentry.scm",
+ )
+diff --git a/src/sentry/features/temporary.py b/src/sentry/features/temporary.py
+index 03a692ae33a8c0..b1b310e9fc4bc7 100644
+--- a/src/sentry/features/temporary.py
++++ b/src/sentry/features/temporary.py
+@@ -393,8 +393,6 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     manager.add("organizations:uptime-backlog-retry", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
+     # Enable storing HTTP response captures for uptime monitor failures
+     manager.add("organizations:uptime-response-capture", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False, default=True)
+-    # Enable runtime assertions for uptime monitors
+-    manager.add("organizations:uptime-runtime-assertions", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable auto spam classification at User Feedback ingest time
+     manager.add("organizations:user-feedback-spam-ingest", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable view hierarchies options
+@@ -480,6 +478,8 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     manager.add("organizations:on-demand-gen-metrics-deprecation-query-prefill", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
+     # Enables Conduit demo endpoint and UI
+     manager.add("organizations:conduit-demo", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
++    # Enable hard timeout alarm for webhooks
++    manager.add("organizations:sentry-app-webhook-hard-timeout", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
+ 
+     # Enables organization access to the new notification platform
+     manager.add("organizations:notification-platform.internal-testing", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+diff --git a/src/sentry/integrations/github_copilot/models.py b/src/sentry/integrations/github_copilot/models.py
+index 24fa83fbe4e117..8f952b0b29c51f 100644
+--- a/src/sentry/integrations/github_copilot/models.py
++++ b/src/sentry/integrations/github_copilot/models.py
+@@ -72,7 +72,8 @@ class GithubCopilotTask(BaseModel):
+     agent_collaborators: list[GithubCopilotAgentCollaborator] | None = None
+     owner_id: int | None = None
+     repo_id: int | None = None
+-    status: str | None = None  # queued, in_progress, completed, failed, timed_out
++    status: str | None = None
++    state: str | None = None  # queued, in_progress, completed, failed, timed_out
+     session_count: int | None = None
+     artifacts: list[GithubCopilotArtifact] | None = None
+     archived_at: str | None = None
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index 17b19ff513688c..bfaaba394828f9 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -2648,6 +2648,16 @@
+     flags=FLAG_AUTOMATOR_MODIFIABLE,
+ )
+ 
++# Hard timeout for webhook requests to prevent indefinite hangs.
++# Must be strictly less than the shortest task processing_deadline_duration that
++# calls send_and_save_webhook_request (currently 8s for send_alert_webhook_v2 and
++# send_resource_change_webhook), otherwise timeout_alarm raises ValueError.
++register(
++    "sentry-apps.webhook.hard-timeout.sec",
++    default=5.0,
++    flags=FLAG_AUTOMATOR_MODIFIABLE,
++)
++
+ # Enables statistical detectors for a project
+ register(
+     "statistical_detectors.enable",
+diff --git a/src/sentry/prevent/__init__.py b/src/sentry/prevent/__init__.py
+deleted file mode 100644
+index e69de29bb2d1d6..00000000000000
+diff --git a/src/sentry/prevent/endpoints/__init__.py b/src/sentry/prevent/endpoints/__init__.py
+deleted file mode 100644
+index e69de29bb2d1d6..00000000000000
+diff --git a/src/sentry/prevent/migrations/0001_create_prevent_ai_configuration.py b/src/sentry/prevent/migrations/0001_create_prevent_ai_configuration.py
+deleted file mode 100644
+index 7f6d97a97f0c7d..00000000000000
+--- a/src/sentry/prevent/migrations/0001_create_prevent_ai_configuration.py
++++ /dev/null
+@@ -1,64 +0,0 @@
+-# Generated by Django 5.2.1 on 2025-10-24 18:52
+-
+-import django.db.models.deletion
+-from django.db import migrations, models
+-
+-import sentry.db.models.fields.bounded
+-import sentry.db.models.fields.foreignkey
+-import sentry.db.models.fields.hybrid_cloud_foreign_key
+-from sentry.new_migrations.migrations import CheckedMigration
+-
+-
+-class Migration(CheckedMigration):
+-    # This flag is used to mark that a migration shouldn't be automatically run in production.
+-    # This should only be used for operations where it's safe to run the migration after your
+-    # code has deployed. So this should not be used for most operations that alter the schema
+-    # of a table.
+-    # Here are some things that make sense to mark as post deployment:
+-    # - Large data migrations. Typically we want these to be run manually so that they can be
+-    #   monitored and not block the deploy for a long period of time while they run.
+-    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
+-    #   run this outside deployments so that we don't block them. Note that while adding an index
+-    #   is a schema change, it's completely safe to run the operation after the code has deployed.
+-    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
+-
+-    is_post_deployment = False
+-
+-    initial = True
+-
+-    dependencies = [
+-        ("sentry", "0999_add_extrapolation_mode_to_snuba_query"),
+-    ]
+-
+-    operations = [
+-        migrations.CreateModel(
+-            name="PreventAIConfiguration",
+-            fields=[
+-                (
+-                    "id",
+-                    sentry.db.models.fields.bounded.BoundedBigAutoField(
+-                        primary_key=True, serialize=False
+-                    ),
+-                ),
+-                ("date_updated", models.DateTimeField(auto_now=True)),
+-                ("date_added", models.DateTimeField(auto_now_add=True)),
+-                (
+-                    "integration_id",
+-                    sentry.db.models.fields.hybrid_cloud_foreign_key.HybridCloudForeignKey(
+-                        "sentry.Integration", db_index=True, null=True, on_delete="CASCADE"
+-                    ),
+-                ),
+-                ("data", models.JSONField(default=dict)),
+-                (
+-                    "organization",
+-                    sentry.db.models.fields.foreignkey.FlexibleForeignKey(
+-                        on_delete=django.db.models.deletion.CASCADE, to="sentry.organization"
+-                    ),
+-                ),
+-            ],
+-            options={
+-                "db_table": "prevent_ai_configuration",
+-                "unique_together": {("organization_id", "integration_id")},
+-            },
+-        ),
+-    ]
+diff --git a/src/sentry/prevent/migrations/0002_alter_integration_id_not_null.py b/src/sentry/prevent/migrations/0002_alter_integration_id_not_null.py
+deleted file mode 100644
+index e556610e6a4eff..00000000000000
+--- a/src/sentry/prevent/migrations/0002_alter_integration_id_not_null.py
++++ /dev/null
+@@ -1,36 +0,0 @@
+-# Generated by Django 5.2.1 on 2025-10-30 21:42
+-
+-from django.db import migrations
+-
+-import sentry.db.models.fields.hybrid_cloud_foreign_key
+-from sentry.new_migrations.migrations import CheckedMigration
+-
+-
+-class Migration(CheckedMigration):
+-    # This flag is used to mark that a migration shouldn't be automatically run in production.
+-    # This should only be used for operations where it's safe to run the migration after your
+-    # code has deployed. So this should not be used for most operations that alter the schema
+-    # of a table.
+-    # Here are some things that make sense to mark as post deployment:
+-    # - Large data migrations. Typically we want these to be run manually so that they can be
+-    #   monitored and not block the deploy for a long period of time while they run.
+-    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
+-    #   run this outside deployments so that we don't block them. Note that while adding an index
+-    #   is a schema change, it's completely safe to run the operation after the code has deployed.
+-    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
+-
+-    is_post_deployment = False
+-
+-    dependencies = [
+-        ("prevent", "0001_create_prevent_ai_configuration"),
+-    ]
+-
+-    operations = [
+-        migrations.AlterField(
+-            model_name="preventaiconfiguration",
+-            name="integration_id",
+-            field=sentry.db.models.fields.hybrid_cloud_foreign_key.HybridCloudForeignKey(
+-                "sentry.Integration", db_index=True, on_delete="CASCADE"
+-            ),
+-        ),
+-    ]
+diff --git a/src/sentry/prevent/migrations/0003_pending_delete_prevent_ai_configuration_table.py b/src/sentry/prevent/migrations/0003_pending_delete_prevent_ai_configuration_table.py
+deleted file mode 100644
+index 35a5d103820234..00000000000000
+--- a/src/sentry/prevent/migrations/0003_pending_delete_prevent_ai_configuration_table.py
++++ /dev/null
+@@ -1,46 +0,0 @@
+-# Generated by Django 5.2.8 on 2026-01-26 21:34
+-# Drops FK constraint before marking table for pending deletion
+-
+-from django.db import migrations
+-from django.db.models import deletion
+-
+-from sentry.db.models.fields.foreignkey import FlexibleForeignKey
+-from sentry.new_migrations.migrations import CheckedMigration
+-from sentry.new_migrations.monkey.models import SafeDeleteModel
+-from sentry.new_migrations.monkey.state import DeletionAction
+-
+-
+-class Migration(CheckedMigration):
+-    # This flag is used to mark that a migration shouldn't be automatically run in production.
+-    # This should only be used for operations where it's safe to run the migration after your
+-    # code has deployed. So this should not be used for most operations that alter the schema
+-    # of a table.
+-    # Here are some things that make sense to mark as post deployment:
+-    # - Large data migrations. Typically we want these to be run manually so that they can be
+-    #   monitored and not block the deploy for a long period of time while they run.
+-    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
+-    #   run this outside deployments so that we don't block them. Note that while adding an index
+-    #   is a schema change, it's completely safe to run the operation after the code has deployed.
+-    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
+-
+-    is_post_deployment = False
+-
+-    dependencies = [
+-        ("prevent", "0002_alter_integration_id_not_null"),
+-    ]
+-
+-    operations = [
+-        migrations.AlterField(
+-            model_name="preventaiconfiguration",
+-            name="organization",
+-            field=FlexibleForeignKey(
+-                db_constraint=False,
+-                on_delete=deletion.CASCADE,
+-                to="sentry.organization",
+-            ),
+-        ),
+-        SafeDeleteModel(
+-            name="PreventAIConfiguration",
+-            deletion_action=DeletionAction.MOVE_TO_PENDING,
+-        ),
+-    ]
+diff --git a/src/sentry/prevent/migrations/0004_delete_prevent_ai_configuration_table.py b/src/sentry/prevent/migrations/0004_delete_prevent_ai_configuration_table.py
+deleted file mode 100644
+index 96cb929b9a1947..00000000000000
+--- a/src/sentry/prevent/migrations/0004_delete_prevent_ai_configuration_table.py
++++ /dev/null
+@@ -1,32 +0,0 @@
+-# Generated by Django 5.2.8 on 2026-01-26 21:53
+-
+-from sentry.new_migrations.migrations import CheckedMigration
+-from sentry.new_migrations.monkey.models import SafeDeleteModel
+-from sentry.new_migrations.monkey.state import DeletionAction
+-
+-
+-class Migration(CheckedMigration):
+-    # This flag is used to mark that a migration shouldn't be automatically run in production.
+-    # This should only be used for operations where it's safe to run the migration after your
+-    # code has deployed. So this should not be used for most operations that alter the schema
+-    # of a table.
+-    # Here are some things that make sense to mark as post deployment:
+-    # - Large data migrations. Typically we want these to be run manually so that they can be
+-    #   monitored and not block the deploy for a long period of time while they run.
+-    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
+-    #   run this outside deployments so that we don't block them. Note that while adding an index
+-    #   is a schema change, it's completely safe to run the operation after the code has deployed.
+-    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
+-
+-    is_post_deployment = False
+-
+-    dependencies = [
+-        ("prevent", "0003_pending_delete_prevent_ai_configuration_table"),
+-    ]
+-
+-    operations = [
+-        SafeDeleteModel(
+-            name="PreventAIConfiguration",
+-            deletion_action=DeletionAction.DELETE,
+-        ),
+-    ]
+diff --git a/src/sentry/prevent/migrations/__init__.py b/src/sentry/prevent/migrations/__init__.py
+deleted file mode 100644
+index e69de29bb2d1d6..00000000000000
+diff --git a/src/sentry/seer/autofix/coding_agent.py b/src/sentry/seer/autofix/coding_agent.py
+index 35975fdee6ad9a..f4b99d13be2e30 100644
+--- a/src/sentry/seer/autofix/coding_agent.py
++++ b/src/sentry/seer/autofix/coding_agent.py
+@@ -558,8 +558,8 @@ def poll_github_copilot_agents(
+                         pr_url=pr_url,
+                     )
+ 
+-                    # Status: queued, in_progress, completed, failed, timed_out
+-                    is_task_done = task_status.status == "completed"
++                    # The Copilot API uses `state` (not `status`) for task lifecycle.
++                    is_task_done = task_status.state == "completed"
+                     new_status = (
+                         CodingAgentStatus.COMPLETED if is_task_done else CodingAgentStatus.RUNNING
+                     )
+@@ -575,19 +575,19 @@ def poll_github_copilot_agents(
+                         extra={
+                             "agent_id": agent_id,
+                             "pr_url": pr_url,
+-                            "task_status": task_status.status,
++                            "task_state": task_status.state,
+                             "is_task_done": is_task_done,
+                         },
+                     )
+ 
+-            elif task_status.status in ("failed", "timed_out"):
++            elif task_status.state in ("failed", "timed_out"):
+                 update_coding_agent_state(
+                     agent_id=agent_id,
+                     status=CodingAgentStatus.FAILED,
+                 )
+                 logger.info(
+                     "coding_agent.github_copilot.task_failed",
+-                    extra={"agent_id": agent_id, "task_status": task_status.status},
++                    extra={"agent_id": agent_id, "task_state": task_status.state},
+                 )
+ 
+         except Exception:
+diff --git a/src/sentry/seer/autofix/on_completion_hook.py b/src/sentry/seer/autofix/on_completion_hook.py
+index c4d09d4f7b8544..aedefbcceb4381 100644
+--- a/src/sentry/seer/autofix/on_completion_hook.py
++++ b/src/sentry/seer/autofix/on_completion_hook.py
+@@ -242,6 +242,7 @@ def _maybe_trigger_supergroups_embedding(
+             trigger_supergroups_embedding(
+                 organization_id=organization.id,
+                 group_id=group_id,
++                project_id=group.project_id,
+                 artifact_data=root_cause_artifact.data,
+             )
+         except Exception:
+diff --git a/src/sentry/seer/signed_seer_api.py b/src/sentry/seer/signed_seer_api.py
+index 5ad619b5060b2e..691f43521a9ccf 100644
+--- a/src/sentry/seer/signed_seer_api.py
++++ b/src/sentry/seer/signed_seer_api.py
+@@ -231,6 +231,7 @@ class SummarizeIssueRequest(TypedDict):
+ class SupergroupsEmbeddingRequest(TypedDict):
+     organization_id: int
+     group_id: int
++    project_id: int
+     artifact_data: dict[str, Any]
+ 
+ 
+@@ -238,6 +239,7 @@ class SupergroupsListRequest(TypedDict):
+     organization_id: int
+     offset: NotRequired[int | None]
+     limit: NotRequired[int | None]
++    project_ids: NotRequired[list[int] | None]
+ 
+ 
+ class SupergroupsGetRequest(TypedDict):
+diff --git a/src/sentry/seer/supergroups.py b/src/sentry/seer/supergroups.py
+index 665272ffc1469f..8a3201ec8cc75b 100644
+--- a/src/sentry/seer/supergroups.py
++++ b/src/sentry/seer/supergroups.py
+@@ -11,11 +11,13 @@
+ def trigger_supergroups_embedding(
+     organization_id: int,
+     group_id: int,
++    project_id: int,
+     artifact_data: dict,
+ ) -> None:
+     body = SupergroupsEmbeddingRequest(
+         organization_id=organization_id,
+         group_id=group_id,
++        project_id=project_id,
+         artifact_data=artifact_data,
+     )
+     viewer_context = SeerViewerContext(organization_id=organization_id)
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_details.py b/src/sentry/sentry_apps/api/endpoints/installation_details.py
+index f2ada20c049c78..f824a4a3c01c40 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_details.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_details.py
+@@ -23,6 +23,7 @@
+ )
+ from sentry.sentry_apps.models.sentry_app_installation import SentryAppInstallation
+ from sentry.utils.audit import create_audit_entry
++from sentry.utils.sentry_apps.webhooks import WebhookTimeoutError
+ 
+ 
+ @control_silo_endpoint
+@@ -45,19 +46,9 @@ def get(self, request: Request, installation) -> Response:
+ 
+     def delete(self, request: Request, installation) -> Response:
+         sentry_app_installation = SentryAppInstallation.objects.get(id=installation.id)
+-        with transaction.atomic(using=router.db_for_write(SentryAppInstallation)):
+-            try:
+-                assert request.user.is_authenticated, (
+-                    "User must be authenticated to delete installation"
+-                )
+-                SentryAppInstallationNotifier(
+-                    sentry_app_installation=sentry_app_installation,
+-                    user=request.user,
+-                    action="deleted",
+-                ).run()
+-            # if the error is from a request exception, log the error and continue
+-            except RequestException as exc:
+-                sentry_sdk.capture_exception(exc)
++        db = router.db_for_write(SentryAppInstallation)
++
++        with transaction.atomic(using=db):
+             sentry_app_installation.update(status=SentryAppInstallationStatus.PENDING_DELETION)
+             ScheduledDeletion.schedule(sentry_app_installation, days=0, actor=request.user)
+             create_audit_entry(
+@@ -67,6 +58,23 @@ def delete(self, request: Request, installation) -> Response:
+                 event=audit_log.get_event_id("SENTRY_APP_UNINSTALL"),
+                 data={"sentry_app": sentry_app_installation.sentry_app.name},
+             )
++
++            def notify_on_commit() -> None:
++                try:
++                    assert request.user.is_authenticated, (
++                        "User must be authenticated to delete installation"
++                    )
++                    SentryAppInstallationNotifier(
++                        sentry_app_installation=sentry_app_installation,
++                        user=request.user,
++                        action="deleted",
++                    ).run()
++                except RequestException as exc:
++                    sentry_sdk.capture_exception(exc)
++                except WebhookTimeoutError:
++                    pass
++
++            transaction.on_commit(notify_on_commit, using=db)
+         if request.user.is_authenticated:
+             analytics.record(
+                 SentryAppUninstalledEvent(
+diff --git a/src/sentry/sentry_apps/metrics.py b/src/sentry/sentry_apps/metrics.py
+index dfd9d90fc279a7..aad977fa71eb26 100644
+--- a/src/sentry/sentry_apps/metrics.py
++++ b/src/sentry/sentry_apps/metrics.py
+@@ -70,6 +70,7 @@ class SentryAppWebhookHaltReason(StrEnum):
+     MISSING_INSTALLATION = "missing_installation"
+     RESTRICTED_IP = "restricted_ip"
+     CONNECTION_RESET = "connection_reset"
++    HARD_TIMEOUT = "hard_timeout"
+ 
+ 
+ class SentryAppExternalRequestFailureReason(StrEnum):
+diff --git a/src/sentry/sentry_apps/tasks/sentry_apps.py b/src/sentry/sentry_apps/tasks/sentry_apps.py
+index e38d114d29ec1f..403f2fd0d6dfba 100644
+--- a/src/sentry/sentry_apps/tasks/sentry_apps.py
++++ b/src/sentry/sentry_apps/tasks/sentry_apps.py
+@@ -173,7 +173,7 @@ def _webhook_issue_data(
+     name="sentry.sentry_apps.tasks.sentry_apps.send_alert_webhook_v2",
+     namespace=sentryapp_tasks,
+     retry=Retry(times=3, delay=60 * 5),
+-    processing_deadline_duration=5,
++    processing_deadline_duration=8,
+     silo_mode=SiloMode.CELL,
+ )
+ @retry_decorator
+@@ -697,7 +697,7 @@ def get_webhook_data(
+     namespace=sentryapp_tasks,
+     retry=Retry(times=3, delay=60 * 5),
+     compression_type=CompressionType.ZSTD,
+-    processing_deadline_duration=5,
++    processing_deadline_duration=8,
+     silo_mode=SiloMode.CELL,
+ )
+ @retry_decorator
+diff --git a/src/sentry/snuba/occurrences_rpc.py b/src/sentry/snuba/occurrences_rpc.py
+index 0b471580026c55..3240e98162d431 100644
+--- a/src/sentry/snuba/occurrences_rpc.py
++++ b/src/sentry/snuba/occurrences_rpc.py
+@@ -4,8 +4,12 @@
+ 
+ import sentry_sdk
+ from sentry_protos.snuba.v1.request_common_pb2 import PageToken
+-from sentry_protos.snuba.v1.trace_item_attribute_pb2 import AttributeKey, AttributeValue
+-from sentry_protos.snuba.v1.trace_item_filter_pb2 import ComparisonFilter, TraceItemFilter
++from sentry_protos.snuba.v1.trace_item_attribute_pb2 import AttributeKey
++from sentry_protos.snuba.v1.trace_item_filter_pb2 import (
++    ExistsFilter,
++    NotFilter,
++    TraceItemFilter,
++)
+ 
+ from sentry.search.eap.columns import ColumnDefinitions, ResolvedAttribute
+ from sentry.search.eap.occurrences.definitions import OCCURRENCE_DEFINITIONS
+@@ -20,14 +24,14 @@
+ 
+ class OccurrenceCategory(Enum):
+     """
+-    Category of occurrence events in EAP.
++    Category of occurrence trace items in EAP.
+ 
+-    In EAP, both error events and issue platform (generic) events are stored as
++    In EAP, both error events and issue platform events are stored as
+     TRACE_ITEM_TYPE_OCCURRENCE.
+     """
+ 
+     ERROR = "error"
+-    GENERIC = "generic"
++    ISSUE_PLATFORM = "issue_platform"
+ 
+ 
+ class Occurrences(rpc_dataset_common.RPCBase):
+@@ -243,21 +247,24 @@ def run_grouped_timeseries_query(
+ 
+     @classmethod
+     def _build_category_filter(cls, category: OccurrenceCategory | None) -> TraceItemFilter | None:
++        issue_occurrence_id_key = AttributeKey(
++            name="issue_occurrence_id", type=AttributeKey.TYPE_STRING
++        )
+         if category == OccurrenceCategory.ERROR:
++            # Error events: no occurrence attached, so issue_occurrence_id does NOT exist
+             return TraceItemFilter(
+-                comparison_filter=ComparisonFilter(
+-                    key=AttributeKey(name="type", type=AttributeKey.TYPE_STRING),
+-                    op=ComparisonFilter.OP_NOT_EQUALS,
+-                    value=AttributeValue(val_str="generic"),
++                not_filter=NotFilter(
++                    filters=[
++                        TraceItemFilter(
++                            exists_filter=ExistsFilter(key=issue_occurrence_id_key),
++                        )
++                    ]
+                 )
+             )
+-        elif category == OccurrenceCategory.GENERIC:
++        elif category == OccurrenceCategory.ISSUE_PLATFORM:
++            # Issue platform events: occurrence attached, so issue_occurrence_id EXISTS
+             return TraceItemFilter(
+-                comparison_filter=ComparisonFilter(
+-                    key=AttributeKey(name="type", type=AttributeKey.TYPE_STRING),
+-                    op=ComparisonFilter.OP_EQUALS,
+-                    value=AttributeValue(val_str="generic"),
+-                )
++                exists_filter=ExistsFilter(key=issue_occurrence_id_key),
+             )
+ 
+         return None
+diff --git a/src/sentry/tasks/summaries/utils.py b/src/sentry/tasks/summaries/utils.py
+index e688932f7bd372..f6883de820d69c 100644
+--- a/src/sentry/tasks/summaries/utils.py
++++ b/src/sentry/tasks/summaries/utils.py
+@@ -438,7 +438,7 @@ def _project_key_performance_issues_eap(
+             limit=3,
+             referrer=referrer,
+             config=SearchResolverConfig(),
+-            occurrence_category=OccurrenceCategory.GENERIC,
++            occurrence_category=OccurrenceCategory.ISSUE_PLATFORM,
+         )
+     except Exception:
+         logger.exception(
+diff --git a/src/sentry/taskworker/workerchild.py b/src/sentry/taskworker/workerchild.py
+index ec72c7a9834905..6f387c22059681 100644
+--- a/src/sentry/taskworker/workerchild.py
++++ b/src/sentry/taskworker/workerchild.py
+@@ -50,22 +50,44 @@ def child_worker_init(process_type: str) -> None:
+ 
+ @contextlib.contextmanager
+ def timeout_alarm(
+-    seconds: int, handler: Callable[[int, FrameType | None], None]
++    seconds: float, handler: Callable[[int, FrameType | None], None]
+ ) -> Generator[None]:
+     """
+-    Context manager to handle SIGALRM handlers
++    Context manager to handle SIGALRM handlers.
++
++    Uses setitimer(ITIMER_REAL) for float-precision timeouts (delivers SIGALRM).
+ 
+     To prevent tasks from consuming a worker forever, we set a timeout
+     alarm that will interrupt tasks that run longer than
+     their processing_deadline.
++
++    When nested, the inner timeout must be strictly less than the outer alarm's
++    remaining time. This ensures both handlers fire sequentially with correct
++    semantics: the inner fires first, then the outer is restored and can fire
++    later if execution continues. The outer alarm's remaining time is restored
++    on exit, adjusted for elapsed time.
+     """
+-    original = signal.signal(signal.SIGALRM, handler)
++    original_handler = signal.signal(signal.SIGALRM, handler)
++    previous_remaining, _ = signal.setitimer(signal.ITIMER_REAL, seconds)
++
++    if 0 < previous_remaining <= seconds:
++        # Undo: restore original outer timer and handler before raising
++        signal.setitimer(signal.ITIMER_REAL, previous_remaining)
++        signal.signal(signal.SIGALRM, original_handler)
++        raise ValueError(
++            f"Inner timeout ({seconds}s) must be less than outer alarm remaining ({previous_remaining}s)"
++        )
+     try:
+-        signal.alarm(seconds)
+         yield
+     finally:
+-        signal.alarm(0)
+-        signal.signal(signal.SIGALRM, original)
++        remaining_inner, _ = signal.setitimer(signal.ITIMER_REAL, 0)
++        signal.signal(signal.SIGALRM, original_handler)
++
++        if previous_remaining > 0:
++            # Restore original outer timer adjusted for elapsed time.
++            # elapsed = seconds - remaining_inner, so outer restore = previous_remaining - seconds + remaining_inner.
++            # This is always > 0: remaining_inner >= 0 and previous_remaining > seconds was enforced at entry.
++            signal.setitimer(signal.ITIMER_REAL, previous_remaining - seconds + remaining_inner)
+ 
+ 
+ def load_parameters(data: str, headers: dict[str, str]) -> dict[str, Any]:
+diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
+index 65516b9ef38b7e..b0bcc47aae7f9e 100644
+--- a/src/sentry/testutils/cases.py
++++ b/src/sentry/testutils/cases.py
+@@ -3205,16 +3205,21 @@ def setUp(self):
+             return_value="https://fake.com/",
+         )
+         self.mock_requests_get_ctx = mock.patch("sentry.uptime.rdap.query.requests.get")
++        self.mock_invoke_checker_validator_ctx = mock.patch(
++            "sentry.uptime.checker_api.invoke_checker_validator", return_value=None
++        )
+         self.mock_resolve_hostname = self.mock_resolve_hostname_ctx.__enter__()
+         self.mock_resolve_rdap_provider = self.mock_resolve_rdap_provider_ctx.__enter__()
+         self.mock_requests_get = self.mock_requests_get_ctx.__enter__()
+         self.mock_requests_get.return_value.json.return_value = {"entities": [{"handle": "hi"}]}
++        self.mock_invoke_checker_validator = self.mock_invoke_checker_validator_ctx.__enter__()
+ 
+     def tearDown(self):
+         super().tearDown()
+         self.mock_resolve_hostname_ctx.__exit__(None, None, None)
+         self.mock_resolve_rdap_provider_ctx.__exit__(None, None, None)
+         self.mock_requests_get_ctx.__exit__(None, None, None)
++        self.mock_invoke_checker_validator_ctx.__exit__(None, None, None)
+ 
+     def create_uptime_result(
+         self,
+@@ -3555,7 +3560,7 @@ def create_eap_occurrence(
+         environment: str | None = None,
+         title: str = "some error",
+         transaction: str | None = None,
+-        occurrence_type: str = "error",
++        issue_occurrence_id: str | None = None,
+         tags: dict[str, str] | None = None,
+         attributes: dict[str, Any] | None = None,
+         retention_days: int = 90,
+@@ -3577,11 +3582,12 @@ def create_eap_occurrence(
+         data: dict[str, Any] = {
+             "level": level,
+             "title": title,
+-            "type": occurrence_type,
+         }
+         preprocessed: dict[str, Any] = {}
+         if group_id is not None:
+             preprocessed["group_id"] = group_id
++        if issue_occurrence_id is not None:
++            preprocessed["issue_occurrence_id"] = issue_occurrence_id
+         if environment is not None:
+             data["environment"] = environment
+         if transaction is not None:
+diff --git a/src/sentry/testutils/pytest/kafka.py b/src/sentry/testutils/pytest/kafka.py
+index 4c231cb58de2f9..76d2cb1e013de5 100644
+--- a/src/sentry/testutils/pytest/kafka.py
++++ b/src/sentry/testutils/pytest/kafka.py
+@@ -6,6 +6,8 @@
+ from confluent_kafka import Consumer, Producer
+ from confluent_kafka.admin import AdminClient
+ 
++from sentry.testutils.pytest import xdist
++
+ _log = logging.getLogger(__name__)
+ 
+ MAX_SECONDS_WAITING_FOR_EVENT = 16
+@@ -71,10 +73,8 @@ def scope_consumers():
+ 
+     """
+     all_consumers: MutableMapping[str, Consumer | None] = {
+-        # Relay is configured to use this topic for all ingest messages. See
+-        # `templates/config.yml`.
+-        "ingest-events": None,
+-        "outcomes": None,
++        xdist.get_kafka_topic("ingest-events"): None,
++        xdist.get_kafka_topic("outcomes"): None,
+     }
+ 
+     yield all_consumers
+@@ -106,10 +106,8 @@ def ingest_consumer(settings):
+         from sentry.consumers import get_stream_processor
+         from sentry.utils.batching_kafka_consumer import create_topics
+ 
+-        # Relay is configured to use this topic for all ingest messages. See
+-        # `template/config.yml`.
+         cluster_name = "default"
+-        topic_event_name = "ingest-events"
++        topic_event_name = xdist.get_kafka_topic("ingest-events")
+ 
+         if scope_consumers[topic_event_name] is not None:
+             # reuse whatever was already created (will ignore the settings)
+@@ -120,8 +118,7 @@ def ingest_consumer(settings):
+         admin.delete_topic(topic_event_name)
+         create_topics(cluster_name, [topic_event_name])
+ 
+-        # simulate the event ingestion task
+-        group_id = "test-consumer"
++        group_id = xdist.get_kafka_topic("test-consumer")
+ 
+         consumer = get_stream_processor(
+             "ingest-attachments",
+diff --git a/src/sentry/testutils/pytest/relay.py b/src/sentry/testutils/pytest/relay.py
+index f1551226ca6024..ac4298f525d677 100644
+--- a/src/sentry/testutils/pytest/relay.py
++++ b/src/sentry/testutils/pytest/relay.py
+@@ -13,7 +13,7 @@
+ import requests
+ 
+ from sentry.runner.commands.devservices import get_docker_client
+-from sentry.testutils.pytest.sentry import TEST_REDIS_DB
++from sentry.testutils.pytest import xdist
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -23,6 +23,8 @@
+ 
+ 
+ def _relay_server_container_name() -> str:
++    if xdist._worker_id:
++        return f"sentry_test_relay_server_{xdist._worker_id}"
+     return "sentry_test_relay_server"
+ 
+ 
+@@ -66,9 +68,10 @@ def relay_server_setup(live_server, tmpdir_factory):
+     template_path = _get_template_dir()
+     sources = ["config.yml", "credentials.json"]
+ 
+-    relay_port = ephemeral_port_reserve.reserve(ip="127.0.0.1", port=33331)
++    worker_num = xdist._worker_num if xdist._worker_num is not None else 0
++    relay_port = ephemeral_port_reserve.reserve(ip="127.0.0.1", port=33331 + worker_num * 100)
+ 
+-    redis_db = TEST_REDIS_DB
++    redis_db = xdist.get_redis_db()
+ 
+     from sentry.relay import projectconfig_cache
+     from sentry.relay.projectconfig_cache.redis import RedisProjectConfigCache
+@@ -84,6 +87,8 @@ def relay_server_setup(live_server, tmpdir_factory):
+         "KAFKA_HOST": "kafka",
+         "REDIS_HOST": "redis",
+         "REDIS_DB": redis_db,
++        "KAFKA_TOPIC_EVENTS": xdist.get_kafka_topic("ingest-events"),
++        "KAFKA_TOPIC_OUTCOMES": xdist.get_kafka_topic("outcomes"),
+     }
+ 
+     for source in sources:
+diff --git a/src/sentry/testutils/pytest/sentry.py b/src/sentry/testutils/pytest/sentry.py
+index e473d3e7a67d3d..121c3f2210ad4d 100644
+--- a/src/sentry/testutils/pytest/sentry.py
++++ b/src/sentry/testutils/pytest/sentry.py
+@@ -19,6 +19,7 @@
+ 
+ from sentry.runner.importer import install_plugin_apps
+ from sentry.silo.base import SiloMode
++from sentry.testutils.pytest import xdist
+ from sentry.testutils.region import TestEnvRegionDirectory
+ from sentry.testutils.silo import monkey_patch_single_process_silo_mode_state
+ from sentry.types import region
+@@ -32,8 +33,6 @@
+     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir, "tests")
+ )
+ 
+-TEST_REDIS_DB = 9
+-
+ 
+ def _use_monolith_dbs() -> bool:
+     return os.environ.get("SENTRY_USE_MONOLITH_DBS", "0") == "1"
+@@ -69,10 +68,21 @@ def _configure_test_env_regions() -> None:
+     # Assign a random name on every test run, as a reminder that test setup and
+     # assertions should not depend on this value. If you need to test behavior that
+     # depends on region attributes, use `override_regions` in your test case.
+-    region_name = "testregion" + "".join(random.choices(string.digits, k=6))
++    # Under xdist, seed deterministically so all workers generate the same name
++    # (divergent names break xdist's requirement for identical test collection).
++    xdist_uid = os.environ.get("PYTEST_XDIST_TESTRUNUID")
++    r = random.Random(xdist_uid) if xdist_uid else random
++    region_name = "testregion" + "".join(r.choices(string.digits, k=6))
++
++    # Under xdist, each worker gets a unique snowflake_id (1, 2, 3, ...) so
++    # concurrent model creation doesn't produce colliding IDs.
++    region_snowflake_id = xdist._worker_num + 1 if xdist._worker_num is not None else 0
+ 
+     default_region = Cell(
+-        region_name, 0, settings.SENTRY_OPTIONS["system.url-prefix"], RegionCategory.MULTI_TENANT
++        region_name,
++        region_snowflake_id,
++        settings.SENTRY_OPTIONS["system.url-prefix"],
++        RegionCategory.MULTI_TENANT,
+     )
+ 
+     settings.SENTRY_REGION = region_name
+@@ -198,6 +208,9 @@ def pytest_configure(config: pytest.Config) -> None:
+     settings.SENTRY_RATELIMITER = "sentry.ratelimits.redis.RedisRateLimiter"
+     settings.SENTRY_RATELIMITER_OPTIONS = {}
+ 
++    if snuba_url := xdist.get_snuba_url():
++        settings.SENTRY_SNUBA = snuba_url
++
+     settings.SENTRY_ISSUE_PLATFORM_FUTURES_MAX_LIMIT = 1
+ 
+     if not hasattr(settings, "SENTRY_OPTIONS"):
+@@ -205,7 +218,7 @@ def pytest_configure(config: pytest.Config) -> None:
+ 
+     settings.SENTRY_OPTIONS.update(
+         {
+-            "redis.clusters": {"default": {"hosts": {0: {"db": TEST_REDIS_DB}}}},
++            "redis.clusters": {"default": {"hosts": {0: {"db": xdist.get_redis_db()}}}},
+             "mail.backend": "django.core.mail.backends.locmem.EmailBackend",
+             "system.url-prefix": "http://testserver",
+             "system.base-hostname": "testserver",
+diff --git a/src/sentry/testutils/pytest/template/config.yml b/src/sentry/testutils/pytest/template/config.yml
+index 6d663882dd3d2f..e8d136c12c4375 100644
+--- a/src/sentry/testutils/pytest/template/config.yml
++++ b/src/sentry/testutils/pytest/template/config.yml
+@@ -14,10 +14,10 @@ processing:
+   kafka_config:
+     - {name: 'bootstrap.servers', value: '${KAFKA_HOST}:9093'}
+   topics:
+-    events: ingest-events
+-    attachments: ingest-events
+-    transactions: ingest-events
+-    outcomes: outcomes
++    events: ${KAFKA_TOPIC_EVENTS}
++    attachments: ${KAFKA_TOPIC_EVENTS}
++    transactions: ${KAFKA_TOPIC_EVENTS}
++    outcomes: ${KAFKA_TOPIC_OUTCOMES}
+   redis: redis://${REDIS_HOST}:6379/${REDIS_DB}
+ aggregator:
+   bucket_interval: 1 # Use shortest possible interval to speed up tests
+diff --git a/src/sentry/testutils/pytest/xdist.py b/src/sentry/testutils/pytest/xdist.py
+new file mode 100644
+index 00000000000000..3ad38b62dd6522
+--- /dev/null
++++ b/src/sentry/testutils/pytest/xdist.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++import os
++
++_TEST_REDIS_DB = 9
++_SNUBA_BASE_PORT = 1230
++# Redis defaults to 16 DBs (0-15). With base DB 9, max 7 workers (gw0-gw6).
++_MAX_WORKERS = 7
++
++_worker_id: str | None = os.environ.get("PYTEST_XDIST_WORKER")
++_worker_num: int | None = int(_worker_id.replace("gw", "")) if _worker_id else None
++
++if _worker_num is not None and _worker_num >= _MAX_WORKERS:
++    raise RuntimeError(
++        f"xdist worker {_worker_id} exceeds max supported workers ({_MAX_WORKERS}). "
++        f"Redis only has DBs 0-15 and base DB is {_TEST_REDIS_DB}."
++    )
++
++
++def get_redis_db() -> int:
++    if _worker_num is not None:
++        return _TEST_REDIS_DB + _worker_num
++    return _TEST_REDIS_DB
++
++
++def get_kafka_topic(base_name: str) -> str:
++    if _worker_id:
++        return f"{base_name}-{_worker_id}"
++    return base_name
++
++
++def get_snuba_url() -> str | None:
++    if _worker_num is not None and os.environ.get("XDIST_PER_WORKER_SNUBA"):
++        return f"http://127.0.0.1:{_SNUBA_BASE_PORT + _worker_num}"
++    return None
+diff --git a/src/sentry/testutils/skips.py b/src/sentry/testutils/skips.py
+index c4a0b9426ca0d9..0567f945fee00b 100644
+--- a/src/sentry/testutils/skips.py
++++ b/src/sentry/testutils/skips.py
+@@ -4,6 +4,8 @@
+ 
+ import pytest
+ 
++from sentry.testutils.pytest import xdist
++
+ 
+ def _service_available(host: str, port: int) -> bool:
+     try:
+@@ -21,8 +23,9 @@ def _requires_service_message(name: str) -> str:
+ 
+ @pytest.fixture(scope="session")
+ def _requires_snuba() -> None:
+-    # TODO: ability to ask devservices what port a service is on
+-    if not _service_available("127.0.0.1", 1218):
++    snuba_url = xdist.get_snuba_url()
++    port = int(snuba_url.rsplit(":", 1)[1]) if snuba_url else 1218
++    if not _service_available("127.0.0.1", port):
+         pytest.fail(_requires_service_message("snuba"))
+ 
+ 
+diff --git a/src/sentry/uptime/checker_api.py b/src/sentry/uptime/checker_api.py
+index 36fc5967171910..8f9fc37dc95bbf 100644
+--- a/src/sentry/uptime/checker_api.py
++++ b/src/sentry/uptime/checker_api.py
+@@ -39,9 +39,9 @@ def create_preview_check(validated_data, region: UptimeRegionConfig) -> CheckCon
+ # Call into the uptime checker to validation the check config, throwing a validation
+ # error if the config does not pass validation.
+ def invoke_checker_validator(
+-    validation_enabled: bool, check_config: CheckConfig, region: UptimeRegionConfig
++    check_config: CheckConfig, region: UptimeRegionConfig
+ ) -> requests.Response | None:
+-    if not validation_enabled:
++    if not region.api_endpoint:
+         return None
+ 
+     result = requests.post(
+@@ -55,9 +55,9 @@ def invoke_checker_validator(
+ 
+ # Call into the uptime checker to execute the check config
+ def invoke_checker_preview(
+-    assertions_enabled: bool, check_config: CheckConfig, region: UptimeRegionConfig
++    check_config: CheckConfig, region: UptimeRegionConfig
+ ) -> requests.Response | None:
+-    if not assertions_enabled:
++    if not region.api_endpoint:
+         return None
+ 
+     result = requests.post(
+diff --git a/src/sentry/uptime/endpoints/organization_uptime_alert_preview_check.py b/src/sentry/uptime/endpoints/organization_uptime_alert_preview_check.py
+index a7e88cfe4c5ccf..4846359b74032e 100644
+--- a/src/sentry/uptime/endpoints/organization_uptime_alert_preview_check.py
++++ b/src/sentry/uptime/endpoints/organization_uptime_alert_preview_check.py
+@@ -4,7 +4,6 @@
+ from rest_framework.request import Request
+ from rest_framework.response import Response
+ 
+-from sentry import features
+ from sentry.api.api_owners import ApiOwner
+ from sentry.api.api_publish_status import ApiPublishStatus
+ from sentry.api.base import cell_silo_endpoint
+@@ -64,9 +63,6 @@ def post(
+         request: Request,
+         organization: Organization,
+     ) -> Response:
+-        assertions_enabled = features.has(
+-            "organizations:uptime-runtime-assertions", organization, actor=request.user
+-        )
+         validator = UptimeCheckPreviewValidator(
+             data=request.data, context={"organization": organization, "request": request}
+         )
+@@ -79,7 +75,7 @@ def post(
+         region = get_region_config(check_config["active_regions"][0])
+         assert region is not None
+ 
+-        result = checker_api.invoke_checker_preview(assertions_enabled, check_config, region)
++        result = checker_api.invoke_checker_preview(check_config, region)
+ 
+         if result is None:
+             return self.respond(status=400)
+diff --git a/src/sentry/uptime/endpoints/organization_uptime_assertion_suggestions.py b/src/sentry/uptime/endpoints/organization_uptime_assertion_suggestions.py
+index 72dffa45f0192f..855aa428ac54cc 100644
+--- a/src/sentry/uptime/endpoints/organization_uptime_assertion_suggestions.py
++++ b/src/sentry/uptime/endpoints/organization_uptime_assertion_suggestions.py
+@@ -11,7 +11,6 @@
+ from rest_framework.request import Request
+ from rest_framework.response import Response
+ 
+-from sentry import features
+ from sentry.api.api_owners import ApiOwner
+ from sentry.api.api_publish_status import ApiPublishStatus
+ from sentry.api.base import cell_silo_endpoint
+@@ -92,16 +91,6 @@ def post(
+                 status=403,
+             )
+ 
+-        # Check if assertions are enabled
+-        assertions_enabled = features.has(
+-            "organizations:uptime-runtime-assertions", organization, actor=request.user
+-        )
+-        if not assertions_enabled:
+-            return self.respond(
+-                {"detail": "Uptime assertions are not enabled for this organization"},
+-                status=403,
+-            )
+-
+         # Validate the request
+         validator = UptimeCheckPreviewValidator(
+             data=request.data, context={"organization": organization, "request": request}
+@@ -117,7 +106,7 @@ def post(
+             return self.respond({"detail": "No uptime region configured"}, status=400)
+ 
+         # Run the preview check
+-        result = checker_api.invoke_checker_preview(assertions_enabled, check_config, region)
++        result = checker_api.invoke_checker_preview(check_config, region)
+ 
+         if result is None:
+             return self.respond(
+diff --git a/src/sentry/uptime/endpoints/validators.py b/src/sentry/uptime/endpoints/validators.py
+index bb777f4777f5f3..8c619a85da7441 100644
+--- a/src/sentry/uptime/endpoints/validators.py
++++ b/src/sentry/uptime/endpoints/validators.py
+@@ -12,7 +12,7 @@
+     CHECKSTATUS_SUCCESS,
+ )
+ 
+-from sentry import audit_log, features, quotas
++from sentry import audit_log, quotas
+ from sentry.api.fields.actor import OwnerActorField
+ from sentry.api.serializers.rest_framework import CamelSnakeSerializer
+ from sentry.auth.superuser import is_active_superuser
+@@ -151,10 +151,6 @@ def _validate_request_size(method, url, headers, body):
+ def _validate_check_config(
+     attrs, uptime_subscription: UptimeSubscription | None, organization, user
+ ):
+-    assertions_enabled = features.has(
+-        "organizations:uptime-runtime-assertions", organization, actor=user
+-    )
+-
+     validated_data = attrs
+     if uptime_subscription is not None:
+         validated_data = {}
+@@ -177,7 +173,7 @@ def _validate_check_config(
+     region = get_region_config(get_active_regions()[0].slug)
+     assert region is not None
+     check_config = checker_api.create_preview_check(validated_data, region)
+-    result = checker_api.invoke_checker_validator(assertions_enabled, check_config, region)
++    result = checker_api.invoke_checker_validator(check_config, region)
+     if result is not None and result.status_code >= 400:
+         raise serializers.ValidationError({"assertion": result.json()})
+ 
+diff --git a/src/sentry/uptime/migrations/0055_backfill_2xx_status_assertion.py b/src/sentry/uptime/migrations/0055_backfill_2xx_status_assertion.py
+new file mode 100644
+index 00000000000000..27a7798a31e791
+--- /dev/null
++++ b/src/sentry/uptime/migrations/0055_backfill_2xx_status_assertion.py
+@@ -0,0 +1,95 @@
++# Generated by Django 5.2.11 on 2026-02-20 10:53
++import copy
++import logging
++from typing import Any
++
++from django.db import migrations
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db.migrations.state import StateApps
++
++from sentry.new_migrations.migrations import CheckedMigration
++from sentry.utils.query import RangeQuerySetWrapperWithProgressBar
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_STATUS_CODE_CHECKS = [
++    {"op": "status_code_check", "operator": {"cmp": "greater_than"}, "value": 199},
++    {"op": "status_code_check", "operator": {"cmp": "less_than"}, "value": 300},
++]
++
++
++def _has_any_status_code_check(node: dict[str, Any]) -> bool:
++    op = node.get("op")
++    if op == "status_code_check":
++        return True
++    elif op in ("and", "or"):
++        return any(_has_any_status_code_check(child) for child in node.get("children", []))
++    elif op == "not":
++        operand = node.get("operand")
++        return _has_any_status_code_check(operand) if operand else False
++    return False
++
++
++def ensure_2xx_status_checks(
++    assertion: dict[str, Any] | None,
++) -> tuple[dict[str, Any], bool]:
++    """
++    Ensure the assertion contains at least one status_code_check. If none exists,
++    add the default >199 and <300 pair. Returns (assertion, was_modified).
++    """
++    if not assertion or not assertion.get("root"):
++        return {"root": {"op": "and", "children": copy.deepcopy(DEFAULT_STATUS_CODE_CHECKS)}}, True
++
++    root = assertion["root"]
++    if _has_any_status_code_check(root):
++        return assertion, False
++
++    # No status code check found — add the pair
++    if root.get("op") == "and":
++        new_children = list(root.get("children", [])) + copy.deepcopy(DEFAULT_STATUS_CODE_CHECKS)
++        return {"root": {**root, "children": new_children}}, True
++    else:
++        # Root is not an "and" group — wrap it
++        return {
++            "root": {"op": "and", "children": [root, *copy.deepcopy(DEFAULT_STATUS_CODE_CHECKS)]}
++        }, True
++
++
++def backfill_2xx_status_assertion(apps: StateApps, schema_editor: BaseDatabaseSchemaEditor) -> None:
++    UptimeSubscription = apps.get_model("uptime", "UptimeSubscription")
++
++    subscriptions = UptimeSubscription.objects.all()
++
++    for subscription in RangeQuerySetWrapperWithProgressBar(subscriptions):
++        new_assertion, was_modified = ensure_2xx_status_checks(subscription.assertion)
++        if was_modified:
++            subscription.assertion = new_assertion
++            subscription.save(update_fields=["assertion"])
++
++
++class Migration(CheckedMigration):
++    # This flag is used to mark that a migration shouldn't be automatically run in production.
++    # This should only be used for operations where it's safe to run the migration after your
++    # code has deployed. So this should not be used for most operations that alter the schema
++    # of a table.
++    # Here are some things that make sense to mark as post deployment:
++    # - Large data migrations. Typically we want these to be run manually so that they can be
++    #   monitored and not block the deploy for a long period of time while they run.
++    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
++    #   run this outside deployments so that we don't block them. Note that while adding an index
++    #   is a schema change, it's completely safe to run the operation after the code has deployed.
++    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
++
++    is_post_deployment = True
++
++    dependencies = [
++        ("uptime", "0054_delete_bad_assertions"),
++    ]
++
++    operations = [
++        migrations.RunPython(
++            backfill_2xx_status_assertion,
++            migrations.RunPython.noop,
++            hints={"tables": ["uptime_uptimesubscription"]},
++        )
++    ]
+diff --git a/src/sentry/utils/sentry_apps/webhooks.py b/src/sentry/utils/sentry_apps/webhooks.py
+index 97399851e0306a..37457aaa46b8e9 100644
+--- a/src/sentry/utils/sentry_apps/webhooks.py
++++ b/src/sentry/utils/sentry_apps/webhooks.py
+@@ -2,6 +2,7 @@
+ 
+ import logging
+ from collections.abc import Callable, Mapping
++from types import FrameType
+ from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar
+ 
+ import sentry_sdk
+@@ -9,9 +10,10 @@
+ from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
+ from rest_framework import status
+ 
+-from sentry import options
++from sentry import features, options
+ from sentry.exceptions import RestrictedIPAddress
+ from sentry.http import safe_urlopen
++from sentry.organizations.services.organization.service import organization_service
+ from sentry.sentry_apps.metrics import (
+     SentryAppEventType,
+     SentryAppWebhookFailureReason,
+@@ -20,6 +22,7 @@
+ from sentry.sentry_apps.models.sentry_app import SentryApp, track_response_code
+ from sentry.sentry_apps.utils.errors import SentryAppSentryError
+ from sentry.shared_integrations.exceptions import ApiHostError, ApiTimeoutError, ClientError
++from sentry.taskworker.workerchild import timeout_alarm
+ from sentry.utils.sentry_apps import SentryAppWebhookRequestsBuffer
+ 
+ if TYPE_CHECKING:
+@@ -36,6 +39,23 @@
+ T = TypeVar("T", bound=Mapping[str, Any])
+ 
+ 
++class WebhookTimeoutError(Exception):
++    """This error represents a user set hard timeout for when a
++    webhook request should've completed within X seconds
++    """
++
++    pass
++
++
++def _handle_webhook_timeout(signum: int, frame: FrameType | None) -> None:
++    """Handler for when a webhook request exceeds the hard timeout deadline.
++    - This is a workaround for safe_create_connection sockets hanging when the given url
++    cannot be reached or resolved.
++    - TODO(christinarlong): Add sentry app disabling logic here
++    """
++    raise WebhookTimeoutError("Webhook request exceeded hard timeout deadline")
++
++
+ def ignore_unpublished_app_errors(
+     func: Callable[Concatenate[SentryApp | RpcSentryApp, P], R],
+ ) -> Callable[Concatenate[SentryApp | RpcSentryApp, P], R | None]:
+@@ -99,12 +119,39 @@ def send_and_save_webhook_request(
+ 
+         assert url is not None
+         try:
+-            response = safe_urlopen(
+-                url=url,
+-                data=app_platform_event.body,
+-                headers=app_platform_event.headers,
+-                timeout=options.get("sentry-apps.webhook.timeout.sec"),
++            organization_context = organization_service.get_organization_by_id(
++                id=app_platform_event.install.organization_id,
++                include_projects=False,
++                include_teams=False,
++            )
++            if organization_context is not None and features.has(
++                "organizations:sentry-app-webhook-hard-timeout",
++                organization_context.organization,
++            ):
++                # We're using a signal based timeout here because we need to interrupt the blocking socket.connect() opeartion.
++                # See SENTRY-5HA6 for more context. Here we're hanging at the socket.connect() call and the timeout we set
++                # in safe_urlopen is not being respected.
++                timeout_seconds = options.get("sentry-apps.webhook.hard-timeout.sec")
++                with timeout_alarm(timeout_seconds, _handle_webhook_timeout):
++                    response = safe_urlopen(
++                        url=url,
++                        data=app_platform_event.body,
++                        headers=app_platform_event.headers,
++                        timeout=options.get("sentry-apps.webhook.timeout.sec"),
++                    )
++            else:
++                response = safe_urlopen(
++                    url=url,
++                    data=app_platform_event.body,
++                    headers=app_platform_event.headers,
++                    timeout=options.get("sentry-apps.webhook.timeout.sec"),
++                )
++
++        except WebhookTimeoutError:
++            lifecycle.record_halt(
++                halt_reason=f"send_and_save_webhook_request.{SentryAppWebhookHaltReason.HARD_TIMEOUT}"
+             )
++            raise
+         except (Timeout, ConnectionError) as e:
+             error_type = e.__class__.__name__.lower()
+             lifecycle.add_extras(
+diff --git a/static/app/components/repositories/scmIntegrationTree/scmIntegrationTreeRow.tsx b/static/app/components/repositories/scmIntegrationTree/scmIntegrationTreeRow.tsx
+index 4e015276bc8e4e..8e2e1a3fe86c8d 100644
+--- a/static/app/components/repositories/scmIntegrationTree/scmIntegrationTreeRow.tsx
++++ b/static/app/components/repositories/scmIntegrationTree/scmIntegrationTreeRow.tsx
+@@ -390,9 +390,13 @@ const RowContainer = styled('div')`
+   top: 0;
+   left: 0;
+   width: 100%;
+-  border-bottom: 1px solid ${p => p.theme.tokens.border.neutral.muted};
+-  &:last-child {
+-    border-bottom: none;
++  &:not(:last-child)::after {
++    content: '';
++    position: absolute;
++    bottom: 0;
++    left: 0;
++    right: 0;
++    border-bottom: 1px solid ${p => p.theme.tokens.border.neutral.muted};
+   }
+ `;
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ec467fc9b2e080..4f47d7f85ccffe 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -5,8 +5,15 @@
+ 
+ import psutil
+ import pytest
++import pytest_rerunfailures
+ import responses
+ import sentry_sdk
++
++# Disable crash recovery server in pytest-rerunfailures. Under xdist, Sentry's
++# global socket.setdefaulttimeout(5) causes the server's per-worker recv threads
++# to die during Django init (~10s), silently breaking crash recovery anyway.
++# Normal --reruns (in-memory retry) is unaffected.
++pytest_rerunfailures.HAS_PYTEST_HANDLECRASHITEM = False  # type: ignore[attr-defined]
+ from django.core.cache import cache
+ from django.db import connections
+ 
+diff --git a/tests/sentry/integrations/github_copilot/test_client.py b/tests/sentry/integrations/github_copilot/test_client.py
+index 724b77d90d9cc7..681465f8fc4a80 100644
+--- a/tests/sentry/integrations/github_copilot/test_client.py
++++ b/tests/sentry/integrations/github_copilot/test_client.py
+@@ -51,13 +51,13 @@ def test_get_task_status(self, mock_get: Mock) -> None:
+         mock_response = Mock()
+         mock_response.json = {
+             "id": "task-123",
+-            "status": "completed",
++            "state": "completed",
+             "created_at": "2024-01-01T00:00:00Z",
+-            "last_updated_at": "2024-01-01T01:00:00Z",
++            "updated_at": "2024-01-01T01:00:00Z",
+             "artifacts": [
+                 {
+                     "provider": "github",
+-                    "type": "pull_request",
++                    "type": "github_resource",
+                     "data": {"id": 456, "type": "pull", "global_id": "PR_abc123"},
+                 }
+             ],
+@@ -71,7 +71,7 @@ def test_get_task_status(self, mock_get: Mock) -> None:
+ 
+         assert isinstance(result, GithubCopilotTask)
+         assert result.id == "task-123"
+-        assert result.status == "completed"
++        assert result.state == "completed"
+         assert result.artifacts is not None
+         assert len(result.artifacts) == 1
+         assert result.artifacts[0].data is not None
+@@ -90,7 +90,7 @@ def test_get_task_status_no_artifacts(self, mock_get: Mock) -> None:
+         mock_response = Mock()
+         mock_response.json = {
+             "id": "task-123",
+-            "status": "running",
++            "state": "in_progress",
+         }
+         mock_response.status_code = 200
+         mock_get.return_value = mock_response
+@@ -100,7 +100,7 @@ def test_get_task_status_no_artifacts(self, mock_get: Mock) -> None:
+         )
+ 
+         assert result.id == "task-123"
+-        assert result.status == "running"
++        assert result.state == "in_progress"
+         assert result.artifacts is None
+ 
+     def _make_launch_request(self, prompt: str = "Fix the bug") -> CodingAgentLaunchRequest:
+diff --git a/tests/sentry/prevent/__init__.py b/tests/sentry/prevent/__init__.py
+deleted file mode 100644
+index e69de29bb2d1d6..00000000000000
+diff --git a/tests/sentry/prevent/endpoints/__init__.py b/tests/sentry/prevent/endpoints/__init__.py
+deleted file mode 100644
+index e69de29bb2d1d6..00000000000000
+diff --git a/tests/sentry/seer/autofix/test_autofix_on_completion_hook.py b/tests/sentry/seer/autofix/test_autofix_on_completion_hook.py
+index 08b1436835f64d..0e540a9ceff578 100644
+--- a/tests/sentry/seer/autofix/test_autofix_on_completion_hook.py
++++ b/tests/sentry/seer/autofix/test_autofix_on_completion_hook.py
+@@ -393,6 +393,7 @@ def test_triggers_embedding_on_root_cause(self, mock_trigger_sg):
+         mock_trigger_sg.assert_called_once_with(
+             organization_id=self.organization.id,
+             group_id=self.group.id,
++            project_id=self.group.project_id,
+             artifact_data=block.artifacts[0].data,
+         )
+ 
+diff --git a/tests/sentry/seer/autofix/test_coding_agent.py b/tests/sentry/seer/autofix/test_coding_agent.py
+index 2487e7a37c3df0..c513bdca2eeb00 100644
+--- a/tests/sentry/seer/autofix/test_coding_agent.py
++++ b/tests/sentry/seer/autofix/test_coding_agent.py
+@@ -513,7 +513,7 @@ def test_poll_updates_state_when_pr_created(self, mock_identity_service, mock_up
+         mock_client = MagicMock()
+         mock_client.get_task_status.return_value = GithubCopilotTask(
+             id="task-123",
+-            status="completed",
++            state="completed",
+             artifacts=[
+                 GithubCopilotArtifact(
+                     provider="github",
+@@ -572,7 +572,7 @@ def test_poll_marks_agent_failed_on_error_status(
+         mock_get_task_status = MagicMock(
+             return_value=GithubCopilotTask(
+                 id="task-123",
+-                status="failed",
++                state="failed",
+             )
+         )
+ 
+@@ -609,7 +609,7 @@ def test_poll_keeps_running_status_when_task_not_done(
+         mock_get_task_status = MagicMock(
+             return_value=GithubCopilotTask(
+                 id="task-123",
+-                status="running",
++                state="in_progress",
+                 artifacts=[
+                     GithubCopilotArtifact(
+                         provider="github",
+diff --git a/tests/sentry/seer/test_supergroups.py b/tests/sentry/seer/test_supergroups.py
+index aeab09d7290b80..7f7b282dbcd382 100644
+--- a/tests/sentry/seer/test_supergroups.py
++++ b/tests/sentry/seer/test_supergroups.py
+@@ -12,6 +12,7 @@ def test_calls_seer_with_correct_payload(self, mock_request):
+         trigger_supergroups_embedding(
+             organization_id=1,
+             group_id=123,
++            project_id=456,
+             artifact_data={"one_line_description": "Null pointer in auth module"},
+         )
+ 
+@@ -23,4 +24,5 @@ def test_calls_seer_with_correct_payload(self, mock_request):
+         payload = call_args.args[0]
+         assert payload["organization_id"] == 1
+         assert payload["group_id"] == 123
++        assert payload["project_id"] == 456
+         assert payload["artifact_data"] == {"one_line_description": "Null pointer in auth module"}
+diff --git a/tests/sentry/tasks/test_weekly_reports.py b/tests/sentry/tasks/test_weekly_reports.py
+index 0d35c9c249687a..ff82f73926c37c 100644
+--- a/tests/sentry/tasks/test_weekly_reports.py
++++ b/tests/sentry/tasks/test_weekly_reports.py
+@@ -1,6 +1,7 @@
+ import zoneinfo
+ from datetime import timedelta
+ from unittest import mock
++from uuid import uuid4
+ 
+ import pytest
+ from django.core import mail
+@@ -448,7 +449,7 @@ def test_project_key_performance_issues_eap_matches_snuba(self) -> None:
+                     group_id=perf_group_1.id,
+                     project=self.project,
+                     timestamp=self.now - timedelta(minutes=i + 1),
+-                    occurrence_type="generic",
++                    issue_occurrence_id=uuid4().hex,
+                 )
+                 for i in range(3)
+             ]
+@@ -457,7 +458,7 @@ def test_project_key_performance_issues_eap_matches_snuba(self) -> None:
+                     group_id=perf_group_2.id,
+                     project=self.project,
+                     timestamp=self.now - timedelta(minutes=1),
+-                    occurrence_type="generic",
++                    issue_occurrence_id=uuid4().hex,
+                 ),
+             ]
+         )
+diff --git a/tests/sentry/taskworker/test_workerchild.py b/tests/sentry/taskworker/test_workerchild.py
+new file mode 100644
+index 00000000000000..cad75605bc2c57
+--- /dev/null
++++ b/tests/sentry/taskworker/test_workerchild.py
+@@ -0,0 +1,159 @@
++from __future__ import annotations
++
++import signal
++import time
++from collections.abc import Generator
++from types import FrameType
++
++import pytest
++
++from sentry.taskworker.workerchild import timeout_alarm
++
++
++class AlarmFired(Exception):
++    pass
++
++
++class InnerFired(Exception):
++    pass
++
++
++class OuterFired(Exception):
++    pass
++
++
++class TestTimeoutAlarm:
++    @staticmethod
++    def noop(signum: int, frame: FrameType | None) -> None:
++        pass
++
++    @pytest.fixture(autouse=True)
++    def restore_signal_state(self) -> Generator[None]:
++        # Save any existing timer (e.g. from pytest-timeout) and handler before the test.
++        saved_remaining, saved_interval = signal.setitimer(signal.ITIMER_REAL, 0)
++        saved_handler = signal.signal(signal.SIGALRM, signal.SIG_DFL)
++        try:
++            yield
++        finally:
++            signal.setitimer(signal.ITIMER_REAL, 0)
++            signal.signal(signal.SIGALRM, saved_handler)
++            if saved_remaining > 0:
++                signal.setitimer(signal.ITIMER_REAL, saved_remaining, saved_interval)
++
++    def test_no_previous_alarm_no_alarm_after_exit(self) -> None:
++        """With no outer alarm, no alarm remains after context exits."""
++        with timeout_alarm(0.5, self.noop):
++            pass
++
++        remaining, _ = signal.getitimer(signal.ITIMER_REAL)
++        assert remaining == 0
++
++    def test_handler_fires_after_timeout(self) -> None:
++        called = []
++
++        def handler(signum: int, frame: FrameType | None) -> None:
++            called.append(signum)
++            raise AlarmFired()
++
++        with pytest.raises(AlarmFired):
++            with timeout_alarm(0.1, handler):
++                time.sleep(1)
++
++        assert called == [signal.SIGALRM]
++
++    def test_raises_if_inner_geq_outer(self) -> None:
++        """Raises ValueError when inner timeout >= outer remaining, fully restores outer timer and handler."""
++        outer_called = []
++
++        def outer_handler(signum: int, frame: FrameType | None) -> None:
++            outer_called.append(signum)
++
++        signal.signal(signal.SIGALRM, outer_handler)
++        signal.setitimer(signal.ITIMER_REAL, 10)
++
++        with pytest.raises(ValueError, match="Inner timeout.*must be less than.*outer alarm"):
++            with timeout_alarm(10, self.noop):
++                pass
++
++        # Outer timer must still be active
++        remaining, _ = signal.getitimer(signal.ITIMER_REAL)
++        assert remaining > 0, "Outer timer should have been restored after ValueError"
++
++        # Outer handler must be restored
++        assert signal.getsignal(signal.SIGALRM) is outer_handler
++
++    def test_outer_alarm_restored_after_inner_completes_normally(self) -> None:
++        """When the inner timeout_alarm exits without firing, the outer alarm is still active."""
++
++        def outer_handler(signum: int, frame: FrameType | None) -> None:
++            pass
++
++        with timeout_alarm(0.5, outer_handler):
++            with timeout_alarm(0.3, self.noop):
++                pass  # completes before inner alarm fires
++
++            remaining, _ = signal.getitimer(signal.ITIMER_REAL)
++            assert remaining > 0, "Outer alarm was not restored after inner exited normally"
++
++        remaining, _ = signal.getitimer(signal.ITIMER_REAL)
++        assert remaining == 0
++
++    def test_outer_alarm_fires_with_minimal_gap(self) -> None:
++        """
++        With a 0.1s inner / 0.2s outer gap, the outer alarm is still restored and fires
++        after the inner. Verifies the kernel-derived elapsed calculation
++        (previous_remaining - seconds + remaining_inner) correctly restores the outer
++        timer even when the gap between inner and outer is small.
++        """
++        times: dict[str, float] = {}
++        start = time.monotonic()
++
++        def inner_handler(signum: int, frame: FrameType | None) -> None:
++            times["inner"] = time.monotonic()
++            raise InnerFired()
++
++        def outer_handler(signum: int, frame: FrameType | None) -> None:
++            times["outer"] = time.monotonic()
++            raise OuterFired()
++
++        with pytest.raises(OuterFired):
++            with timeout_alarm(0.2, outer_handler):
++                try:
++                    with timeout_alarm(0.1, inner_handler):
++                        time.sleep(1)
++                except InnerFired:
++                    time.sleep(1)
++
++        assert "outer" in times, "Outer alarm should have fired"
++        outer_elapsed = times["outer"] - start
++        assert 0.15 <= outer_elapsed <= 0.5, f"Outer fired at {outer_elapsed:.3f}s, expected ~0.2s"
++
++    def test_nested_inner_fires_then_outer_fires(self) -> None:
++        """Inner alarm (0.3s) fires first, then outer alarm (0.5s) fires ~0.2s later."""
++        times: dict[str, float] = {}
++        start = time.monotonic()
++
++        def inner_handler(signum: int, frame: FrameType | None) -> None:
++            times["inner"] = time.monotonic()
++            raise InnerFired()
++
++        def outer_handler(signum: int, frame: FrameType | None) -> None:
++            times["outer"] = time.monotonic()
++            raise OuterFired()
++
++        with pytest.raises(OuterFired):
++            with timeout_alarm(0.5, outer_handler):
++                try:
++                    with timeout_alarm(0.3, inner_handler):
++                        time.sleep(10)
++                except InnerFired:
++                    # Inner fired and restored the outer alarm with ~0.2s remaining.
++                    # Sleep again so the outer alarm can fire.
++                    time.sleep(10)
++
++        inner_elapsed = times["inner"] - start
++        outer_elapsed = times["outer"] - start
++
++        assert 0.2 <= inner_elapsed <= 0.5, f"Inner fired at {inner_elapsed:.3f}s, expected ~0.3s"
++        assert 0.4 <= outer_elapsed <= 0.8, f"Outer fired at {outer_elapsed:.3f}s, expected ~0.5s"
++        assert outer_elapsed > inner_elapsed, "Outer must fire after inner"
+diff --git a/tests/sentry/uptime/endpoints/__init__.py b/tests/sentry/uptime/endpoints/__init__.py
+index 79461740c5e804..9bfeb15f4d2e56 100644
+--- a/tests/sentry/uptime/endpoints/__init__.py
++++ b/tests/sentry/uptime/endpoints/__init__.py
+@@ -1,3 +1,5 @@
++from unittest import mock
++
+ from sentry.testutils.cases import APITestCase
+ 
+ 
+@@ -5,3 +7,11 @@ class UptimeAlertBaseEndpointTest(APITestCase):
+     def setUp(self) -> None:
+         super().setUp()
+         self.login_as(user=self.user)
++        self.mock_invoke_checker_validator_ctx = mock.patch(
++            "sentry.uptime.checker_api.invoke_checker_validator", return_value=None
++        )
++        self.mock_invoke_checker_validator = self.mock_invoke_checker_validator_ctx.__enter__()
++
++    def tearDown(self) -> None:
++        super().tearDown()
++        self.mock_invoke_checker_validator_ctx.__exit__(None, None, None)
+diff --git a/tests/sentry/uptime/endpoints/test_detector.py b/tests/sentry/uptime/endpoints/test_detector.py
+index ab309d67069f18..5a69c976063937 100644
+--- a/tests/sentry/uptime/endpoints/test_detector.py
++++ b/tests/sentry/uptime/endpoints/test_detector.py
+@@ -1,3 +1,5 @@
++from unittest import mock
++
+ from django.utils import timezone
+ from rest_framework import status
+ 
+@@ -47,6 +49,10 @@ class UptimeDetectorBaseTest(APITestCase):
+     def setUp(self) -> None:
+         super().setUp()
+         self.login_as(user=self.user)
++        self.mock_invoke_checker_validator_ctx = mock.patch(
++            "sentry.uptime.checker_api.invoke_checker_validator", return_value=None
++        )
++        self.mock_invoke_checker_validator = self.mock_invoke_checker_validator_ctx.__enter__()
+         self.environment = self.create_environment(
+             organization_id=self.organization.id, name="production"
+         )
+@@ -69,6 +75,10 @@ def setUp(self) -> None:
+             name="Test Detector",
+         )
+ 
++    def tearDown(self) -> None:
++        super().tearDown()
++        self.mock_invoke_checker_validator_ctx.__exit__(None, None, None)
++
+ 
+ class OrganizationDetectorDetailsPutTest(UptimeDetectorBaseTest):
+     endpoint = "sentry-api-0-organization-detector-details"
+@@ -300,6 +310,14 @@ class OrganizationDetectorIndexPostTest(APITestCase):
+     def setUp(self):
+         super().setUp()
+         self.login_as(user=self.user)
++        self.mock_invoke_checker_validator_ctx = mock.patch(
++            "sentry.uptime.checker_api.invoke_checker_validator", return_value=None
++        )
++        self.mock_invoke_checker_validator = self.mock_invoke_checker_validator_ctx.__enter__()
++
++    def tearDown(self):
++        super().tearDown()
++        self.mock_invoke_checker_validator_ctx.__exit__(None, None, None)
+ 
+     def test_create_detector_validation_error(self):
+         invalid_data = _get_valid_data(
+diff --git a/tests/sentry/uptime/endpoints/test_organization_uptime_alert_preview.py b/tests/sentry/uptime/endpoints/test_organization_uptime_alert_preview.py
+index 7b6eae7ec93e46..ea2ccf2d94dd32 100644
+--- a/tests/sentry/uptime/endpoints/test_organization_uptime_alert_preview.py
++++ b/tests/sentry/uptime/endpoints/test_organization_uptime_alert_preview.py
+@@ -1,3 +1,5 @@
++from unittest import mock
++
+ import responses
+ from django.test import override_settings
+ from django.urls import reverse
+@@ -19,7 +21,6 @@
+ class OrganizationUptimeAlertPreview(UptimeAlertBaseEndpointTest):
+     endpoint = "sentry-api-0-organization-uptime-alert-preview-check"
+     method = "post"
+-    features: dict[str, bool] = {"organizations:uptime-runtime-assertions": True}
+ 
+     def setUp(self) -> None:
+         super().setUp()
+@@ -29,105 +30,108 @@ def setUp(self) -> None:
+         }
+ 
+     def test_bad_config(self) -> None:
+-        with self.feature(self.features):
+-            response = self.get_error_response(
+-                self.organization.slug, name="test", region="default"
+-            )
+-            assert "url" in response.data
+-            assert response.data["url"][0].code == "required"
+-            assert "timeoutMs" in response.data
+-            assert response.data["timeoutMs"][0].code == "required"
++        response = self.get_error_response(self.organization.slug, name="test", region="default")
++        assert "url" in response.data
++        assert response.data["url"][0].code == "required"
++        assert "timeoutMs" in response.data
++        assert response.data["timeoutMs"][0].code == "required"
+ 
+-    @responses.activate
+     def test_bad_checker_validation(self) -> None:
+-        with self.feature(self.features):
+-            # (We issue a validate call before the actual check execution.)
+-            responses.add(
+-                responses.POST,
+-                "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/validate_check",
+-                status=400,
+-                json={"error": True},
+-            )
+-            response = self.get_error_response(
+-                self.organization.slug,
+-                name="test",
+-                environment="uptime-prod",
+-                owner=f"user:{self.user.id}",
+-                url="http://sentry.io",
+-                timeout_ms=1500,
+-                body=None,
+-                region="default",
+-            )
++        mock_response = mock.Mock()
++        mock_response.status_code = 400
++        mock_response.json.return_value = {"error": True}
++        self.mock_invoke_checker_validator.return_value = mock_response
++
++        response = self.get_error_response(
++            self.organization.slug,
++            name="test",
++            environment="uptime-prod",
++            owner=f"user:{self.user.id}",
++            url="http://sentry.io",
++            timeout_ms=1500,
++            body=None,
++            region="default",
++            assertion={
++                "root": {
++                    "op": "and",
++                    "id": "root-1",
++                    "children": [
++                        {
++                            "id": "child-1",
++                            "op": "status_code_check",
++                            "operator": {"cmp": "equals"},
++                            "value": 200,
++                        }
++                    ],
++                }
++            },
++        )
+ 
+-            assert "assertion" in response.data
+-            assert "error" in response.data["assertion"]
+-            assert response.data["assertion"]["error"].code == "invalid"
++        assert "assertion" in response.data
++        assert "error" in response.data["assertion"]
++        assert response.data["assertion"]["error"].code == "invalid"
+ 
+     @responses.activate
+     def test_success(self) -> None:
+-        with self.feature(self.features):
+-            # (We issue a validate call before the actual check execution.)
+-            responses.add(
+-                responses.POST,
+-                "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/validate_check",
+-                status=200,
+-                json={"succeeded": True},
+-            )
+-            responses.add(
+-                responses.POST,
+-                "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/execute_config",
+-                status=200,
+-                json={"succeeded": True},
+-            )
+-            self.get_success_response(
+-                self.organization.slug,
+-                name="test",
+-                environment="uptime-prod",
+-                owner=f"user:{self.user.id}",
+-                url="http://sentry.io",
+-                timeout_ms=1500,
+-                body=None,
+-                region="default",
+-            )
++        # (We issue a validate call before the actual check execution.)
++        responses.add(
++            responses.POST,
++            "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/validate_check",
++            status=200,
++            json={"succeeded": True},
++        )
++        responses.add(
++            responses.POST,
++            "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/execute_config",
++            status=200,
++            json={"succeeded": True},
++        )
++        self.get_success_response(
++            self.organization.slug,
++            name="test",
++            environment="uptime-prod",
++            owner=f"user:{self.user.id}",
++            url="http://sentry.io",
++            timeout_ms=1500,
++            body=None,
++            region="default",
++        )
+ 
+     @responses.activate
+     def test_alerts_write_permission(self) -> None:
+         """Test that a user with only alerts:write permission can run a preview check"""
+-        with self.feature(self.features):
+-            api_key = self.create_api_key(
+-                organization=self.organization, scope_list=["alerts:write"]
+-            )
++        api_key = self.create_api_key(organization=self.organization, scope_list=["alerts:write"])
+ 
+-            responses.add(
+-                responses.POST,
+-                "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/validate_check",
+-                status=200,
+-                json={"succeeded": True},
+-            )
+-            responses.add(
+-                responses.POST,
+-                "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/execute_config",
+-                status=200,
+-                json={"succeeded": True},
+-            )
++        responses.add(
++            responses.POST,
++            "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/validate_check",
++            status=200,
++            json={"succeeded": True},
++        )
++        responses.add(
++            responses.POST,
++            "http://pop-st-1.uptime-checker.s4s.sentry.internal:80/execute_config",
++            status=200,
++            json={"succeeded": True},
++        )
+ 
+-            url = reverse(
+-                "sentry-api-0-organization-uptime-alert-preview-check",
+-                kwargs={"organization_id_or_slug": self.organization.slug},
+-            )
+-            response = self.client.post(
+-                url,
+-                data={
+-                    "name": "test",
+-                    "environment": "uptime-prod",
+-                    "owner": f"user:{self.user.id}",
+-                    "url": "http://sentry.io",
+-                    "timeoutMs": 1500,
+-                    "body": None,
+-                    "region": "default",
+-                },
+-                format="json",
+-                HTTP_AUTHORIZATION=self.create_basic_auth_header(api_key.key),
+-            )
++        url = reverse(
++            "sentry-api-0-organization-uptime-alert-preview-check",
++            kwargs={"organization_id_or_slug": self.organization.slug},
++        )
++        response = self.client.post(
++            url,
++            data={
++                "name": "test",
++                "environment": "uptime-prod",
++                "owner": f"user:{self.user.id}",
++                "url": "http://sentry.io",
++                "timeoutMs": 1500,
++                "body": None,
++                "region": "default",
++            },
++            format="json",
++            HTTP_AUTHORIZATION=self.create_basic_auth_header(api_key.key),
++        )
+ 
+-            assert response.status_code == 200, response.content
++        assert response.status_code == 200, response.content
+diff --git a/tests/sentry/uptime/endpoints/test_validators.py b/tests/sentry/uptime/endpoints/test_validators.py
+index 038c982f8e6aad..5a674d661355de 100644
+--- a/tests/sentry/uptime/endpoints/test_validators.py
++++ b/tests/sentry/uptime/endpoints/test_validators.py
+@@ -78,6 +78,13 @@ def setUp(self):
+             "project": self.project,
+             "request": self.make_request(),
+         }
++        self.mock_invoke_checker_validator_ctx = mock.patch(
++            "sentry.uptime.checker_api.invoke_checker_validator", return_value=None
++        )
++        self.mock_invoke_checker_validator = self.mock_invoke_checker_validator_ctx.__enter__()
++
++    def tearDown(self):
++        self.mock_invoke_checker_validator_ctx.__exit__(None, None, None)
+ 
+     def test_simple(self):
+         validator = UptimeMonitorDataSourceValidator(
+diff --git a/tests/sentry/uptime/migrations/test_0055_backfill_2xx_status_assertion.py b/tests/sentry/uptime/migrations/test_0055_backfill_2xx_status_assertion.py
+new file mode 100644
+index 00000000000000..4ebc67f7b7af81
+--- /dev/null
++++ b/tests/sentry/uptime/migrations/test_0055_backfill_2xx_status_assertion.py
+@@ -0,0 +1,245 @@
++import importlib
++import uuid
++
++import pytest
++
++from sentry.testutils.cases import TestMigrations
++
++migration = importlib.import_module("sentry.uptime.migrations.0055_backfill_2xx_status_assertion")
++ensure_2xx_status_checks = migration.ensure_2xx_status_checks
++
++GT_199 = {"op": "status_code_check", "operator": {"cmp": "greater_than"}, "value": 199}
++LT_300 = {"op": "status_code_check", "operator": {"cmp": "less_than"}, "value": 300}
++
++
++class TestEnsure2xxStatusChecks:
++    def test_none_assertion(self) -> None:
++        result, was_modified = ensure_2xx_status_checks(None)
++        assert was_modified
++        assert result == {"root": {"op": "and", "children": [GT_199, LT_300]}}
++
++    def test_empty_dict(self) -> None:
++        result, was_modified = ensure_2xx_status_checks({})
++        assert was_modified
++        assert result == {"root": {"op": "and", "children": [GT_199, LT_300]}}
++
++    def test_already_has_status_code_check_at_root(self) -> None:
++        assertion = {
++            "root": {"op": "status_code_check", "operator": {"cmp": "equals"}, "value": 200}
++        }
++        result, was_modified = ensure_2xx_status_checks(assertion)
++        assert not was_modified
++        assert result == assertion
++
++    def test_already_has_status_code_check_nested_in_and(self) -> None:
++        assertion = {
++            "root": {
++                "op": "and",
++                "children": [
++                    {"op": "status_code_check", "operator": {"cmp": "equals"}, "value": 200},
++                    {
++                        "op": "json_path",
++                        "operator": {"cmp": "equals"},
++                        "value": "$.status",
++                        "operand": {"jsonpath_op": "literal", "value": "ok"},
++                    },
++                ],
++            }
++        }
++        result, was_modified = ensure_2xx_status_checks(assertion)
++        assert not was_modified
++        assert result == assertion
++
++    def test_already_has_status_code_check_nested_in_or(self) -> None:
++        assertion = {
++            "root": {
++                "op": "or",
++                "children": [
++                    {"op": "status_code_check", "operator": {"cmp": "equals"}, "value": 200},
++                    {"op": "status_code_check", "operator": {"cmp": "equals"}, "value": 204},
++                ],
++            }
++        }
++        result, was_modified = ensure_2xx_status_checks(assertion)
++        assert not was_modified
++        assert result == assertion
++
++    def test_already_has_status_code_check_inside_not(self) -> None:
++        assertion = {
++            "root": {
++                "op": "not",
++                "operand": {"op": "status_code_check", "operator": {"cmp": "equals"}, "value": 404},
++            }
++        }
++        result, was_modified = ensure_2xx_status_checks(assertion)
++        assert not was_modified
++        assert result == assertion
++
++    def test_already_has_status_code_check_deeply_nested(self) -> None:
++        assertion = {
++            "root": {
++                "op": "and",
++                "children": [
++                    {
++                        "op": "or",
++                        "children": [
++                            {
++                                "op": "status_code_check",
++                                "operator": {"cmp": "equals"},
++                                "value": 200,
++                            },
++                            {
++                                "op": "status_code_check",
++                                "operator": {"cmp": "equals"},
++                                "value": 204,
++                            },
++                        ],
++                    }
++                ],
++            }
++        }
++        result, was_modified = ensure_2xx_status_checks(assertion)
++        assert not was_modified
++        assert result == assertion
++
++    def test_no_status_code_check_and_root(self) -> None:
++        json_path_check = {
++            "op": "json_path",
++            "operator": {"cmp": "equals"},
++            "value": "$.status",
++            "operand": {"jsonpath_op": "literal", "value": "ok"},
++        }
++        assertion = {"root": {"op": "and", "children": [json_path_check]}}
++        result, was_modified = ensure_2xx_status_checks(assertion)
++        assert was_modified
++        assert result == {"root": {"op": "and", "children": [json_path_check, GT_199, LT_300]}}
++
++    def test_no_status_code_check_non_and_root(self) -> None:
++        json_path_check = {
++            "op": "json_path",
++            "operator": {"cmp": "equals"},
++            "value": "$.status",
++            "operand": {"jsonpath_op": "literal", "value": "ok"},
++        }
++        assertion = {"root": json_path_check}
++        result, was_modified = ensure_2xx_status_checks(assertion)
++        assert was_modified
++        assert result == {"root": {"op": "and", "children": [json_path_check, GT_199, LT_300]}}
++
++
++@pytest.mark.skip(reason="TestMigrations is slow; run explicitly")
++class Backfill2xxStatusAssertionMigrationTest(TestMigrations):
++    migrate_from = "0054_delete_bad_assertions"
++    migrate_to = "0055_backfill_2xx_status_assertion"
++    app = "uptime"
++
++    def setup_initial_state(self) -> None:
++        self.organization = self.create_organization(name="test-org")
++        self.project = self.create_project(organization=self.organization)
++
++        self.null_assertion_sub = self.create_uptime_subscription(
++            subscription_id=uuid.uuid4().hex,
++            interval_seconds=300,
++            region_slugs=["default"],
++        )
++
++        self.existing_status_code_sub = self.create_uptime_subscription(
++            subscription_id=uuid.uuid4().hex,
++            interval_seconds=300,
++            region_slugs=["default"],
++            assertion={
++                "root": {
++                    "op": "and",
++                    "children": [
++                        {"op": "status_code_check", "operator": {"cmp": "equals"}, "value": 200}
++                    ],
++                }
++            },
++        )
++
++        self.json_path_only_sub = self.create_uptime_subscription(
++            subscription_id=uuid.uuid4().hex,
++            interval_seconds=300,
++            region_slugs=["default"],
++            assertion={
++                "root": {
++                    "op": "and",
++                    "children": [
++                        {
++                            "op": "json_path",
++                            "operator": {"cmp": "equals"},
++                            "value": "$.status",
++                            "operand": {"jsonpath_op": "literal", "value": "ok"},
++                        }
++                    ],
++                }
++            },
++        )
++
++        self.non_and_root_sub = self.create_uptime_subscription(
++            subscription_id=uuid.uuid4().hex,
++            interval_seconds=300,
++            region_slugs=["default"],
++            assertion={
++                "root": {
++                    "op": "json_path",
++                    "operator": {"cmp": "equals"},
++                    "value": "$.status",
++                    "operand": {"jsonpath_op": "literal", "value": "ok"},
++                }
++            },
++        )
++
++    def test_migration(self) -> None:
++        # null assertion gets the default >199 AND <300 pair
++        self.null_assertion_sub.refresh_from_db()
++        assert self.null_assertion_sub.assertion == {
++            "root": {"op": "and", "children": [GT_199, LT_300]}
++        }
++
++        # existing status_code_check is left untouched
++        self.existing_status_code_sub.refresh_from_db()
++        assert self.existing_status_code_sub.assertion == {
++            "root": {
++                "op": "and",
++                "children": [
++                    {"op": "status_code_check", "operator": {"cmp": "equals"}, "value": 200}
++                ],
++            }
++        }
++
++        # json_path only — pair appended, existing child preserved
++        self.json_path_only_sub.refresh_from_db()
++        assert self.json_path_only_sub.assertion == {
++            "root": {
++                "op": "and",
++                "children": [
++                    {
++                        "op": "json_path",
++                        "operator": {"cmp": "equals"},
++                        "value": "$.status",
++                        "operand": {"jsonpath_op": "literal", "value": "ok"},
++                    },
++                    GT_199,
++                    LT_300,
++                ],
++            }
++        }
++
++        # non-and root — wrapped in a new and group
++        self.non_and_root_sub.refresh_from_db()
++        assert self.non_and_root_sub.assertion == {
++            "root": {
++                "op": "and",
++                "children": [
++                    {
++                        "op": "json_path",
++                        "operator": {"cmp": "equals"},
++                        "value": "$.status",
++                        "operand": {"jsonpath_op": "literal", "value": "ok"},
++                    },
++                    GT_199,
++                    LT_300,
++                ],
++            }
++        }
+diff --git a/tests/sentry/utils/sentry_apps/test_webhook_timeout.py b/tests/sentry/utils/sentry_apps/test_webhook_timeout.py
+new file mode 100644
+index 00000000000000..ffd6f2fc379187
+--- /dev/null
++++ b/tests/sentry/utils/sentry_apps/test_webhook_timeout.py
+@@ -0,0 +1,155 @@
++import time
++from unittest.mock import ANY, Mock, patch
++
++import pytest
++from requests import Response
++
++from sentry.sentry_apps.api.serializers.app_platform_event import AppPlatformEvent
++from sentry.sentry_apps.metrics import SentryAppWebhookHaltReason
++from sentry.sentry_apps.utils.webhooks import IssueActionType, SentryAppResourceType
++from sentry.testutils.asserts import assert_halt_metric
++from sentry.testutils.cases import TestCase
++from sentry.testutils.helpers.features import with_feature
++from sentry.testutils.helpers.options import override_options
++from sentry.testutils.silo import region_silo_test
++from sentry.utils.sentry_apps.webhooks import WebhookTimeoutError, send_and_save_webhook_request
++
++
++@region_silo_test
++class WebhookTimeoutTest(TestCase):
++    def setUp(self):
++        self.organization = self.create_organization()
++        self.sentry_app = self.create_sentry_app(
++            name="TestApp",
++            organization=self.organization,
++            webhook_url="https://example.com/webhook",
++            published=True,
++        )
++        self.install = self.create_sentry_app_installation(
++            organization=self.organization, slug=self.sentry_app.slug
++        )
++
++    @with_feature("organizations:sentry-app-webhook-hard-timeout")
++    @override_options(
++        {
++            "sentry-apps.webhook.hard-timeout.sec": 5.0,
++            "sentry-apps.webhook.timeout.sec": 1.0,
++            "sentry-apps.webhook.restricted-webhook-sending": [],
++            "sentry-apps.webhook-logging.enabled": {"installation_uuid": [], "sentry_app_slug": []},
++        }
++    )
++    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
++    def test_webhook_completes_before_timeout(self, mock_safe_urlopen):
++        # Mock successful response
++        mock_response = Mock(spec=Response)
++        mock_response.status_code = 200
++        mock_response.headers = {}
++        mock_safe_urlopen.return_value = mock_response
++
++        app_platform_event = AppPlatformEvent(
++            resource=SentryAppResourceType.ISSUE,
++            action=IssueActionType.CREATED,
++            install=self.install,
++            data={"test": "data"},
++        )
++
++        # Should complete without raising WebhookTimeoutError
++        response = send_and_save_webhook_request(self.sentry_app, app_platform_event)
++
++        assert response == mock_response
++        mock_safe_urlopen.assert_called_once()
++
++    @with_feature("organizations:sentry-app-webhook-hard-timeout")
++    @override_options(
++        {
++            "sentry-apps.webhook.hard-timeout.sec": 1.0,
++            "sentry-apps.webhook.timeout.sec": 10.0,
++            "sentry-apps.webhook.restricted-webhook-sending": [],
++            "sentry-apps.webhook-logging.enabled": {"installation_uuid": [], "sentry_app_slug": []},
++        }
++    )
++    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
++    def test_webhook_interrupted_by_hard_timeout(self, mock_safe_urlopen):
++        # Make safe_urlopen sleep longer than the timeout
++        def slow_urlopen(*args, **kwargs):
++            time.sleep(6.0)  # Sleep longer than 1 second timeout
++            mock_response = Mock(spec=Response)
++            mock_response.status_code = 200
++            return mock_response
++
++        mock_safe_urlopen.side_effect = slow_urlopen
++
++        # Create event
++        app_platform_event = AppPlatformEvent(
++            resource=SentryAppResourceType.ISSUE,
++            action=IssueActionType.CREATED,
++            install=self.install,
++            data={"test": "data"},
++        )
++
++        # Should raise WebhookTimeoutError
++        with pytest.raises(WebhookTimeoutError, match="Webhook request exceeded hard timeout"):
++            send_and_save_webhook_request(self.sentry_app, app_platform_event)
++
++    @with_feature("organizations:sentry-app-webhook-hard-timeout")
++    @override_options(
++        {
++            "sentry-apps.webhook.hard-timeout.sec": 1.0,
++            "sentry-apps.webhook.timeout.sec": 10.0,
++            "sentry-apps.webhook.restricted-webhook-sending": [],
++        }
++    )
++    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
++    @patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
++    def test_lifecycle_record_halt_called_on_timeout(self, mock_record, mock_safe_urlopen):
++        # Make safe_urlopen sleep
++        def slow_urlopen(*args, **kwargs):
++            time.sleep(2.0)
++            return Mock(spec=Response)
++
++        mock_safe_urlopen.side_effect = slow_urlopen
++
++        app_platform_event = AppPlatformEvent(
++            resource=SentryAppResourceType.ISSUE,
++            action=IssueActionType.CREATED,
++            install=self.install,
++            data={"test": "data"},
++        )
++
++        with pytest.raises(WebhookTimeoutError):
++            send_and_save_webhook_request(self.sentry_app, app_platform_event)
++
++        assert_halt_metric(
++            mock_record=mock_record,
++            error_msg=f"send_and_save_webhook_request.{SentryAppWebhookHaltReason.HARD_TIMEOUT}",
++        )
++
++    @with_feature("organizations:sentry-app-webhook-hard-timeout")
++    @override_options(
++        {
++            "sentry-apps.webhook.hard-timeout.sec": 5.0,
++            "sentry-apps.webhook.timeout.sec": 10.0,
++            "sentry-apps.webhook.restricted-webhook-sending": [],
++            "sentry-apps.webhook-logging.enabled": {"installation_uuid": [], "sentry_app_slug": []},
++        }
++    )
++    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
++    @patch("sentry.utils.sentry_apps.webhooks.timeout_alarm")
++    def test_timeout_alarm_is_used(self, mock_timeout_alarm, mock_safe_urlopen):
++        mock_response = Mock(spec=Response)
++        mock_response.status_code = 200
++        mock_response.headers = {}
++        mock_safe_urlopen.return_value = mock_response
++        mock_timeout_alarm.return_value.__enter__ = Mock(return_value=None)
++        mock_timeout_alarm.return_value.__exit__ = Mock(return_value=False)
++
++        app_platform_event = AppPlatformEvent(
++            resource=SentryAppResourceType.ISSUE,
++            action=IssueActionType.CREATED,
++            install=self.install,
++            data={"test": "data"},
++        )
++
++        send_and_save_webhook_request(self.sentry_app, app_platform_event)
++
++        mock_timeout_alarm.assert_called_once_with(5.0, ANY)
+diff --git a/tests/sentry/workflow_engine/endpoints/test_organization_detector_index.py b/tests/sentry/workflow_engine/endpoints/test_organization_detector_index.py
+index 9b85ccfee24955..63f13bcd888eee 100644
+--- a/tests/sentry/workflow_engine/endpoints/test_organization_detector_index.py
++++ b/tests/sentry/workflow_engine/endpoints/test_organization_detector_index.py
+@@ -52,6 +52,10 @@ class OrganizationDetectorIndexBaseTest(APITestCase):
+     def setUp(self) -> None:
+         super().setUp()
+         self.login_as(user=self.user)
++        self.mock_invoke_checker_validator_ctx = mock.patch(
++            "sentry.uptime.checker_api.invoke_checker_validator", return_value=None
++        )
++        self.mock_invoke_checker_validator = self.mock_invoke_checker_validator_ctx.__enter__()
+         self.environment = Environment.objects.create(
+             organization_id=self.organization.id, name="production"
+         )
+@@ -66,6 +70,10 @@ def setUp(self) -> None:
+             type=IssueStreamGroupType.slug, project=self.project, name="Issue Stream"
+         )
+ 
++    def tearDown(self) -> None:
++        super().tearDown()
++        self.mock_invoke_checker_validator_ctx.__exit__(None, None, None)
++
+ 
+ @cell_silo_test
+ class OrganizationDetectorIndexGetTest(OrganizationDetectorIndexBaseTest):
+diff --git a/tests/snuba/api/endpoints/test_organization_events_trace.py b/tests/snuba/api/endpoints/test_organization_events_trace.py
+index 036fcb4d9cbd01..f4c0291057dfeb 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_trace.py
++++ b/tests/snuba/api/endpoints/test_organization_events_trace.py
+@@ -1520,13 +1520,13 @@ def test_simple_with_eap_as_source_of_truth(self) -> None:
+                     project=self.project,
+                     group_id=first_group.id,
+                     trace_id=self.trace_id,
+-                    occurrence_type="generic",
++                    issue_occurrence_id=uuid4().hex,
+                 ),
+                 self.create_eap_occurrence(
+                     project=self.project,
+                     group_id=second_group.id,
+                     trace_id=self.trace_id,
+-                    occurrence_type="generic",
++                    issue_occurrence_id=uuid4().hex,
+                 ),
+             ]
+         )
+diff --git a/tests/snuba/api/endpoints/test_organization_trace_meta.py b/tests/snuba/api/endpoints/test_organization_trace_meta.py
+index c46c3f99e5b1b7..d1d31df6001096 100644
+--- a/tests/snuba/api/endpoints/test_organization_trace_meta.py
++++ b/tests/snuba/api/endpoints/test_organization_trace_meta.py
+@@ -102,13 +102,13 @@ def test_simple_with_eap_as_source_of_truth(self) -> None:
+                     project=self.project,
+                     group_id=first_group.id,
+                     trace_id=self.trace_id,
+-                    occurrence_type="generic",
++                    issue_occurrence_id=uuid4().hex,
+                 ),
+                 self.create_eap_occurrence(
+                     project=self.project,
+                     group_id=second_group.id,
+                     trace_id=self.trace_id,
+-                    occurrence_type="generic",
++                    issue_occurrence_id=uuid4().hex,
+                 ),
+             ]
+         )
+@@ -174,7 +174,6 @@ def test_with_errors_eap_eval_not_allowlisted_uses_snuba(self) -> None:
+                     project=self.gen1_project,
+                     group_id=group.id,
+                     trace_id=self.trace_id,
+-                    occurrence_type="error",
+                 ),
+             ]
+         )
+@@ -207,7 +206,6 @@ def test_with_errors_eap_allowlisted_uses_eap(self) -> None:
+                     project=self.gen1_project,
+                     group_id=group.id,
+                     trace_id=self.trace_id,
+-                    occurrence_type="error",
+                 ),
+             ]
+         )
+diff --git a/tests/snuba/search/test_eap_occurrences.py b/tests/snuba/search/test_eap_occurrences.py
+index 499514ecf9f028..9b6c0eeebb10db 100644
+--- a/tests/snuba/search/test_eap_occurrences.py
++++ b/tests/snuba/search/test_eap_occurrences.py
+@@ -67,31 +67,36 @@ def test_create_and_store_occurrence(self) -> None:
+         assert len(result["data"]) == 1
+         assert result["data"][0]["count()"] == 1
+ 
+-    def test_occurrence_type_filtering(self) -> None:
++    def test_occurrence_category_filtering(self) -> None:
+         group_error = self.create_group(project=self.project)
+         group_generic = self.create_group(project=self.project)
+ 
++        # Error events have no issue_occurrence_id
+         error_occurrence = self.create_eap_occurrence(
+             group_id=group_error.id,
+-            occurrence_type="error",
+         )
++        # Issue platform events have an issue_occurrence_id
+         generic_occurrence = self.create_eap_occurrence(
+             group_id=group_generic.id,
+-            occurrence_type="generic",
++            issue_occurrence_id=uuid4().hex,
+         )
+         self.store_eap_items([error_occurrence, generic_occurrence])
+ 
+-        # OccurrenceCategory.ERROR filters for type != "generic"
++        # OccurrenceCategory.ERROR filters for items without issue_occurrence_id
+         error_result = self._query_occurrences(
++            selected_columns=["group_id", "count()"],
+             occurrence_category=OccurrenceCategory.ERROR,
+         )
+         assert error_result["data"][0]["count()"] == 1
++        assert error_result["data"][0]["group_id"] == group_error.id
+ 
+-        # OccurrenceCategory.GENERIC filters for type == "generic"
++        # OccurrenceCategory.ISSUE_PLATFORM filters for items with issue_occurrence_id
+         generic_result = self._query_occurrences(
+-            occurrence_category=OccurrenceCategory.GENERIC,
++            selected_columns=["group_id", "count()"],
++            occurrence_category=OccurrenceCategory.ISSUE_PLATFORM,
+         )
+         assert generic_result["data"][0]["count()"] == 1
++        assert generic_result["data"][0]["group_id"] == group_generic.id
+ 
+         # No category filter returns both
+         all_result = self._query_occurrences()
+@@ -225,11 +230,13 @@ def test_filters_by_occurrence_category(self) -> None:
+         group = self.create_group(project=self.project)
+         self.store_eap_items(
+             [
+-                self.create_eap_occurrence(group_id=group.id, occurrence_type="error"),
+-                self.create_eap_occurrence(group_id=group.id, occurrence_type="error"),
+-                self.create_eap_occurrence(group_id=group.id, occurrence_type="error"),
+-                self.create_eap_occurrence(group_id=group.id, occurrence_type="generic"),
+-                self.create_eap_occurrence(group_id=group.id, occurrence_type="generic"),
++                # Error events: no issue_occurrence_id
++                self.create_eap_occurrence(group_id=group.id),
++                self.create_eap_occurrence(group_id=group.id),
++                self.create_eap_occurrence(group_id=group.id),
++                # Issue platform events: have issue_occurrence_id
++                self.create_eap_occurrence(group_id=group.id, issue_occurrence_id=uuid4().hex),
++                self.create_eap_occurrence(group_id=group.id, issue_occurrence_id=uuid4().hex),
+             ]
+         )
+ 
+@@ -247,7 +254,7 @@ def test_filters_by_occurrence_category(self) -> None:
+             start=self.start,
+             end=self.end,
+             referrer=self.referrer,
+-            occurrence_category=OccurrenceCategory.GENERIC,
++            occurrence_category=OccurrenceCategory.ISSUE_PLATFORM,
+         )
+ 
+         assert error_count == 3
+@@ -282,14 +289,12 @@ def test_counts_grouped_by_trace_ids_with_occurrence_category(self) -> None:
+         trace_id = uuid4().hex
+         self.store_eap_items(
+             [
++                # Error events: no issue_occurrence_id
++                self.create_eap_occurrence(group_id=group.id, trace_id=trace_id),
++                self.create_eap_occurrence(group_id=group.id, trace_id=trace_id),
++                # Issue platform event: has issue_occurrence_id
+                 self.create_eap_occurrence(
+-                    group_id=group.id, trace_id=trace_id, occurrence_type="error"
+-                ),
+-                self.create_eap_occurrence(
+-                    group_id=group.id, trace_id=trace_id, occurrence_type="error"
+-                ),
+-                self.create_eap_occurrence(
+-                    group_id=group.id, trace_id=trace_id, occurrence_type="generic"
++                    group_id=group.id, trace_id=trace_id, issue_occurrence_id=uuid4().hex
+                 ),
+             ]
+         )
+@@ -310,7 +315,7 @@ def test_counts_grouped_by_trace_ids_with_occurrence_category(self) -> None:
+             snuba_params=snuba_params,
+             trace_ids=[trace_id],
+             referrer=self.referrer,
+-            occurrence_category=OccurrenceCategory.GENERIC,
++            occurrence_category=OccurrenceCategory.ISSUE_PLATFORM,
+         )
+ 
+         assert grouped_errors == {trace_id: 2}

@@ -1,0 +1,192 @@
+diff --git a/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx b/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx
+index 0baf66e88bc581..7796f102d2c3e2 100644
+--- a/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx
++++ b/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx
+@@ -285,7 +285,11 @@ export function getMenuOptions(
+       .map((series, index) => {
+         const transformed = transformWidgetSeriesToTimeSeries(series, widget);
+ 
+-        if (!transformed || transformed.timeSeries.meta.isOther) {
++        if (
++          !transformed ||
++          transformed.timeSeries.meta.isOther ||
++          isEquation(transformed.timeSeries.yAxis)
++        ) {
+           return null;
+         }
+ 
+diff --git a/static/app/views/explore/toolbar/index.spec.tsx b/static/app/views/explore/toolbar/index.spec.tsx
+index 6bd935ec2119a1..d31dc7b6f624e0 100644
+--- a/static/app/views/explore/toolbar/index.spec.tsx
++++ b/static/app/views/explore/toolbar/index.spec.tsx
+@@ -640,7 +640,39 @@ describe('ExploreToolbar', () => {
+     expect(aggregateSortBys).toEqual([{field: 'count(span.duration)', kind: 'asc'}]);
+   });
+ 
+-  it('opens compare queries', async () => {
++  it('disables compare queries when only one chart is available', async () => {
++    function Component() {
++      return <ExploreToolbar />;
++    }
++    act(() => {
++      render(
++        <Wrapper>
++          <Component />
++        </Wrapper>,
++        {
++          organization,
++          initialRouterConfig: {
++            location: {
++              pathname: '/traces/',
++              query: {
++                visualize: encodeURIComponent(
++                  '{"chartType":1,"yAxes":["p95(span.duration)"]}'
++                ),
++              },
++            },
++          },
++        }
++      );
++    });
++
++    const section = screen.getByTestId('section-save-as');
++    await userEvent.hover(within(section).getByText(/Compare Queries/));
++
++    const compareButton = within(section).getByRole('button', {name: 'Compare'});
++    expect(compareButton).toHaveAttribute('aria-disabled', 'true');
++  });
++
++  it('opens compare queries when multiple charts are added and Compare Queries link is clicked', async () => {
+     function Component() {
+       return <ExploreToolbar />;
+     }
+@@ -663,9 +695,11 @@ describe('ExploreToolbar', () => {
+       }
+     );
+ 
++    await userEvent.click(screen.getByRole('button', {name: 'Add Chart'}));
++
+     const section = screen.getByTestId('section-save-as');
+ 
+-    await userEvent.click(within(section).getByText(/Compare/));
++    await userEvent.click(within(section).getByText(/Compare Queries/));
+     expect(router.location.pathname).toBe(
+       '/organizations/org-slug/explore/traces/compare/'
+     );
+@@ -673,7 +707,7 @@ describe('ExploreToolbar', () => {
+       expect.objectContaining({
+         queries: [
+           '{"chartType":0,"groupBys":[],"query":"","sortBys":["-timestamp"],"yAxes":["count(span.duration)"]}',
+-          '{"fields":["id","span.duration","timestamp"],"groupBys":[],"query":"","sortBys":["-timestamp"],"yAxes":["count(span.duration)"]}',
++          '{"chartType":0,"groupBys":[],"query":"","sortBys":["-timestamp"],"yAxes":["count(span.duration)"]}',
+         ],
+       })
+     );
+diff --git a/static/app/views/explore/toolbar/toolbarSaveAs.tsx b/static/app/views/explore/toolbar/toolbarSaveAs.tsx
+index 726468e7675734..014731307853f4 100644
+--- a/static/app/views/explore/toolbar/toolbarSaveAs.tsx
++++ b/static/app/views/explore/toolbar/toolbarSaveAs.tsx
+@@ -66,10 +66,15 @@ export function ToolbarSaveAs() {
+   const aggregateSortBys = useQueryParamsAggregateSortBys();
+   const mode = useQueryParamsMode();
+   const id = useQueryParamsId();
+-  const visualizeYAxes = useMemo(
+-    () => dedupeArray(visualizes.filter(isVisualizeFunction).map(v => v.yAxis)),
++
++  const visualizeFunctions = useMemo(
++    () => visualizes.filter(isVisualizeFunction),
+     [visualizes]
+   );
++  const visualizeYAxes = useMemo(
++    () => dedupeArray(visualizeFunctions.map(v => v.yAxis)),
++    [visualizeFunctions]
++  );
+   const [caseInsensitive] = useCaseInsensitivity();
+ 
+   const sortBys = mode === Mode.SAMPLES ? sampleSortBys : aggregateSortBys;
+@@ -281,6 +286,8 @@ export function ToolbarSaveAs() {
+     return null;
+   }
+ 
++  const canCompareQueries = visualizeFunctions.length >= 2;
++
+   return (
+     <StyledToolbarSection data-test-id="section-save-as">
+       <Grid flow="column" align="center" gap="md">
+@@ -308,42 +315,46 @@ export function ToolbarSaveAs() {
+             )}
+           />
+         </Tooltip>
+-        <Tooltip
+-          disabled={!hasCrossEvents}
+-          title={t('Comparing cross event queries is not supported during early access.')}
+-        >
+-          <LinkButton
+-            aria-label={t('Compare')}
+-            disabled={hasCrossEvents}
+-            onClick={() =>
+-              trackAnalytics('trace_explorer.compare', {
+-                organization,
+-              })
+-            }
+-            to={generateExploreCompareRoute({
++        <WideLinkButton
++          aria-label={t('Compare')}
++          disabled={hasCrossEvents || !canCompareQueries}
++          onClick={() =>
++            trackAnalytics('trace_explorer.compare', {
+               organization,
+-              mode,
+-              location,
+-              queries: [
+-                {
+-                  query,
+-                  groupBys,
+-                  sortBys,
+-                  yAxes: [visualizeYAxes[0]!],
+-                  chartType: visualizes[0]!.chartType,
+-                  caseInsensitive: caseInsensitive ? '1' : undefined,
+-                },
+-              ],
+-            })}
+-          >
+-            {`${t('Compare Queries')}`}
+-          </LinkButton>
+-        </Tooltip>
++            })
++          }
++          to={generateExploreCompareRoute({
++            organization,
++            mode,
++            location,
++            queries: visualizeFunctions.map(visual => ({
++              query,
++              groupBys,
++              sortBys,
++              yAxes: [visual.yAxis],
++              chartType: visual.chartType,
++              caseInsensitive: caseInsensitive ? '1' : undefined,
++            })),
++          })}
++          tooltipProps={
++            hasCrossEvents
++              ? {title: t('Comparing queries is not supported during early access.')}
++              : canCompareQueries
++                ? undefined
++                : {title: t('Add two or more charts to compare chart queries.')}
++          }
++        >
++          {t('Compare Queries')}
++        </WideLinkButton>
+       </Grid>
+     </StyledToolbarSection>
+   );
+ }
+ 
++const WideLinkButton = styled(LinkButton)`
++  width: 100%;
++`;
++
+ const DisabledText = styled('span')`
+   color: ${p => p.theme.tokens.content.disabled};
+ `;

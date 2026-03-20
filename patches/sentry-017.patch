@@ -1,59 +1,93 @@
-diff --git a/static/app/views/dashboards/widgetBuilder/hooks/useWidgetBuilderState.tsx b/static/app/views/dashboards/widgetBuilder/hooks/useWidgetBuilderState.tsx
-index d182ebf8bde..fd6e643a8f9 100644
---- a/static/app/views/dashboards/widgetBuilder/hooks/useWidgetBuilderState.tsx
-+++ b/static/app/views/dashboards/widgetBuilder/hooks/useWidgetBuilderState.tsx
-@@ -1217,6 +1217,9 @@ function useWidgetBuilderState(): {
-  * Returns the default display type if the value is not a valid display type
+diff --git a/static/app/components/core/form/field/autoSaveField.spec.tsx b/static/app/components/core/form/field/autoSaveField.spec.tsx
+new file mode 100644
+index 00000000000000..6b21c3f1cd41fa
+--- /dev/null
++++ b/static/app/components/core/form/field/autoSaveField.spec.tsx
+@@ -0,0 +1,48 @@
++import {expectTypeOf} from 'expect-type';
++import {z} from 'zod';
++
++import {AutoSaveField} from '@sentry/scraps/form';
++
++const testSchema = z.object({
++  testField: z.string(),
++});
++
++describe('AutoSaveField', () => {
++  describe('types', () => {
++    it('should have data type flow towards callbacks', () => {
++      function TypeTestField() {
++        return (
++          <AutoSaveField
++            name="testField"
++            schema={testSchema}
++            initialValue=""
++            mutationOptions={{
++              onMutate: variables => {
++                expectTypeOf(variables).toEqualTypeOf<{testField: string}>();
++                return {
++                  context: true,
++                };
++              },
++              mutationFn: data => Promise.resolve(data.testField),
++              onSuccess: data => {
++                expectTypeOf(data).toEqualTypeOf<string>();
++              },
++              onError: (error, variables, context) => {
++                expectTypeOf(error).toEqualTypeOf<Error>();
++                expectTypeOf(variables).toEqualTypeOf<{testField: string}>();
++                expectTypeOf(context).toEqualTypeOf<{context: boolean} | undefined>();
++              },
++            }}
++          >
++            {field => (
++              <field.Layout.Row label="Username">
++                <field.Input value={field.state.value} onChange={field.handleChange} />
++              </field.Layout.Row>
++            )}
++          </AutoSaveField>
++        );
++      }
++      void TypeTestField;
++    });
++  });
++});
+diff --git a/static/app/components/core/form/field/autoSaveField.tsx b/static/app/components/core/form/field/autoSaveField.tsx
+index 7b858b8a00ed5e..1ee9058241fc7b 100644
+--- a/static/app/components/core/form/field/autoSaveField.tsx
++++ b/static/app/components/core/form/field/autoSaveField.tsx
+@@ -102,6 +102,8 @@ type AutoSaveFieldRenderArg<
   */
- function deserializeDisplayType(value: string): DisplayType {
-+  if (value === DisplayType.TOP_N) {
-+    return DisplayType.AREA;
-+  }
-   if (Object.values(DisplayType).includes(value as DisplayType)) {
-     return value as DisplayType;
-   }
-diff --git a/static/app/views/dashboards/widgetCard/index.spec.tsx b/static/app/views/dashboards/widgetCard/index.spec.tsx
-index 0341ddf878e..aeea64d5196 100644
---- a/static/app/views/dashboards/widgetCard/index.spec.tsx
-+++ b/static/app/views/dashboards/widgetCard/index.spec.tsx
-@@ -295,9 +295,10 @@ describe('Dashboards > WidgetCard', () => {
-     );
  
-     await userEvent.click(await screen.findByLabelText('Widget actions'));
-+    // TOP_N is converted to AREA, so the discover URL no longer has display=top5
-     expect(screen.getByRole('menuitemradio', {name: 'Open in Discover'})).toHaveAttribute(
-       'href',
--      '/organizations/org-slug/explore/discover/results/?display=top5&environment=prod&field=transaction&field=count%28%29&name=Errors&project=1&query=event.type%3Aerror&queryDataset=error-events&statsPeriod=14d&yAxis=count%28%29'
-+      '/organizations/org-slug/explore/discover/results/?environment=prod&field=transaction&field=count%28%29&name=Errors&project=1&query=event.type%3Aerror&queryDataset=error-events&statsPeriod=14d&yAxis=count%28%29'
-     );
-   });
+ interface AutoSaveFieldProps<
++  TData,
++  TContext,
+   TSchema extends z.ZodObject<z.ZodRawShape>,
+   TFieldName extends Extract<keyof z.infer<TSchema>, string>,
+ > {
+@@ -119,10 +121,10 @@ interface AutoSaveFieldProps<
+    * TanStack Query mutation options - mutationFn receives single-field data
+    */
+   mutationOptions: UseMutationOptions<
+-    any, // it doesn't matter here what the mutation returns
++    TData,
+     Error,
+     NoInfer<Record<TFieldName, z.infer<TSchema>[TFieldName]>>,
+-    any // context type from onMutate - allow any shape
++    TContext
+   >;
  
-diff --git a/static/app/views/dashboards/widgetCard/index.tsx b/static/app/views/dashboards/widgetCard/index.tsx
-index d21bc055ece..ddb248fd653 100644
---- a/static/app/views/dashboards/widgetCard/index.tsx
-+++ b/static/app/views/dashboards/widgetCard/index.tsx
-@@ -43,7 +43,6 @@ import {
-   WidgetType,
- } from 'sentry/views/dashboards/types';
- import {widgetCanUseTimeSeriesVisualization} from 'sentry/views/dashboards/utils/widgetCanUseTimeSeriesVisualization';
--import {DEFAULT_RESULTS_LIMIT} from 'sentry/views/dashboards/widgetBuilder/utils';
- import {WidgetCardChartContainer} from 'sentry/views/dashboards/widgetCard/widgetCardChartContainer';
- import type WidgetLegendSelectionState from 'sentry/views/dashboards/widgetLegendSelectionState';
- import type {TabularColumn} from 'sentry/views/dashboards/widgets/common/types';
-@@ -191,15 +190,7 @@ function WidgetCard(props: Props) {
-   } = props;
+   /**
+@@ -155,9 +157,11 @@ interface AutoSaveFieldProps<
+ }
  
-   if (widget.displayType === DisplayType.TOP_N) {
--    const queries = widget.queries.map(query => ({
--      ...query,
--      // Use the last aggregate because that's where the y-axis is stored
--      aggregates: query.aggregates.length
--        ? [query.aggregates[query.aggregates.length - 1]!]
--        : [],
--    }));
--    widget.queries = queries;
--    widget.limit = DEFAULT_RESULTS_LIMIT;
-+    widget.displayType = DisplayType.AREA;
-   }
- 
-   const hasSessionDuration = widget.queries.some(query =>
+ export function AutoSaveField<
++  TData,
++  TContext,
+   TSchema extends z.ZodObject<z.ZodRawShape>,
+   TFieldName extends Extract<keyof z.infer<TSchema>, string>,
+->(props: AutoSaveFieldProps<TSchema, TFieldName>) {
++>(props: AutoSaveFieldProps<TData, TContext, TSchema, TFieldName>) {
+   const {name, schema, initialValue, mutationOptions, confirm, children} = props;
+   const id = useId();
+   const mutation = useMutation(mutationOptions);

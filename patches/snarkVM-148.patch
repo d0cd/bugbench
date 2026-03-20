@@ -1,82 +1,188 @@
-diff --git a/console/collections/src/merkle_tree/mod.rs b/console/collections/src/merkle_tree/mod.rs
-index d3f621fc1..28d64e207 100644
---- a/console/collections/src/merkle_tree/mod.rs
-+++ b/console/collections/src/merkle_tree/mod.rs
-@@ -59,7 +59,11 @@ impl<E: Environment, LH: LeafHash<Hash = PH::Hash>, PH: PathHash<Hash = Field<E>
-         ensure!(DEPTH <= 64u8, "Merkle tree depth must be less than or equal to 64");
+diff --git a/Cargo.lock b/Cargo.lock
+index 47d3071aa..18b32f73c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -444,9 +444,9 @@ dependencies = [
  
-         // Compute the maximum number of leaves.
--        let max_leaves = leaves.len().next_power_of_two();
-+        let max_leaves = match leaves.len().checked_next_power_of_two() {
-+            Some(num_leaves) => num_leaves,
-+            None => bail!("Integer overflow when computing the maximum number of leaves in the Merkle tree"),
-+        };
+ [[package]]
+ name = "crossbeam-channel"
+-version = "0.5.2"
++version = "0.5.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e54ea8bc3fb1ee042f5aace6e3c6e025d3874866da222930f70ce62aceba0bfa"
++checksum = "fdbfe11fe19ff083c48923cf179540e8cd0535903dc35e178a1fdeeb59aef51f"
+ dependencies = [
+  "cfg-if 1.0.0",
+  "crossbeam-utils",
+diff --git a/algorithms/src/commitment/bhp.rs b/algorithms/src/commitment/bhp.rs
+index a2db333a3..b25f522db 100644
+--- a/algorithms/src/commitment/bhp.rs
++++ b/algorithms/src/commitment/bhp.rs
+@@ -19,6 +19,7 @@ use snarkvm_curves::{AffineCurve, ProjectiveCurve};
+ use snarkvm_fields::{ConstraintFieldError, Field, PrimeField, ToConstraintField};
+ use snarkvm_utilities::{BitIteratorLE, FromBytes, ToBytes};
+ 
++use itertools::Itertools;
+ use std::{
+     fmt::Debug,
+     io::{Read, Result as IoResult, Write},
+@@ -46,11 +47,14 @@ impl<G: ProjectiveCurve, const NUM_WINDOWS: usize, const WINDOW_SIZE: usize> Com
+         let random_base_message = format!("{} for random base", message);
+         let (generator, _, _) = hash_to_curve::<G::Affine>(&random_base_message);
+         let mut base = generator.into_projective();
+-        let mut random_base = Vec::with_capacity(WINDOW_SIZE);
+-        for _ in 0..WINDOW_SIZE {
 +
-         // Compute the number of nodes.
-         let num_nodes = max_leaves - 1;
-         // Compute the tree size as the maximum number of leaves plus the number of nodes.
-@@ -114,7 +118,10 @@ impl<E: Environment, LH: LeafHash<Hash = PH::Hash>, PH: PathHash<Hash = Field<E>
-     /// Returns a new Merkle tree with the given new leaves appended to it.
-     pub fn append(&mut self, new_leaves: &[LH::Leaf]) -> Result<()> {
-         // Compute the maximum number of leaves.
--        let max_leaves = (self.number_of_leaves + new_leaves.len()).next_power_of_two();
-+        let max_leaves = match (self.number_of_leaves + new_leaves.len()).checked_next_power_of_two() {
-+            Some(num_leaves) => num_leaves,
-+            None => bail!("Integer overflow when computing the maximum number of leaves in the Merkle tree"),
-+        };
-         // Compute the number of nodes.
-         let num_nodes = max_leaves - 1;
-         // Compute the tree size as the maximum number of leaves plus the number of nodes.
-@@ -127,7 +134,7 @@ impl<E: Environment, LH: LeafHash<Hash = PH::Hash>, PH: PathHash<Hash = Field<E>
-         // Initialize the Merkle tree.
-         let mut tree = vec![self.empty_hash; num_nodes];
-         // Extend the new Merkle tree with the existing leaf hashes.
--        tree.extend(self.leaf_hashes());
-+        tree.extend(self.leaf_hashes()?);
-         // Extend the new Merkle tree with the new leaf hashes.
-         tree.extend(&self.leaf_hasher.hash_leaves(new_leaves)?);
-         // Resize the new Merkle tree with empty hashes to pad up to `tree_size`.
-@@ -137,7 +144,10 @@ impl<E: Environment, LH: LeafHash<Hash = PH::Hash>, PH: PathHash<Hash = Field<E>
-         let timer = timer!("while");
++        let num_scalar_bits = G::ScalarField::size_in_bits();
++        let mut random_base = Vec::with_capacity(num_scalar_bits);
++        for _ in 0..num_scalar_bits {
+             random_base.push(base);
+             base.double_in_place();
+         }
++        assert_eq!(random_base.len(), num_scalar_bits);
  
-         // Initialize a precompute index to track the starting index of each precomputed level.
--        let mut precompute_index = self.number_of_leaves.next_power_of_two() - 1;
-+        let mut precompute_index = match self.number_of_leaves.checked_next_power_of_two() {
-+            Some(num_leaves) => num_leaves - 1,
-+            None => bail!("Integer overflow when computing the Merkle tree precompute index"),
-+        };
-         // Initialize a start index to track the starting index of the current level.
-         let mut start_index = num_nodes;
-         // Initialize a middle index to separate the precomputed indices from the new indices that need to be computed.
-@@ -220,7 +230,10 @@ impl<E: Environment, LH: LeafHash<Hash = PH::Hash>, PH: PathHash<Hash = Field<E>
-         let leaf_hash = self.leaf_hasher.hash_leaf(leaf)?;
- 
-         // Compute the start index (on the left) for the leaf hashes level in the Merkle tree.
--        let start = self.number_of_leaves.next_power_of_two() - 1;
-+        let start = match self.number_of_leaves.checked_next_power_of_two() {
-+            Some(num_leaves) => num_leaves - 1,
-+            None => bail!("Integer overflow when computing the Merkle tree start index"),
-+        };
-         // Compute the absolute index of the leaf in the Merkle tree.
-         let mut index = start + leaf_index;
-         // Ensure the leaf index is valid.
-@@ -275,13 +288,16 @@ impl<E: Environment, LH: LeafHash<Hash = PH::Hash>, PH: PathHash<Hash = Field<E>
+         Self { bhp_crh: bhp, random_base }
      }
+@@ -69,7 +73,7 @@ impl<G: ProjectiveCurve, const NUM_WINDOWS: usize, const WINDOW_SIZE: usize> Com
  
-     /// Returns the leaf hashes from the Merkle tree.
--    pub fn leaf_hashes(&self) -> &[LH::Hash] {
-+    pub fn leaf_hashes(&self) -> Result<&[LH::Hash]> {
-         // Compute the start index (on the left) for the leaf hashes level in the Merkle tree.
--        let start = self.number_of_leaves.next_power_of_two() - 1;
-+        let start = match self.number_of_leaves.checked_next_power_of_two() {
-+            Some(num_leaves) => num_leaves - 1,
-+            None => bail!("Integer overflow when computing the Merkle tree start index"),
-+        };
-         // Compute the end index (on the right) for the leaf hashes level in the Merkle tree.
-         let end = start + self.number_of_leaves;
-         // Return the leaf hashes.
--        &self.tree[start..end]
-+        Ok(&self.tree[start..end])
-     }
- }
+         // Compute h^r.
+         let scalar_bits = BitIteratorLE::new(randomness.to_repr());
+-        for (bit, power) in scalar_bits.into_iter().zip(&self.random_base) {
++        for (bit, power) in scalar_bits.take(G::ScalarField::size_in_bits()).zip_eq(&self.random_base) {
+             if bit {
+                 output += power
+             }
+diff --git a/dpc/Cargo.toml b/dpc/Cargo.toml
+index e1a905c65..7166137e1 100644
+--- a/dpc/Cargo.toml
++++ b/dpc/Cargo.toml
+@@ -32,6 +32,11 @@ name = "posw"
+ path = "benches/posw.rs"
+ harness = false
  
++[[bench]]
++name = "record"
++path = "benches/record.rs"
++harness = false
++
+ [[bench]]
+ name = "transaction"
+ path = "benches/transaction.rs"
+diff --git a/dpc/benches/record.rs b/dpc/benches/record.rs
+new file mode 100644
+index 000000000..2b19b813c
+--- /dev/null
++++ b/dpc/benches/record.rs
+@@ -0,0 +1,112 @@
++// Copyright (C) 2019-2022 Aleo Systems Inc.
++// This file is part of the snarkVM library.
++
++// The snarkVM library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkVM library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
++
++#[macro_use]
++extern crate criterion;
++
++use snarkvm_dpc::{prelude::*, testnet2::Testnet2};
++
++use criterion::Criterion;
++use rand::{thread_rng, Rng};
++use snarkvm_utilities::UniformRand;
++
++fn bench_record_decryption(
++    c: &mut Criterion,
++    benchmark_id: &str,
++    decryption_key: DecryptionKey<Testnet2>,
++    ciphertext: <Testnet2 as Network>::RecordCiphertext,
++) {
++    c.bench_function(benchmark_id, move |b| b.iter(|| Record::decrypt(&decryption_key, &ciphertext)));
++}
++
++fn record_decrypt_noop(c: &mut Criterion) {
++    let rng = &mut thread_rng();
++    let private_key: PrivateKey<Testnet2> = PrivateKey::new(rng);
++    let address = private_key.to_address();
++    let decryption_key = DecryptionKey::from(ViewKey::from_private_key(&private_key));
++
++    let ciphertext_noop = Record::new_noop(address, rng).unwrap().ciphertext().clone();
++    bench_record_decryption(c, "record_decrypt_noop", decryption_key, ciphertext_noop);
++}
++
++fn record_decrypt_with_payload(c: &mut Criterion) {
++    let rng = &mut thread_rng();
++    let private_key: PrivateKey<Testnet2> = PrivateKey::new(rng);
++    let address = private_key.to_address();
++    let decryption_key = DecryptionKey::from(ViewKey::from_private_key(&private_key));
++    let mut payload = [0u8; Testnet2::RECORD_PAYLOAD_SIZE_IN_BYTES];
++    rng.fill(&mut payload);
++
++    let ciphertext_with_payload =
++        Record::new(address, AleoAmount::from_gate(1234), Some(Payload::from(&payload)), None, rng)
++            .unwrap()
++            .ciphertext()
++            .clone();
++    bench_record_decryption(c, "record_decrypt_with_payload", decryption_key, ciphertext_with_payload);
++}
++
++fn record_decrypt_with_program_id(c: &mut Criterion) {
++    let mut rng = &mut thread_rng();
++    let private_key: PrivateKey<Testnet2> = PrivateKey::new(rng);
++    let address = private_key.to_address();
++    let decryption_key = DecryptionKey::from(ViewKey::from_private_key(&private_key));
++    let program_id = <Testnet2 as Network>::ProgramID::rand(&mut rng);
++
++    let ciphertext_with_program_id =
++        Record::new(address, AleoAmount::from_gate(1234), None, Some(program_id), rng).unwrap().ciphertext().clone();
++    bench_record_decryption(c, "record_decrypt_with_program_id", decryption_key, ciphertext_with_program_id);
++}
++
++fn record_decrypt_with_payload_and_program_id(c: &mut Criterion) {
++    let mut rng = &mut thread_rng();
++    let private_key: PrivateKey<Testnet2> = PrivateKey::new(rng);
++    let address = private_key.to_address();
++    let decryption_key = DecryptionKey::from(ViewKey::from_private_key(&private_key));
++
++    let mut payload = [0u8; Testnet2::RECORD_PAYLOAD_SIZE_IN_BYTES];
++    rng.fill(&mut payload);
++    let program_id = <Testnet2 as Network>::ProgramID::rand(&mut rng);
++
++    let ciphertext_with_program_id_and_payload =
++        Record::new(address, AleoAmount::from_gate(1234), Some(Payload::from(&payload)), Some(program_id), rng)
++            .unwrap()
++            .ciphertext()
++            .clone();
++    bench_record_decryption(
++        c,
++        "record_decrypt_payload_and_program_id",
++        decryption_key,
++        ciphertext_with_program_id_and_payload,
++    );
++}
++
++fn record_decrypt_with_incorrect_view_key(c: &mut Criterion) {
++    let rng = &mut thread_rng();
++    let private_key: PrivateKey<Testnet2> = PrivateKey::new(rng);
++    let decryption_key = DecryptionKey::from(ViewKey::from_private_key(&private_key));
++    let other_address: Address<Testnet2> = PrivateKey::new(rng).into();
++
++    let ciphertext_incorrect_view_key = Record::new_noop(other_address, rng).unwrap().ciphertext().clone();
++    bench_record_decryption(c, "record_decrypt_incorrect_view_key", decryption_key, ciphertext_incorrect_view_key);
++}
++
++criterion_group! {
++    name = record;
++    config = Criterion::default().sample_size(100);
++    targets = record_decrypt_noop, record_decrypt_with_payload, record_decrypt_with_program_id, record_decrypt_with_payload_and_program_id, record_decrypt_with_incorrect_view_key
++}
++
++criterion_main!(record);

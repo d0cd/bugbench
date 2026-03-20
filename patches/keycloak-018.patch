@@ -1,21 +1,184 @@
-diff --git a/.github/workflows/js-ci.yml b/.github/workflows/js-ci.yml
-index 4cc0e1d23d..cd75943d07 100644
---- a/.github/workflows/js-ci.yml
-+++ b/.github/workflows/js-ci.yml
-@@ -190,7 +190,7 @@ jobs:
-     needs:
-       - conditional
-       - build-keycloak
--    if: needs.conditional.outputs.js-ci == 'true'
-+    if: needs.conditional.outputs.js-ci == 'true' && github.repository == 'keycloak/keycloak'
-     runs-on: ubuntu-latest
-     env:
-       WORKSPACE: admin-ui
-@@ -243,6 +243,7 @@ jobs:
-           CYPRESS_BASE_URL: http://localhost:8080/admin/
-           CYPRESS_KEYCLOAK_SERVER: http://localhost:8080
-           CYPRESS_RECORD_KEY: b8f1d15e-eab8-4ee7-8e44-c6d7cd8fc0eb
-+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/InfinispanSingleUseObjectProvider.java b/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/InfinispanSingleUseObjectProvider.java
+index a24a478d938a..021b6cc9d793 100644
+--- a/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/InfinispanSingleUseObjectProvider.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/InfinispanSingleUseObjectProvider.java
+@@ -20,10 +20,7 @@
+ import java.util.Map;
+ import java.util.concurrent.TimeUnit;
  
-       - name: Upload server logs
-         uses: actions/upload-artifact@v3
+-import org.infinispan.client.hotrod.exceptions.HotRodClientException;
+ import org.infinispan.commons.api.BasicCache;
+-import org.jboss.logging.Logger;
+-import org.keycloak.common.util.Time;
+ import org.keycloak.models.KeycloakSession;
+ import org.keycloak.models.ModelException;
+ import org.keycloak.models.SingleUseObjectProvider;
+@@ -31,7 +28,7 @@
+ import org.keycloak.models.sessions.infinispan.entities.SingleUseObjectValueEntity;
+ 
+ /**
+- * TODO: Check if Boolean can be used as single-use cache argument instead of SingleUseObjectValueEntity. With respect to other single-use cache usecases like "Revoke Refresh Token" .
++ * TODO: Check if Boolean can be used as single-use cache argument instead of SingleUseObjectValueEntity. With respect to other single-use cache use cases like "Revoke Refresh Token" .
+  * Also with respect to the usage of streams iterating over "actionTokens" cache (check there are no ClassCastExceptions when casting values directly to SingleUseObjectValueEntity)
+  *
+  *
+@@ -39,8 +36,6 @@
+  */
+ public class InfinispanSingleUseObjectProvider implements SingleUseObjectProvider {
+ 
+-    public static final Logger logger = Logger.getLogger(InfinispanSingleUseObjectProvider.class);
+-
+     private final KeycloakSession session;
+     private final BasicCache<String, SingleUseObjectValueEntity> singleUseObjectCache;
+     private final boolean persistRevokedTokens;
+@@ -56,15 +51,7 @@ public InfinispanSingleUseObjectProvider(KeycloakSession session, BasicCache<Str
+     @Override
+     public void put(String key, long lifespanSeconds, Map<String, String> notes) {
+         SingleUseObjectValueEntity tokenValue = new SingleUseObjectValueEntity(notes);
+-        try {
+-            tx.put(singleUseObjectCache, key, tokenValue, Time.toMillis(lifespanSeconds), TimeUnit.MILLISECONDS);
+-        } catch (HotRodClientException re) {
+-            // No need to retry. The hotrod (remoteCache) has some retries in itself in case of some random network error happened.
+-            if (logger.isDebugEnabled()) {
+-                logger.debugf(re, "Failed when adding code %s", key);
+-            }
+-            throw re;
+-        }
++        tx.put(singleUseObjectCache, key, tokenValue, lifespanSeconds, TimeUnit.SECONDS);
+         if (persistRevokedTokens && key.endsWith(REVOKED_KEY)) {
+             if (!notes.isEmpty()) {
+                 throw new ModelException("Notes are not supported for revoked tokens");
+@@ -79,9 +66,7 @@ public Map<String, String> get(String key) {
+             throw new ModelException("Revoked tokens can't be retrieved");
+         }
+ 
+-        SingleUseObjectValueEntity singleUseObjectValueEntity;
+-
+-        singleUseObjectValueEntity = tx.get(singleUseObjectCache, key);
++        SingleUseObjectValueEntity singleUseObjectValueEntity = tx.get(singleUseObjectCache, key);
+         return singleUseObjectValueEntity != null ? singleUseObjectValueEntity.getNotes() : null;
+     }
+ 
+@@ -91,18 +76,14 @@ public Map<String, String> remove(String key) {
+            throw new ModelException("Revoked tokens can't be removed");
+         }
+ 
+-        try {
+-            SingleUseObjectValueEntity existing = singleUseObjectCache.remove(key);
+-            return existing == null ? null : existing.getNotes();
+-        } catch (HotRodClientException re) {
+-            // No need to retry. The hotrod (remoteCache) has some retries in itself in case of some random network error happened.
+-            // In case of lock conflict, we don't want to retry anyway as there was likely an attempt to remove the code from different place.
+-            if (logger.isDebugEnabled()) {
+-                logger.debugf(re, "Failed when removing code %s", key);
+-            }
+-
++        // Using a get-before-remove allows us to return the value even in cases when a state transfer happens in Infinispan
++        // where it might not return the value in all cases.
++        // This workaround can be removed once https://github.com/infinispan/infinispan/issues/16703 is implemented.
++        var data = singleUseObjectCache.get(key);
++        if (data == null) {
+             return null;
+         }
++        return singleUseObjectCache.remove(key, data) ? data.getNotes() : null;
+     }
+ 
+     @Override
+@@ -121,18 +102,7 @@ public boolean putIfAbsent(String key, long lifespanInSeconds) {
+         }
+ 
+         SingleUseObjectValueEntity tokenValue = new SingleUseObjectValueEntity(null);
+-
+-        try {
+-            SingleUseObjectValueEntity existing = singleUseObjectCache.putIfAbsent(key, tokenValue, Time.toMillis(lifespanInSeconds), TimeUnit.MILLISECONDS);
+-            return existing == null;
+-        } catch (HotRodClientException re) {
+-            // No need to retry. The hotrod (remoteCache) has some retries in itself in case of some random network error happened.
+-            // In case of lock conflict, we don't want to retry anyway as there was likely an attempt to use the token from different place.
+-            logger.debugf(re, "Failed when adding token %s", key);
+-
+-            return false;
+-        }
+-
++        return singleUseObjectCache.putIfAbsent(key, tokenValue, lifespanInSeconds, TimeUnit.SECONDS) == null;
+     }
+ 
+     @Override
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/entities/SingleUseObjectValueEntity.java b/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/entities/SingleUseObjectValueEntity.java
+index e612dd9f966a..240c5058ac0b 100644
+--- a/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/entities/SingleUseObjectValueEntity.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/entities/SingleUseObjectValueEntity.java
+@@ -62,4 +62,16 @@ public String toString() {
+         return String.format("SingleUseObjectValueEntity [ notes=%s ]", notes.toString());
+     }
+ 
++    @Override
++    public boolean equals(Object o) {
++        if (o == null || getClass() != o.getClass()) return false;
++
++        SingleUseObjectValueEntity that = (SingleUseObjectValueEntity) o;
++        return notes.equals(that.notes);
++    }
++
++    @Override
++    public int hashCode() {
++        return notes.hashCode();
++    }
+ }
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/remote/RemoteInfinispanSingleUseObjectProvider.java b/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/remote/RemoteInfinispanSingleUseObjectProvider.java
+index 8cd34dcbc475..5b02a406639a 100644
+--- a/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/remote/RemoteInfinispanSingleUseObjectProvider.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/sessions/infinispan/remote/RemoteInfinispanSingleUseObjectProvider.java
+@@ -62,7 +62,16 @@ public Map<String, String> get(String key) {
+     @Override
+     public Map<String, String> remove(String key) {
+         try {
+-            return unwrap(withReturnValue().remove(key));
++            // Using a get-before-remove allows us to return the value even in cases when a state transfer happens in Infinispan
++            // where it might not return the value in all cases.
++            // This workaround can be removed once https://github.com/infinispan/infinispan/issues/16703 is implemented.
++            var data = transaction.getCache().getWithMetadata(key);
++            if (data == null) {
++                return null;
++            }
++            return transaction.getCache().removeWithVersion(key, data.getVersion()) ?
++                    unwrap(data.getValue()) :
++                    null;
+         } catch (HotRodClientException re) {
+             // No need to retry. The hotrod (remoteCache) has some retries in itself in case of some random network error happened.
+             // In case of lock conflict, we don't want to retry anyway as there was likely an attempt to remove the code from different place.
+diff --git a/services/src/main/java/org/keycloak/services/resources/admin/AdminConsole.java b/services/src/main/java/org/keycloak/services/resources/admin/AdminConsole.java
+index c0d943a623b7..bbb928bc49e4 100644
+--- a/services/src/main/java/org/keycloak/services/resources/admin/AdminConsole.java
++++ b/services/src/main/java/org/keycloak/services/resources/admin/AdminConsole.java
+@@ -50,7 +50,6 @@
+ import org.keycloak.services.cors.Cors;
+ import org.keycloak.services.managers.AppAuthManager;
+ import org.keycloak.services.managers.AuthenticationManager;
+-import org.keycloak.services.managers.ClientManager;
+ import org.keycloak.services.managers.RealmManager;
+ import org.keycloak.services.util.ViteManifest;
+ import org.keycloak.theme.FreeMarkerException;
+@@ -181,22 +180,6 @@ public void setTemporary(boolean temporary) {
+         }
+     }
+ 
+-    /**
+-     * Adapter configuration for the admin console for this realm
+-     *
+-     * @return
+-     */
+-    @Path("config")
+-    @GET
+-    @Produces(MediaType.APPLICATION_JSON)
+-    @NoCache
+-    public ClientManager.InstallationAdapterConfig config() {
+-        ClientModel consoleApp = realm.getClientByClientId(Constants.ADMIN_CONSOLE_CLIENT_ID);
+-        if (consoleApp == null) {
+-            throw new NotFoundException("Could not find admin console client");
+-        }
+-        return new ClientManager(new RealmManager(session)).toInstallationRepresentation(realm, consoleApp, session.getContext().getUri().getBaseUri());    }
+-
+     @Path("whoami")
+     @OPTIONS
+     public Response whoAmIPreFlight() {

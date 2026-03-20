@@ -1,45 +1,135 @@
-diff --git a/storage/src/state/ledger.rs b/storage/src/state/ledger.rs
-index 6ffd23f90..2fbe4d503 100644
---- a/storage/src/state/ledger.rs
-+++ b/storage/src/state/ledger.rs
-@@ -146,7 +146,7 @@ impl<N: Network> LedgerState<N> {
-         // Iterate and append each block hash from genesis to tip to validate ledger state.
-         const INCREMENT: u32 = 500;
-         let mut start_block_height = 0u32;
--        while start_block_height < latest_block_height {
-+        while start_block_height <= latest_block_height {
-             // Compute the end block height (inclusive) for this iteration.
-             let end_block_height = std::cmp::min(start_block_height.saturating_add(INCREMENT), latest_block_height);
+diff --git a/node/bft/src/bft.rs b/node/bft/src/bft.rs
+index 6337fabbb..4c286899c 100644
+--- a/node/bft/src/bft.rs
++++ b/node/bft/src/bft.rs
+@@ -867,7 +867,7 @@ impl<N: Network> BFT<N> {
+         // Acquire the BFT write lock.
+         let mut dag = self.dag.write();
  
-@@ -161,8 +161,11 @@ impl<N: Network> LedgerState<N> {
- 
-             // Split the block hashes into (last_block_hash, [start_block_hash, ..., penultimate_block_hash]).
-             if let Some((end_block_hash, block_hashes_excluding_last)) = block_hashes.split_last() {
--                // Add the block hashes (up to penultimate) to the ledger tree.
--                ledger.ledger_tree.write().add_all(block_hashes_excluding_last)?;
-+                // It's possible that the batch only contains one block.
-+                if !block_hashes_excluding_last.is_empty() {
-+                    // Add the block hashes (up to penultimate) to the ledger tree.
-+                    ledger.ledger_tree.write().add_all(block_hashes_excluding_last)?;
-+                }
- 
-                 // Check 1 - Ensure the root of the ledger tree matches the one saved in the ledger roots map.
-                 let ledger_root = ledger.get_previous_ledger_root(end_block_height)?;
-@@ -187,12 +190,12 @@ impl<N: Network> LedgerState<N> {
-                 ledger.ledger_tree.write().add(end_block_hash)?;
-             }
- 
--            // Update the starting block height for the next iteration.
--            start_block_height = std::cmp::min(end_block_height.saturating_add(1), latest_block_height);
--
-             // Log the progress of the validation procedure.
--            let progress = (start_block_height as f64 / latest_block_height as f64 * 100f64) as u8;
--            debug!("Validating the ledger up to block {} ({}%)", start_block_height, progress);
-+            let progress = (end_block_height as f64 / latest_block_height as f64 * 100f64) as u8;
-+            debug!("Validating the ledger up to block {} ({}%)", end_block_height, progress);
-+
-+            // Update the starting block height for the next iteration.
-+            start_block_height = end_block_height.saturating_add(1);
+-        // Commit all the certificates excluding the latest leader certificate.
++        // Commit all the certificates.
+         for certificate in certificates {
+             dag.commit(&certificate, self.storage().max_gc_rounds());
          }
+diff --git a/node/bft/src/gateway.rs b/node/bft/src/gateway.rs
+index 9f3e55c1f..784cad63f 100644
+--- a/node/bft/src/gateway.rs
++++ b/node/bft/src/gateway.rs
+@@ -657,12 +657,26 @@ impl<N: Network> Gateway<N> {
+                 if let Some(sync_sender) = self.sync_sender.get() {
+                     // Retrieve the block response.
+                     let BlockResponse { request, blocks } = block_response;
++
+                     // Check the response corresponds to a request.
+                     if !self.cache.remove_outbound_block_request(peer_ip, &request) {
+                         bail!("Unsolicited block response from '{peer_ip}'")
+                     }
++
+                     // Perform the deferred non-blocking deserialization of the blocks.
+-                    let blocks = blocks.deserialize().await.map_err(|error| anyhow!("[BlockResponse] {error}"))?;
++                    // The deserialization can take a long time (minutes). We should not be running
++                    // this on a blocking task, but on a rayon thread pool.
++                    let (send, recv) = tokio::sync::oneshot::channel();
++                    rayon::spawn_fifo(move || {
++                        let blocks = blocks.deserialize_blocking().map_err(|error| anyhow!("[BlockResponse] {error}"));
++                        let _ = send.send(blocks);
++                    });
++                    let blocks = match recv.await {
++                        Ok(Ok(blocks)) => blocks,
++                        Ok(Err(error)) => bail!("Peer '{peer_ip}' sent an invalid block response - {error}"),
++                        Err(error) => bail!("Peer '{peer_ip}' sent an invalid block response - {error}"),
++                    };
++
+                     // Ensure the block response is well-formed.
+                     blocks.ensure_response_is_well_formed(peer_ip, request.start_height, request.end_height)?;
+                     // Send the blocks to the sync module.
+@@ -988,6 +1002,22 @@ impl<N: Network> Gateway<N> {
+         }
+     }
  
-         // If this is new storage, the while loop above did not execute,
++    /// Processes a message received from the network.
++    async fn process_message_inner(&self, peer_addr: SocketAddr, message: Event<N>) {
++        // Process the message. Disconnect if the peer violated the protocol.
++        if let Err(error) = self.inbound(peer_addr, message).await {
++            if let Some(peer_ip) = self.resolver.get_listener(peer_addr) {
++                warn!("{CONTEXT} Disconnecting from '{peer_ip}' - {error}");
++                let self_ = self.clone();
++                tokio::spawn(async move {
++                    Transport::send(&self_, peer_ip, DisconnectReason::ProtocolViolation.into()).await;
++                    // Disconnect from this peer.
++                    self_.disconnect(peer_ip);
++                });
++            }
++        }
++    }
++
+     // Remove addresses whose ban time has expired.
+     fn handle_banned_ips(&self) {
+         self.tcp.banned_peers().remove_old_bans(IP_BAN_TIME_IN_SECS);
+@@ -1088,17 +1118,15 @@ impl<N: Network> Reading for Gateway<N> {
+ 
+     /// Processes a message received from the network.
+     async fn process_message(&self, peer_addr: SocketAddr, message: Self::Message) -> io::Result<()> {
+-        // Process the message. Disconnect if the peer violated the protocol.
+-        if let Err(error) = self.inbound(peer_addr, message).await {
+-            if let Some(peer_ip) = self.resolver.get_listener(peer_addr) {
+-                warn!("{CONTEXT} Disconnecting from '{peer_ip}' - {error}");
+-                let self_ = self.clone();
+-                tokio::spawn(async move {
+-                    Transport::send(&self_, peer_ip, DisconnectReason::ProtocolViolation.into()).await;
+-                    // Disconnect from this peer.
+-                    self_.disconnect(peer_ip);
+-                });
+-            }
++        if matches!(message, Event::BlockRequest(_) | Event::BlockResponse(_)) {
++            let self_ = self.clone();
++            // Handle BlockRequest and BlockResponse messages in a separate task to not block the
++            // inbound queue.
++            tokio::spawn(async move {
++                self_.process_message_inner(peer_addr, message).await;
++            });
++        } else {
++            self.process_message_inner(peer_addr, message).await;
+         }
+         Ok(())
+     }
+diff --git a/node/bft/src/sync/mod.rs b/node/bft/src/sync/mod.rs
+index a99ef2699..976e489a8 100644
+--- a/node/bft/src/sync/mod.rs
++++ b/node/bft/src/sync/mod.rs
+@@ -296,12 +296,15 @@ impl<N: Network> Sync<N> {
+         Ok(())
+     }
+ 
+-    /// Syncs the storage with the given blocks.
++    /// Syncs the storage with blocks already received from peers.
+     pub async fn sync_storage_with_blocks(&self) -> Result<()> {
+         // Acquire the response lock.
+         let _lock = self.response_lock.lock().await;
+ 
+-        // Retrieve the latest block height.
++        // Retrieve the next block height.
++        // This variable is used to index blocks that are added to the ledger;
++        // it is incremented as blocks as added.
++        // So 'current' means 'currently being added'.
+         let mut current_height = self.ledger.latest_block_height() + 1;
+ 
+         // Retrieve the maximum block height of the peers.
+diff --git a/node/sync/src/block_sync.rs b/node/sync/src/block_sync.rs
+index 7fe9534b2..7096c0452 100644
+--- a/node/sync/src/block_sync.rs
++++ b/node/sync/src/block_sync.rs
+@@ -78,11 +78,11 @@ impl BlockSyncMode {
+ ///
+ /// # State
+ /// - When a request is inserted, the `requests` map and `request_timestamps` map insert an entry for the request height.
+-/// - When a response is inserted, the `requests` map inserts the entry for the request height.
++/// - When a response is inserted, the `responses` map inserts the entry for the request height.
+ /// - When a request is completed, the `requests` map still has the entry, but its `sync_ips` is empty;
+ ///   the `request_timestamps` map remains unchanged.
+ /// - When a response is removed/completed, the `requests` map and `request_timestamps` map also remove the entry for the request height.
+-/// - When a request is timed out, the `requests`, `request_timestamps`, and `responses` map remove the entry for the request height;
++/// - When a request is timed out, the `requests`, `request_timestamps`, and `responses` map remove the entry for the request height.
+ #[derive(Clone, Debug)]
+ pub struct BlockSync<N: Network> {
+     /// The block sync mode.

@@ -1,0 +1,2542 @@
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 2bee2c91d01ab5..646a3cda727a90 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -493,6 +493,7 @@ def env(
+     "sentry.prevent",
+     "sentry.seer",
+     "sentry.scm",
++    "sentry.issue_detection",
+ )
+ 
+ # Silence internal hints from Django's system checks
+diff --git a/src/sentry/eventstream/item_helpers.py b/src/sentry/eventstream/item_helpers.py
+index 9922dc62c0cd19..c751fe58968894 100644
+--- a/src/sentry/eventstream/item_helpers.py
++++ b/src/sentry/eventstream/item_helpers.py
+@@ -157,6 +157,10 @@ def _extract_from_event(event: Event | GroupEvent) -> Mapping[str, float | int]:
+     return out
+ 
+ 
++def format_attr_key(key: str) -> str:
++    return f"attr[{key}]"
++
++
+ def _extract_tags_and_contexts(
+     event_data: Mapping[str, Any],
+ ) -> Mapping[str, str | float | int | bool | None]:
+@@ -167,9 +171,8 @@ def _extract_tags_and_contexts(
+         "dist": event_data.get("dist"),
+     }
+ 
+-    # From a user's perspective, "attributes" are tags + contexts.
++    # From a user's perspective, "attributes" are tags + contexts (+ flags, from ctx).
+     # Yes, it's confusing with the general EAP attributes.
+-    format_attr_key = lambda key: f"attr[{key}]"
+ 
+     attr_keys = set()
+     tags = event_data.get("tags")
+diff --git a/src/sentry/hybridcloud/services/project_key_mapping/__init__.py b/src/sentry/hybridcloud/services/project_key_mapping/__init__.py
+new file mode 100644
+index 00000000000000..94cd79c8a21b67
+--- /dev/null
++++ b/src/sentry/hybridcloud/services/project_key_mapping/__init__.py
+@@ -0,0 +1 @@
++from .model import *  # noqa
+diff --git a/src/sentry/hybridcloud/services/project_key_mapping/model.py b/src/sentry/hybridcloud/services/project_key_mapping/model.py
+new file mode 100644
+index 00000000000000..9af0ca279cfe2f
+--- /dev/null
++++ b/src/sentry/hybridcloud/services/project_key_mapping/model.py
+@@ -0,0 +1,7 @@
++from sentry.hybridcloud.rpc import RpcModel
++
++
++class RpcProjectKeyMapping(RpcModel):
++    id: int
++    public_key: str
++    cell_name: str
+diff --git a/src/sentry/hybridcloud/services/replica/impl.py b/src/sentry/hybridcloud/services/replica/impl.py
+index 52b9284d69626f..79dd006ce57a4a 100644
+--- a/src/sentry/hybridcloud/services/replica/impl.py
++++ b/src/sentry/hybridcloud/services/replica/impl.py
+@@ -1,7 +1,8 @@
++import logging
+ from collections.abc import Iterator, Mapping
+ from typing import Any
+ 
+-from django.db import router, transaction
++from django.db import IntegrityError, router, transaction
+ from django.db.models import Q
+ 
+ from sentry.auth.services.auth import RpcApiKey, RpcApiToken, RpcAuthIdentity, RpcAuthProvider
+@@ -20,7 +21,11 @@
+ from sentry.hybridcloud.services.control_organization_provisioning import (
+     RpcOrganizationSlugReservation,
+ )
+-from sentry.hybridcloud.services.replica.service import ControlReplicaService, RegionReplicaService
++from sentry.hybridcloud.services.project_key_mapping import RpcProjectKeyMapping
++from sentry.hybridcloud.services.replica.service import (
++    ControlReplicaService,
++    RegionReplicaService,
++)
+ from sentry.integrations.models.external_actor import ExternalActor
+ from sentry.integrations.models.integration import Integration
+ from sentry.models.apikey import ApiKey
+@@ -34,12 +39,15 @@
+ from sentry.models.organizationmemberteamreplica import OrganizationMemberTeamReplica
+ from sentry.models.organizationslugreservationreplica import OrganizationSlugReservationReplica
+ from sentry.models.orgauthtoken import OrgAuthToken
++from sentry.models.projectkeymapping import ProjectKeyMapping
+ from sentry.models.team import Team
+ from sentry.models.teamreplica import TeamReplica
+ from sentry.notifications.services import RpcExternalActor
+ from sentry.organizations.services.organization import RpcOrganizationMemberTeam, RpcTeam
+ from sentry.users.models.user import User
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def get_foreign_key_columns(
+     destination: BaseModel,
+@@ -368,3 +376,24 @@ def upsert_replicated_team(self, *, team: RpcTeam) -> None:
+         )
+ 
+         handle_replication(Team, destination)
++
++    def upsert_project_key_mapping(self, *, project_key: RpcProjectKeyMapping) -> bool:
++        try:
++            with transaction.atomic(router.db_for_write(ProjectKeyMapping)):
++                ProjectKeyMapping.objects.update_or_create(
++                    project_key_id=project_key.id,
++                    cell_name=project_key.cell_name,
++                    defaults={"public_key": project_key.public_key},
++                )
++        except IntegrityError:
++            logger.error(
++                "project_key_mapping.conflict",
++                extra={"project_key_id": project_key.id, "cell_name": project_key.cell_name},
++            )
++            return False
++        return True
++
++    def delete_project_key_mapping(self, *, project_key_id: int, cell_name: str) -> None:
++        ProjectKeyMapping.objects.filter(
++            project_key_id=project_key_id, cell_name=cell_name
++        ).delete()
+diff --git a/src/sentry/hybridcloud/services/replica/service.py b/src/sentry/hybridcloud/services/replica/service.py
+index e4d3d51d65d476..68bf03c0b9e6d5 100644
+--- a/src/sentry/hybridcloud/services/replica/service.py
++++ b/src/sentry/hybridcloud/services/replica/service.py
+@@ -7,6 +7,7 @@
+ from sentry.hybridcloud.services.control_organization_provisioning import (
+     RpcOrganizationSlugReservation,
+ )
++from sentry.hybridcloud.services.project_key_mapping import RpcProjectKeyMapping
+ from sentry.notifications.services import RpcExternalActor
+ from sentry.organizations.services.organization import RpcOrganizationMemberTeam, RpcTeam
+ from sentry.silo.base import SiloMode
+@@ -38,6 +39,20 @@ def remove_replicated_organization_member_team(
+     def upsert_external_actor_replica(self, *, external_actor: RpcExternalActor) -> None:
+         pass
+ 
++    @rpc_method
++    @abc.abstractmethod
++    def upsert_project_key_mapping(self, *, project_key: RpcProjectKeyMapping) -> bool:
++        """
++        Returns True if the mapping was successfully created or updated, False if there was a
++        conflict (e.g. a duplicate public_key).
++        """
++        pass
++
++    @rpc_method
++    @abc.abstractmethod
++    def delete_project_key_mapping(self, *, project_key_id: int, cell_name: str) -> None:
++        pass
++
+     @classmethod
+     def get_local_implementation(cls) -> RpcService:
+         from .impl import DatabaseBackedControlReplicaService
+diff --git a/src/sentry/integrations/issue_alert_image_builder.py b/src/sentry/integrations/issue_alert_image_builder.py
+index 23d2557dbe3ad5..88a9332bf7771d 100644
+--- a/src/sentry/integrations/issue_alert_image_builder.py
++++ b/src/sentry/integrations/issue_alert_image_builder.py
+@@ -11,11 +11,11 @@
+ from sentry.integrations.time_utils import get_approx_start_time, get_relative_time
+ from sentry.integrations.types import ExternalProviderEnum
+ from sentry.issue_detection.detectors import utils
+-from sentry.issues.grouptype import (
+-    GroupType,
++from sentry.issue_detection.grouptype import (
+     PerformanceP95EndpointRegressionGroupType,
+     ProfileFunctionRegressionType,
+ )
++from sentry.issues.grouptype import GroupType
+ from sentry.models.apikey import ApiKey
+ from sentry.models.group import Group
+ from sentry.snuba.referrer import Referrer
+diff --git a/src/sentry/integrations/slack/message_builder/image_block_builder.py b/src/sentry/integrations/slack/message_builder/image_block_builder.py
+index ff78aa23156b4e..ad46f06514f6be 100644
+--- a/src/sentry/integrations/slack/message_builder/image_block_builder.py
++++ b/src/sentry/integrations/slack/message_builder/image_block_builder.py
+@@ -2,7 +2,7 @@
+ from sentry.integrations.slack.message_builder.base.block import BlockSlackMessageBuilder
+ from sentry.integrations.slack.message_builder.types import SlackBlock
+ from sentry.integrations.types import ExternalProviderEnum
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceP95EndpointRegressionGroupType,
+     ProfileFunctionRegressionType,
+ )
+diff --git a/src/sentry/issue_detection/apps.py b/src/sentry/issue_detection/apps.py
+new file mode 100644
+index 00000000000000..e8bf453cc4eb6f
+--- /dev/null
++++ b/src/sentry/issue_detection/apps.py
+@@ -0,0 +1,8 @@
++from django.apps import AppConfig
++
++
++class Config(AppConfig):
++    name = "sentry.issue_detection"
++
++    def ready(self) -> None:
++        pass
+diff --git a/src/sentry/issue_detection/detectors/consecutive_db_detector.py b/src/sentry/issue_detection/detectors/consecutive_db_detector.py
+index bfbb275d6de4f0..e41df84ff5091d 100644
+--- a/src/sentry/issue_detection/detectors/consecutive_db_detector.py
++++ b/src/sentry/issue_detection/detectors/consecutive_db_detector.py
+@@ -16,7 +16,7 @@
+     get_span_evidence_value,
+     get_total_span_duration,
+ )
+-from sentry.issues.grouptype import PerformanceConsecutiveDBQueriesGroupType
++from sentry.issue_detection.grouptype import PerformanceConsecutiveDBQueriesGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/consecutive_http_detector.py b/src/sentry/issue_detection/detectors/consecutive_http_detector.py
+index eb546476eddaaa..6b9c0b74040526 100644
+--- a/src/sentry/issue_detection/detectors/consecutive_http_detector.py
++++ b/src/sentry/issue_detection/detectors/consecutive_http_detector.py
+@@ -16,7 +16,7 @@
+     get_url_from_span,
+     is_filtered_url,
+ )
+-from sentry.issues.grouptype import PerformanceConsecutiveHTTPQueriesGroupType
++from sentry.issue_detection.grouptype import PerformanceConsecutiveHTTPQueriesGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/http_overhead_detector.py b/src/sentry/issue_detection/detectors/http_overhead_detector.py
+index 409a7581d51a95..e5e31e4cb84d5d 100644
+--- a/src/sentry/issue_detection/detectors/http_overhead_detector.py
++++ b/src/sentry/issue_detection/detectors/http_overhead_detector.py
+@@ -13,7 +13,7 @@
+     get_url_from_span,
+     is_filtered_url,
+ )
+-from sentry.issues.grouptype import PerformanceHTTPOverheadGroupType
++from sentry.issue_detection.grouptype import PerformanceHTTPOverheadGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/io_main_thread_detector.py b/src/sentry/issue_detection/detectors/io_main_thread_detector.py
+index 765d9d0b2abeb3..e9cbe3e0147cea 100644
+--- a/src/sentry/issue_detection/detectors/io_main_thread_detector.py
++++ b/src/sentry/issue_detection/detectors/io_main_thread_detector.py
+@@ -7,11 +7,11 @@
+ import sentry_sdk
+ from symbolic.proguard import ProguardMapper
+ 
+-from sentry.issues.grouptype import (
+-    GroupType,
++from sentry.issue_detection.grouptype import (
+     PerformanceDBMainThreadGroupType,
+     PerformanceFileIOMainThreadGroupType,
+ )
++from sentry.issues.grouptype import GroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.lang.java.proguard import open_proguard_mapper
+ from sentry.models.debugfile import ProjectDebugFile
+diff --git a/src/sentry/issue_detection/detectors/large_http_payload_detector.py b/src/sentry/issue_detection/detectors/large_http_payload_detector.py
+index 370b0a9d71691b..eacf6bb1c1133c 100644
+--- a/src/sentry/issue_detection/detectors/large_http_payload_detector.py
++++ b/src/sentry/issue_detection/detectors/large_http_payload_detector.py
+@@ -4,7 +4,7 @@
+ from datetime import timedelta
+ from typing import Any
+ 
+-from sentry.issues.grouptype import PerformanceLargeHTTPPayloadGroupType
++from sentry.issue_detection.grouptype import PerformanceLargeHTTPPayloadGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/mn_plus_one_db_span_detector.py b/src/sentry/issue_detection/detectors/mn_plus_one_db_span_detector.py
+index 8daaed6251de8d..2cb8af71a456df 100644
+--- a/src/sentry/issue_detection/detectors/mn_plus_one_db_span_detector.py
++++ b/src/sentry/issue_detection/detectors/mn_plus_one_db_span_detector.py
+@@ -12,12 +12,12 @@
+     get_span_evidence_value,
+     total_span_time,
+ )
+-from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceMNPlusOneDBQueriesGroupType,
+     PerformanceNPlusOneGroupType,
+ )
++from sentry.issue_detection.performance_problem import PerformanceProblem
++from sentry.issue_detection.types import Span
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/n_plus_one_api_calls_detector.py b/src/sentry/issue_detection/detectors/n_plus_one_api_calls_detector.py
+index cdf5923a4c62cd..fdcfd8f6249a20 100644
+--- a/src/sentry/issue_detection/detectors/n_plus_one_api_calls_detector.py
++++ b/src/sentry/issue_detection/detectors/n_plus_one_api_calls_detector.py
+@@ -18,9 +18,9 @@
+     parameterize_url,
+     parameterize_url_with_result,
+ )
++from sentry.issue_detection.grouptype import PerformanceNPlusOneAPICallsGroupType
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+ from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import PerformanceNPlusOneAPICallsGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/n_plus_one_db_span_detector.py b/src/sentry/issue_detection/detectors/n_plus_one_db_span_detector.py
+index 0ce29a42460738..9f77dcb0389007 100644
+--- a/src/sentry/issue_detection/detectors/n_plus_one_db_span_detector.py
++++ b/src/sentry/issue_detection/detectors/n_plus_one_db_span_detector.py
+@@ -9,9 +9,9 @@
+     get_span_evidence_value,
+     total_span_time,
+ )
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+ from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/query_injection_detector.py b/src/sentry/issue_detection/detectors/query_injection_detector.py
+index 72ba98f91176ca..c89200127b89ac 100644
+--- a/src/sentry/issue_detection/detectors/query_injection_detector.py
++++ b/src/sentry/issue_detection/detectors/query_injection_detector.py
+@@ -5,9 +5,9 @@
+ 
+ from sentry.issue_detection.base import DetectorType, PerformanceDetector
+ from sentry.issue_detection.detectors.utils import get_notification_attachment_body
++from sentry.issue_detection.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+ from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/render_blocking_asset_span_detector.py b/src/sentry/issue_detection/detectors/render_blocking_asset_span_detector.py
+index d6a10ad1906361..21a3c12631411b 100644
+--- a/src/sentry/issue_detection/detectors/render_blocking_asset_span_detector.py
++++ b/src/sentry/issue_detection/detectors/render_blocking_asset_span_detector.py
+@@ -4,7 +4,7 @@
+ from datetime import timedelta
+ from typing import Any
+ 
+-from sentry.issues.grouptype import PerformanceRenderBlockingAssetSpanGroupType
++from sentry.issue_detection.grouptype import PerformanceRenderBlockingAssetSpanGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/slow_db_query_detector.py b/src/sentry/issue_detection/detectors/slow_db_query_detector.py
+index 0ef6a509f1cf16..9f2ad981a0ccb1 100644
+--- a/src/sentry/issue_detection/detectors/slow_db_query_detector.py
++++ b/src/sentry/issue_detection/detectors/slow_db_query_detector.py
+@@ -4,7 +4,7 @@
+ import logging
+ from datetime import timedelta
+ 
+-from sentry.issues.grouptype import PerformanceSlowDBQueryGroupType
++from sentry.issue_detection.grouptype import PerformanceSlowDBQueryGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/sql_injection_detector.py b/src/sentry/issue_detection/detectors/sql_injection_detector.py
+index ff185066e68d86..e8569ac253aa48 100644
+--- a/src/sentry/issue_detection/detectors/sql_injection_detector.py
++++ b/src/sentry/issue_detection/detectors/sql_injection_detector.py
+@@ -7,9 +7,9 @@
+ 
+ from sentry.issue_detection.base import DetectorType, PerformanceDetector
+ from sentry.issue_detection.detectors.utils import get_notification_attachment_body
++from sentry.issue_detection.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+ from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/detectors/uncompressed_asset_detector.py b/src/sentry/issue_detection/detectors/uncompressed_asset_detector.py
+index 0b655dc20f1361..16203baf7acd6a 100644
+--- a/src/sentry/issue_detection/detectors/uncompressed_asset_detector.py
++++ b/src/sentry/issue_detection/detectors/uncompressed_asset_detector.py
+@@ -4,7 +4,7 @@
+ import re
+ from typing import Any
+ 
+-from sentry.issues.grouptype import PerformanceUncompressedAssetsGroupType
++from sentry.issue_detection.grouptype import PerformanceUncompressedAssetsGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.organization import Organization
+ from sentry.models.project import Project
+diff --git a/src/sentry/issue_detection/grouptype.py b/src/sentry/issue_detection/grouptype.py
+index bae4d4690dd8ed..85ea6ea9528263 100644
+--- a/src/sentry/issue_detection/grouptype.py
++++ b/src/sentry/issue_detection/grouptype.py
+@@ -1,5 +1,339 @@
+ from __future__ import annotations
+ 
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from dataclasses import dataclass
+ 
+-__all__ = ["PerformanceNPlusOneGroupType"]
++from sentry.issues.grouptype import (
++    GroupCategory,
++    GroupType,
++    NoiseConfig,
++    NotificationConfig,
++    NotificationContextField,
++)
++from sentry.types.group import PriorityLevel
++
++
++@dataclass(frozen=True)
++class PerformanceSlowDBQueryGroupType(GroupType):
++    type_id = 1001
++    slug = "performance_slow_db_query"
++    description = "Slow DB Query"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    noise_config = NoiseConfig(ignore_limit=100)
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceRenderBlockingAssetSpanGroupType(GroupType):
++    type_id = 1004
++    slug = "performance_render_blocking_asset_span"
++    description = "Large Render Blocking Asset"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.FRONTEND.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = True
++    use_flagpole_for_all_features = True
++
++
++@dataclass(frozen=True)
++class PerformanceNPlusOneGroupType(GroupType):
++    type_id = 1006
++    slug = "performance_n_plus_one_db_queries"
++    description = "N+1 Query"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceNPlusOneExperimentalGroupType(GroupType):
++    type_id = 1906
++    slug = "performance_n_plus_one_db_queries_experimental"
++    description = "N+1 Query (Experimental)"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = False
++
++
++@dataclass(frozen=True)
++class PerformanceConsecutiveDBQueriesGroupType(GroupType):
++    type_id = 1007
++    slug = "performance_consecutive_db_queries"
++    description = "Consecutive DB Queries"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    noise_config = NoiseConfig(ignore_limit=15)
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceFileIOMainThreadGroupType(GroupType):
++    type_id = 1008
++    slug = "performance_file_io_main_thread"
++    description = "File IO on Main Thread"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.MOBILE.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceConsecutiveHTTPQueriesGroupType(GroupType):
++    type_id = 1009
++    slug = "performance_consecutive_http"
++    description = "Consecutive HTTP"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.HTTP_CLIENT.value
++    noise_config = NoiseConfig(ignore_limit=5)
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceNPlusOneAPICallsGroupType(GroupType):
++    type_id = 1010
++    slug = "performance_n_plus_one_api_calls"
++    description = "N+1 API Call"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.HTTP_CLIENT.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceNPlusOneAPICallsExperimentalGroupType(GroupType):
++    type_id = 1910
++    slug = "performance_n_plus_one_api_calls_experimental"
++    description = "N+1 API Call (Experimental)"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.HTTP_CLIENT.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = False
++
++
++@dataclass(frozen=True)
++class PerformanceMNPlusOneDBQueriesGroupType(GroupType):
++    """
++    This group type is only used for fingerprinting MN+1 DB Performance Issues.
++    No field other than `type_id` are referenced, so changes will not have an affect.
++    The MN+1 detector uses the PerformanceNPlusOneGroupType, so reference that GroupType instead.
++    """
++
++    type_id = 1011
++    slug = "performance_m_n_plus_one_db_queries"
++    description = "MN+1 Query"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceMNPlusOneDBQueriesExperimentalGroupType(GroupType):
++    type_id = 1911
++    slug = "performance_m_n_plus_one_db_queries_experimental"
++    description = "MN+1 Query (Experimental)"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = False
++
++
++@dataclass(frozen=True)
++class PerformanceUncompressedAssetsGroupType(GroupType):
++    type_id = 1012
++    slug = "performance_uncompressed_assets"
++    description = "Uncompressed Asset"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.FRONTEND.value
++    noise_config = NoiseConfig(ignore_limit=100)
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceDBMainThreadGroupType(GroupType):
++    type_id = 1013
++    slug = "performance_db_main_thread"
++    description = "DB on Main Thread"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.MOBILE.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceLargeHTTPPayloadGroupType(GroupType):
++    type_id = 1015
++    slug = "performance_large_http_payload"
++    description = "Large HTTP payload"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.HTTP_CLIENT.value
++    noise_config = NoiseConfig()
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceHTTPOverheadGroupType(GroupType):
++    type_id = 1016
++    slug = "performance_http_overhead"
++    description = "HTTP/1.1 Overhead"
++    noise_config = NoiseConfig(ignore_limit=20)
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.HTTP_CLIENT.value
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class PerformanceP95EndpointRegressionGroupType(GroupType):
++    type_id = 1018
++    slug = "performance_p95_endpoint_regression"
++    description = "Endpoint Regression"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.METRIC.value
++    enable_auto_resolve = False
++    enable_escalation_detection = False
++    default_priority = PriorityLevel.MEDIUM
++    released = True
++    notification_config = NotificationConfig(context=[NotificationContextField.APPROX_START_TIME])
++
++
++# experimental
++@dataclass(frozen=True)
++class PerformanceStreamedSpansGroupTypeExperimental(GroupType):
++    type_id = 1019
++    slug = "performance_streamed_spans_exp"
++    description = "Streamed Spans (Experimental)"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.METRIC.value
++    enable_auto_resolve = False
++    enable_escalation_detection = False
++    default_priority = PriorityLevel.LOW
++
++
++# Experimental Group Type for Query Injection Vulnerability
++@dataclass(frozen=True)
++class DBQueryInjectionVulnerabilityGroupType(GroupType):
++    type_id = 1020
++    slug = "db_query_injection_vulnerability"
++    description = "Potential Database Query Injection Vulnerability"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    enable_auto_resolve = False
++    enable_escalation_detection = False
++    noise_config = NoiseConfig(ignore_limit=5)
++    default_priority = PriorityLevel.MEDIUM
++
++
++@dataclass(frozen=True)
++class QueryInjectionVulnerabilityGroupType(GroupType):
++    type_id = 1021
++    slug = "query_injection_vulnerability"
++    description = "Potential Query Injection Vulnerability"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.DB_QUERY.value
++    enable_auto_resolve = False
++    enable_escalation_detection = False
++    noise_config = NoiseConfig(ignore_limit=10)
++    default_priority = PriorityLevel.MEDIUM
++
++
++# 2000 was ProfileBlockingFunctionMainThreadType
++@dataclass(frozen=True)
++class ProfileFileIOGroupType(GroupType):
++    type_id = 2001
++    slug = "profile_file_io_main_thread"
++    description = "File I/O on Main Thread"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.MOBILE.value
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class ProfileImageDecodeGroupType(GroupType):
++    type_id = 2002
++    slug = "profile_image_decode_main_thread"
++    description = "Image Decoding on Main Thread"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.MOBILE.value
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class ProfileJSONDecodeType(GroupType):
++    type_id = 2003
++    slug = "profile_json_decode_main_thread"
++    description = "JSON Decoding on Main Thread"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.MOBILE.value
++    default_priority = PriorityLevel.LOW
++    released = True
++
++
++@dataclass(frozen=True)
++class ProfileRegexType(GroupType):
++    type_id = 2007
++    slug = "profile_regex_main_thread"
++    description = "Regex on Main Thread"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.MOBILE.value
++    released = True
++    default_priority = PriorityLevel.LOW
++
++
++@dataclass(frozen=True)
++class ProfileFrameDropType(GroupType):
++    type_id = 2009
++    slug = "profile_frame_drop"
++    description = "Frame Drop"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.MOBILE.value
++    noise_config = NoiseConfig(ignore_limit=2000)
++    released = True
++    default_priority = PriorityLevel.LOW
++
++
++@dataclass(frozen=True)
++class ProfileFunctionRegressionType(GroupType):
++    type_id = 2011
++    slug = "profile_function_regression"
++    description = "Function Regression"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.METRIC.value
++    enable_auto_resolve = False
++    released = True
++    default_priority = PriorityLevel.MEDIUM
++    notification_config = NotificationConfig(context=[NotificationContextField.APPROX_START_TIME])
++
++
++@dataclass(frozen=True)
++class WebVitalsGroup(GroupType):  # TODO: Rename to WebVitalsGroupType
++    type_id = 10001
++    slug = "web_vitals"
++    description = "Web Vitals"
++    category = GroupCategory.PERFORMANCE.value
++    category_v2 = GroupCategory.FRONTEND.value
++    enable_auto_resolve = False
++    enable_escalation_detection = False
++    enable_status_change_workflow_notifications = False
++    enable_workflow_notifications = False
++    # Web Vital issues are always triggered for the purpose of using autofix
++    always_trigger_seer_automation = True
++    released = True
+diff --git a/src/sentry/issues/endpoints/project_performance_issue_settings.py b/src/sentry/issues/endpoints/project_performance_issue_settings.py
+index 3b6969d0bb45e5..dc961680bd7870 100644
+--- a/src/sentry/issues/endpoints/project_performance_issue_settings.py
++++ b/src/sentry/issues/endpoints/project_performance_issue_settings.py
+@@ -11,14 +11,7 @@
+ from sentry.api.base import cell_silo_endpoint
+ from sentry.api.bases.project import ProjectEndpoint, ProjectSettingPermission
+ from sentry.auth.superuser import superuser_has_permission
+-from sentry.issue_detection.performance_detection import (
+-    SETTINGS_PROJECT_OPTION_KEY,
+-    get_merged_settings,
+-    reset_performance_settings,
+-    update_performance_settings,
+-)
+-from sentry.issues.grouptype import (
+-    GroupType,
++from sentry.issue_detection.grouptype import (
+     PerformanceConsecutiveDBQueriesGroupType,
+     PerformanceConsecutiveHTTPQueriesGroupType,
+     PerformanceDBMainThreadGroupType,
+@@ -35,6 +28,13 @@
+     QueryInjectionVulnerabilityGroupType,
+     WebVitalsGroup,
+ )
++from sentry.issue_detection.performance_detection import (
++    SETTINGS_PROJECT_OPTION_KEY,
++    get_merged_settings,
++    reset_performance_settings,
++    update_performance_settings,
++)
++from sentry.issues.grouptype import GroupType
+ from sentry.models.project import Project
+ 
+ MAX_VALUE = 2147483647
+diff --git a/src/sentry/issues/endpoints/project_user_issue.py b/src/sentry/issues/endpoints/project_user_issue.py
+index d8e6b07e51a660..9db35ec87fc2fd 100644
+--- a/src/sentry/issues/endpoints/project_user_issue.py
++++ b/src/sentry/issues/endpoints/project_user_issue.py
+@@ -13,7 +13,8 @@
+ from sentry.api.bases.project import ProjectEndpoint, ProjectPermission
+ from sentry.apidocs.parameters import GlobalParams
+ from sentry.grouping.grouptype import ErrorGroupType
+-from sentry.issues.grouptype import GroupType, WebVitalsGroup
++from sentry.issue_detection.grouptype import WebVitalsGroup
++from sentry.issues.grouptype import GroupType
+ from sentry.issues.issue_occurrence import IssueEvidence, IssueOccurrence
+ from sentry.issues.producer import PayloadType, produce_occurrence_to_kafka
+ from sentry.models.organization import Organization
+diff --git a/src/sentry/issues/grouptype.py b/src/sentry/issues/grouptype.py
+index 0770b3815cd404..70ee3df4ac7bd2 100644
+--- a/src/sentry/issues/grouptype.py
++++ b/src/sentry/issues/grouptype.py
+@@ -354,317 +354,6 @@ class ReplayGroupTypeDefaults:
+     notification_config = NotificationConfig(context=[])
+ 
+ 
+-@dataclass(frozen=True)
+-class PerformanceSlowDBQueryGroupType(GroupType):
+-    type_id = 1001
+-    slug = "performance_slow_db_query"
+-    description = "Slow DB Query"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    noise_config = NoiseConfig(ignore_limit=100)
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceRenderBlockingAssetSpanGroupType(GroupType):
+-    type_id = 1004
+-    slug = "performance_render_blocking_asset_span"
+-    description = "Large Render Blocking Asset"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.FRONTEND.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-    use_flagpole_for_all_features = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceNPlusOneGroupType(GroupType):
+-    type_id = 1006
+-    slug = "performance_n_plus_one_db_queries"
+-    description = "N+1 Query"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceNPlusOneExperimentalGroupType(GroupType):
+-    type_id = 1906
+-    slug = "performance_n_plus_one_db_queries_experimental"
+-    description = "N+1 Query (Experimental)"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = False
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceConsecutiveDBQueriesGroupType(GroupType):
+-    type_id = 1007
+-    slug = "performance_consecutive_db_queries"
+-    description = "Consecutive DB Queries"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    noise_config = NoiseConfig(ignore_limit=15)
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceFileIOMainThreadGroupType(GroupType):
+-    type_id = 1008
+-    slug = "performance_file_io_main_thread"
+-    description = "File IO on Main Thread"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.MOBILE.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceConsecutiveHTTPQueriesGroupType(GroupType):
+-    type_id = 1009
+-    slug = "performance_consecutive_http"
+-    description = "Consecutive HTTP"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.HTTP_CLIENT.value
+-    noise_config = NoiseConfig(ignore_limit=5)
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceNPlusOneAPICallsGroupType(GroupType):
+-    type_id = 1010
+-    slug = "performance_n_plus_one_api_calls"
+-    description = "N+1 API Call"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.HTTP_CLIENT.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceNPlusOneAPICallsExperimentalGroupType(GroupType):
+-    type_id = 1910
+-    slug = "performance_n_plus_one_api_calls_experimental"
+-    description = "N+1 API Call (Experimental)"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.HTTP_CLIENT.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = False
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceMNPlusOneDBQueriesGroupType(GroupType):
+-    """
+-    This group type is only used for fingerprinting MN+1 DB Performance Issues.
+-    No field other than `type_id` are referenced, so changes will not have an affect.
+-    The MN+1 detector uses the PerformanceNPlusOneGroupType, so reference that GroupType instead.
+-    """
+-
+-    type_id = 1011
+-    slug = "performance_m_n_plus_one_db_queries"
+-    description = "MN+1 Query"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceMNPlusOneDBQueriesExperimentalGroupType(GroupType):
+-    type_id = 1911
+-    slug = "performance_m_n_plus_one_db_queries_experimental"
+-    description = "MN+1 Query (Experimental)"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = False
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceUncompressedAssetsGroupType(GroupType):
+-    type_id = 1012
+-    slug = "performance_uncompressed_assets"
+-    description = "Uncompressed Asset"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.FRONTEND.value
+-    noise_config = NoiseConfig(ignore_limit=100)
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceDBMainThreadGroupType(GroupType):
+-    type_id = 1013
+-    slug = "performance_db_main_thread"
+-    description = "DB on Main Thread"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.MOBILE.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceLargeHTTPPayloadGroupType(GroupType):
+-    type_id = 1015
+-    slug = "performance_large_http_payload"
+-    description = "Large HTTP payload"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.HTTP_CLIENT.value
+-    noise_config = NoiseConfig()
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceHTTPOverheadGroupType(GroupType):
+-    type_id = 1016
+-    slug = "performance_http_overhead"
+-    description = "HTTP/1.1 Overhead"
+-    noise_config = NoiseConfig(ignore_limit=20)
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.HTTP_CLIENT.value
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class PerformanceP95EndpointRegressionGroupType(GroupType):
+-    type_id = 1018
+-    slug = "performance_p95_endpoint_regression"
+-    description = "Endpoint Regression"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.METRIC.value
+-    enable_auto_resolve = False
+-    enable_escalation_detection = False
+-    default_priority = PriorityLevel.MEDIUM
+-    released = True
+-    notification_config = NotificationConfig(context=[NotificationContextField.APPROX_START_TIME])
+-
+-
+-# experimental
+-@dataclass(frozen=True)
+-class PerformanceStreamedSpansGroupTypeExperimental(GroupType):
+-    type_id = 1019
+-    slug = "performance_streamed_spans_exp"
+-    description = "Streamed Spans (Experimental)"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.METRIC.value
+-    enable_auto_resolve = False
+-    enable_escalation_detection = False
+-    default_priority = PriorityLevel.LOW
+-
+-
+-# Experimental Group Type for Query Injection Vulnerability
+-@dataclass(frozen=True)
+-class DBQueryInjectionVulnerabilityGroupType(GroupType):
+-    type_id = 1020
+-    slug = "db_query_injection_vulnerability"
+-    description = "Potential Database Query Injection Vulnerability"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    enable_auto_resolve = False
+-    enable_escalation_detection = False
+-    noise_config = NoiseConfig(ignore_limit=5)
+-    default_priority = PriorityLevel.MEDIUM
+-
+-
+-@dataclass(frozen=True)
+-class QueryInjectionVulnerabilityGroupType(GroupType):
+-    type_id = 1021
+-    slug = "query_injection_vulnerability"
+-    description = "Potential Query Injection Vulnerability"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.DB_QUERY.value
+-    enable_auto_resolve = False
+-    enable_escalation_detection = False
+-    noise_config = NoiseConfig(ignore_limit=10)
+-    default_priority = PriorityLevel.MEDIUM
+-
+-
+-# 2000 was ProfileBlockingFunctionMainThreadType
+-@dataclass(frozen=True)
+-class ProfileFileIOGroupType(GroupType):
+-    type_id = 2001
+-    slug = "profile_file_io_main_thread"
+-    description = "File I/O on Main Thread"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.MOBILE.value
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class ProfileImageDecodeGroupType(GroupType):
+-    type_id = 2002
+-    slug = "profile_image_decode_main_thread"
+-    description = "Image Decoding on Main Thread"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.MOBILE.value
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class ProfileJSONDecodeType(GroupType):
+-    type_id = 2003
+-    slug = "profile_json_decode_main_thread"
+-    description = "JSON Decoding on Main Thread"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.MOBILE.value
+-    default_priority = PriorityLevel.LOW
+-    released = True
+-
+-
+-@dataclass(frozen=True)
+-class ProfileRegexType(GroupType):
+-    type_id = 2007
+-    slug = "profile_regex_main_thread"
+-    description = "Regex on Main Thread"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.MOBILE.value
+-    released = True
+-    default_priority = PriorityLevel.LOW
+-
+-
+-@dataclass(frozen=True)
+-class ProfileFrameDropType(GroupType):
+-    type_id = 2009
+-    slug = "profile_frame_drop"
+-    description = "Frame Drop"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.MOBILE.value
+-    noise_config = NoiseConfig(ignore_limit=2000)
+-    released = True
+-    default_priority = PriorityLevel.LOW
+-
+-
+-@dataclass(frozen=True)
+-class ProfileFunctionRegressionType(GroupType):
+-    type_id = 2011
+-    slug = "profile_function_regression"
+-    description = "Function Regression"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.METRIC.value
+-    enable_auto_resolve = False
+-    released = True
+-    default_priority = PriorityLevel.MEDIUM
+-    notification_config = NotificationConfig(context=[NotificationContextField.APPROX_START_TIME])
+-
+-
+ @dataclass(frozen=True)
+ class LLMDetectedExperimentalGroupType(GroupType):
+     type_id = 3501
+@@ -731,22 +420,6 @@ class FeedbackGroup(GroupType):
+     enable_escalation_detection = False
+ 
+ 
+-@dataclass(frozen=True)
+-class WebVitalsGroup(GroupType):  # TODO: Rename to WebVitalsGroupType
+-    type_id = 10001
+-    slug = "web_vitals"
+-    description = "Web Vitals"
+-    category = GroupCategory.PERFORMANCE.value
+-    category_v2 = GroupCategory.FRONTEND.value
+-    enable_auto_resolve = False
+-    enable_escalation_detection = False
+-    enable_status_change_workflow_notifications = False
+-    enable_workflow_notifications = False
+-    # Web Vital issues are always triggered for the purpose of using autofix
+-    always_trigger_seer_automation = True
+-    released = True
+-
+-
+ def should_create_group(
+     grouptype: type[GroupType],
+     client: RedisCluster | StrictRedis,
+diff --git a/src/sentry/notifications/notifications/rules.py b/src/sentry/notifications/notifications/rules.py
+index e2fdfc9420c392..b107c97094f86d 100644
+--- a/src/sentry/notifications/notifications/rules.py
++++ b/src/sentry/notifications/notifications/rules.py
+@@ -17,12 +17,11 @@
+     ExternalProviders,
+     IntegrationProviderSlug,
+ )
+-from sentry.issues.grouptype import (
+-    GROUP_CATEGORIES_CUSTOM_EMAIL,
+-    GroupCategory,
++from sentry.issue_detection.grouptype import (
+     PerformanceP95EndpointRegressionGroupType,
+     ProfileFunctionRegressionType,
+ )
++from sentry.issues.grouptype import GROUP_CATEGORIES_CUSTOM_EMAIL, GroupCategory
+ from sentry.models.group import Group
+ from sentry.notifications.notifications.base import ProjectNotification
+ from sentry.notifications.types import (
+diff --git a/src/sentry/notifications/utils/__init__.py b/src/sentry/notifications/utils/__init__.py
+index 4f427867e6fd09..4eede0a2f83d04 100644
+--- a/src/sentry/notifications/utils/__init__.py
++++ b/src/sentry/notifications/utils/__init__.py
+@@ -17,14 +17,14 @@
+ from sentry.integrations.manager import default_manager as integrations
+ from sentry.integrations.services.integration import integration_service
+ from sentry.issue_detection.detectors.utils import get_url_from_span
+-from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceConsecutiveDBQueriesGroupType,
+     PerformanceNPlusOneAPICallsExperimentalGroupType,
+     PerformanceNPlusOneAPICallsGroupType,
+     PerformanceRenderBlockingAssetSpanGroupType,
+ )
++from sentry.issue_detection.performance_problem import PerformanceProblem
++from sentry.issue_detection.types import Span
+ from sentry.models.activity import Activity
+ from sentry.models.commit import Commit
+ from sentry.models.deploy import Deploy
+diff --git a/src/sentry/seer/autofix/autofix.py b/src/sentry/seer/autofix/autofix.py
+index 550cb450a9cd22..0dcf5562c60be2 100644
+--- a/src/sentry/seer/autofix/autofix.py
++++ b/src/sentry/seer/autofix/autofix.py
+@@ -17,7 +17,7 @@
+ from sentry.constants import ENABLE_SEER_CODING_DEFAULT, DataCategory, ObjectStatus
+ from sentry.integrations.models.external_actor import ExternalActor
+ from sentry.integrations.types import ExternalProviders
+-from sentry.issues.grouptype import WebVitalsGroup
++from sentry.issue_detection.grouptype import WebVitalsGroup
+ from sentry.models.commitauthor import CommitAuthor
+ from sentry.models.group import Group
+ from sentry.models.project import Project
+diff --git a/src/sentry/spans/buffer.py b/src/sentry/spans/buffer.py
+index 69065c1f433139..7a0011dd25b478 100644
+--- a/src/sentry/spans/buffer.py
++++ b/src/sentry/spans/buffer.py
+@@ -70,12 +70,13 @@
+ import math
+ import time
+ from collections.abc import Generator, MutableMapping, Sequence
+-from typing import Any, NamedTuple
++from typing import Any, NamedTuple, cast
+ 
+ import orjson
+ import zstandard
+ from django.conf import settings
+ from django.utils.functional import cached_property
++from sentry_kafka_schemas.schema_types.ingest_spans_v1 import SpanEvent
+ from sentry_redis_tools.clients import RedisCluster, StrictRedis
+ 
+ from sentry import options
+@@ -612,12 +613,13 @@ def flush_segments(self, now: int) -> dict[SegmentKey, FlushedSegment]:
+             # This incr metric is needed to get a rate overall.
+             metrics.incr("spans.buffer.flush_segments.count_spans_per_segment", amount=len(segment))
+             for payload in segment:
+-                span = orjson.loads(payload)
++                span: SpanEvent = orjson.loads(payload)
+ 
+                 if not attribute_value(span, "sentry.segment.id"):
+-                    if not isinstance(span.get("attributes"), dict):
+-                        span["attributes"] = {}
+-                    span["attributes"]["sentry.segment.id"] = {
++                    attributes = span.get("attributes")
++                    if not isinstance(attributes, dict):
++                        span["attributes"] = attributes = {}
++                    attributes["sentry.segment.id"] = {
+                         "type": "string",
+                         "value": segment_span_id,
+                     }
+@@ -627,7 +629,7 @@ def flush_segments(self, now: int) -> dict[SegmentKey, FlushedSegment]:
+                 if is_segment:
+                     has_root_span = True
+ 
+-                output_spans.append(OutputSpan(payload=span))
++                output_spans.append(OutputSpan(payload=cast(dict[str, Any], span)))
+ 
+             metrics.incr(
+                 "spans.buffer.flush_segments.num_segments_per_shard", tags={"shard_i": shard}
+diff --git a/src/sentry/spans/consumers/process_segments/message.py b/src/sentry/spans/consumers/process_segments/message.py
+index 56b3da85e9c197..f9bb9891c0667f 100644
+--- a/src/sentry/spans/consumers/process_segments/message.py
++++ b/src/sentry/spans/consumers/process_segments/message.py
+@@ -19,8 +19,8 @@
+ from sentry.ingest.transaction_clusterer.normalization import normalize_segment_name
+ from sentry.insights import FilterSpan
+ from sentry.insights import modules as insights_modules
++from sentry.issue_detection.grouptype import PerformanceStreamedSpansGroupTypeExperimental
+ from sentry.issue_detection.performance_detection import detect_performance_problems
+-from sentry.issues.grouptype import PerformanceStreamedSpansGroupTypeExperimental
+ from sentry.issues.issue_occurrence import IssueOccurrence
+ from sentry.issues.producer import PayloadType, produce_occurrence_to_kafka
+ from sentry.killswitches import killswitch_matches_context
+diff --git a/src/sentry/statistical_detectors/issue_platform_adapter.py b/src/sentry/statistical_detectors/issue_platform_adapter.py
+index c42c309ba55287..2ac56551e19323 100644
+--- a/src/sentry/statistical_detectors/issue_platform_adapter.py
++++ b/src/sentry/statistical_detectors/issue_platform_adapter.py
+@@ -2,7 +2,8 @@
+ import uuid
+ from datetime import datetime, timezone
+ 
+-from sentry.issues.grouptype import GroupType, PerformanceP95EndpointRegressionGroupType
++from sentry.issue_detection.grouptype import PerformanceP95EndpointRegressionGroupType
++from sentry.issues.grouptype import GroupType
+ from sentry.issues.issue_occurrence import IssueEvidence, IssueOccurrence
+ from sentry.issues.producer import PayloadType, produce_occurrence_to_kafka
+ from sentry.seer.breakpoints import BreakpointData
+diff --git a/src/sentry/tagstore/snuba/backend.py b/src/sentry/tagstore/snuba/backend.py
+index dc3a8d673b02cf..e4946882019847 100644
+--- a/src/sentry/tagstore/snuba/backend.py
++++ b/src/sentry/tagstore/snuba/backend.py
+@@ -28,6 +28,7 @@
+ from sentry import features, options
+ from sentry.api.paginator import SequencePaginator
+ from sentry.api.utils import default_start_end_dates, handle_query_errors
++from sentry.eventstream.item_helpers import format_attr_key
+ from sentry.issues.grouptype import GroupCategory
+ from sentry.models.group import Group
+ from sentry.models.organization import Organization
+@@ -186,7 +187,7 @@ def __eap_get_tags_for_group(
+         """
+         tag_key should be unformatted (i.e. "foo" rather than "tags[foo]")
+         """
+-        attr_name = f"tags[{tag_key}]"
++        attr_name = format_attr_key(tag_key)
+         if limit is None or limit > 100:
+             # EAP imposes a limit of 100 buckets max
+             limit = 100
+diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
+index 65516b9ef38b7e..35555353b0b81f 100644
+--- a/src/sentry/testutils/cases.py
++++ b/src/sentry/testutils/cases.py
+@@ -87,13 +87,13 @@
+     _gather_attribute_data_from_event_data,
+ )
+ from sentry.eventstream.snuba import SnubaEventStream
+-from sentry.issue_detection.performance_detection import detect_performance_problems
+-from sentry.issues.grouptype import (
+-    NoiseConfig,
++from sentry.issue_detection.grouptype import (
+     PerformanceFileIOMainThreadGroupType,
+     PerformanceNPlusOneGroupType,
+     PerformanceSlowDBQueryGroupType,
+ )
++from sentry.issue_detection.performance_detection import detect_performance_problems
++from sentry.issues.grouptype import NoiseConfig
+ from sentry.issues.ingest import send_issue_occurrence_to_eventstream
+ from sentry.mail import mail_adapter
+ from sentry.models.apitoken import ApiToken
+diff --git a/src/sentry/testutils/helpers/notifications.py b/src/sentry/testutils/helpers/notifications.py
+index 42a758faa395b5..924ed772b7fde3 100644
+--- a/src/sentry/testutils/helpers/notifications.py
++++ b/src/sentry/testutils/helpers/notifications.py
+@@ -6,14 +6,14 @@
+ from typing import Any
+ 
+ from sentry.integrations.types import ExternalProviders
+-from sentry.issues.grouptype import (
+-    FeedbackGroup,
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneAPICallsGroupType,
+     PerformanceNPlusOneGroupType,
+     PerformanceRenderBlockingAssetSpanGroupType,
+     PerformanceSlowDBQueryGroupType,
+     ProfileFileIOGroupType,
+ )
++from sentry.issues.grouptype import FeedbackGroup
+ from sentry.issues.issue_occurrence import IssueEvidence, IssueOccurrence
+ from sentry.models.group import Group
+ from sentry.notifications.notifications.base import BaseNotification
+diff --git a/src/sentry/web_vitals/issue_platform_adapter.py b/src/sentry/web_vitals/issue_platform_adapter.py
+index bd6bc7e5082648..0ecb0e1e42e9af 100644
+--- a/src/sentry/web_vitals/issue_platform_adapter.py
++++ b/src/sentry/web_vitals/issue_platform_adapter.py
+@@ -4,7 +4,7 @@
+ 
+ import sentry_sdk
+ 
+-from sentry.issues.grouptype import WebVitalsGroup
++from sentry.issue_detection.grouptype import WebVitalsGroup
+ from sentry.issues.ingest import hash_fingerprint
+ from sentry.issues.issue_occurrence import IssueEvidence, IssueOccurrence
+ from sentry.issues.producer import PayloadType, produce_occurrence_to_kafka
+diff --git a/static/app/components/eventOrGroupHeader.tsx b/static/app/components/eventOrGroupHeader.tsx
+index 2e4cd3498a6e1f..a4ae1ad486a182 100644
+--- a/static/app/components/eventOrGroupHeader.tsx
++++ b/static/app/components/eventOrGroupHeader.tsx
+@@ -177,7 +177,8 @@ const IconWrapper = styled('span')`
+ 
+ const TitleWithLink = styled(Link)`
+   display: block;
+-  width: 100%;
++  width: fit-content;
++  max-width: 100%;
+   white-space: nowrap;
+   overflow: hidden;
+   text-overflow: ellipsis;
+diff --git a/static/app/components/group/issueSeerBadge.tsx b/static/app/components/group/issueSeerBadge.tsx
+index 83307a953c9084..f0ce7b29737456 100644
+--- a/static/app/components/group/issueSeerBadge.tsx
++++ b/static/app/components/group/issueSeerBadge.tsx
+@@ -51,7 +51,7 @@ export function IssueSeerBadge({group}: IssueSeerBadgeProps) {
+         }}
+       >
+         <IconSeer size="xs" />
+-        {seerFixable && <p>{t('Quick Fix')}</p>}
++        {seerFixable && <span>{t('Quick Fix')}</span>}
+       </SeerLink>
+     </Tooltip>
+   );
+diff --git a/static/app/views/performance/transactionSummary/transactionOverview/eapSidebarCharts.tsx b/static/app/views/performance/transactionSummary/transactionOverview/eapSidebarCharts.tsx
+index da5f9061390f2a..734c92af7db986 100644
+--- a/static/app/views/performance/transactionSummary/transactionOverview/eapSidebarCharts.tsx
++++ b/static/app/views/performance/transactionSummary/transactionOverview/eapSidebarCharts.tsx
+@@ -43,6 +43,7 @@ function FailureRateWidget({transactionName}: FailureRateWidgetProps) {
+ 
+   const transactionSearch = new MutableSearch('');
+   transactionSearch.addFilterValue('transaction', transactionName);
++  transactionSearch.addFilterValue('is_transaction', 'true');
+ 
+   const {
+     data: failureRateSeriesData,
+diff --git a/tests/acceptance/chartcuterie/test_image_block_builder.py b/tests/acceptance/chartcuterie/test_image_block_builder.py
+index 4c94102b0117a6..ad876ef3e524f9 100644
+--- a/tests/acceptance/chartcuterie/test_image_block_builder.py
++++ b/tests/acceptance/chartcuterie/test_image_block_builder.py
+@@ -6,7 +6,7 @@
+ from django.core.cache import cache
+ 
+ from sentry.integrations.slack.message_builder.image_block_builder import ImageBlockBuilder
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceHTTPOverheadGroupType,
+     PerformanceP95EndpointRegressionGroupType,
+     ProfileFunctionRegressionType,
+diff --git a/tests/acceptance/test_performance_issues.py b/tests/acceptance/test_performance_issues.py
+index e2dd7f494ddd55..a64615f86158d4 100644
+--- a/tests/acceptance/test_performance_issues.py
++++ b/tests/acceptance/test_performance_issues.py
+@@ -7,11 +7,11 @@
+ 
+ from fixtures.page_objects.issue_details import IssueDetailsPage
+ from sentry import options
+-from sentry.issues.grouptype import (
+-    NoiseConfig,
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneAPICallsGroupType,
+     PerformanceNPlusOneGroupType,
+ )
++from sentry.issues.grouptype import NoiseConfig
+ from sentry.issues.ingest import send_issue_occurrence_to_eventstream
+ from sentry.models.group import Group
+ from sentry.testutils.cases import AcceptanceTestCase, PerformanceIssueTestCase, SnubaTestCase
+diff --git a/tests/sentry/api/serializers/test_group_stream.py b/tests/sentry/api/serializers/test_group_stream.py
+index 8fe90ac39b7ab7..91067f918bf33e 100644
+--- a/tests/sentry/api/serializers/test_group_stream.py
++++ b/tests/sentry/api/serializers/test_group_stream.py
+@@ -6,7 +6,8 @@
+     StreamGroupSerializer,
+     StreamGroupSerializerSnuba,
+ )
+-from sentry.issues.grouptype import GroupCategory, ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
++from sentry.issues.grouptype import GroupCategory
+ from sentry.models.environment import Environment
+ from sentry.testutils.cases import BaseMetricsTestCase, PerformanceIssueTestCase, TestCase
+ from sentry.testutils.helpers.datetime import before_now, freeze_time
+diff --git a/tests/sentry/event_manager/test_event_manager.py b/tests/sentry/event_manager/test_event_manager.py
+index 6d2bf1f11c8a00..18e23e3e48819c 100644
+--- a/tests/sentry/event_manager/test_event_manager.py
++++ b/tests/sentry/event_manager/test_event_manager.py
+@@ -46,11 +46,11 @@
+ from sentry.ingest.inbound_filters import FilterStatKeys
+ from sentry.ingest.transaction_clusterer import ClustererNamespace
+ from sentry.integrations.models.external_issue import ExternalIssue
+-from sentry.issues.grouptype import (
+-    GroupCategory,
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneGroupType,
+     PerformanceSlowDBQueryGroupType,
+ )
++from sentry.issues.grouptype import GroupCategory
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.activity import Activity
+ from sentry.models.commit import Commit
+diff --git a/tests/sentry/integrations/slack/test_message_builder.py b/tests/sentry/integrations/slack/test_message_builder.py
+index 82b36119126326..6bd26afbb42756 100644
+--- a/tests/sentry/integrations/slack/test_message_builder.py
++++ b/tests/sentry/integrations/slack/test_message_builder.py
+@@ -21,12 +21,11 @@
+ from sentry.integrations.slack.message_builder.routing import encode_action_id
+ from sentry.integrations.slack.message_builder.types import SlackAction
+ from sentry.integrations.time_utils import time_since
+-from sentry.issues.grouptype import (
+-    FeedbackGroup,
+-    GroupCategory,
++from sentry.issue_detection.grouptype import (
+     PerformanceP95EndpointRegressionGroupType,
+     ProfileFileIOGroupType,
+ )
++from sentry.issues.grouptype import FeedbackGroup, GroupCategory
+ from sentry.issues.ownership.grammar import Matcher, Owner, Rule, dump_schema
+ from sentry.models.group import Group, GroupStatus
+ from sentry.models.groupassignee import GroupAssignee
+diff --git a/tests/sentry/integrations/slack/webhooks/actions/test_status.py b/tests/sentry/integrations/slack/webhooks/actions/test_status.py
+index df677bb12bf10e..d56981ba675f80 100644
+--- a/tests/sentry/integrations/slack/webhooks/actions/test_status.py
++++ b/tests/sentry/integrations/slack/webhooks/actions/test_status.py
+@@ -14,7 +14,7 @@
+     UNLINK_IDENTITY_MESSAGE,
+ )
+ from sentry.integrations.types import EventLifecycleOutcome
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.models.activity import Activity, ActivityIntegration
+ from sentry.models.authidentity import AuthIdentity
+ from sentry.models.authprovider import AuthProvider
+diff --git a/tests/sentry/integrations/utils/test_issue_summary_for_alerts.py b/tests/sentry/integrations/utils/test_issue_summary_for_alerts.py
+index ab023d66ee78ea..1e3e26ad15ebd2 100644
+--- a/tests/sentry/integrations/utils/test_issue_summary_for_alerts.py
++++ b/tests/sentry/integrations/utils/test_issue_summary_for_alerts.py
+@@ -2,7 +2,7 @@
+ 
+ from sentry.grouping.grouptype import ErrorGroupType
+ from sentry.integrations.utils.issue_summary_for_alerts import fetch_issue_summary
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.helpers.features import with_feature
+ 
+diff --git a/tests/sentry/issue_detection/test_consecutive_db_detector.py b/tests/sentry/issue_detection/test_consecutive_db_detector.py
+index 89b99e3f1e5bfd..f5bd36f082de41 100644
+--- a/tests/sentry/issue_detection/test_consecutive_db_detector.py
++++ b/tests/sentry/issue_detection/test_consecutive_db_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.consecutive_db_detector import ConsecutiveDBSpanDetector
++from sentry.issue_detection.grouptype import PerformanceConsecutiveDBQueriesGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceConsecutiveDBQueriesGroupType
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import (
+diff --git a/tests/sentry/issue_detection/test_consecutive_http_detector.py b/tests/sentry/issue_detection/test_consecutive_http_detector.py
+index cceaa0ecdcb61d..648bef23372f8c 100644
+--- a/tests/sentry/issue_detection/test_consecutive_http_detector.py
++++ b/tests/sentry/issue_detection/test_consecutive_http_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.consecutive_http_detector import ConsecutiveHTTPSpanDetector
++from sentry.issue_detection.grouptype import PerformanceConsecutiveHTTPQueriesGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceConsecutiveHTTPQueriesGroupType
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.spans.grouping.strategy.base import Span
+ from sentry.testutils.cases import TestCase
+diff --git a/tests/sentry/issue_detection/test_db_main_thread_detector.py b/tests/sentry/issue_detection/test_db_main_thread_detector.py
+index a6b16e4039c509..7b767dc59a64f9 100644
+--- a/tests/sentry/issue_detection/test_db_main_thread_detector.py
++++ b/tests/sentry/issue_detection/test_db_main_thread_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.io_main_thread_detector import DBMainThreadDetector
++from sentry.issue_detection.grouptype import PerformanceDBMainThreadGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceDBMainThreadGroupType
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import get_event
+diff --git a/tests/sentry/issue_detection/test_file_io_on_main_thread_detector.py b/tests/sentry/issue_detection/test_file_io_on_main_thread_detector.py
+index 7fdbdea4b620a8..d0420d0e252c69 100644
+--- a/tests/sentry/issue_detection/test_file_io_on_main_thread_detector.py
++++ b/tests/sentry/issue_detection/test_file_io_on_main_thread_detector.py
+@@ -8,12 +8,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.io_main_thread_detector import FileIOMainThreadDetector
++from sentry.issue_detection.grouptype import PerformanceFileIOMainThreadGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceFileIOMainThreadGroupType
+ from sentry.models.debugfile import create_files_from_dif_zip
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+diff --git a/tests/sentry/issue_detection/test_http_overhead_detector.py b/tests/sentry/issue_detection/test_http_overhead_detector.py
+index bdcc2767a0bbd0..0109c3baa437a9 100644
+--- a/tests/sentry/issue_detection/test_http_overhead_detector.py
++++ b/tests/sentry/issue_detection/test_http_overhead_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.http_overhead_detector import HTTPOverheadDetector
++from sentry.issue_detection.grouptype import PerformanceHTTPOverheadGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceHTTPOverheadGroupType
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import (
+     PROJECT_ID,
+diff --git a/tests/sentry/issue_detection/test_large_http_payload_detector.py b/tests/sentry/issue_detection/test_large_http_payload_detector.py
+index 6b73ecfc8f8098..3092a62ff26c2d 100644
+--- a/tests/sentry/issue_detection/test_large_http_payload_detector.py
++++ b/tests/sentry/issue_detection/test_large_http_payload_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.large_http_payload_detector import LargeHTTPPayloadDetector
++from sentry.issue_detection.grouptype import PerformanceLargeHTTPPayloadGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceLargeHTTPPayloadGroupType
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import create_event, create_span
+diff --git a/tests/sentry/issue_detection/test_m_n_plus_one_db_detector.py b/tests/sentry/issue_detection/test_m_n_plus_one_db_detector.py
+index b11ccc5578b9b9..befcb2de1e0330 100644
+--- a/tests/sentry/issue_detection/test_m_n_plus_one_db_detector.py
++++ b/tests/sentry/issue_detection/test_m_n_plus_one_db_detector.py
+@@ -8,16 +8,16 @@
+ 
+ from sentry.issue_detection.base import DetectorType
+ from sentry.issue_detection.detectors.mn_plus_one_db_span_detector import MNPlusOneDBSpanDetector
++from sentry.issue_detection.grouptype import (
++    PerformanceMNPlusOneDBQueriesGroupType,
++    PerformanceNPlusOneGroupType,
++)
+ from sentry.issue_detection.performance_detection import (
+     _detect_performance_problems,
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import (
+-    PerformanceMNPlusOneDBQueriesGroupType,
+-    PerformanceNPlusOneGroupType,
+-)
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import get_event
+diff --git a/tests/sentry/issue_detection/test_n_plus_one_api_calls_detector.py b/tests/sentry/issue_detection/test_n_plus_one_api_calls_detector.py
+index d3e07b975eba34..501b7ab531b85f 100644
+--- a/tests/sentry/issue_detection/test_n_plus_one_api_calls_detector.py
++++ b/tests/sentry/issue_detection/test_n_plus_one_api_calls_detector.py
+@@ -9,13 +9,13 @@
+ from sentry.issue_detection.base import DetectorType
+ from sentry.issue_detection.detectors.n_plus_one_api_calls_detector import NPlusOneAPICallsDetector
+ from sentry.issue_detection.detectors.utils import parameterize_url
++from sentry.issue_detection.grouptype import PerformanceNPlusOneAPICallsGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+ from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import PerformanceNPlusOneAPICallsGroupType
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import create_event, create_span, get_event
+ 
+diff --git a/tests/sentry/issue_detection/test_n_plus_one_db_span_detector.py b/tests/sentry/issue_detection/test_n_plus_one_db_span_detector.py
+index 29e19628631fa2..3c0d26447fbd85 100644
+--- a/tests/sentry/issue_detection/test_n_plus_one_db_span_detector.py
++++ b/tests/sentry/issue_detection/test_n_plus_one_db_span_detector.py
+@@ -7,12 +7,12 @@
+ 
+ from sentry.issue_detection.base import DetectorType
+ from sentry.issue_detection.detectors.n_plus_one_db_span_detector import NPlusOneDBSpanDetector
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+diff --git a/tests/sentry/issue_detection/test_performance_detection.py b/tests/sentry/issue_detection/test_performance_detection.py
+index 72a12fde98e615..90c7ae98e36366 100644
+--- a/tests/sentry/issue_detection/test_performance_detection.py
++++ b/tests/sentry/issue_detection/test_performance_detection.py
+@@ -8,6 +8,11 @@
+ from sentry.issue_detection.base import DetectorType
+ from sentry.issue_detection.detectors.n_plus_one_db_span_detector import NPlusOneDBSpanDetector
+ from sentry.issue_detection.detectors.utils import total_span_time
++from sentry.issue_detection.grouptype import (
++    PerformanceConsecutiveHTTPQueriesGroupType,
++    PerformanceNPlusOneGroupType,
++    PerformanceSlowDBQueryGroupType,
++)
+ from sentry.issue_detection.performance_detection import (
+     PERFORMANCE_DETECTOR_CONFIG_MAPPINGS,
+     SETTINGS_PROJECT_OPTION_KEY,
+@@ -23,12 +28,7 @@
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+ from sentry.issue_detection.types import Span
+-from sentry.issues.grouptype import (
+-    PerformanceConsecutiveHTTPQueriesGroupType,
+-    PerformanceNPlusOneGroupType,
+-    PerformanceSlowDBQueryGroupType,
+-    registry,
+-)
++from sentry.issues.grouptype import registry
+ from sentry.services.eventstore.models import Event
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.helpers import override_options
+diff --git a/tests/sentry/issue_detection/test_query_injection_detector.py b/tests/sentry/issue_detection/test_query_injection_detector.py
+index 011be04223ee76..87215227015153 100644
+--- a/tests/sentry/issue_detection/test_query_injection_detector.py
++++ b/tests/sentry/issue_detection/test_query_injection_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.query_injection_detector import QueryInjectionDetector
++from sentry.issue_detection.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import get_event
+ 
+diff --git a/tests/sentry/issue_detection/test_render_blocking_asset_detector.py b/tests/sentry/issue_detection/test_render_blocking_asset_detector.py
+index 357f7a6076c2cd..cf1f39e69a2e19 100644
+--- a/tests/sentry/issue_detection/test_render_blocking_asset_detector.py
++++ b/tests/sentry/issue_detection/test_render_blocking_asset_detector.py
+@@ -7,12 +7,12 @@
+ from sentry.issue_detection.detectors.render_blocking_asset_span_detector import (
+     RenderBlockingAssetSpanDetector,
+ )
++from sentry.issue_detection.grouptype import PerformanceRenderBlockingAssetSpanGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceRenderBlockingAssetSpanGroupType
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import (
+diff --git a/tests/sentry/issue_detection/test_slow_db_span_detector.py b/tests/sentry/issue_detection/test_slow_db_span_detector.py
+index a4dff766dbe3d0..51e1abe8bf89a4 100644
+--- a/tests/sentry/issue_detection/test_slow_db_span_detector.py
++++ b/tests/sentry/issue_detection/test_slow_db_span_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.slow_db_query_detector import SlowDBQueryDetector
++from sentry.issue_detection.grouptype import PerformanceSlowDBQueryGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceSlowDBQueryGroupType
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import create_event, create_span, get_event
+diff --git a/tests/sentry/issue_detection/test_sql_injection_detector.py b/tests/sentry/issue_detection/test_sql_injection_detector.py
+index 91c5385b370700..9cc82caccfc930 100644
+--- a/tests/sentry/issue_detection/test_sql_injection_detector.py
++++ b/tests/sentry/issue_detection/test_sql_injection_detector.py
+@@ -5,12 +5,12 @@
+ import pytest
+ 
+ from sentry.issue_detection.detectors.sql_injection_detector import SQLInjectionDetector
++from sentry.issue_detection.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import QueryInjectionVulnerabilityGroupType
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.issue_detection.event_generators import get_event
+ 
+diff --git a/tests/sentry/issue_detection/test_uncompressed_asset_detector.py b/tests/sentry/issue_detection/test_uncompressed_asset_detector.py
+index a63023e0b3685e..f51befd2e0fab2 100644
+--- a/tests/sentry/issue_detection/test_uncompressed_asset_detector.py
++++ b/tests/sentry/issue_detection/test_uncompressed_asset_detector.py
+@@ -7,12 +7,12 @@
+ from sentry.issue_detection.detectors.uncompressed_asset_detector import (
+     UncompressedAssetSpanDetector,
+ )
++from sentry.issue_detection.grouptype import PerformanceUncompressedAssetsGroupType
+ from sentry.issue_detection.performance_detection import (
+     get_detection_settings,
+     run_detector_on_data,
+ )
+ from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import PerformanceUncompressedAssetsGroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
+ from sentry.models.options.project_option import ProjectOption
+ from sentry.testutils.cases import TestCase
+diff --git a/tests/sentry/issues/endpoints/test_group_details.py b/tests/sentry/issues/endpoints/test_group_details.py
+index af1d0b7685928e..5bb13411169b4a 100644
+--- a/tests/sentry/issues/endpoints/test_group_details.py
++++ b/tests/sentry/issues/endpoints/test_group_details.py
+@@ -7,7 +7,7 @@
+ from sentry import audit_log, buffer, tsdb
+ from sentry.buffer.redis import RedisBuffer
+ from sentry.deletions.tasks.hybrid_cloud import schedule_hybrid_cloud_foreign_key_jobs
+-from sentry.issues.grouptype import PerformanceSlowDBQueryGroupType
++from sentry.issue_detection.grouptype import PerformanceSlowDBQueryGroupType
+ from sentry.models.activity import Activity
+ from sentry.models.apikey import ApiKey
+ from sentry.models.auditlogentry import AuditLogEntry
+diff --git a/tests/sentry/issues/endpoints/test_group_events.py b/tests/sentry/issues/endpoints/test_group_events.py
+index d6eaf08d7731af..88b3405f2b12b7 100644
+--- a/tests/sentry/issues/endpoints/test_group_events.py
++++ b/tests/sentry/issues/endpoints/test_group_events.py
+@@ -6,7 +6,7 @@
+ from urllib3.connectionpool import ConnectionPool
+ from urllib3.exceptions import ReadTimeoutError
+ 
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.search.eap.occurrences.rollout_utils import EAPOccurrencesComparator
+ from sentry.testutils.cases import APITestCase, PerformanceIssueTestCase, SnubaTestCase
+ from sentry.testutils.helpers import parse_link_header
+diff --git a/tests/sentry/issues/endpoints/test_organization_group_index.py b/tests/sentry/issues/endpoints/test_organization_group_index.py
+index 3be938d45e708a..5352fdc6a2734c 100644
+--- a/tests/sentry/issues/endpoints/test_organization_group_index.py
++++ b/tests/sentry/issues/endpoints/test_organization_group_index.py
+@@ -22,12 +22,11 @@
+ from sentry.incidents.grouptype import MetricIssue
+ from sentry.integrations.models.external_issue import ExternalIssue
+ from sentry.integrations.models.organization_integration import OrganizationIntegration
+-from sentry.issues.grouptype import (
+-    FeedbackGroup,
+-    NoiseConfig,
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneGroupType,
+     PerformanceSlowDBQueryGroupType,
+ )
++from sentry.issues.grouptype import FeedbackGroup, NoiseConfig
+ from sentry.issues.ingest import save_issue_occurrence
+ from sentry.models.activity import Activity
+ from sentry.models.apitoken import ApiToken
+diff --git a/tests/sentry/issues/endpoints/test_project_user_issue.py b/tests/sentry/issues/endpoints/test_project_user_issue.py
+index 0ea6f2aaed381c..cd8e03a2dbf748 100644
+--- a/tests/sentry/issues/endpoints/test_project_user_issue.py
++++ b/tests/sentry/issues/endpoints/test_project_user_issue.py
+@@ -4,7 +4,7 @@
+ 
+ from django.urls import reverse
+ 
+-from sentry.issues.grouptype import WebVitalsGroup
++from sentry.issue_detection.grouptype import WebVitalsGroup
+ from sentry.issues.producer import PayloadType
+ from sentry.testutils.cases import APITestCase
+ from sentry.testutils.helpers.features import with_feature
+diff --git a/tests/sentry/issues/escalating/test_escalating.py b/tests/sentry/issues/escalating/test_escalating.py
+index bf4af24b45a620..a3cfaabf1ecc12 100644
+--- a/tests/sentry/issues/escalating/test_escalating.py
++++ b/tests/sentry/issues/escalating/test_escalating.py
+@@ -8,6 +8,7 @@
+ 
+ import pytest
+ 
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.issues.escalating.escalating import (
+     GroupsCountResponse,
+     _query_groups_past_counts_eap,
+@@ -19,7 +20,7 @@
+     query_groups_past_counts,
+ )
+ from sentry.issues.escalating.escalating_group_forecast import EscalatingGroupForecast
+-from sentry.issues.grouptype import GroupCategory, ProfileFileIOGroupType
++from sentry.issues.grouptype import GroupCategory
+ from sentry.models.group import Group, GroupStatus
+ from sentry.models.groupinbox import GroupInbox
+ from sentry.services.eventstore.models import Event, GroupEvent
+diff --git a/tests/sentry/issues/test_group.py b/tests/sentry/issues/test_group.py
+index a10a56ae7456ad..e2021762f826f8 100644
+--- a/tests/sentry/issues/test_group.py
++++ b/tests/sentry/issues/test_group.py
+@@ -3,8 +3,8 @@
+ 
+ import pytest
+ 
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.issues.group import get_group_by_occurrence_fingerprint
+-from sentry.issues.grouptype import ProfileFileIOGroupType
+ from sentry.issues.ingest import hash_fingerprint
+ from sentry.issues.issue_occurrence import IssueOccurrence
+ from sentry.issues.producer import PayloadType, produce_occurrence_to_kafka
+diff --git a/tests/sentry/issues/test_grouptype.py b/tests/sentry/issues/test_grouptype.py
+index b4d598d3b3d825..4bbaf205a51079 100644
+--- a/tests/sentry/issues/test_grouptype.py
++++ b/tests/sentry/issues/test_grouptype.py
+@@ -3,6 +3,10 @@
+ from unittest.mock import patch
+ 
+ from sentry.grouping.grouptype import ErrorGroupType
++from sentry.issue_detection.grouptype import (
++    PerformanceNPlusOneGroupType,
++    PerformanceSlowDBQueryGroupType,
++)
+ from sentry.issues.grouptype import (
+     DEFAULT_EXPIRY_TIME,
+     DEFAULT_IGNORE_LIMIT,
+@@ -10,8 +14,6 @@
+     GroupType,
+     GroupTypeRegistry,
+     NoiseConfig,
+-    PerformanceNPlusOneGroupType,
+-    PerformanceSlowDBQueryGroupType,
+     get_group_type_by_slug,
+     get_group_types_by_category,
+ )
+diff --git a/tests/sentry/issues/test_merge.py b/tests/sentry/issues/test_merge.py
+index bc3bc6bdd9af1e..8d613f8cab8b98 100644
+--- a/tests/sentry/issues/test_merge.py
++++ b/tests/sentry/issues/test_merge.py
+@@ -3,7 +3,7 @@
+ import pytest
+ import rest_framework
+ 
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.issues.merge import handle_merge
+ from sentry.models.activity import Activity
+ from sentry.models.group import Group, GroupStatus
+diff --git a/tests/sentry/issues/test_occurrence_consumer.py b/tests/sentry/issues/test_occurrence_consumer.py
+index 52683e5173db6c..698c5d8b58261b 100644
+--- a/tests/sentry/issues/test_occurrence_consumer.py
++++ b/tests/sentry/issues/test_occurrence_consumer.py
+@@ -13,7 +13,7 @@
+ from jsonschema import ValidationError
+ 
+ from sentry import options
+-from sentry.issues.grouptype import PerformanceSlowDBQueryGroupType, ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import PerformanceSlowDBQueryGroupType, ProfileFileIOGroupType
+ from sentry.issues.issue_occurrence import IssueOccurrence
+ from sentry.issues.occurrence_consumer import (
+     EventLookupError,
+diff --git a/tests/sentry/issues/test_utils.py b/tests/sentry/issues/test_utils.py
+index 6a4bbdac99b259..d6357adb97db4c 100644
+--- a/tests/sentry/issues/test_utils.py
++++ b/tests/sentry/issues/test_utils.py
+@@ -8,8 +8,8 @@
+ from django.utils import timezone
+ 
+ from sentry.event_manager import GroupInfo
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.issues.escalating.escalating import GroupsCountResponse
+-from sentry.issues.grouptype import ProfileFileIOGroupType
+ from sentry.issues.ingest import process_occurrence_data, save_issue_occurrence
+ from sentry.issues.issue_occurrence import IssueEvidence, IssueOccurrence, IssueOccurrenceData
+ from sentry.issues.occurrence_consumer import process_event_and_issue_occurrence
+diff --git a/tests/sentry/mail/test_actions.py b/tests/sentry/mail/test_actions.py
+index 6ac28200a529c9..98cd3736573384 100644
+--- a/tests/sentry/mail/test_actions.py
++++ b/tests/sentry/mail/test_actions.py
+@@ -2,7 +2,7 @@
+ 
+ from sentry.eventstream.types import EventStreamEventType
+ from sentry.grouping.grouptype import ErrorGroupType
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.mail.actions import NotifyEmailAction
+ from sentry.mail.forms.notify_email import NotifyEmailForm
+ from sentry.models.organizationmember import OrganizationMember
+diff --git a/tests/sentry/models/test_group.py b/tests/sentry/models/test_group.py
+index 0a3b6af5d165f5..9c4d8a87b7b0e4 100644
+--- a/tests/sentry/models/test_group.py
++++ b/tests/sentry/models/test_group.py
+@@ -8,7 +8,8 @@
+ from django.db.models import ProtectedError
+ from django.utils import timezone
+ 
+-from sentry.issues.grouptype import FeedbackGroup, ProfileFileIOGroupType, ReplayHydrationErrorType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
++from sentry.issues.grouptype import FeedbackGroup, ReplayHydrationErrorType
+ from sentry.models.activity import Activity
+ from sentry.models.group import Group, GroupStatus, get_group_with_redirect
+ from sentry.models.groupopenperiod import GroupOpenPeriod
+diff --git a/tests/sentry/notifications/test_utils.py b/tests/sentry/notifications/test_utils.py
+index 6ac95957b2da9b..97019c098237b2 100644
+--- a/tests/sentry/notifications/test_utils.py
++++ b/tests/sentry/notifications/test_utils.py
+@@ -1,12 +1,12 @@
+ import types
+ from unittest import TestCase
+ 
+-from sentry.issue_detection.performance_problem import PerformanceProblem
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneAPICallsGroupType,
+     PerformanceNPlusOneGroupType,
+     PerformanceRenderBlockingAssetSpanGroupType,
+ )
++from sentry.issue_detection.performance_problem import PerformanceProblem
+ from sentry.notifications.utils import (
+     NPlusOneAPICallProblemContext,
+     PerformanceProblemContext,
+diff --git a/tests/sentry/rules/history/test_preview.py b/tests/sentry/rules/history/test_preview.py
+index d410ce9c481668..aa7bc3087a603b 100644
+--- a/tests/sentry/rules/history/test_preview.py
++++ b/tests/sentry/rules/history/test_preview.py
+@@ -6,11 +6,11 @@
+ from django.utils import timezone
+ 
+ from sentry.grouping.grouptype import ErrorGroupType
+-from sentry.issues.grouptype import (
+-    GroupCategory,
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneGroupType,
+     ProfileFileIOGroupType,
+ )
++from sentry.issues.grouptype import GroupCategory
+ from sentry.models.activity import Activity
+ from sentry.models.group import Group
+ from sentry.models.groupassignee import GroupAssignee
+diff --git a/tests/sentry/seer/autofix/test_autofix.py b/tests/sentry/seer/autofix/test_autofix.py
+index fabc6c249b993f..379581f3524c7d 100644
+--- a/tests/sentry/seer/autofix/test_autofix.py
++++ b/tests/sentry/seer/autofix/test_autofix.py
+@@ -5,7 +5,7 @@
+ import pytest
+ from django.contrib.auth.models import AnonymousUser
+ 
+-from sentry.issues.grouptype import WebVitalsGroup
++from sentry.issue_detection.grouptype import WebVitalsGroup
+ from sentry.issues.ingest import save_issue_occurrence
+ from sentry.seer.autofix.autofix import (
+     TIMEOUT_SECONDS,
+diff --git a/tests/sentry/seer/autofix/test_issue_summary.py b/tests/sentry/seer/autofix/test_issue_summary.py
+index 75aee98a200bc8..ab257042f23b0b 100644
+--- a/tests/sentry/seer/autofix/test_issue_summary.py
++++ b/tests/sentry/seer/autofix/test_issue_summary.py
+@@ -7,7 +7,7 @@
+ import pytest
+ 
+ from sentry.api.serializers.rest_framework.base import convert_dict_key_case, snake_to_camel_case
+-from sentry.issues.grouptype import WebVitalsGroup
++from sentry.issue_detection.grouptype import WebVitalsGroup
+ from sentry.issues.ingest import save_issue_occurrence
+ from sentry.locks import locks
+ from sentry.seer.autofix.constants import SeerAutomationSource
+diff --git a/tests/sentry/seer/explorer/test_tools.py b/tests/sentry/seer/explorer/test_tools.py
+index aff9aa3aa6e4cd..f75eb7a1ad15a6 100644
+--- a/tests/sentry/seer/explorer/test_tools.py
++++ b/tests/sentry/seer/explorer/test_tools.py
+@@ -10,7 +10,7 @@
+ 
+ from sentry.api import client
+ from sentry.constants import ObjectStatus
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.models.activity import Activity
+ from sentry.models.group import Group
+ from sentry.models.groupassignee import GroupAssignee
+diff --git a/tests/sentry/services/eventstore/snuba/test_backend.py b/tests/sentry/services/eventstore/snuba/test_backend.py
+index 0fe4e75ecfd1ac..22585daf5760c3 100644
+--- a/tests/sentry/services/eventstore/snuba/test_backend.py
++++ b/tests/sentry/services/eventstore/snuba/test_backend.py
+@@ -3,7 +3,7 @@
+ 
+ from snuba_sdk import Column, Condition, Op
+ 
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.services.eventstore.base import Filter
+ from sentry.services.eventstore.models import Event
+ from sentry.services.eventstore.snuba.backend import SnubaEventStorage
+diff --git a/tests/sentry/spans/consumers/process_segments/test_message.py b/tests/sentry/spans/consumers/process_segments/test_message.py
+index 599fa0870f6b4f..d8825803a1da7f 100644
+--- a/tests/sentry/spans/consumers/process_segments/test_message.py
++++ b/tests/sentry/spans/consumers/process_segments/test_message.py
+@@ -6,7 +6,7 @@
+ import pytest
+ from sentry_conventions.attributes import ATTRIBUTE_NAMES
+ 
+-from sentry.issues.grouptype import PerformanceStreamedSpansGroupTypeExperimental
++from sentry.issue_detection.grouptype import PerformanceStreamedSpansGroupTypeExperimental
+ from sentry.models.environment import Environment
+ from sentry.models.release import Release
+ from sentry.spans.consumers.process_segments.message import _verify_compatibility, process_segment
+@@ -135,7 +135,7 @@ def test_create_models(self) -> None:
+     def test_n_plus_one_issue_detection(self, mock_eventstream: mock.MagicMock) -> None:
+         spans = self.generate_n_plus_one_spans()
+         with mock.patch(
+-            "sentry.issues.grouptype.PerformanceStreamedSpansGroupTypeExperimental.released",
++            "sentry.issue_detection.grouptype.PerformanceStreamedSpansGroupTypeExperimental.released",
+             return_value=True,
+         ):
+             process_segment(spans)
+@@ -194,7 +194,7 @@ def repeating_span():
+         spans = [segment_span, child_span, cause_span] + repeating_spans
+ 
+         with mock.patch(
+-            "sentry.issues.grouptype.PerformanceStreamedSpansGroupTypeExperimental.released"
++            "sentry.issue_detection.grouptype.PerformanceStreamedSpansGroupTypeExperimental.released"
+         ) as mock_released:
+             mock_released.return_value = True
+             process_segment(spans)
+diff --git a/tests/sentry/spans/test_buffer.py b/tests/sentry/spans/test_buffer.py
+index 9ed199843de24e..6084fc41897cf8 100644
+--- a/tests/sentry/spans/test_buffer.py
++++ b/tests/sentry/spans/test_buffer.py
+@@ -2,13 +2,19 @@
+ 
+ import itertools
+ from collections.abc import Sequence
++from typing import cast
+ from unittest import mock
+ 
+ import orjson
+ import pytest
++import sentry_kafka_schemas
++from sentry_kafka_schemas.schema_types.ingest_spans_v1 import SpanEvent
+ from sentry_redis_tools.clients import StrictRedis
+ 
++from sentry.conf.types.kafka_definition import Topic, get_topic_codec
+ from sentry.spans.buffer import FlushedSegment, OutputSpan, Span, SpansBuffer
++from sentry.spans.consumers.process.factory import SPANS_CODEC, validate_span_event
++from sentry.spans.consumers.process_segments.types import attribute_value
+ from sentry.spans.segment_key import SegmentKey
+ from sentry.testutils.helpers.options import override_options
+ 
+@@ -32,6 +38,7 @@
+     "spans.buffer.evalsha-latency-threshold": 100,
+     "spans.buffer.debug-traces": [],
+     "spans.buffer.evalsha-cumulative-logger-enabled": True,
++    "spans.process-segments.schema-validation": 1.0,
+     "spans.buffer.zero-copy-dest-threshold-bytes": 0,
+     "spans.buffer.done-flush-conditional-zrem": False,
+     "spans.buffer.write-distributed-payloads": False,
+@@ -1646,3 +1653,69 @@ def test_distributed_transition_write_then_read() -> None:
+         assert len(rv[seg_key].spans) == 2
+         buf.done_flush_segments(rv)
+         assert_clean_distributed(buf.client)
++
++
++def _get_schema_examples():
++    """Load all ingest-spans schema examples for parametrization."""
++    examples = []
++    for ex in sentry_kafka_schemas.iter_examples("ingest-spans"):
++        examples.append(pytest.param(ex.load(), id=ex.path.stem))
++    return examples
++
++
++@pytest.mark.parametrize("example", _get_schema_examples())
++def test_schema_examples(buffer: SpansBuffer, example: dict) -> None:
++    """
++    Feed official ingest-spans schema examples through the buffer pipeline
++    to verify they are handled without errors.
++    """
++    # Replicate the parsing logic from process_batch() in factory.py
++    segment_id = cast(str | None, attribute_value(example, "sentry.segment.id"))
++    validate_span_event(cast(SpanEvent, example), segment_id)
++
++    payload = orjson.dumps(example)
++
++    span = Span(
++        trace_id=example["trace_id"],
++        span_id=example["span_id"],
++        parent_span_id=example.get("parent_span_id"),
++        segment_id=segment_id,
++        project_id=example["project_id"],
++        payload=payload,
++        end_timestamp=cast(float, example["end_timestamp"]),
++        is_segment_span=bool(example.get("parent_span_id") is None or example.get("is_segment")),
++    )
++
++    process_spans([span], buffer, now=0)
++    assert_ttls(buffer.client)
++
++    # Flush past both root-timeout (10s) and timeout (60s)
++    rv = buffer.flush_segments(now=61)
++
++    assert len(rv) == 1
++    segment = list(rv.values())[0]
++    assert len(segment.spans) == 1
++
++    output_span = segment.spans[0]
++    assert output_span.payload["span_id"] == example["span_id"]
++    assert output_span.payload["trace_id"] == example["trace_id"]
++
++    # Verify top-level keys are preserved (except is_segment and attributes
++    # which the buffer modifies)
++    for key in example:
++        if key in ("is_segment", "attributes"):
++            continue
++        assert key in output_span.payload, f"Key {key!r} missing from output payload"
++
++    # Validate that the output span still conforms to the ingest-spans schema.
++    # It's not explicitly written anywhere that the spans schema in
++    # buffered-segments is the same one as the input schema, but right now
++    # that's what it is.
++    SPANS_CODEC.validate(cast(SpanEvent, output_span.payload))
++
++    # Validate that the assembled segment conforms to the buffered-segments schema
++    buffered_segments_codec = get_topic_codec(Topic.BUFFERED_SEGMENTS)
++    buffered_segments_codec.validate({"spans": [span.payload for span in segment.spans]})
++
++    buffer.done_flush_segments(rv)
++    assert_clean(buffer.client)
+diff --git a/tests/sentry/statistical_detectors/test_issue_platform_adapter.py b/tests/sentry/statistical_detectors/test_issue_platform_adapter.py
+index 367023e3561ced..2561eb85d73434 100644
+--- a/tests/sentry/statistical_detectors/test_issue_platform_adapter.py
++++ b/tests/sentry/statistical_detectors/test_issue_platform_adapter.py
+@@ -1,6 +1,6 @@
+ from unittest import mock
+ 
+-from sentry.issues.grouptype import PerformanceP95EndpointRegressionGroupType
++from sentry.issue_detection.grouptype import PerformanceP95EndpointRegressionGroupType
+ from sentry.seer.breakpoints import BreakpointData
+ from sentry.statistical_detectors.issue_platform_adapter import send_regression_to_platform
+ 
+diff --git a/tests/sentry/tasks/test_auto_resolve_issues.py b/tests/sentry/tasks/test_auto_resolve_issues.py
+index 234c18ef4d0f0c..70ca02379f9c15 100644
+--- a/tests/sentry/tasks/test_auto_resolve_issues.py
++++ b/tests/sentry/tasks/test_auto_resolve_issues.py
+@@ -5,7 +5,7 @@
+ from django.utils import timezone
+ 
+ from sentry.analytics.events.issue_auto_resolved import IssueAutoResolvedEvent
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceP95EndpointRegressionGroupType,
+     PerformanceSlowDBQueryGroupType,
+ )
+diff --git a/tests/sentry/tasks/test_post_process.py b/tests/sentry/tasks/test_post_process.py
+index 80988620d85315..6ba99be52ed36f 100644
+--- a/tests/sentry/tasks/test_post_process.py
++++ b/tests/sentry/tasks/test_post_process.py
+@@ -22,13 +22,12 @@
+ from sentry.integrations.models.integration import Integration
+ from sentry.integrations.source_code_management.commit_context import CommitInfo, FileBlameInfo
+ from sentry.integrations.types import DataForwarderProviderSlug
+-from sentry.issues.auto_source_code_config.utils.platform import get_supported_platforms
+-from sentry.issues.grouptype import (
+-    FeedbackGroup,
+-    GroupCategory,
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneGroupType,
+     PerformanceP95EndpointRegressionGroupType,
+ )
++from sentry.issues.auto_source_code_config.utils.platform import get_supported_platforms
++from sentry.issues.grouptype import FeedbackGroup, GroupCategory
+ from sentry.issues.ingest import save_issue_occurrence
+ from sentry.issues.ownership.grammar import Matcher, Owner, Rule, dump_schema
+ from sentry.models.activity import Activity, ActivityIntegration
+diff --git a/tests/sentry/tasks/test_statistical_detectors.py b/tests/sentry/tasks/test_statistical_detectors.py
+index e53ccc82d96d39..7de57ea1515fcc 100644
+--- a/tests/sentry/tasks/test_statistical_detectors.py
++++ b/tests/sentry/tasks/test_statistical_detectors.py
+@@ -6,11 +6,11 @@
+ import pytest
+ from django.db.models import F
+ 
+-from sentry.issues.endpoints.project_performance_issue_settings import InternalProjectOptions
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceP95EndpointRegressionGroupType,
+     ProfileFunctionRegressionType,
+ )
++from sentry.issues.endpoints.project_performance_issue_settings import InternalProjectOptions
+ from sentry.issues.occurrence_consumer import _process_message
+ from sentry.issues.producer import PayloadType
+ from sentry.issues.status_change_message import StatusChangeMessage
+diff --git a/tests/sentry/tasks/test_web_vitals_issue_detection.py b/tests/sentry/tasks/test_web_vitals_issue_detection.py
+index 59870fd42c69f6..9d09afe15278ee 100644
+--- a/tests/sentry/tasks/test_web_vitals_issue_detection.py
++++ b/tests/sentry/tasks/test_web_vitals_issue_detection.py
+@@ -3,7 +3,7 @@
+ 
+ import pytest
+ 
+-from sentry.issues.grouptype import WebVitalsGroup
++from sentry.issue_detection.grouptype import WebVitalsGroup
+ from sentry.issues.ingest import hash_fingerprint
+ from sentry.models.grouphash import GroupHash
+ from sentry.tasks.web_vitals_issue_detection import run_web_vitals_issue_detection
+diff --git a/tests/sentry/tasks/test_weekly_escalating_forecast.py b/tests/sentry/tasks/test_weekly_escalating_forecast.py
+index aba58fb7ca1cb2..d8453cf916d68a 100644
+--- a/tests/sentry/tasks/test_weekly_escalating_forecast.py
++++ b/tests/sentry/tasks/test_weekly_escalating_forecast.py
+@@ -2,12 +2,12 @@
+ from unittest.mock import MagicMock, patch
+ 
+ from sentry.grouping.grouptype import ErrorGroupType
++from sentry.issue_detection.grouptype import PerformanceP95EndpointRegressionGroupType
+ from sentry.issues.analytics import IssueForecastSaved
+ from sentry.issues.escalating.escalating_group_forecast import (
+     ONE_EVENT_FORECAST,
+     EscalatingGroupForecast,
+ )
+-from sentry.issues.grouptype import PerformanceP95EndpointRegressionGroupType
+ from sentry.models.group import Group, GroupStatus
+ from sentry.tasks.weekly_escalating_forecast import run_escalating_forecast
+ from sentry.testutils.cases import APITestCase, SnubaTestCase
+diff --git a/tests/sentry/tasks/test_weekly_reports.py b/tests/sentry/tasks/test_weekly_reports.py
+index 86b2472cdcdb8f..391e942a1616b9 100644
+--- a/tests/sentry/tasks/test_weekly_reports.py
++++ b/tests/sentry/tasks/test_weekly_reports.py
+@@ -11,7 +11,7 @@
+ 
+ from sentry.analytics.events.weekly_report import WeeklyReportSent
+ from sentry.constants import DataCategory
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.models.group import GroupStatus
+ from sentry.models.grouphistory import GroupHistoryStatus
+ from sentry.models.organizationmember import OrganizationMember
+diff --git a/tests/sentry/utils/sdk_crashes/test_sdk_crash_detection.py b/tests/sentry/utils/sdk_crashes/test_sdk_crash_detection.py
+index 87cb6e081cd826..c0cabfbf6f1f6e 100644
+--- a/tests/sentry/utils/sdk_crashes/test_sdk_crash_detection.py
++++ b/tests/sentry/utils/sdk_crashes/test_sdk_crash_detection.py
+@@ -5,7 +5,7 @@
+ import pytest
+ 
+ from fixtures.sdk_crash_detection.crash_event_cocoa import get_crash_event
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.services.eventstore.models import Event
+ from sentry.services.eventstore.snuba.backend import SnubaEventStorage
+ from sentry.testutils.cases import BaseTestCase, SnubaTestCase, TestCase
+diff --git a/tests/sentry/workflow_engine/endpoints/test_organization_detector_types.py b/tests/sentry/workflow_engine/endpoints/test_organization_detector_types.py
+index 9add66442cf9a9..c98e9ebd0ea5dd 100644
+--- a/tests/sentry/workflow_engine/endpoints/test_organization_detector_types.py
++++ b/tests/sentry/workflow_engine/endpoints/test_organization_detector_types.py
+@@ -3,12 +3,8 @@
+ from unittest.mock import patch
+ 
+ from sentry.incidents.grouptype import MetricIssue
+-from sentry.issues.grouptype import (
+-    GroupCategory,
+-    GroupType,
+-    GroupTypeRegistry,
+-    PerformanceSlowDBQueryGroupType,
+-)
++from sentry.issue_detection.grouptype import PerformanceSlowDBQueryGroupType
++from sentry.issues.grouptype import GroupCategory, GroupType, GroupTypeRegistry
+ from sentry.monitors.grouptype import MonitorIncidentType
+ from sentry.testutils.cases import APITestCase
+ from sentry.testutils.silo import cell_silo_test
+diff --git a/tests/sentry/workflow_engine/handlers/condition/test_base.py b/tests/sentry/workflow_engine/handlers/condition/test_base.py
+index 8773ad7b662bcd..fea82b5b5c807d 100644
+--- a/tests/sentry/workflow_engine/handlers/condition/test_base.py
++++ b/tests/sentry/workflow_engine/handlers/condition/test_base.py
+@@ -2,7 +2,7 @@
+ from typing import Any, Mapping
+ from uuid import uuid4
+ 
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.models.group import Group
+ from sentry.testutils.cases import PerformanceIssueTestCase, RuleTestCase, SnubaTestCase
+ from sentry.testutils.helpers.datetime import before_now
+diff --git a/tests/sentry/workflow_engine/handlers/condition/test_issue_category_handler.py b/tests/sentry/workflow_engine/handlers/condition/test_issue_category_handler.py
+index 861d743efec679..60d6c707937a85 100644
+--- a/tests/sentry/workflow_engine/handlers/condition/test_issue_category_handler.py
++++ b/tests/sentry/workflow_engine/handlers/condition/test_issue_category_handler.py
+@@ -4,7 +4,8 @@
+ import pytest
+ from jsonschema import ValidationError
+ 
+-from sentry.issues.grouptype import GroupCategory, PerformanceNPlusOneGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
++from sentry.issues.grouptype import GroupCategory
+ from sentry.rules.filters.issue_category import IssueCategoryFilter
+ from sentry.workflow_engine.models.data_condition import Condition
+ from sentry.workflow_engine.types import WorkflowEventData
+diff --git a/tests/sentry/workflow_engine/processors/test_detector.py b/tests/sentry/workflow_engine/processors/test_detector.py
+index 27be466cc00f4f..86ce108c106331 100644
+--- a/tests/sentry/workflow_engine/processors/test_detector.py
++++ b/tests/sentry/workflow_engine/processors/test_detector.py
+@@ -9,7 +9,8 @@
+ 
+ from sentry.grouping.grouptype import ErrorGroupType
+ from sentry.incidents.grouptype import MetricIssue
+-from sentry.issues.grouptype import FeedbackGroup, PerformanceNPlusOneAPICallsGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneAPICallsGroupType
++from sentry.issues.grouptype import FeedbackGroup
+ from sentry.issues.issue_occurrence import IssueOccurrence
+ from sentry.issues.producer import PayloadType
+ from sentry.issues.status_change_message import StatusChangeMessage
+diff --git a/tests/snuba/api/endpoints/test_group_details.py b/tests/snuba/api/endpoints/test_group_details.py
+index 99747b15cc25fa..e9da575b9cd51c 100644
+--- a/tests/snuba/api/endpoints/test_group_details.py
++++ b/tests/snuba/api/endpoints/test_group_details.py
+@@ -5,8 +5,8 @@
+ from rest_framework.exceptions import ErrorDetail
+ 
+ from sentry import tsdb
++from sentry.issue_detection.grouptype import PerformanceSlowDBQueryGroupType
+ from sentry.issues.escalating.forecasts import generate_and_save_forecasts
+-from sentry.issues.grouptype import PerformanceSlowDBQueryGroupType
+ from sentry.models.activity import Activity
+ from sentry.models.environment import Environment
+ from sentry.models.group import Group, GroupStatus
+diff --git a/tests/snuba/api/endpoints/test_organization_events.py b/tests/snuba/api/endpoints/test_organization_events.py
+index bf521f0b6342b0..093b631452728b 100644
+--- a/tests/snuba/api/endpoints/test_organization_events.py
++++ b/tests/snuba/api/endpoints/test_organization_events.py
+@@ -17,7 +17,7 @@
+     DiscoverSavedQueryTypes,
+     TeamKeyTransaction,
+ )
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.models.group import GroupStatus
+ from sentry.models.project import Project
+ from sentry.models.projectteam import ProjectTeam
+diff --git a/tests/snuba/api/endpoints/test_organization_events_meta.py b/tests/snuba/api/endpoints/test_organization_events_meta.py
+index 89d8abc61e2b3f..b76e182e40e9f5 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_meta.py
++++ b/tests/snuba/api/endpoints/test_organization_events_meta.py
+@@ -4,7 +4,7 @@
+ from django.urls import reverse
+ from rest_framework.exceptions import ParseError
+ 
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.testutils.cases import (
+     APITestCase,
+     MetricsEnhancedPerformanceTestCase,
+diff --git a/tests/snuba/api/endpoints/test_organization_events_stats.py b/tests/snuba/api/endpoints/test_organization_events_stats.py
+index 31d94f98427d78..72ca0cc40591fa 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_stats.py
++++ b/tests/snuba/api/endpoints/test_organization_events_stats.py
+@@ -15,7 +15,7 @@
+ from snuba_sdk.function import Function
+ 
+ from sentry.constants import MAX_TOP_EVENTS
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.models.project import Project
+ from sentry.models.transaction_threshold import ProjectTransactionThreshold, TransactionMetric
+ from sentry.snuba.discover import OTHER_KEY
+diff --git a/tests/snuba/api/endpoints/test_organization_group_index_stats.py b/tests/snuba/api/endpoints/test_organization_group_index_stats.py
+index 8292523e28e2ed..92375794d1d4b4 100644
+--- a/tests/snuba/api/endpoints/test_organization_group_index_stats.py
++++ b/tests/snuba/api/endpoints/test_organization_group_index_stats.py
+@@ -1,6 +1,6 @@
+ import uuid
+ 
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.testutils.cases import APITestCase, SnubaTestCase
+ from sentry.testutils.helpers.datetime import before_now
+ from tests.sentry.issues.test_utils import OccurrenceTestMixin
+diff --git a/tests/snuba/api/endpoints/test_organization_trace.py b/tests/snuba/api/endpoints/test_organization_trace.py
+index bdcf41cc033752..0ace05b63a41df 100644
+--- a/tests/snuba/api/endpoints/test_organization_trace.py
++++ b/tests/snuba/api/endpoints/test_organization_trace.py
+@@ -9,7 +9,7 @@
+ from sentry_protos.snuba.v1.trace_item_pb2 import TraceItem
+ 
+ from sentry.conf.types.uptime import UptimeRegionConfig
+-from sentry.issues.grouptype import (
++from sentry.issue_detection.grouptype import (
+     PerformanceFileIOMainThreadGroupType,
+     PerformanceSlowDBQueryGroupType,
+ )
+diff --git a/tests/snuba/api/endpoints/test_project_group_index.py b/tests/snuba/api/endpoints/test_project_group_index.py
+index 3924e5905e05b1..95487f1b0e497d 100644
+--- a/tests/snuba/api/endpoints/test_project_group_index.py
++++ b/tests/snuba/api/endpoints/test_project_group_index.py
+@@ -15,7 +15,7 @@
+ from sentry.incidents.grouptype import MetricIssue
+ from sentry.integrations.models.external_issue import ExternalIssue
+ from sentry.integrations.models.organization_integration import OrganizationIntegration
+-from sentry.issues.grouptype import PerformanceSlowDBQueryGroupType
++from sentry.issue_detection.grouptype import PerformanceSlowDBQueryGroupType
+ from sentry.models.activity import Activity
+ from sentry.models.apitoken import ApiToken
+ from sentry.models.group import Group, GroupStatus
+diff --git a/tests/snuba/api/serializers/test_group.py b/tests/snuba/api/serializers/test_group.py
+index ca1fd026214b52..61962090989b8c 100644
+--- a/tests/snuba/api/serializers/test_group.py
++++ b/tests/snuba/api/serializers/test_group.py
+@@ -6,11 +6,8 @@
+ from sentry.api.event_search import SearchFilter, SearchKey, SearchValue
+ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.group import GroupSerializerSnuba
+-from sentry.issues.grouptype import (
+-    GroupCategory,
+-    PerformanceNPlusOneGroupType,
+-    ProfileFileIOGroupType,
+-)
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType, ProfileFileIOGroupType
++from sentry.issues.grouptype import GroupCategory
+ from sentry.models.group import Group, GroupStatus
+ from sentry.models.groupenvironment import GroupEnvironment
+ from sentry.models.grouplink import GroupLink
+diff --git a/tests/snuba/models/test_group.py b/tests/snuba/models/test_group.py
+index cf93a7908e534f..ab46a2c26e586d 100644
+--- a/tests/snuba/models/test_group.py
++++ b/tests/snuba/models/test_group.py
+@@ -7,7 +7,7 @@
+ 
+ from snuba_sdk import Column, Condition, Op
+ 
+-from sentry.issues.grouptype import PerformanceNPlusOneGroupType, ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType, ProfileFileIOGroupType
+ from sentry.models.group import Group
+ from sentry.services.eventstore.models import GroupEvent
+ from sentry.testutils.cases import PerformanceIssueTestCase, SnubaTestCase, TestCase
+diff --git a/tests/snuba/rules/conditions/test_event_frequency.py b/tests/snuba/rules/conditions/test_event_frequency.py
+index 46c87551b049b8..a1a5b5e8201916 100644
+--- a/tests/snuba/rules/conditions/test_event_frequency.py
++++ b/tests/snuba/rules/conditions/test_event_frequency.py
+@@ -8,8 +8,9 @@
+ from django.utils import timezone
+ from snuba_sdk import Op
+ 
++from sentry.issue_detection.grouptype import PerformanceNPlusOneGroupType
+ from sentry.issues.constants import get_issue_tsdb_group_model
+-from sentry.issues.grouptype import GroupCategory, PerformanceNPlusOneGroupType
++from sentry.issues.grouptype import GroupCategory
+ from sentry.models.group import Group
+ from sentry.models.project import Project
+ from sentry.models.rule import Rule
+diff --git a/tests/snuba/search/test_backend.py b/tests/snuba/search/test_backend.py
+index 536b7445917e69..665f48d5d6b4de 100644
+--- a/tests/snuba/search/test_backend.py
++++ b/tests/snuba/search/test_backend.py
+@@ -9,12 +9,11 @@
+ from sentry.exceptions import InvalidSearchQuery
+ from sentry.grouping.grouptype import ErrorGroupType
+ from sentry.incidents.grouptype import MetricIssue
+-from sentry.issues.grouptype import (
+-    FeedbackGroup,
+-    NoiseConfig,
++from sentry.issue_detection.grouptype import (
+     PerformanceNPlusOneGroupType,
+     PerformanceRenderBlockingAssetSpanGroupType,
+ )
++from sentry.issues.grouptype import FeedbackGroup, NoiseConfig
+ from sentry.issues.ingest import send_issue_occurrence_to_eventstream
+ from sentry.issues.issue_search import convert_query_values, issue_search_config, parse_search_query
+ from sentry.models.environment import Environment
+diff --git a/tests/snuba/tagstore/test_tagstore_backend.py b/tests/snuba/tagstore/test_tagstore_backend.py
+index a2dae2909bdb70..ed50c1b6614ebd 100644
+--- a/tests/snuba/tagstore/test_tagstore_backend.py
++++ b/tests/snuba/tagstore/test_tagstore_backend.py
+@@ -5,7 +5,7 @@
+ import pytest
+ from django.utils import timezone
+ 
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.models.environment import Environment
+ from sentry.models.release import Release
+ from sentry.models.releaseprojectenvironment import ReleaseProjectEnvironment, ReleaseStages
+diff --git a/tests/snuba/tsdb/test_tsdb_backend.py b/tests/snuba/tsdb/test_tsdb_backend.py
+index 2e4a502e3d5f93..fb9c685653165a 100644
+--- a/tests/snuba/tsdb/test_tsdb_backend.py
++++ b/tests/snuba/tsdb/test_tsdb_backend.py
+@@ -3,7 +3,7 @@
+ 
+ from snuba_sdk import Limit
+ 
+-from sentry.issues.grouptype import ProfileFileIOGroupType
++from sentry.issue_detection.grouptype import ProfileFileIOGroupType
+ from sentry.models.environment import Environment
+ from sentry.models.group import Group
+ from sentry.models.grouprelease import GroupRelease

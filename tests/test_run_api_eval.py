@@ -11,7 +11,7 @@ import yaml
 from click.testing import CliRunner
 
 from bugeval.cli import cli
-from bugeval.pr_eval_models import CaseToolState, CaseToolStatus, RunState, ToolDef, ToolType
+from bugeval.pr_eval_models import CaseToolStatus, ToolDef, ToolType
 from bugeval.run_api_eval import process_case_tool_api
 from tests.conftest import make_case
 
@@ -131,7 +131,7 @@ def test_process_case_tool_api_saves_findings(tmp_path: Path) -> None:
         )
 
     assert state.status == CaseToolStatus.done
-    findings_file = tmp_path / "raw" / "case-001-greptile" / "findings.json"
+    findings_file = tmp_path / "raw" / "case-001-greptile-diff-only" / "findings.json"
     assert findings_file.exists()
     findings = json.loads(findings_file.read_text())
     assert len(findings) == 1
@@ -204,7 +204,7 @@ def test_run_api_eval_dry_run_with_case(tmp_path: Path) -> None:
     assert "done" in result.output or "skip" in result.output
 
 
-def test_run_api_eval_checkpoint_written(tmp_path: Path) -> None:
+def test_run_api_eval_dry_run_completes(tmp_path: Path) -> None:
     config_path = _make_config_yaml(tmp_path)
     cases_dir = tmp_path / "cases"
     patches_dir = tmp_path / "patches"
@@ -214,7 +214,7 @@ def test_run_api_eval_checkpoint_written(tmp_path: Path) -> None:
     run_dir = tmp_path / "results"
 
     runner = CliRunner()
-    runner.invoke(
+    result = runner.invoke(
         cli,
         [
             "run-api-eval",
@@ -229,11 +229,8 @@ def test_run_api_eval_checkpoint_written(tmp_path: Path) -> None:
             "--dry-run",
         ],
     )
-    checkpoint = run_dir / "checkpoint.yaml"
-    assert checkpoint.exists()
-    rs = RunState.load(checkpoint)
-    state = rs.get("case-001", "greptile")
-    assert state.status == CaseToolStatus.done
+    assert result.exit_code == 0
+    assert "done" in result.output
 
 
 def test_run_api_eval_missing_patch_marks_failed(tmp_path: Path) -> None:
@@ -246,7 +243,7 @@ def test_run_api_eval_missing_patch_marks_failed(tmp_path: Path) -> None:
     run_dir = tmp_path / "results"
 
     runner = CliRunner()
-    runner.invoke(
+    result = runner.invoke(
         cli,
         [
             "run-api-eval",
@@ -260,15 +257,13 @@ def test_run_api_eval_missing_patch_marks_failed(tmp_path: Path) -> None:
             str(run_dir),
         ],
     )
-    checkpoint = run_dir / "checkpoint.yaml"
-    assert checkpoint.exists()
-    rs = RunState.load(checkpoint)
-    state = rs.get("case-001", "greptile")
-    assert state.status == CaseToolStatus.failed
-    assert "patch not found" in (state.error or "")
+    assert "failed" in result.output
+    # Error marker should exist
+    error_path = run_dir / "raw" / "case-001-greptile-diff-only" / "error.json"
+    assert error_path.exists()
 
 
-def test_run_api_eval_checkpoint_resume_skips_done(tmp_path: Path) -> None:
+def test_run_api_eval_resume_skips_done(tmp_path: Path) -> None:
     config_path = _make_config_yaml(tmp_path)
     cases_dir = tmp_path / "cases"
     patches_dir = tmp_path / "patches"
@@ -278,10 +273,10 @@ def test_run_api_eval_checkpoint_resume_skips_done(tmp_path: Path) -> None:
     run_dir = tmp_path / "results"
     run_dir.mkdir(parents=True)
 
-    # Pre-seed checkpoint with done state
-    rs = RunState()
-    rs.set(CaseToolState(case_id="case-001", tool="greptile", status=CaseToolStatus.done))
-    rs.save(run_dir / "checkpoint.yaml")
+    # Pre-populate raw dir with metadata.json to simulate completed case
+    raw_dir = run_dir / "raw" / "case-001-greptile-diff-only"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "metadata.json").write_text('{"time_seconds": 1.0}')
 
     runner = CliRunner()
     result = runner.invoke(
@@ -361,7 +356,7 @@ def test_process_case_api_writes_metadata_json(tmp_path: Path) -> None:
             dry_run=False,
         )
 
-    metadata_file = tmp_path / "raw" / "case-001-greptile" / "metadata.json"
+    metadata_file = tmp_path / "raw" / "case-001-greptile-diff-only" / "metadata.json"
     assert metadata_file.exists()
 
 
@@ -395,7 +390,7 @@ def test_metadata_json_has_time_seconds(tmp_path: Path) -> None:
             dry_run=False,
         )
 
-    metadata_file = tmp_path / "raw" / "case-001-greptile" / "metadata.json"
+    metadata_file = tmp_path / "raw" / "case-001-greptile-diff-only" / "metadata.json"
     meta = json.loads(metadata_file.read_text())
     assert "time_seconds" in meta
     assert isinstance(meta["time_seconds"], float)
@@ -433,9 +428,8 @@ def test_run_api_eval_limit_slices_cases(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    checkpoint = run_dir / "checkpoint.yaml"
-    rs = RunState.load(checkpoint)
-    assert len(rs.states()) == 2
+    # Dry run outputs [done] for each processed case
+    assert result.output.count("[done]") == 2
 
 
 def test_run_api_eval_fail_after_aborts(tmp_path: Path) -> None:
@@ -467,10 +461,11 @@ def test_run_api_eval_fail_after_aborts(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    checkpoint = run_dir / "checkpoint.yaml"
-    rs = RunState.load(checkpoint)
-    failed = [s for s in rs.states() if s.status == CaseToolStatus.failed]
-    assert len(failed) == 2
+    raw_dir = run_dir / "raw"
+    error_count = sum(
+        1 for d in raw_dir.iterdir() if d.is_dir() and (d / "error.json").exists()
+    )
+    assert error_count == 2
 
 
 def test_run_api_eval_unknown_tools_filter_exits(tmp_path: Path) -> None:

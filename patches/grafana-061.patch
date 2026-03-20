@@ -1,0 +1,1670 @@
+diff --git a/packages/grafana-e2e-selectors/src/selectors/components.ts b/packages/grafana-e2e-selectors/src/selectors/components.ts
+index 283855d183f63..74e2b589bd72b 100644
+--- a/packages/grafana-e2e-selectors/src/selectors/components.ts
++++ b/packages/grafana-e2e-selectors/src/selectors/components.ts
+@@ -706,6 +706,9 @@ export const versionedComponents = {
+       addAnnotationButton: {
+         '12.6.0': 'data-testid add annotation button',
+       },
++      addLinkButton: {
++        '12.6.0': 'data-testid add link button',
++      },
+       variableNameInput: {
+         '12.0.0': 'data-testid variable name input',
+       },
+diff --git a/pkg/services/accesscontrol/acimpl/service.go b/pkg/services/accesscontrol/acimpl/service.go
+index 77f493eda4780..1356c6fea628b 100644
+--- a/pkg/services/accesscontrol/acimpl/service.go
++++ b/pkg/services/accesscontrol/acimpl/service.go
+@@ -13,6 +13,7 @@ import (
+ 	"go.opentelemetry.io/otel/attribute"
+ 
+ 	claims "github.com/grafana/authlib/types"
++	"golang.org/x/sync/singleflight"
+ 
+ 	"github.com/grafana/grafana/pkg/api/routing"
+ 	"github.com/grafana/grafana/pkg/apimachinery/identity"
+@@ -124,6 +125,7 @@ type Service struct {
+ 	isInitialized  bool
+ 	sql            db.DB
+ 	serverLock     *serverlock.ServerLockService
++	singleFlight   singleflight.Group
+ }
+ 
+ func (s *Service) GetUsageStats(_ context.Context) map[string]any {
+@@ -268,23 +270,47 @@ func (s *Service) getCachedUserPermissions(ctx context.Context, user identity.Re
+ 	ctx, span := tracer.Start(ctx, "accesscontrol.acimpl.getCachedUserPermissions")
+ 	defer span.End()
+ 
+-	permissions, err := s.getCachedBasicRolesPermissions(ctx, user, options)
+-	if err != nil {
+-		return nil, err
++	assemble := func() ([]accesscontrol.Permission, error) {
++		permissions, err := s.getCachedBasicRolesPermissions(ctx, user, options)
++		if err != nil {
++			return nil, err
++		}
++
++		teamsPermissions, err := s.getCachedTeamsPermissions(ctx, user, options)
++		if err != nil {
++			return nil, err
++		}
++		permissions = append(permissions, teamsPermissions...)
++
++		userManagedPermissions, err := s.getCachedUserDirectPermissions(ctx, user, options)
++		if err != nil {
++			return nil, err
++		}
++		permissions = append(permissions, userManagedPermissions...)
++		span.SetAttributes(attribute.Int("num_permissions", len(permissions)))
++
++		return permissions, nil
+ 	}
+ 
+-	teamsPermissions, err := s.getCachedTeamsPermissions(ctx, user, options)
+-	if err != nil {
+-		return nil, err
++	// Skip deduplication when the caller explicitly wants a fresh load.
++	if options.ReloadCache {
++		return assemble()
+ 	}
+-	permissions = append(permissions, teamsPermissions...)
+ 
+-	userManagedPermissions, err := s.getCachedUserDirectPermissions(ctx, user, options)
++	// Deduplicate concurrent permission assemblies for the same user.
++	// Without this, concurrent requests for the same user each independently
++	// re-assemble from sub-caches on cache expiry, amplifying DB load.
++	res, err, _ := s.singleFlight.Do(user.GetCacheKey(), func() (any, error) {
++		return assemble()
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	permissions = append(permissions, userManagedPermissions...)
+-	span.SetAttributes(attribute.Int("num_permissions", len(permissions)))
++
++	permissions, ok := res.([]accesscontrol.Permission)
++	if !ok {
++		return nil, fmt.Errorf("unexpected type returned from singleFlight: %T", res)
++	}
+ 
+ 	return permissions, nil
+ }
+diff --git a/pkg/services/accesscontrol/acimpl/service_bench_test.go b/pkg/services/accesscontrol/acimpl/service_bench_test.go
+index 9fb41a34f9660..23fcae434089d 100644
+--- a/pkg/services/accesscontrol/acimpl/service_bench_test.go
++++ b/pkg/services/accesscontrol/acimpl/service_bench_test.go
+@@ -3,6 +3,7 @@ package acimpl
+ import (
+ 	"context"
+ 	"fmt"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -16,6 +17,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/services/accesscontrol/database"
+ 	"github.com/grafana/grafana/pkg/services/accesscontrol/permreg"
+ 	"github.com/grafana/grafana/pkg/services/accesscontrol/resourcepermissions"
++	"github.com/grafana/grafana/pkg/services/featuremgmt"
+ 	"github.com/grafana/grafana/pkg/services/org"
+ 	"github.com/grafana/grafana/pkg/services/user"
+ 	"github.com/grafana/grafana/pkg/setting"
+@@ -275,3 +277,132 @@ func benchSearchUserWithAction(b *testing.B, usersCount, resourceCount int) {
+ }
+ 
+ func BenchmarkSearchUserWithAction_1K_1k(b *testing.B) { benchSearchUserWithAction(b, 1000, 1000) } // ~0.6s/op (mysql)
++
++// setupBenchManyTeams creates a single user assigned to teamCount teams, each team having one
++// managed role with a datasource:query permission. This mirrors the customer scenario where a
++// user belongs to many LDAP/SAML groups mapped to Grafana teams, and each team grants access
++// to a specific datasource.
++func setupBenchManyTeams(b *testing.B, teamCount int) (*Service, *user.SignedInUser) {
++	b.Helper()
++	now := time.Now()
++	sqlStore := db.InitTestDB(b)
++	store := database.ProvideService(sqlStore)
++	cfg := setting.NewCfg()
++	cfg.RBAC.PermissionCache = true
++	acService := &Service{
++		cfg:            cfg,
++		features:       featuremgmt.WithFeatures(),
++		log:            log.New("accesscontrol-bench"),
++		registrations:  accesscontrol.RegistrationList{},
++		store:          store,
++		roles:          accesscontrol.BuildBasicRoleDefinitions(),
++		cache:          localcache.New(cacheTTL, cacheTTL),
++		permRegistry:   permreg.ProvidePermissionRegistry(),
++		actionResolver: resourcepermissions.NewActionSetService(),
++	}
++	require.NoError(b, acService.RegisterFixedRoles(context.Background()))
++
++	userID := int64(1)
++	require.NoError(b, sqlStore.WithDbSession(context.Background(), func(sess *db.Session) error {
++		if _, err := sess.Insert(user.User{
++			ID: userID, UID: "user1", Name: "user1",
++			Login: "user1", Email: "user1@example.org",
++			Created: now, Updated: now,
++		}); err != nil {
++			return err
++		}
++		_, err := sess.Insert(org.OrgUser{
++			ID: userID, UserID: userID, OrgID: 1,
++			Role: org.RoleViewer, Created: now, Updated: now,
++		})
++		return err
++	}))
++
++	teamIDs := make([]int64, teamCount)
++	roles := make([]accesscontrol.Role, teamCount)
++	teamRoles := make([]accesscontrol.TeamRole, teamCount)
++	permissions := make([]accesscontrol.Permission, teamCount)
++	for i := 0; i < teamCount; i++ {
++		teamIDs[i] = int64(i + 1)
++		roles[i] = accesscontrol.Role{
++			ID: teamIDs[i], UID: fmt.Sprintf("managed_teams_%d_permissions", teamIDs[i]),
++			Name:  fmt.Sprintf("managed:teams:%d:permissions", teamIDs[i]),
++			OrgID: 1, Version: 1, Created: now, Updated: now,
++		}
++		teamRoles[i] = accesscontrol.TeamRole{
++			OrgID: 1, RoleID: teamIDs[i], TeamID: teamIDs[i], Created: now,
++		}
++		permissions[i] = accesscontrol.Permission{
++			RoleID:  teamIDs[i],
++			Action:  "datasources:query",
++			Scope:   fmt.Sprintf("datasources:uid:ds-%d", teamIDs[i]),
++			Created: now, Updated: now,
++		}
++	}
++
++	require.NoError(b, sqlStore.WithDbSession(context.Background(), func(sess *db.Session) error {
++		if _, err := sess.Insert(roles); err != nil {
++			return err
++		}
++		if _, err := sess.Insert(teamRoles); err != nil {
++			return err
++		}
++		_, err := sess.Insert(permissions)
++		return err
++	}))
++
++	signedInUser := &user.SignedInUser{
++		UserID:  userID,
++		OrgID:   1,
++		OrgRole: org.RoleViewer,
++		Teams:   teamIDs,
++	}
++
++	return acService, signedInUser
++}
++
++// benchGetUserPermissionsManyTeamsConcurrent measures the cost of N goroutines concurrently
++// calling GetUserPermissions for the same user who belongs to many teams — the thundering
++// herd scenario triggered by 800 parallel datasource buildinfo proxy requests on alert rule
++// creation. The cache is flushed before each iteration to simulate expiry.
++func benchGetUserPermissionsManyTeamsConcurrent(b *testing.B, teamCount, concurrency int) {
++	b.Helper()
++	acService, signedInUser := setupBenchManyTeams(b, teamCount)
++
++	b.ResetTimer()
++	for n := 0; n < b.N; n++ {
++		// Flush all sub-caches to simulate the moment the TTL expires and all
++		// concurrent requests arrive simultaneously with a cold cache.
++		acService.cache = localcache.New(cacheTTL, cacheTTL)
++
++		var wg sync.WaitGroup
++		wg.Add(concurrency)
++		for i := 0; i < concurrency; i++ {
++			go func() {
++				defer wg.Done()
++				_, err := acService.GetUserPermissions(context.Background(), signedInUser, accesscontrol.Options{})
++				require.NoError(b, err)
++			}()
++		}
++		wg.Wait()
++	}
++}
++
++// Realistic customer scale: ~100–200 teams, 100–800 concurrent requests.
++// 800 concurrent matches the number of Prometheus datasource buildinfo calls fired
++// simultaneously when creating an alert rule (customer had ~800 Prometheus datasources).
++func BenchmarkGetUserPermissions_ManyTeams_100teams_1concurrent(b *testing.B) {
++	benchGetUserPermissionsManyTeamsConcurrent(b, 100, 1)
++}
++func BenchmarkGetUserPermissions_ManyTeams_100teams_100concurrent(b *testing.B) {
++	benchGetUserPermissionsManyTeamsConcurrent(b, 100, 100)
++}
++func BenchmarkGetUserPermissions_ManyTeams_100teams_800concurrent(b *testing.B) {
++	benchGetUserPermissionsManyTeamsConcurrent(b, 100, 800)
++}
++func BenchmarkGetUserPermissions_ManyTeams_200teams_100concurrent(b *testing.B) {
++	benchGetUserPermissionsManyTeamsConcurrent(b, 200, 100)
++}
++func BenchmarkGetUserPermissions_ManyTeams_200teams_800concurrent(b *testing.B) {
++	benchGetUserPermissionsManyTeamsConcurrent(b, 200, 800)
++}
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.test.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.test.tsx
+index 74c1b931bd257..e1fdb6877eb4d 100644
+--- a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.test.tsx
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.test.tsx
+@@ -1,4 +1,4 @@
+-import { act, fireEvent, render } from '@testing-library/react';
++import { act, fireEvent, render, within } from '@testing-library/react';
+ import userEvent from '@testing-library/user-event';
+ 
+ import { DashboardAnnotationsDataLayer } from '../../scene/DashboardAnnotationsDataLayer';
+@@ -50,9 +50,12 @@ async function renderAnnotationsList(annotationLayers: DashboardAnnotationsDataL
+     elements: {
+       dashboardScene,
+       dataLayerSet,
+-      aboveListItems: () => renderResult.getAllByTestId('annotations-list-visible-annotation-name'),
+-      controlsMenuListItems: () => renderResult.getAllByTestId('annotations-list-controls-menu-annotation-name'),
+-      hiddenListItems: () => renderResult.getAllByTestId('annotations-list-hidden-annotation-name'),
++      aboveListItems: () =>
++        within(renderResult.getByTestId('annotations-list-visible')).getAllByTestId('annotation-name'),
++      controlsMenuListItems: () =>
++        within(renderResult.getByTestId('annotations-list-controls-menu')).getAllByTestId('annotation-name'),
++      hiddenListItems: () =>
++        within(renderResult.getByTestId('annotations-list-hidden')).getAllByTestId('annotation-name'),
+       addAnnotationButton: () => renderResult.getByRole('button', { name: /add annotation query/i }),
+     },
+   };
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.tsx
+index bb54757323ace..c4d7289ad4d3c 100644
+--- a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.tsx
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardAnnotationsList.tsx
+@@ -106,9 +106,8 @@ export function DashboardAnnotationsList({ dataLayerSet }: { dataLayerSet: Dashb
+             'Above dashboard ({{count}})',
+             { count: visible.length }
+           )}
+-          dataTestId={`${ID_VISIBLE_LIST}-annotation-name`}
+           onClickItem={onClickAnnotation}
+-          renderItemLabel={(a) => <AnnotationName annotation={a} />}
++          renderItemLabel={renderItemLabel}
+         />
+         <DraggableList
+           items={controlsMenu}
+@@ -120,9 +119,8 @@ export function DashboardAnnotationsList({ dataLayerSet }: { dataLayerSet: Dashb
+               count: controlsMenu.length,
+             }
+           )}
+-          dataTestId={`${ID_CONTROLS_MENU_LIST}-annotation-name`}
+           onClickItem={onClickAnnotation}
+-          renderItemLabel={(a) => <AnnotationName annotation={a} />}
++          renderItemLabel={renderItemLabel}
+         />
+         <DraggableList
+           items={hidden}
+@@ -130,9 +128,8 @@ export function DashboardAnnotationsList({ dataLayerSet }: { dataLayerSet: Dashb
+           title={t('dashboard-scene.dashboard-annotations-list.title-hidden-count', 'Hidden ({{count}})', {
+             count: hidden.length,
+           })}
+-          dataTestId={`${ID_HIDDEN_LIST}-annotation-name`}
+           onClickItem={onClickAnnotation}
+-          renderItemLabel={(a) => <AnnotationName annotation={a} />}
++          renderItemLabel={renderItemLabel}
+         />
+       </DragDropContext>
+       <AddAnnotationButton dataLayerSet={dataLayerSet} />
+@@ -140,6 +137,8 @@ export function DashboardAnnotationsList({ dataLayerSet }: { dataLayerSet: Dashb
+   );
+ }
+ 
++const renderItemLabel = (a: DashboardAnnotationsDataLayer) => <AnnotationName annotation={a} />;
++
+ function AnnotationName({ annotation }: { annotation: DashboardAnnotationsDataLayer }) {
+   const theme = useTheme2();
+   const styles = useStyles2(getStyles);
+@@ -168,15 +167,15 @@ function AnnotationName({ annotation }: { annotation: DashboardAnnotationsDataLa
+   }, [annoName, query.builtIn, query.enable, styles.muted]);
+ 
+   return (
+-    <div>
++    <>
+       <span
+         className={styles.color}
+         style={{
+           backgroundColor: theme.visualization.getColorByName(query.iconColor),
+         }}
+       />
+-      {name}
+-    </div>
++      <span data-testid="annotation-name">{name}</span>
++    </>
+   );
+ }
+ 
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardEditableElement.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardEditableElement.tsx
+index 87bfacaaa975d..dc7525002893c 100644
+--- a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardEditableElement.tsx
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardEditableElement.tsx
+@@ -15,6 +15,7 @@ import { dashboardSceneGraph } from '../../utils/dashboardSceneGraph';
+ 
+ import { DashboardAnnotationsList } from './DashboardAnnotationsList';
+ import { DashboardDescriptionInput, DashboardTitleInput } from './DashboardBasicOptions';
++import { AddLinkButton, DashboardLinksList } from './DashboardLinksList';
+ import { AddVariableButton, DashboardVariablesList } from './DashboardVariablesList';
+ 
+ function useEditPaneOptions(
+@@ -48,8 +49,9 @@ function useEditPaneOptions(
+   const layoutCategory = useLayoutCategory(body);
+   const variablesCategory = useVariablesCategory(dashboard);
+   const annotationsCategory = useAnnotationsCategory(dashboardSceneGraph.getDataLayers(dashboard));
++  const linksCategory = useLinksCategory(dashboard);
+ 
+-  return [dashboardOptions, ...layoutCategory, ...variablesCategory, ...annotationsCategory];
++  return [dashboardOptions, ...layoutCategory, ...variablesCategory, ...annotationsCategory, ...linksCategory];
+ }
+ 
+ export class DashboardEditableElement implements EditableDashboardElement {
+@@ -160,3 +162,38 @@ function useAnnotationsCategory(dataLayerSet: DashboardDataLayerSet): OptionsPan
+     return [category];
+   }, [dataLayerSet, annotationsListId]);
+ }
++
++function useLinksCategory(dashboard: DashboardScene): OptionsPaneCategoryDescriptor[] {
++  const { links } = dashboard.useState();
++  const linksListId = useId();
++  const addLinkButtonId = useId();
++
++  return useMemo(() => {
++    const category = new OptionsPaneCategoryDescriptor({
++      title: t('dashboard-scene.use-links-category.category.title.links', 'Links'),
++      id: 'dashboard-links',
++    });
++
++    if (links.length) {
++      category.addItem(
++        new OptionsPaneItemDescriptor({
++          title: '',
++          id: linksListId,
++          skipField: true,
++          render: () => <DashboardLinksList dashboard={dashboard} />,
++        })
++      );
++    }
++
++    category.addItem(
++      new OptionsPaneItemDescriptor({
++        title: '',
++        id: addLinkButtonId,
++        skipField: true,
++        render: () => <AddLinkButton dashboard={dashboard} />,
++      })
++    );
++
++    return [category];
++  }, [addLinkButtonId, dashboard, links.length, linksListId]);
++}
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardLinksList.test.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardLinksList.test.tsx
+new file mode 100644
+index 0000000000000..cbfc11985de94
+--- /dev/null
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardLinksList.test.tsx
+@@ -0,0 +1,174 @@
++import { fireEvent, render, within } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++
++import { DashboardLink, DashboardLinkPlacement } from '@grafana/schema';
++
++import { DashboardScene } from '../../scene/DashboardScene';
++import { createDefaultLink, openLinkEditPane } from '../../settings/links/LinkAddEditableElement';
++import { activateFullSceneTree } from '../../utils/test-utils';
++
++import { DashboardLinksList, partitionLinksByPlacement } from './DashboardLinksList';
++
++jest.mock('../../settings/links/LinkAddEditableElement', () => ({
++  ...jest.requireActual('../../settings/links/LinkAddEditableElement'),
++  openAddLinkPane: jest.fn(),
++  openLinkEditPane: jest.fn(),
++}));
++
++jest.mock('../../utils/interactions', () => ({
++  DashboardInteractions: {
++    addVariableButtonClicked: jest.fn(),
++  },
++}));
++
++jest.mock('app/core/hooks/useQueryParams', () => ({
++  useQueryParams: () => [{}, () => {}],
++}));
++jest.mock('react-use', () => ({
++  useLocalStorage: () => [{}, () => {}],
++}));
++
++function renderLinksList(links: DashboardLink[] = []) {
++  const user = userEvent.setup();
++
++  const dashboardScene = new DashboardScene({
++    links,
++    isEditing: true,
++  });
++  activateFullSceneTree(dashboardScene);
++  jest.spyOn(dashboardScene.state.editPane, 'selectObject');
++
++  const renderResult = render(<DashboardLinksList dashboard={dashboardScene} />);
++
++  return {
++    ...renderResult,
++    user,
++    elements: {
++      dashboardScene,
++      aboveListItems: () => within(renderResult.getByTestId('links-list-visible')).getAllByTestId('link-title'),
++      controlsMenuListItems: () =>
++        within(renderResult.getByTestId('links-list-controls-menu')).getAllByTestId('link-title'),
++    },
++  };
++}
++
++function buildLinks() {
++  const defaultLink = createDefaultLink();
++
++  return {
++    visibleLink1: {
++      ...defaultLink,
++      title: 'visibleLink1',
++    },
++    visibleLink2: {
++      ...defaultLink,
++      title: 'visibleLink2',
++    },
++    controlsMenuLink1: {
++      ...defaultLink,
++      title: 'controlsMenuLink1',
++      placement: 'inControlsMenu' as DashboardLinkPlacement,
++    },
++  };
++}
++
++describe('<DashboardLinksList />', () => {
++  test('renders 2 sections (one per link display type)', () => {
++    const { visibleLink1, visibleLink2, controlsMenuLink1 } = buildLinks();
++    const { getByRole, elements } = renderLinksList([controlsMenuLink1, visibleLink2, visibleLink1]);
++
++    [/above dashboard/i, /controls menu/i].forEach((name) => {
++      expect(getByRole('heading', { name })).toBeInTheDocument();
++    });
++
++    const aboveNames = Array.from(elements.aboveListItems()).map((item) => item.textContent);
++    expect(aboveNames).toEqual(['visibleLink2', 'visibleLink1']); // order is preserved
++
++    const controlsMenuNames = Array.from(elements.controlsMenuListItems()).map((item) => item.textContent);
++    expect(controlsMenuNames).toEqual(['controlsMenuLink1']);
++  });
++
++  test('always renders the 2 section titles even if one is empty', () => {
++    const { controlsMenuLink1 } = buildLinks();
++    const { getByRole } = renderLinksList([controlsMenuLink1]);
++
++    [/above dashboard/i, /controls menu/i].forEach((name) => {
++      expect(getByRole('heading', { name })).toBeInTheDocument();
++    });
++  });
++
++  describe('User interactions', () => {
++    describe('when a link title is clicked', () => {
++      test('selects the link in the pane', async () => {
++        const { visibleLink1 } = buildLinks();
++        const { user, getByText, elements } = renderLinksList([visibleLink1]);
++
++        await user.click(getByText(visibleLink1.title));
++
++        expect(openLinkEditPane).toHaveBeenCalledWith(elements.dashboardScene, 0);
++      });
++    });
++
++    describe('drag and drop', () => {
++      async function dragItem(
++        container: HTMLElement,
++        findByText: (text: RegExp) => Promise<HTMLElement>,
++        itemIndex: number,
++        direction: 'up' | 'down',
++        positions = 1
++      ) {
++        const dragHandles = container.querySelectorAll('[data-rfd-drag-handle-draggable-id]');
++        const handle = dragHandles[itemIndex] as HTMLElement;
++        handle.focus();
++        expect(handle).toHaveFocus();
++
++        // press space to start dragging
++        fireEvent.keyDown(handle, { keyCode: 32 });
++        await findByText(/you have lifted an item/i); // @hello-pangea/dnd announces each phase via aria-live; awaiting it ensures the library has processed the event
++
++        // press arrow down/up to drag
++        const arrowKey = direction === 'down' ? 40 : 38;
++        for (let i = 0; i < positions; i++) {
++          fireEvent.keyDown(handle, { keyCode: arrowKey });
++          await findByText(/you have moved the item/i);
++        }
++
++        // press space to drop
++        fireEvent.keyDown(handle, { keyCode: 32 });
++        await findByText(/you have dropped the item/i);
++      }
++
++      test('reorders visible links when dragged down by one position', async () => {
++        const { visibleLink1, visibleLink2, controlsMenuLink1 } = buildLinks();
++        const { container, findByText, elements } = renderLinksList([visibleLink1, visibleLink2, controlsMenuLink1]);
++
++        await dragItem(container, findByText, 0, 'down');
++
++        const aboveNames = Array.from(elements.aboveListItems()).map((item) => item.textContent);
++        expect(aboveNames).toEqual(['visibleLink2', 'visibleLink1']);
++      });
++    });
++  });
++});
++
++describe('partitionLinksByPlacement()', () => {
++  test('separates links into 2 lists: visible and controlsMenu, while preserving order', () => {
++    const { visibleLink1, visibleLink2, controlsMenuLink1 } = buildLinks();
++
++    const { visible, controlsMenu } = partitionLinksByPlacement([visibleLink2, visibleLink1, controlsMenuLink1]);
++
++    expect(visible.length).toBe(2);
++    expect(visible[0]).toEqual(expect.objectContaining(visibleLink2)); // we make links Scene-like for DraggableList
++    expect(visible[1]).toEqual(expect.objectContaining(visibleLink1)); // we make links Scene-like for DraggableList
++
++    expect(controlsMenu.length).toBe(1);
++    expect(controlsMenu[0]).toEqual(expect.objectContaining(controlsMenuLink1)); // we make links Scene-like for DraggableList
++  });
++
++  test('returns empty lists when given no links', () => {
++    const { visible, controlsMenu } = partitionLinksByPlacement([]);
++
++    expect(visible).toEqual([]);
++    expect(controlsMenu).toEqual([]);
++  });
++});
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardLinksList.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardLinksList.tsx
+new file mode 100644
+index 0000000000000..add0bcd880770
+--- /dev/null
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardLinksList.tsx
+@@ -0,0 +1,145 @@
++import { DragDropContext, DropResult } from '@hello-pangea/dnd';
++import { useCallback, useMemo } from 'react';
++
++import { selectors } from '@grafana/e2e-selectors';
++import { t, Trans } from '@grafana/i18n';
++import { DashboardLink, DashboardLinkPlacement } from '@grafana/schema/dist/esm/index.gen';
++import { Box, Button } from '@grafana/ui';
++
++import { DashboardScene } from '../../scene/DashboardScene';
++import { openAddLinkPane, openLinkEditPane } from '../../settings/links/LinkAddEditableElement';
++import { DashboardInteractions } from '../../utils/interactions';
++import { dashboardEditActions } from '../shared';
++
++import { DraggableList } from './DraggableList';
++
++const ID_VISIBLE_LIST = 'links-list-visible';
++const ID_CONTROLS_MENU_LIST = 'links-list-controls-menu';
++
++const DROPPABLE_TO_PLACEMENT: Record<string, DashboardLinkPlacement | undefined> = {
++  [ID_VISIBLE_LIST]: undefined,
++  [ID_CONTROLS_MENU_LIST]: 'inControlsMenu',
++};
++
++export function DashboardLinksList({ dashboard }: { dashboard: DashboardScene }) {
++  const { links } = dashboard.useState();
++  const { visible, controlsMenu } = useMemo(() => partitionLinksByPlacement(links), [links]);
++
++  const onClickLink = useCallback(
++    (link: PseudoSceneLink) => {
++      openLinkEditPane(dashboard, Number(link.state.key));
++    },
++    [dashboard]
++  );
++
++  const onDragEnd = useCallback(
++    (result: DropResult) => {
++      const { source, destination } = result;
++      if (!destination) {
++        return;
++      }
++
++      const isSameList = source.droppableId === destination.droppableId;
++      if (isSameList && source.index === destination.index) {
++        return;
++      }
++
++      const currentLinks = dashboard.state.links;
++      const lists: Record<string, PseudoSceneLink[]> = {
++        [ID_VISIBLE_LIST]: [...visible],
++        [ID_CONTROLS_MENU_LIST]: [...controlsMenu],
++      };
++
++      const sourceList = lists[source.droppableId];
++      const destList = isSameList ? sourceList : lists[destination.droppableId];
++
++      const [moved] = sourceList.splice(source.index, 1);
++      destList.splice(destination.index, 0, moved);
++
++      const newPlacement = DROPPABLE_TO_PLACEMENT[destination.droppableId];
++
++      dashboardEditActions.edit({
++        source: dashboard,
++        description: t('dashboard-scene.links-list.drag-end-description', 'Reorder links list'),
++        perform: () => {
++          const reorderedLinks = [...lists[ID_VISIBLE_LIST], ...lists[ID_CONTROLS_MENU_LIST]].map((l) => {
++            const { state: _, ...link } = l;
++            const placement = l === moved ? newPlacement : l.placement;
++            return { ...link, placement };
++          });
++          dashboard.setState({ links: reorderedLinks });
++        },
++        undo: () => {
++          dashboard.setState({ links: currentLinks });
++        },
++      });
++    },
++    [dashboard, visible, controlsMenu]
++  );
++
++  return (
++    <DragDropContext onDragEnd={onDragEnd}>
++      <DraggableList
++        items={visible}
++        droppableId={ID_VISIBLE_LIST}
++        title={t('dashboard-scene.links-list.title-above-dashboard', 'Above dashboard ({{count}})', {
++          count: visible.length,
++        })}
++        onClickItem={onClickLink}
++        renderItemLabel={renderItemLabel}
++      />
++      <DraggableList
++        items={controlsMenu}
++        droppableId={ID_CONTROLS_MENU_LIST}
++        title={t('dashboard-scene.links-list.title-controls-menu', 'Controls menu ({{count}})', {
++          count: controlsMenu.length,
++        })}
++        onClickItem={onClickLink}
++        renderItemLabel={renderItemLabel}
++      />
++    </DragDropContext>
++  );
++}
++
++const renderItemLabel = (l: DashboardLink) => <span data-testid="link-title">{l.title}</span>;
++
++export function AddLinkButton({ dashboard }: { dashboard: DashboardScene }) {
++  const onAddLink = useCallback(() => {
++    openAddLinkPane(dashboard);
++    DashboardInteractions.addLinkButtonClicked({ source: 'edit_pane' });
++  }, [dashboard]);
++
++  return (
++    <Box display="flex" paddingTop={1} paddingBottom={1}>
++      <Button
++        fullWidth
++        icon="plus"
++        size="sm"
++        variant="secondary"
++        onClick={onAddLink}
++        data-testid={selectors.components.PanelEditor.ElementEditPane.addLinkButton}
++      >
++        <Trans i18nKey="dashboard-scene.dashboard-links-list.add-link">Add link</Trans>
++      </Button>
++    </Box>
++  );
++}
++
++// we make links Scene-like for DraggableList
++type PseudoSceneLink = DashboardLink & { state: { key: string; name: string } };
++
++export function partitionLinksByPlacement(links: DashboardLink[]) {
++  const visible: PseudoSceneLink[] = [];
++  const controlsMenu: PseudoSceneLink[] = [];
++
++  links.forEach((link, index) => {
++    // we make links Scene-like for DraggableList
++    if (link.placement === 'inControlsMenu') {
++      controlsMenu.push({ ...link, state: { key: String(index), name: link.title } });
++    } else {
++      visible.push({ ...link, state: { key: String(index), name: link.title } });
++    }
++  });
++
++  return { visible, controlsMenu };
++}
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.test.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.test.tsx
+index 08ba53ef1229c..63e92a8d95148 100644
+--- a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.test.tsx
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.test.tsx
+@@ -1,4 +1,4 @@
+-import { fireEvent, render } from '@testing-library/react';
++import { fireEvent, render, within } from '@testing-library/react';
+ import userEvent from '@testing-library/user-event';
+ 
+ import { VariableHide } from '@grafana/data';
+@@ -49,9 +49,10 @@ function renderVariablesList(variables: SceneVariable[] = []) {
+     user,
+     elements: {
+       dashboardScene,
+-      aboveListItems: () => renderResult.getAllByTestId('variables-list-visible-variable-name'),
+-      controlsMenuListItems: () => renderResult.getAllByTestId('variables-list-controls-menu-variable-name'),
+-      hiddenListItems: () => renderResult.getAllByTestId('variables-list-hidden-variable-name'),
++      aboveListItems: () => within(renderResult.getByTestId('variables-list-visible')).getAllByTestId('variable-name'),
++      controlsMenuListItems: () =>
++        within(renderResult.getByTestId('variables-list-controls-menu')).getAllByTestId('variable-name'),
++      hiddenListItems: () => within(renderResult.getByTestId('variables-list-hidden')).getAllByTestId('variable-name'),
+     },
+   };
+ }
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.tsx
+index a1f0765a996d4..58c4bad755852 100644
+--- a/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.tsx
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DashboardVariablesList.tsx
+@@ -103,9 +103,8 @@ export function DashboardVariablesList({ variableSet }: { variableSet: SceneVari
+         title={t('dashboard-scene.variables-list.title-above-dashboard', 'Above dashboard ({{count}})', {
+           count: visible.length,
+         })}
+-        dataTestId={`${ID_VISIBLE_LIST}-variable-name`}
+         onClickItem={onClickVariable}
+-        renderItemLabel={(v) => v.state.name}
++        renderItemLabel={renderItemLabel}
+       />
+       <DraggableList
+         items={controlsMenu}
+@@ -113,22 +112,22 @@ export function DashboardVariablesList({ variableSet }: { variableSet: SceneVari
+         title={t('dashboard-scene.variables-list.title-controls-menu', 'Controls menu ({{count}})', {
+           count: controlsMenu.length,
+         })}
+-        dataTestId={`${ID_CONTROLS_MENU_LIST}-variable-name`}
+         onClickItem={onClickVariable}
+-        renderItemLabel={(v) => v.state.name}
++        renderItemLabel={renderItemLabel}
+       />
+       <DraggableList
+         items={hidden}
+         droppableId={ID_HIDDEN_LIST}
+         title={t('dashboard-scene.variables-list.title-hidden', 'Hidden ({{count}})', { count: hidden.length })}
+-        dataTestId={`${ID_HIDDEN_LIST}-variable-name`}
+         onClickItem={onClickVariable}
+-        renderItemLabel={(v) => v.state.name}
++        renderItemLabel={renderItemLabel}
+       />
+     </DragDropContext>
+   );
+ }
+ 
++const renderItemLabel = (v: SceneVariable) => <span data-testid="variable-name">{v.state.name}</span>;
++
+ function getTargetHide(droppableId: string, currentHide: VariableHide): VariableHide {
+   if (droppableId === ID_VISIBLE_LIST) {
+     return currentHide === VariableHide.dontHide || currentHide === VariableHide.hideLabel
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DraggableList.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DraggableList.tsx
+index c7d2042b05614..5799dbc1d28ff 100644
+--- a/public/app/features/dashboard-scene/edit-pane/dashboard/DraggableList.tsx
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DraggableList.tsx
+@@ -3,7 +3,7 @@ import { ReactNode } from 'react';
+ 
+ import { GrafanaTheme2 } from '@grafana/data';
+ import { Trans } from '@grafana/i18n';
+-import { Button, useStyles2 } from '@grafana/ui';
++import { Button, Text, useStyles2 } from '@grafana/ui';
+ 
+ import { DraggableListItem } from './DraggableListItem';
+ import { DroppableCategory } from './DroppableCategory';
+@@ -12,16 +12,14 @@ interface DraggableListProps<T extends { state: { key?: string; name: string } }
+   items: T[];
+   droppableId: string;
+   title: string;
+-  dataTestId: string;
+   onClickItem: (item: T) => void;
+-  renderItemLabel: (item: T) => ReactNode;
++  renderItemLabel: (item: T) => NonNullable<ReactNode>;
+ }
+ 
+ export function DraggableList<T extends { state: { key?: string; name: string } }>({
+   items,
+   droppableId,
+   title,
+-  dataTestId,
+   onClickItem,
+   renderItemLabel,
+ }: DraggableListProps<T>) {
+@@ -48,7 +46,7 @@ export function DraggableList<T extends { state: { key?: string; name: string }
+                 }
+               }}
+             >
+-              <div data-testid={dataTestId}>{renderItemLabel(item)}</div>
++              <Text truncate>{renderItemLabel(item)}</Text>
+               <Button variant="primary" size="sm" fill="outline">
+                 <Trans i18nKey="dashboard-scene.draggable-items-list.select">Select</Trans>
+               </Button>
+diff --git a/public/app/features/dashboard-scene/edit-pane/dashboard/DroppableCategory.tsx b/public/app/features/dashboard-scene/edit-pane/dashboard/DroppableCategory.tsx
+index 77c55095dc58d..7f037fd7eaaef 100644
+--- a/public/app/features/dashboard-scene/edit-pane/dashboard/DroppableCategory.tsx
++++ b/public/app/features/dashboard-scene/edit-pane/dashboard/DroppableCategory.tsx
+@@ -21,8 +21,8 @@ export function DroppableCategory({ droppableId, title, children }: DroppableCat
+         <div ref={provided.innerRef} {...provided.droppableProps}>
+           <OptionsPaneCategory id={droppableId} className={styles.category} title={title}>
+             {children}
++            {provided.placeholder}
+           </OptionsPaneCategory>
+-          {provided.placeholder}
+         </div>
+       )}
+     </Droppable>
+diff --git a/public/app/features/dashboard-scene/settings/links/LinkAddEditableElement.tsx b/public/app/features/dashboard-scene/settings/links/LinkAddEditableElement.tsx
+index 19966a3a05ca5..773cfb198876e 100644
+--- a/public/app/features/dashboard-scene/settings/links/LinkAddEditableElement.tsx
++++ b/public/app/features/dashboard-scene/settings/links/LinkAddEditableElement.tsx
+@@ -22,7 +22,7 @@ import { NEW_LINK } from './utils';
+ 
+ // Default to dropdown for new links because if a dashboard has a lot of links,
+ // the side pane will be pushed down the page and be unscrollable
+-function createDefaultLink(): DashboardLink {
++export function createDefaultLink(): DashboardLink {
+   return { ...NEW_LINK, asDropdown: true };
+ }
+ 
+@@ -62,7 +62,11 @@ function useLinkTypeShowIf(linkEdit: LinkEdit, type: 'dashboards' | 'link') {
+   return link?.type === type;
+ }
+ 
+-function useEditPaneOptions(this: LinkEditEditableElement, linkEdit: LinkEdit): OptionsPaneCategoryDescriptor[] {
++function useEditPaneOptions(
++  this: LinkEditEditableElement,
++  linkEdit: LinkEdit,
++  isNewElement: boolean
++): OptionsPaneCategoryDescriptor[] {
+   const basicCategoryId = useId();
+   const titleId = useId();
+   const typeId = useId();
+@@ -84,7 +88,7 @@ function useEditPaneOptions(this: LinkEditEditableElement, linkEdit: LinkEdit):
+         new OptionsPaneItemDescriptor({
+           title: '',
+           id: titleId,
+-          render: () => <LinkTextInput linkEdit={linkEdit} prop="title" />,
++          render: () => <LinkTextInput linkEdit={linkEdit} prop="title" autoFocus={isNewElement} />,
+         })
+       )
+       .addItem(
+@@ -126,7 +130,7 @@ function useEditPaneOptions(this: LinkEditEditableElement, linkEdit: LinkEdit):
+           render: () => <LinkIconSelect linkEdit={linkEdit} />,
+         })
+       );
+-  }, [basicCategoryId, titleId, typeId, tagsId, urlId, tooltipId, iconId, linkEdit]);
++  }, [basicCategoryId, titleId, typeId, tagsId, urlId, tooltipId, iconId, linkEdit, isNewElement]);
+ 
+   const optionsCategory = useMemo(() => {
+     return new OptionsPaneCategoryDescriptor({
+diff --git a/public/app/features/dashboard-scene/settings/links/LinkBasicOptions.tsx b/public/app/features/dashboard-scene/settings/links/LinkBasicOptions.tsx
+index 4c0e14f410840..2299e5ddf1c42 100644
+--- a/public/app/features/dashboard-scene/settings/links/LinkBasicOptions.tsx
++++ b/public/app/features/dashboard-scene/settings/links/LinkBasicOptions.tsx
+@@ -6,6 +6,7 @@ import { DashboardLink } from '@grafana/schema';
+ import { Field, Input, Select, Switch, TagsInput } from '@grafana/ui';
+ 
+ import { DashboardScene } from '../../scene/DashboardScene';
++import { useEditPaneInputAutoFocus } from '../../scene/layouts-shared/utils';
+ 
+ import { LinkEdit } from './LinkAddEditableElement';
+ import { linkEditActions } from './actions';
+@@ -65,16 +66,28 @@ const TEXT_LINK_PROP_CONFIG: Record<
+   },
+ };
+ 
+-export function LinkTextInput({ linkEdit, prop }: { linkEdit: LinkEdit; prop: TextLinkProp }) {
++export function LinkTextInput({
++  linkEdit,
++  prop,
++  autoFocus,
++}: {
++  linkEdit: LinkEdit;
++  prop: TextLinkProp;
++  autoFocus?: boolean;
++}) {
+   const { dashboard, link, linkIndex } = useLinkState(linkEdit);
++  const ref = useEditPaneInputAutoFocus({ autoFocus });
++
+   const config = TEXT_LINK_PROP_CONFIG[prop];
+   const oldValue = useRef(link?.[prop] ?? '');
+   if (!link || !config.showIf(link)) {
+     return null;
+   }
++
+   return (
+     <Field label={t(config.labelKey, config.labelFallback)} noMargin>
+       <Input
++        ref={ref}
+         value={link[prop] ?? ''}
+         placeholder={
+           config.placeholderKey && config.placeholderFallback
+diff --git a/public/app/features/provisioning/GettingStarted/FeaturesList.tsx b/public/app/features/provisioning/GettingStarted/FeaturesList.tsx
+index 4b9cd357dfae8..251e15dd558f9 100644
+--- a/public/app/features/provisioning/GettingStarted/FeaturesList.tsx
++++ b/public/app/features/provisioning/GettingStarted/FeaturesList.tsx
+@@ -4,6 +4,7 @@ import { FeatureState, GrafanaTheme2 } from '@grafana/data';
+ import { Trans } from '@grafana/i18n';
+ import { Box, FeatureBadge, LinkButton, Stack, Text, TextLink, useStyles2 } from '@grafana/ui';
+ 
++import { QuotaLimitMessage } from '../Shared/QuotaLimitMessage';
+ import { RepositoryTypeCards } from '../Shared/RepositoryTypeCards';
+ import { isOnPrem } from '../utils/isOnPrem';
+ 
+@@ -43,9 +44,7 @@ export const FeaturesList = ({
+         </li>
+         {!!maxRepositories && (
+           <li>
+-            <Trans i18nKey="provisioning.quota-limit.message-repositories-info" count={maxRepositories}>
+-              Your account is limited to {{ count: maxRepositories }} connected repositories
+-            </Trans>
++            <QuotaLimitMessage maxRepositories={maxRepositories} showActionLink={false} />
+           </li>
+         )}
+       </ul>
+diff --git a/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx b/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx
+index b3c06b6e1ade5..8a78aef38a241 100644
+--- a/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx
++++ b/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx
+@@ -6,6 +6,7 @@ import { useGetFrontendSettingsQuery, Repository } from 'app/api/clients/provisi
+ 
+ import { CONNECT_URL, DEFAULT_REPOSITORY_TYPES } from '../constants';
+ import { checkSyncSettings } from '../utils/checkSyncSettings';
++import { isOnPrem } from '../utils/isOnPrem';
+ import { getOrderedRepositoryConfigs } from '../utils/repositoryTypes';
+ 
+ interface Props {
+@@ -76,10 +77,15 @@ export function getConfigureRepoTooltip({
+   }
+ 
+   if (maxReposReached) {
+-    return t(
+-      'provisioning.connect-repository-button.max-repos-reached-tooltip',
+-      'Your account has reached the maximum number of connected repositories'
+-    );
++    return isOnPrem()
++      ? t(
++          'provisioning.connect-repository-button.max-repos-reached-tooltip-onprem',
++          'Your instance has reached the maximum number of connected repositories. You can increase the limit in your Grafana configuration.'
++        )
++      : t(
++          'provisioning.connect-repository-button.max-repos-reached-tooltip',
++          'Your account has reached the maximum number of connected repositories'
++        );
+   }
+ 
+   return '';
+diff --git a/public/app/features/provisioning/Shared/QuotaLimitMessage.test.tsx b/public/app/features/provisioning/Shared/QuotaLimitMessage.test.tsx
+new file mode 100644
+index 0000000000000..8467a078285b0
+--- /dev/null
++++ b/public/app/features/provisioning/Shared/QuotaLimitMessage.test.tsx
+@@ -0,0 +1,147 @@
++import { Fragment, PropsWithChildren } from 'react';
++import { render, screen } from 'test/test-utils';
++
++import { isOnPrem } from '../utils/isOnPrem';
++
++import { QuotaLimitMessage } from './QuotaLimitMessage';
++
++jest.mock('../utils/isOnPrem', () => ({
++  isOnPrem: jest.fn(() => false),
++}));
++
++const mockIsOnPrem = jest.mocked(isOnPrem);
++
++const EmptyWrapper = ({ children }: PropsWithChildren) => <Fragment>{children}</Fragment>;
++
++function renderMessage(props: Parameters<typeof QuotaLimitMessage>[0] = {}) {
++  return render(<QuotaLimitMessage {...props} />, { wrapper: EmptyWrapper });
++}
++
++describe('QuotaLimitMessage', () => {
++  beforeEach(() => {
++    mockIsOnPrem.mockReturnValue(false);
++  });
++
++  describe('rendering nothing', () => {
++    it('should return null when no limits are set', () => {
++      const { container } = renderMessage();
++      expect(container).toBeEmptyDOMElement();
++    });
++
++    it('should return null when both limits are zero', () => {
++      const { container } = renderMessage({ maxRepositories: 0, maxResourcesPerRepository: 0 });
++      expect(container).toBeEmptyDOMElement();
++    });
++
++    it('should return null when limits are negative', () => {
++      const { container } = renderMessage({ maxRepositories: -1, maxResourcesPerRepository: -5 });
++      expect(container).toBeEmptyDOMElement();
++    });
++  });
++
++  describe('repository limit only (cloud)', () => {
++    it('should show cloud repository limit message', () => {
++      const { container } = renderMessage({ maxRepositories: 3 });
++      expect(container.textContent).toContain('Your account is limited to 3 connected repositories.');
++    });
++
++    it('should show action link with transition by default', () => {
++      const { container } = renderMessage({ maxRepositories: 3 });
++      expect(container.textContent).toContain('To add more repositories,');
++      expect(screen.getByRole('link', { name: /upgrade your account/ })).toBeInTheDocument();
++    });
++
++    it('should link to the upgrade URL', () => {
++      renderMessage({ maxRepositories: 3 });
++      expect(screen.getByRole('link', { name: /upgrade your account/ })).toHaveAttribute(
++        'href',
++        'https://grafana.com/profile/org/subscription'
++      );
++    });
++  });
++
++  describe('repository limit only (on-prem)', () => {
++    beforeEach(() => {
++      mockIsOnPrem.mockReturnValue(true);
++    });
++
++    it('should show on-prem repository limit message', () => {
++      const { container } = renderMessage({ maxRepositories: 3 });
++      expect(container.textContent).toContain('Your instance is limited to 3 connected repositories.');
++    });
++
++    it('should show configuration link', () => {
++      renderMessage({ maxRepositories: 3 });
++      expect(screen.getByRole('link', { name: /update your Grafana configuration/ })).toBeInTheDocument();
++    });
++
++    it('should link to the configuration docs URL', () => {
++      renderMessage({ maxRepositories: 3 });
++      expect(screen.getByRole('link', { name: /update your Grafana configuration/ })).toHaveAttribute(
++        'href',
++        'https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/#provisioning'
++      );
++    });
++  });
++
++  describe('resource limit only (cloud)', () => {
++    it('should show cloud resource limit message', () => {
++      const { container } = renderMessage({ maxResourcesPerRepository: 100 });
++      expect(container.textContent).toContain('Your account is limited to 100 synced resources per repository.');
++    });
++  });
++
++  describe('resource limit only (on-prem)', () => {
++    beforeEach(() => {
++      mockIsOnPrem.mockReturnValue(true);
++    });
++
++    it('should show on-prem resource limit message', () => {
++      const { container } = renderMessage({ maxResourcesPerRepository: 100 });
++      expect(container.textContent).toContain('Your instance is limited to 100 synced resources per repository.');
++    });
++  });
++
++  describe('both limits (cloud)', () => {
++    it('should show both repository and resource limits', () => {
++      const { container } = renderMessage({ maxRepositories: 3, maxResourcesPerRepository: 100 });
++      expect(container.textContent).toContain('Your account is limited to 3 connected repositories');
++      expect(container.textContent).toContain('and 100 synced resources per repository.');
++    });
++
++    it('should use "limits" as the transition type', () => {
++      const { container } = renderMessage({ maxRepositories: 3, maxResourcesPerRepository: 100 });
++      expect(container.textContent).toContain('To add more limits,');
++    });
++  });
++
++  describe('both limits (on-prem)', () => {
++    beforeEach(() => {
++      mockIsOnPrem.mockReturnValue(true);
++    });
++
++    it('should show both on-prem limits', () => {
++      const { container } = renderMessage({ maxRepositories: 3, maxResourcesPerRepository: 100 });
++      expect(container.textContent).toContain('Your instance is limited to 3 connected repositories');
++      expect(container.textContent).toContain('and 100 synced resources per repository.');
++    });
++
++    it('should use "limits" as the transition type', () => {
++      const { container } = renderMessage({ maxRepositories: 3, maxResourcesPerRepository: 100 });
++      expect(container.textContent).toContain('To add more limits,');
++    });
++  });
++
++  describe('showActionLink prop', () => {
++    it('should hide the action link when showActionLink is false', () => {
++      const { container } = renderMessage({ maxRepositories: 3, showActionLink: false });
++      expect(screen.queryByRole('link')).not.toBeInTheDocument();
++      expect(container.textContent).not.toContain('To add more');
++    });
++
++    it('should show the action link when showActionLink is true (default)', () => {
++      renderMessage({ maxRepositories: 3 });
++      expect(screen.getByRole('link')).toBeInTheDocument();
++    });
++  });
++});
+diff --git a/public/app/features/provisioning/Shared/QuotaLimitMessage.tsx b/public/app/features/provisioning/Shared/QuotaLimitMessage.tsx
+new file mode 100644
+index 0000000000000..0ef7ab2f42fbf
+--- /dev/null
++++ b/public/app/features/provisioning/Shared/QuotaLimitMessage.tsx
+@@ -0,0 +1,125 @@
++import { Trans } from '@grafana/i18n';
++import { TextLink } from '@grafana/ui';
++
++import { CONFIGURE_GRAFANA_DOCS_URL, UPGRADE_URL } from '../constants';
++import { isOnPrem } from '../utils/isOnPrem';
++
++interface QuotaLimitMessageProps {
++  maxRepositories?: number;
++  maxResourcesPerRepository?: number;
++  showActionLink?: boolean;
++}
++
++export function QuotaLimitMessage({
++  maxRepositories = 0,
++  maxResourcesPerRepository = 0,
++  showActionLink = true,
++}: QuotaLimitMessageProps) {
++  const onPrem = isOnPrem();
++  const hasRepoLimit = maxRepositories > 0;
++  const hasResourceLimit = maxResourcesPerRepository > 0;
++
++  if (!hasRepoLimit && !hasResourceLimit) {
++    return null;
++  }
++
++  const url = onPrem ? CONFIGURE_GRAFANA_DOCS_URL : UPGRADE_URL;
++  const limitType = hasRepoLimit && hasResourceLimit ? 'limits' : hasResourceLimit ? 'resources' : 'repositories';
++
++  return (
++    <>
++      <LimitText
++        onPrem={onPrem}
++        hasRepoLimit={hasRepoLimit}
++        hasResourceLimit={hasResourceLimit}
++        maxRepositories={maxRepositories}
++        maxResourcesPerRepository={maxResourcesPerRepository}
++      />
++      {showActionLink && (
++        <>
++          {' '}
++          <Trans i18nKey="provisioning.quota-limit.to-increase-limits" values={{ type: limitType }}>
++            To add more {{ type: limitType }},
++          </Trans>{' '}
++          <TextLink href={url} external>
++            {onPrem ? (
++              <Trans i18nKey="provisioning.quota-limit.update-configuration-link">
++                update your Grafana configuration
++              </Trans>
++            ) : (
++              <Trans i18nKey="provisioning.quota-limit.upgrade-link">upgrade your account</Trans>
++            )}
++          </TextLink>
++        </>
++      )}
++    </>
++  );
++}
++
++function LimitText({
++  onPrem,
++  hasRepoLimit,
++  hasResourceLimit,
++  maxRepositories,
++  maxResourcesPerRepository,
++}: {
++  onPrem: boolean;
++  hasRepoLimit: boolean;
++  hasResourceLimit: boolean;
++  maxRepositories: number;
++  maxResourcesPerRepository: number;
++}) {
++  switch (getLimitKind(hasRepoLimit, hasResourceLimit)) {
++    case 'both':
++      return onPrem ? (
++        <>
++          <Trans i18nKey="provisioning.quota-limit.message-both-repositories-onprem" count={maxRepositories}>
++            Your instance is limited to {{ count: maxRepositories }} connected repositories
++          </Trans>{' '}
++          <Trans i18nKey="provisioning.quota-limit.message-both-resources-onprem" count={maxResourcesPerRepository}>
++            and {{ count: maxResourcesPerRepository }} synced resources per repository.
++          </Trans>
++        </>
++      ) : (
++        <>
++          <Trans i18nKey="provisioning.quota-limit.message-both-repositories" count={maxRepositories}>
++            Your account is limited to {{ count: maxRepositories }} connected repositories
++          </Trans>{' '}
++          <Trans i18nKey="provisioning.quota-limit.message-both-resources" count={maxResourcesPerRepository}>
++            and {{ count: maxResourcesPerRepository }} synced resources per repository.
++          </Trans>
++        </>
++      );
++
++    case 'resource':
++      return onPrem ? (
++        <Trans i18nKey="provisioning.quota-limit.message-resource-onprem" count={maxResourcesPerRepository}>
++          Your instance is limited to {{ count: maxResourcesPerRepository }} synced resources per repository.
++        </Trans>
++      ) : (
++        <Trans i18nKey="provisioning.quota-limit.message-resource" count={maxResourcesPerRepository}>
++          Your account is limited to {{ count: maxResourcesPerRepository }} synced resources per repository.
++        </Trans>
++      );
++
++    case 'repository':
++      return onPrem ? (
++        <Trans i18nKey="provisioning.quota-limit.message-repository-onprem" count={maxRepositories}>
++          Your instance is limited to {{ count: maxRepositories }} connected repositories.
++        </Trans>
++      ) : (
++        <Trans i18nKey="provisioning.quota-limit.message-repository" count={maxRepositories}>
++          Your account is limited to {{ count: maxRepositories }} connected repositories.
++        </Trans>
++      );
++  }
++}
++
++type LimitKind = 'both' | 'resource' | 'repository';
++
++function getLimitKind(hasRepoLimit: boolean, hasResourceLimit: boolean): LimitKind {
++  if (hasRepoLimit && hasResourceLimit) {
++    return 'both';
++  }
++  return hasResourceLimit ? 'resource' : 'repository';
++}
+diff --git a/public/app/features/provisioning/Shared/QuotaLimitNote.test.tsx b/public/app/features/provisioning/Shared/QuotaLimitNote.test.tsx
+new file mode 100644
+index 0000000000000..3cb3874b2d8ab
+--- /dev/null
++++ b/public/app/features/provisioning/Shared/QuotaLimitNote.test.tsx
+@@ -0,0 +1,61 @@
++import { Fragment, PropsWithChildren } from 'react';
++import { render } from 'test/test-utils';
++
++import { isOnPrem } from '../utils/isOnPrem';
++
++import { QuotaLimitNote } from './QuotaLimitNote';
++
++jest.mock('../utils/isOnPrem', () => ({
++  isOnPrem: jest.fn(() => false),
++}));
++
++const mockIsOnPrem = jest.mocked(isOnPrem);
++
++const EmptyWrapper = ({ children }: PropsWithChildren) => <Fragment>{children}</Fragment>;
++
++function renderNote(props: Parameters<typeof QuotaLimitNote>[0] = {}) {
++  return render(<QuotaLimitNote {...props} />, { wrapper: EmptyWrapper });
++}
++
++describe('QuotaLimitNote', () => {
++  beforeEach(() => {
++    mockIsOnPrem.mockReturnValue(false);
++  });
++
++  describe('rendering nothing', () => {
++    it('should return null when no limits are set', () => {
++      const { container } = renderNote();
++      expect(container).toBeEmptyDOMElement();
++    });
++
++    it('should return null when both limits are zero', () => {
++      const { container } = renderNote({ maxRepositories: 0, maxResourcesPerRepository: 0 });
++      expect(container).toBeEmptyDOMElement();
++    });
++
++    it('should return null when limits are negative', () => {
++      const { container } = renderNote({ maxRepositories: -1 });
++      expect(container).toBeEmptyDOMElement();
++    });
++  });
++
++  describe('wrapper rendering', () => {
++    it('should render with repository limit', () => {
++      const { container } = renderNote({ maxRepositories: 3 });
++      expect(container).not.toBeEmptyDOMElement();
++      expect(container.textContent).toContain('Note:');
++    });
++
++    it('should render with resource limit', () => {
++      const { container } = renderNote({ maxResourcesPerRepository: 100 });
++      expect(container).not.toBeEmptyDOMElement();
++      expect(container.textContent).toContain('Note:');
++    });
++
++    it('should render with both limits', () => {
++      const { container } = renderNote({ maxRepositories: 3, maxResourcesPerRepository: 100 });
++      expect(container).not.toBeEmptyDOMElement();
++      expect(container.textContent).toContain('Note:');
++    });
++  });
++});
+diff --git a/public/app/features/provisioning/Shared/QuotaLimitNote.tsx b/public/app/features/provisioning/Shared/QuotaLimitNote.tsx
+index 8f27d6e8387fd..37361287168fe 100644
+--- a/public/app/features/provisioning/Shared/QuotaLimitNote.tsx
++++ b/public/app/features/provisioning/Shared/QuotaLimitNote.tsx
+@@ -4,9 +4,9 @@ import { GrafanaTheme2 } from '@grafana/data';
+ import { Trans } from '@grafana/i18n';
+ import { Icon, Stack, Text, useStyles2 } from '@grafana/ui';
+ 
+-import { UPGRADE_URL } from '../constants';
++import { QuotaLimitMessage } from './QuotaLimitMessage';
+ 
+-export interface QuotaLimitNoteProps {
++interface QuotaLimitNoteProps {
+   maxRepositories?: number;
+   maxResourcesPerRepository?: number;
+ }
+@@ -14,10 +14,7 @@ export interface QuotaLimitNoteProps {
+ export function QuotaLimitNote({ maxRepositories = 0, maxResourcesPerRepository = 0 }: QuotaLimitNoteProps) {
+   const styles = useStyles2(getStyles);
+ 
+-  const hasRepoLimit = maxRepositories > 0;
+-  const hasResourceLimit = maxResourcesPerRepository > 0;
+-
+-  if (!hasRepoLimit && !hasResourceLimit) {
++  if (maxRepositories <= 0 && maxResourcesPerRepository <= 0) {
+     return null;
+   }
+ 
+@@ -25,31 +22,8 @@ export function QuotaLimitNote({ maxRepositories = 0, maxResourcesPerRepository
+     <Stack direction="row" alignItems="flex-start">
+       <Icon name="exclamation-triangle" className={styles.warningIcon} size="sm" />
+       <Text variant="bodySmall">
+-        <Trans i18nKey="provisioning.quota-limit.note">Note:</Trans> {/* Generic message about resource quota */}
+-        {hasRepoLimit && hasResourceLimit ? (
+-          <>
+-            <Trans i18nKey="provisioning.quota-limit.note-message-both-repositories" count={maxRepositories}>
+-              Your account is limited to {{ count: maxRepositories }} connected repositories
+-            </Trans>{' '}
+-            <Trans i18nKey="provisioning.quota-limit.note-message-both-resources" count={maxResourcesPerRepository}>
+-              and {{ count: maxResourcesPerRepository }} synced resources per repository. To increase limits,
+-            </Trans>
+-          </>
+-        ) : hasResourceLimit ? (
+-          <Trans i18nKey="provisioning.quota-limit.note-message-resource" count={maxResourcesPerRepository}>
+-            Your account is limited to {{ count: maxResourcesPerRepository }} synced resources per repository. To add
+-            more resources,
+-          </Trans>
+-        ) : (
+-          <Trans i18nKey="provisioning.quota-limit.note-message-repository" count={maxRepositories}>
+-            Your account is limited to {{ count: maxRepositories }} connected repositories. To add more repositories,
+-          </Trans>
+-        )}
+-        {/* Upgrade Link */}
+-        <a href={UPGRADE_URL} target="_blank" rel="noopener noreferrer" className={styles.link}>
+-          <Trans i18nKey="provisioning.quota-limit.upgrade-link">upgrade your account</Trans>{' '}
+-          <Icon name="external-link-alt" size="xs" />
+-        </a>
++        <Trans i18nKey="provisioning.quota-limit.note">Note:</Trans>{' '}
++        <QuotaLimitMessage maxRepositories={maxRepositories} maxResourcesPerRepository={maxResourcesPerRepository} />
+       </Text>
+     </Stack>
+   );
+@@ -61,13 +35,5 @@ const getStyles = (theme: GrafanaTheme2) => {
+       color: theme.colors.warning.text,
+       marginTop: theme.spacing(0.25),
+     }),
+-    link: css({
+-      color: theme.colors.text.link,
+-      textDecoration: 'underline',
+-      '&:hover': {
+-        color: theme.colors.text.link,
+-        textDecoration: 'none',
+-      },
+-    }),
+   };
+ };
+diff --git a/public/app/features/provisioning/Shared/RepositoryList.tsx b/public/app/features/provisioning/Shared/RepositoryList.tsx
+index 7a4a12e162c28..f84132e9168d9 100644
+--- a/public/app/features/provisioning/Shared/RepositoryList.tsx
++++ b/public/app/features/provisioning/Shared/RepositoryList.tsx
+@@ -1,15 +1,16 @@
+ import { useState } from 'react';
+ 
+ import { t, Trans } from '@grafana/i18n';
+-import { Alert, Box, EmptyState, FilterInput, Icon, Stack, TextLink } from '@grafana/ui';
++import { Alert, Box, EmptyState, FilterInput, Icon, Stack } from '@grafana/ui';
+ import { Repository, useGetFrontendSettingsQuery } from 'app/api/clients/provisioning/v0alpha1';
+ 
+ import { RepositoryListItem } from '../Repository/RepositoryListItem';
+ import { useResourceStats } from '../Wizard/hooks/useResourceStats';
+-import { UPGRADE_URL } from '../constants';
+ import { useIsProvisionedInstance } from '../hooks/useIsProvisionedInstance';
+ import { checkSyncSettings } from '../utils/checkSyncSettings';
+ 
++import { QuotaLimitMessage } from './QuotaLimitMessage';
++
+ interface Props {
+   items: Repository[];
+ }
+@@ -70,24 +71,10 @@ export function RepositoryList({ items }: Props) {
+             {isRepoLimitHit && (
+               <>
+                 {' '}
+-                {!!maxResourcesPerRepository ? (
+-                  <>
+-                    <Trans i18nKey="provisioning.quota-limit.message-both-repositories" count={maxRepositories}>
+-                      Your account is limited to {{ count: maxRepositories }} connected repositories
+-                    </Trans>{' '}
+-                    <Trans i18nKey="provisioning.quota-limit.message-both-resources" count={maxResourcesPerRepository}>
+-                      and {{ count: maxResourcesPerRepository }} synced resources per repository.
+-                    </Trans>
+-                  </>
+-                ) : (
+-                  <Trans i18nKey="provisioning.quota-limit.message-repository" count={maxRepositories}>
+-                    Your account is limited to {{ count: maxRepositories }} connected repositories. To add more
+-                    repositories,
+-                  </Trans>
+-                )}{' '}
+-                <TextLink href={UPGRADE_URL} external>
+-                  <Trans i18nKey="provisioning.quota-limit.upgrade-link">upgrade your account</Trans>
+-                </TextLink>
++                <QuotaLimitMessage
++                  maxRepositories={maxRepositories}
++                  maxResourcesPerRepository={maxResourcesPerRepository}
++                />
+               </>
+             )}
+           </Alert>
+diff --git a/public/app/features/provisioning/Wizard/BootstrapStep.tsx b/public/app/features/provisioning/Wizard/BootstrapStep.tsx
+index c6e31a6b177a8..24acb930c932b 100644
+--- a/public/app/features/provisioning/Wizard/BootstrapStep.tsx
++++ b/public/app/features/provisioning/Wizard/BootstrapStep.tsx
+@@ -9,7 +9,8 @@ import { RepositoryViewList } from 'app/api/clients/provisioning/v0alpha1';
+ import { generateRepositoryTitle } from 'app/features/provisioning/utils/data';
+ 
+ import { QuotaLimitNote } from '../Shared/QuotaLimitNote';
+-import { UPGRADE_URL } from '../constants';
++import { CONFIGURE_GRAFANA_DOCS_URL, UPGRADE_URL } from '../constants';
++import { isOnPrem } from '../utils/isOnPrem';
+ 
+ import { BootstrapStepCardIcons } from './BootstrapStepCardIcons';
+ import { BootstrapStepResourceCounting } from './BootstrapStepResourceCounting';
+@@ -95,21 +96,34 @@ export const BootstrapStep = memo(function BootstrapStep({ settingsData, repoNam
+         },
+       });
+     } else if (isQuotaExceeded) {
++      const onPrem = isOnPrem();
+       setStepStatusInfo({
+         status: 'error',
+         error: {
+           title: t('provisioning.bootstrap-step.error-quota-exceeded-title', 'Resource quota exceeded'),
+-          message: t(
+-            'provisioning.bootstrap-step.error-quota-exceeded-message',
+-            'This repository contains {{resourceCount}} resources, which exceeds your account limit of {{limit}}. To sync this repository, upgrade your account or reduce the number of resources to sync.',
+-            { resourceCount, limit: maxResourcesPerRepository }
+-          ),
+-        },
+-        action: {
+-          label: t('provisioning.bootstrap-step.upgrade-action', 'Upgrade account'),
+-          href: UPGRADE_URL,
+-          external: true,
++          message: onPrem
++            ? t(
++                'provisioning.bootstrap-step.error-quota-exceeded-message-onprem',
++                'This repository contains {{resourceCount}} resources, which exceeds your instance limit of {{limit}}. To sync this repository, update your Grafana configuration or reduce the number of resources to sync.',
++                { resourceCount, limit: maxResourcesPerRepository }
++              )
++            : t(
++                'provisioning.bootstrap-step.error-quota-exceeded-message',
++                'This repository contains {{resourceCount}} resources, which exceeds your account limit of {{limit}}. To sync this repository, upgrade your account or reduce the number of resources to sync.',
++                { resourceCount, limit: maxResourcesPerRepository }
++              ),
+         },
++        action: onPrem
++          ? {
++              label: t('provisioning.bootstrap-step.update-configuration-action', 'View configuration docs'),
++              href: CONFIGURE_GRAFANA_DOCS_URL,
++              external: true,
++            }
++          : {
++              label: t('provisioning.bootstrap-step.upgrade-action', 'Upgrade account'),
++              href: UPGRADE_URL,
++              external: true,
++            },
+       });
+     } else {
+       setStepStatusInfo({ status: isLoading ? 'running' : 'idle' });
+diff --git a/public/app/features/provisioning/Wizard/fields.ts b/public/app/features/provisioning/Wizard/fields.ts
+index 566f50351929e..1e3b7732e5462 100644
+--- a/public/app/features/provisioning/Wizard/fields.ts
++++ b/public/app/features/provisioning/Wizard/fields.ts
+@@ -213,7 +213,10 @@ const getProviderConfigs = (): Record<RepoType, Record<string, FieldConfig>> =>
+       },
+       url: {
+         ...shared.url,
+-        description: t('provisioning.git.url-description', 'The Git repository URL'),
++        description: t(
++          'provisioning.git.url-description',
++          'The Git repository URL. Most servers require the URL to end with .git (e.g. https://host/owner/repo.git).'
++        ),
+         // eslint-disable-next-line @grafana/i18n/no-untranslated-strings
+         placeholder: 'https://git.example.com/owner/repository.git',
+         required: true,
+diff --git a/public/app/features/provisioning/constants.ts b/public/app/features/provisioning/constants.ts
+index 05777279ae165..29deb52db1a59 100644
+--- a/public/app/features/provisioning/constants.ts
++++ b/public/app/features/provisioning/constants.ts
+@@ -4,6 +4,8 @@ export const CONNECTIONS_TAB_URL = `${PROVISIONING_URL}?tab=connections`;
+ export const CONNECT_URL = `${PROVISIONING_URL}/connect`;
+ export const GETTING_STARTED_URL = `${PROVISIONING_URL}/getting-started`;
+ export const UPGRADE_URL = 'https://grafana.com/profile/org/subscription';
++export const CONFIGURE_GRAFANA_DOCS_URL =
++  'https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/#provisioning';
+ 
+ export const DEFAULT_REPOSITORY_TYPES: Array<'github' | 'local'> = ['github', 'local'];
+ 
+diff --git a/public/locales/en-US/grafana.json b/public/locales/en-US/grafana.json
+index 1468abbb8398e..4441e5b46db94 100644
+--- a/public/locales/en-US/grafana.json
++++ b/public/locales/en-US/grafana.json
+@@ -6745,6 +6745,9 @@
+       "tooltip-move-link-up": "Move link up",
+       "type": "Type"
+     },
++    "dashboard-links-list": {
++      "add-link": "Add link"
++    },
+     "dashboard-preview-banner": {
+       "title-error-loading-dashboard": "Error loading dashboard"
+     },
+@@ -7025,6 +7028,13 @@
+       "type-link": "Link",
+       "with-tags": "With tags"
+     },
++    "links-list": {
++      "drag-end-description": "Reorder links list",
++      "title-above-dashboard_one": "Above dashboard ({{count}})",
++      "title-above-dashboard_other": "Above dashboard ({{count}})",
++      "title-controls-menu_one": "Controls menu ({{count}})",
++      "title-controls-menu_other": "Controls menu ({{count}})"
++    },
+     "managed-badge": {
+       "kubectl": "Managed by: Kubectl",
+       "plugin": "Managed by: Plugin {{id}}",
+@@ -7384,6 +7394,13 @@
+         }
+       }
+     },
++    "use-links-category": {
++      "category": {
++        "title": {
++          "links": "Links"
++        }
++      }
++    },
+     "use-modal-editor": {
+       "description": {
+         "change-variable-query": "Change variable query"
+@@ -12788,6 +12805,7 @@
+       "empty": "Empty",
+       "error-field-required": "This field is required.",
+       "error-quota-exceeded-message": "This repository contains {{resourceCount}} resources, which exceeds your account limit of {{limit}}. To sync this repository, upgrade your account or reduce the number of resources to sync.",
++      "error-quota-exceeded-message-onprem": "This repository contains {{resourceCount}} resources, which exceeds your instance limit of {{limit}}. To sync this repository, update your Grafana configuration or reduce the number of resources to sync.",
+       "error-quota-exceeded-title": "Resource quota exceeded",
+       "error-repository-status-unhealthy-message": "There was an issue connecting to the repository. Please check the repository settings and try again.",
+       "error-repository-status-unhealthy-title": "Repository status unhealthy",
+@@ -12801,6 +12819,7 @@
+       "retry-action": "Retry",
+       "text-loading-resource-information": "Loading resource information...",
+       "unmanaged-resources-label": "Unmanaged resources",
++      "update-configuration-action": "View configuration docs",
+       "upgrade-action": "Upgrade account"
+     },
+     "code-block": {
+@@ -12847,7 +12866,8 @@
+     "connect-repository-button": {
+       "configure": "Configure",
+       "instance-fully-managed-tooltip": "Configuration is disabled because this instance is fully managed",
+-      "max-repos-reached-tooltip": "Your account has reached the maximum number of connected repositories"
++      "max-repos-reached-tooltip": "Your account has reached the maximum number of connected repositories",
++      "max-repos-reached-tooltip-onprem": "Your instance has reached the maximum number of connected repositories. You can increase the limit in your Grafana configuration."
+     },
+     "connect-step": {
+       "text-folders-not-available": "Folder suggestions will be available after the repository is connected.",
+@@ -13051,7 +13071,7 @@
+       "token-label": "Access Token",
+       "token-required": "Git token is required",
+       "token-user-description": "The username that will be used to access the repository with the access token",
+-      "url-description": "The Git repository URL",
++      "url-description": "The Git repository URL. Most servers require the URL to end with .git (e.g. https://host/owner/repo.git).",
+       "url-pattern": "Must be a valid Git repository URL",
+       "url-required": "Repository URL is required"
+     },
+@@ -13178,21 +13198,23 @@
+     "quota-limit": {
+       "message-both-repositories_one": "Your account is limited to {{count}} connected repository",
+       "message-both-repositories_other": "Your account is limited to {{count}} connected repositories",
++      "message-both-repositories-onprem_one": "Your instance is limited to {{count}} connected repository",
++      "message-both-repositories-onprem_other": "Your instance is limited to {{count}} connected repositories",
+       "message-both-resources_one": "and {{count}} synced resource per repository.",
+       "message-both-resources_other": "and {{count}} synced resources per repository.",
+-      "message-repositories-info_one": "Your account is limited to {{count}} connected repository",
+-      "message-repositories-info_other": "Your account is limited to {{count}} connected repositories",
+-      "message-repository_one": "Your account is limited to {{count}} connected repository. To add more repositories,",
+-      "message-repository_other": "Your account is limited to {{count}} connected repositories. To add more repositories,",
++      "message-both-resources-onprem_one": "and {{count}} synced resource per repository.",
++      "message-both-resources-onprem_other": "and {{count}} synced resources per repository.",
++      "message-repository_one": "Your account is limited to {{count}} connected repository.",
++      "message-repository_other": "Your account is limited to {{count}} connected repositories.",
++      "message-repository-onprem_one": "Your instance is limited to {{count}} connected repository.",
++      "message-repository-onprem_other": "Your instance is limited to {{count}} connected repositories.",
++      "message-resource_one": "Your account is limited to {{count}} synced resource per repository.",
++      "message-resource_other": "Your account is limited to {{count}} synced resources per repository.",
++      "message-resource-onprem_one": "Your instance is limited to {{count}} synced resource per repository.",
++      "message-resource-onprem_other": "Your instance is limited to {{count}} synced resources per repository.",
+       "note": "Note:",
+-      "note-message-both-repositories_one": "Your account is limited to {{count}} connected repository",
+-      "note-message-both-repositories_other": "Your account is limited to {{count}} connected repositories",
+-      "note-message-both-resources_one": "and {{count}} synced resource per repository. To increase limits,",
+-      "note-message-both-resources_other": "and {{count}} synced resources per repository. To increase limits,",
+-      "note-message-repository_one": "Your account is limited to {{count}} connected repository. To add more repositories,",
+-      "note-message-repository_other": "Your account is limited to {{count}} connected repositories. To add more repositories,",
+-      "note-message-resource_one": "Your account is limited to {{count}} synced resource per repository. To add more resources,",
+-      "note-message-resource_other": "Your account is limited to {{count}} synced resources per repository. To add more resources,",
++      "to-increase-limits": "To add more {{type}},",
++      "update-configuration-link": "update your Grafana configuration",
+       "upgrade-link": "upgrade your account"
+     },
+     "read-only-local-tooltip": "This resource is read-only and provisioned through file provisioning. To make any changes, update the connected repository. To modify the settings go to Administration > Provisioning > Repositories.",

@@ -1,8 +1,8 @@
 """Tests for status command."""
 
+import json
 from pathlib import Path
 
-import yaml
 from click.testing import CliRunner
 
 from bugeval.cli import cli
@@ -24,17 +24,19 @@ def test_status_empty_run_dir(tmp_path: Path) -> None:
     assert "Normalized:  0" in result.output
 
 
-def test_status_with_checkpoint(tmp_path: Path) -> None:
-    # Build a minimal checkpoint YAML with 2 done and 1 failed.
-    # RunState._key() uses "::" as separator, so keys must match.
-    checkpoint_data = {
-        "pairs": {
-            "c1::t1": {"case_id": "c1", "tool": "t1", "status": "done"},
-            "c2::t1": {"case_id": "c2", "tool": "t1", "status": "done"},
-            "c3::t1": {"case_id": "c3", "tool": "t1", "status": "failed"},
-        }
-    }
-    (tmp_path / "checkpoint.yaml").write_text(yaml.dump(checkpoint_data))
+def test_status_with_raw_dirs(tmp_path: Path) -> None:
+    """Status counts done/failed from raw/ directory contents."""
+    raw_dir = tmp_path / "raw"
+    # 2 done cases (with metadata.json)
+    for name in ("c1-tool-diff-only", "c2-tool-diff-only"):
+        d = raw_dir / name
+        d.mkdir(parents=True)
+        (d / "metadata.json").write_text(json.dumps({"context_level": "diff-only"}))
+    # 1 failed case (with error.json only)
+    d = raw_dir / "c3-tool-diff-only"
+    d.mkdir(parents=True)
+    (d / "error.json").write_text(json.dumps({"error": "patch not found"}))
+
     runner = CliRunner()
     result = runner.invoke(cli, ["status", "--run-dir", str(tmp_path)])
     assert result.exit_code == 0
@@ -79,3 +81,12 @@ def test_get_run_status_returns_dict(tmp_path: Path) -> None:
     assert info["total"] == 0
     assert not info["has_analysis"]
     assert info["normalized"] == 0
+
+
+def test_status_pr_done_via_comments_json(tmp_path: Path) -> None:
+    """PR tools write comments.json — should count as done."""
+    raw_dir = tmp_path / "raw" / "case-001-coderabbit"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "comments.json").write_text(json.dumps([]))
+    info = get_run_status(tmp_path)
+    assert info["done"] == 1

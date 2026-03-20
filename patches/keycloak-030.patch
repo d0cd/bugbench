@@ -1,99 +1,1225 @@
-diff --git a/services/src/main/java/org/keycloak/email/DefaultEmailSenderProvider.java b/services/src/main/java/org/keycloak/email/DefaultEmailSenderProvider.java
-index ee8ef6593a..5e820d3933 100644
---- a/services/src/main/java/org/keycloak/email/DefaultEmailSenderProvider.java
-+++ b/services/src/main/java/org/keycloak/email/DefaultEmailSenderProvider.java
-@@ -103,6 +103,10 @@ public class DefaultEmailSenderProvider implements EmailSenderProvider {
-     public void validate(Map<String, String> config) throws EmailException {
-         // just static configuration checking here, not really testing email
-         checkFromAddress(config.get("from"), isAllowUTF8(config));
-+        String replyTo = config.get("replyTo");
-+        if (isNotBlank(replyTo)) {
-+            checkReplyToAddress(replyTo, isAllowUTF8(config));
-+        }
+diff --git a/docs/documentation/upgrading/topics/changes/changes-26_6_0.adoc b/docs/documentation/upgrading/topics/changes/changes-26_6_0.adoc
+index 46308cb72b4e..7a0f0ba039d2 100644
+--- a/docs/documentation/upgrading/topics/changes/changes-26_6_0.adoc
++++ b/docs/documentation/upgrading/topics/changes/changes-26_6_0.adoc
+@@ -14,6 +14,18 @@ It was also not aligned with how other script-based features work in {project_na
+ 
+ If you have existing JavaScript-based policies, make sure to enable the `scripts` feature when starting {project_name}.
+ 
++=== Stricter Validation for Client URIs (secure-client-uris)
++The 'secure-client-uris' client policy executor has been updated to enforce stricter validation on Client URIs. This aligns with FAPI 2.0 security requirements by mandating TLS (HTTPS) for client endpoints.
++
++HTTPS Enforcement: The following URIs must now use the https scheme. Existing clients configured with http in these fields will fail validation during updates:
++'Post logout redirect URIs', 'Logo URL', 'Policy URL', and 'Terms of Service URL'.
++
++Expanded Wildcard Support: The + wildcard character is now allowed in 'Valid post logout redirect URIs' and 'Web origins'.
++Configuring + defers validation to the client's standard 'Valid redirect URIs'. Since redirect URIs are already checked for HTTPS, using the wildcard maintains FAPI 2.0 compliance while reducing configuration duplication.
++
++Administrators must ensure that all configured URIs for the fields listed above use https. Clients attempting to update or register with http in these fields will fail validation when using the 'secure-client-uris' executor.
++
++
+ // ------------------------ Notable changes ------------------------ //
+ == Notable changes
+ 
+diff --git a/docs/guides/securing-apps/jwt-authorization-grant.adoc b/docs/guides/securing-apps/jwt-authorization-grant.adoc
+index bf2a92ac0dcf..ff61d6a4f384 100644
+--- a/docs/guides/securing-apps/jwt-authorization-grant.adoc
++++ b/docs/guides/securing-apps/jwt-authorization-grant.adoc
+@@ -160,4 +160,54 @@ As the previous executor, for the moment this enforcer can be used for JWT Autho
+ WARNING: The **jwt-authorization-grant-audience** executor changes the validation of the assertion audience out of the standard compliance. This behavior can have major security implications.
+ 
+ 
++=== JWT Authorization Grant for Google Identity Provider
++
++Google Identity Provider supports the JWT Authorization Grant, allowing the use of a Google ID Token as an assertion.
++According to RFC 7523, the assertion MUST be a JWT. Since Google issues JWTs only for ID Tokens (and not for access tokens), only the ID Token can be used for this authorization grant.
++
++To enable this feature, the **JWT Authorization Grant** switch must be turned on in the Google Identity Provider configuration.
++
++.Google ID Token Payload Example
++[source,json]
++----
++{
++    "iss": "https://accounts.google.com", <1>
++    "azp": "XXXX.apps.googleusercontent.com",
++    "aud": "XXXX.apps.googleusercontent.com", <2>
++    "sub": "100209199795938692365", <3>
++    "at_hash": "AAos4eSIx4b5uQ8N-OAPYg",
++    "iat": 1769503848,
++    "exp": 1769507448 <4>
++}
++----
++<1> Google Issuer.
++<2> Client ID that must be the same configured on the Google Identity Provider.
++<3> Subject that must be linked to the {project_name} user.
++<4> Expires 1 hour after `iat`.
++
++The specifications described in this guide also apply to Google, with the following exceptions:
++
++* **Audience Validation**: Google does not allow adding custom audiences to the ID Token. Therefore, the ID Token cannot contain the Token Endpoint URL or the {project_name} Issuer URL. The `aud` (audience) claim must simply match the Client ID configured for the Google Identity Provider. *This is the only deviation from RFC 7523.*
++* **Replay Check**: It is not possible to perform a replay check because the `jti` claim is missing from the Google ID Token. Consequently, the same Google ID Token can be used multiple times.
++* **Google ID Token Expiration**: The duration of a Google ID Token is fixed at 1 hour and cannot be modified. To limit the validity window, a dedicated property in the configuration allows you to set a maximum time limit for the token. The default value is 1 hour (matching the Google ID Token lifespan).
++
++In a scenario where a mobile application already supports login with Google without involving Keycloak, there may be an issue when integrating Keycloak later. For example, Keycloak might be configured with a Google Identity Provider that uses a different Google client than the one used by the mobile app.
++
++In this case, the Google ID token cannot be used with the JWT Authorization Grant because the `aud` claim in the ID Token does not match the client id configured in the Google Identity Provider.
++
++To address this issue, you can use link:{adminguide_link}#_client_policies[Client Policies] with the `jwt-authorization-grant-audience` executor to explicitly set the Google ID Token audience as the trusted audience, replacing the default audience validation configured for the Identity Provider.
++
++**Example setup:**
++
++Assume you have an OIDC client named `foo`, which is a mobile application receiving a Google ID token with the audience `my-mobile-app.apps.googleusercontent.com`, and you have an already configured Google Identity Provider with a different client-id.
++
++Follow these steps to configure the validation of the audience:
++
++. **Create a Client Policy Profile:** Create a profile and add the `jwt-authorization-grant-audience` executor. Configure the allowed audience in the executor to `my-mobile-app.apps.googleusercontent.com`.
++. **Create a Client Policy:** Create a policy that uses this profile. For the condition, you can use the **client-role** condition and specify a role, for example, `foo-role`.
++. **Configure the Client:** Navigate to the client `foo` settings. Open the **Roles** tab and create a new role named `foo-role`. This role acts effectively as a "marker" to ensure the client policy is triggered. You should create this same role in any other client that requires this specific audience validation.
++. **Validate:** When you send the JWT authorization grant request with your Google ID token from client `foo`, the request will now be accepted, provided that `my-mobile-app.apps.googleusercontent.com` is present as a valid audience in the token.
++
++
+ </@tmpl.guide>
++
+diff --git a/server-spi-private/src/main/java/org/keycloak/models/Constants.java b/server-spi-private/src/main/java/org/keycloak/models/Constants.java
+index 2e33cfc82240..c331335b2c56 100755
+--- a/server-spi-private/src/main/java/org/keycloak/models/Constants.java
++++ b/server-spi-private/src/main/java/org/keycloak/models/Constants.java
+@@ -135,6 +135,8 @@ public final class Constants {
+     // multiple values into single string
+     public static final String CFG_DELIMITER = "##";
+ 
++    public static final String INCLUDE_REDIRECTS = "+";
++
+     // Better performance to use this instead of String.split
+     public static final Pattern CFG_DELIMITER_PATTERN = Pattern.compile("\\s*" + CFG_DELIMITER + "\\s*");
+ 
+diff --git a/server-spi-private/src/main/java/org/keycloak/protocol/oidc/OIDCConfigAttributes.java b/server-spi-private/src/main/java/org/keycloak/protocol/oidc/OIDCConfigAttributes.java
+index 0f069c50a7ec..d2929d7936b0 100644
+--- a/server-spi-private/src/main/java/org/keycloak/protocol/oidc/OIDCConfigAttributes.java
++++ b/server-spi-private/src/main/java/org/keycloak/protocol/oidc/OIDCConfigAttributes.java
+@@ -98,7 +98,9 @@ public final class OIDCConfigAttributes {
+     public static final String JWT_AUTHORIZATION_GRANT_ENABLED = "oauth2.jwt.authorization.grant.enabled";
+     public static final String JWT_AUTHORIZATION_GRANT_IDP = "oauth2.jwt.authorization.grant.idp";
+ 
+-
++    public static final String LOGO_URI = "logoUri";
++    public static final String TOS_URI = "tosUri";
++    public static final String POLICY_URI = "policyUri";
+     private OIDCConfigAttributes() {
      }
  
-     Properties buildEmailProperties(Map<String, String> config, String from) throws EmailException {
-@@ -176,7 +180,8 @@ public class DefaultEmailSenderProvider implements EmailSenderProvider {
-             msg.setReplyTo(new Address[]{toInternetAddress(from, fromDisplayName)});
- 
-             if (isNotBlank(replyTo)) {
--                msg.setReplyTo(new Address[]{toInternetAddress(replyTo, replyToDisplayName)});
-+                final String convertedReplyTo = checkReplyToAddress(replyTo, isAllowUTF8(config));
-+                msg.setReplyTo(new Address[]{toInternetAddress(convertedReplyTo, replyToDisplayName)});
+diff --git a/services/src/main/java/org/keycloak/authentication/authenticators/client/FederatedJWTClientAuthenticator.java b/services/src/main/java/org/keycloak/authentication/authenticators/client/FederatedJWTClientAuthenticator.java
+index c7aca4699a50..fad9283cfbf8 100644
+--- a/services/src/main/java/org/keycloak/authentication/authenticators/client/FederatedJWTClientAuthenticator.java
++++ b/services/src/main/java/org/keycloak/authentication/authenticators/client/FederatedJWTClientAuthenticator.java
+@@ -97,7 +97,7 @@ public void authenticateClient(ClientAuthenticationFlowContext context) {
              }
  
-             msg.setHeader("To", address);
-@@ -259,12 +264,21 @@ public class DefaultEmailSenderProvider implements EmailSenderProvider {
-     }
+             ClientAssertionIdentityProviderFactory.LookupResult lookup = strategy.lookup(context);
+-            if (lookup == null || lookup.identityProviderModel() == null || lookup.clientModel() == null) {
++            if (lookup == null || lookup.identityProviderModel() == null || !lookup.identityProviderModel().isEnabled() || lookup.clientModel() == null) {
+                 return;
+             }
  
-     private static String checkFromAddress(String from, boolean allowutf8) throws EmailException {
--        final String covertedFrom = convertEmail(from, allowutf8);
--        if (from == null) {
-+        final String convertedFrom = convertEmail(from, allowutf8);
-+        if (convertedFrom == null) {
-             throw new EmailException(String.format("Invalid sender address '%s'. If the address contains UTF-8 characters in the local part please ensure the SMTP server supports the SMTPUTF8 extension and enable 'Allow UTF-8' in the email realm configuration.",
-                     from));
+diff --git a/services/src/main/java/org/keycloak/protocol/oidc/grants/JWTAuthorizationGrantType.java b/services/src/main/java/org/keycloak/protocol/oidc/grants/JWTAuthorizationGrantType.java
+index b6fa5cd3e938..7f2d84607001 100644
+--- a/services/src/main/java/org/keycloak/protocol/oidc/grants/JWTAuthorizationGrantType.java
++++ b/services/src/main/java/org/keycloak/protocol/oidc/grants/JWTAuthorizationGrantType.java
+@@ -77,6 +77,10 @@ public Response process(Context context) {
+             }
+             event.detail(Details.IDENTITY_PROVIDER, identityProviderModel.getAlias());
+ 
++            if (!identityProviderModel.isEnabled()) {
++                throw new RuntimeException("Identity Provider is not enabled");
++            }
++
+             if(!OIDCAdvancedConfigWrapper.fromClientModel(context.getClient()).getJWTAuthorizationGrantAllowedIdentityProviders().contains(identityProviderModel.getAlias())) {
+                 throw new RuntimeException("Identity Provider is not allowed for the client");
+             }
+diff --git a/services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java b/services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java
+index 889d884d0c5d..db582ca5414b 100644
+--- a/services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java
++++ b/services/src/main/java/org/keycloak/protocol/oidc/utils/RedirectUtils.java
+@@ -20,7 +20,9 @@
+ import java.net.URI;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashSet;
++import java.util.List;
+ import java.util.Set;
+ import java.util.TreeSet;
+ import java.util.regex.Pattern;
+@@ -214,4 +216,29 @@ public static String validateRedirectUriWildcard(String redirectUri) {
          }
--        return covertedFrom;
-+        return convertedFrom;
-+    }
+         return redirectUri;
+     }
 +
-+    private static String checkReplyToAddress(String replyTo, boolean allowutf8) throws EmailException {
-+        final String convertedReplyTo = convertEmail(replyTo, allowutf8);
-+        if (convertedReplyTo == null) {
-+            throw new EmailException(String.format("Invalid reply-to address '%s'. If the address contains UTF-8 characters in the local part please ensure the SMTP server supports the SMTPUTF8 extension and enable 'Allow UTF-8' in the email realm configuration.",
-+                    replyTo));
++    public static Set<String> resolveUrlsWithRedirects(KeycloakSession session, List<String> origUrls,
++                                                       String rootUrl, List<String> redirectUris, boolean returnAsOrigins) {
++
++        Set<String> refactoredUrls = (origUrls != null) ? new HashSet<>(origUrls) : new HashSet<>();
++        if (refactoredUrls.contains(Constants.INCLUDE_REDIRECTS)) {
++            refactoredUrls.remove(Constants.INCLUDE_REDIRECTS);
++
++            Set<String> redirectsToProcess = (redirectUris != null) ? new HashSet<>(redirectUris) : Collections.emptySet();
++            for (String redirectUri : resolveValidRedirects(session, rootUrl, redirectsToProcess)) {
++                if (isValidScheme(redirectUri)) {
++                    if (returnAsOrigins) {
++                        refactoredUrls.add(UriUtils.getOrigin(redirectUri));
++                    } else {
++                        refactoredUrls.add(redirectUri);
++                    }
++                }
++            }
 +        }
-+        return convertedReplyTo;
-     }
- 
-     private static String convertEmail(String email, boolean allowutf8) throws EmailException {
-diff --git a/services/src/test/java/org/keycloak/email/DefaultEmailSenderProviderTest.java b/services/src/test/java/org/keycloak/email/DefaultEmailSenderProviderTest.java
-index a711c3bf27..0e82cbad04 100644
---- a/services/src/test/java/org/keycloak/email/DefaultEmailSenderProviderTest.java
-+++ b/services/src/test/java/org/keycloak/email/DefaultEmailSenderProviderTest.java
-@@ -6,8 +6,10 @@ import java.util.Properties;
- 
- import org.junit.jupiter.api.Test;
- 
-+import static org.hamcrest.CoreMatchers.containsString;
- import static org.hamcrest.CoreMatchers.is;
- import static org.hamcrest.MatcherAssert.assertThat;
-+import static org.junit.jupiter.api.Assertions.assertThrows;
- 
- class DefaultEmailSenderProviderTest {
- 
-@@ -51,4 +53,33 @@ class DefaultEmailSenderProviderTest {
-         assertThat(properties.getProperty("mail.smtp.connectiontimeout"), is("30000"));
-         assertThat(properties.getProperty("mail.smtp.writetimeout"), is("40000"));
-     }
-+
-+    @Test
-+    void testValidateWithInvalidFromAddressThrowsException() {
-+        // given
-+        DefaultEmailSenderProvider provider = new DefaultEmailSenderProvider(null, null);
-+        Map<String, String> config = new HashMap<>();
-+        config.put("from", "invalid-email");
-+
-+        // when
-+        EmailException exception = assertThrows(EmailException.class, () -> provider.validate(config));
-+
-+        // then
-+        assertThat(exception.getMessage(), containsString("Invalid sender address"));
++        return refactoredUrls;
 +    }
 +
-+    @Test
-+    void testValidateWithInvalidReplyToAddressThrowsException() {
-+        // given
-+        DefaultEmailSenderProvider provider = new DefaultEmailSenderProvider(null, null);
-+        Map<String, String> config = new HashMap<>();
-+        config.put("from", "valid@example.com");
-+        config.put("replyTo", "invalid-replyto");
-+
-+        // when
-+        EmailException exception = assertThrows(EmailException.class, () -> provider.validate(config));
-+
-+        // then
-+        assertThat(exception.getMessage(), containsString("Invalid reply-to address"));
++    private static boolean isValidScheme(String url) {
++        return url != null && (url.startsWith("http://") || url.startsWith("https://"));
 +    }
  }
+diff --git a/services/src/main/java/org/keycloak/protocol/oidc/utils/WebOriginsUtils.java b/services/src/main/java/org/keycloak/protocol/oidc/utils/WebOriginsUtils.java
+index 6ebc8c866711..d29decfb822f 100644
+--- a/services/src/main/java/org/keycloak/protocol/oidc/utils/WebOriginsUtils.java
++++ b/services/src/main/java/org/keycloak/protocol/oidc/utils/WebOriginsUtils.java
+@@ -22,6 +22,7 @@
+ 
+ import org.keycloak.common.util.UriUtils;
+ import org.keycloak.models.ClientModel;
++import org.keycloak.models.Constants;
+ import org.keycloak.models.KeycloakSession;
+ 
+ /**
+@@ -29,15 +30,13 @@
+  */
+ public class WebOriginsUtils {
+ 
+-    public static final String INCLUDE_REDIRECTS = "+";
+-
+     public static Set<String> resolveValidWebOrigins(KeycloakSession session, ClientModel client) {
+         Set<String> origins = new HashSet<>();
+         if (client.getWebOrigins() != null) {
+             origins.addAll(client.getWebOrigins());
+         }
+-        if (origins.contains(INCLUDE_REDIRECTS)) {
+-            origins.remove(INCLUDE_REDIRECTS);
++        if (origins.contains(Constants.INCLUDE_REDIRECTS)) {
++            origins.remove(Constants.INCLUDE_REDIRECTS);
+             for (String redirectUri : RedirectUtils.resolveValidRedirects(session, client.getRootUrl(), client.getRedirectUris())) {
+                 if (redirectUri.startsWith("http://") || redirectUri.startsWith("https://")) {
+                     origins.add(UriUtils.getOrigin(redirectUri));
+diff --git a/services/src/main/java/org/keycloak/services/clientpolicy/executor/SecureClientUrisExecutor.java b/services/src/main/java/org/keycloak/services/clientpolicy/executor/SecureClientUrisExecutor.java
+index d320a70b9503..1e9c2c28d057 100644
+--- a/services/src/main/java/org/keycloak/services/clientpolicy/executor/SecureClientUrisExecutor.java
++++ b/services/src/main/java/org/keycloak/services/clientpolicy/executor/SecureClientUrisExecutor.java
+@@ -17,16 +17,19 @@
+ 
+ package org.keycloak.services.clientpolicy.executor;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Optional;
++import java.util.Set;
+ 
+ import org.keycloak.OAuthErrorException;
+ import org.keycloak.models.CibaConfig;
+ import org.keycloak.models.Constants;
+ import org.keycloak.models.KeycloakSession;
+ import org.keycloak.protocol.oidc.OIDCConfigAttributes;
++import org.keycloak.protocol.oidc.utils.RedirectUtils;
+ import org.keycloak.representations.idm.ClientPolicyExecutorConfigurationRepresentation;
+ import org.keycloak.representations.idm.ClientRepresentation;
+ import org.keycloak.services.clientpolicy.ClientPolicyContext;
+@@ -86,38 +89,40 @@ public void executeOnEvent(ClientPolicyContext context) throws ClientPolicyExcep
+                 confirmSecureRedirectUri(((AuthorizationRequestContext)context).getRedirectUri());
+                 return;
+             default:
+-                return;
+         }
+     }
+ 
+     private void confirmSecureUris(ClientRepresentation clientRep) throws ClientPolicyException {
+         // rootUrl
+         String rootUrl = clientRep.getRootUrl();
+-        if (rootUrl != null) confirmSecureUris(Arrays.asList(rootUrl), "rootUrl");
++        if (rootUrl != null) confirmSecureUris(List.of(rootUrl), "rootUrl");
+ 
+         // adminUrl
+         String adminUrl = clientRep.getAdminUrl();
+-        if (adminUrl != null) confirmSecureUris(Arrays.asList(adminUrl), "adminUrl");
++        if (adminUrl != null) confirmSecureUris(List.of(adminUrl), "adminUrl");
+ 
+         // baseUrl
+         String baseUrl = clientRep.getBaseUrl();
+-        if (baseUrl != null) confirmSecureUris(Arrays.asList(baseUrl), "baseUrl");
+-
+-        // web origins
+-        List<String> webOrigins = clientRep.getWebOrigins();
+-        if (webOrigins != null) confirmSecureUris(webOrigins, "webOrigins");
++        if (baseUrl != null) confirmSecureUris(List.of(baseUrl), "baseUrl");
+ 
+         // backchannel logout URL
+         String logoutUrl = Optional.ofNullable(clientRep.getAttributes()).orElse(Collections.emptyMap()).get(OIDCConfigAttributes.BACKCHANNEL_LOGOUT_URL);
+-        if (logoutUrl != null) confirmSecureUris(Arrays.asList(logoutUrl), "logoutUrl");
++        if (logoutUrl != null) confirmSecureUris(List.of(logoutUrl), "logoutUrl");
+ 
+         // OAuth2 : redirectUris
+         List<String> redirectUris = clientRep.getRedirectUris();
+         if (redirectUris != null) confirmSecureUris(redirectUris, "redirectUris");
+ 
++        // web origins
++        List<String> webOrigins = clientRep.getWebOrigins();
++        if (webOrigins != null) {
++            List<String> resolvedWebOriginUrls = resolveUrlWithRedirects(webOrigins, redirectUris, rootUrl, true);
++            confirmSecureUris(resolvedWebOriginUrls, "webOrigins");
++        }
++
+         // OAuth2 : jwks_uri
+         String jwksUri = Optional.ofNullable(clientRep.getAttributes()).orElse(Collections.emptyMap()).get(OIDCConfigAttributes.JWKS_URL);
+-        if (jwksUri != null) confirmSecureUris(Arrays.asList(jwksUri), "jwksUri");
++        if (jwksUri != null) confirmSecureUris(List.of(jwksUri), "jwksUri");
+ 
+         // OIDD : requestUris
+         List<String> requestUris = getAttributeMultivalued(clientRep, OIDCConfigAttributes.REQUEST_URIS);
+@@ -125,7 +130,27 @@ private void confirmSecureUris(ClientRepresentation clientRep) throws ClientPoli
+ 
+         // CIBA : client notification endpoint
+         String clientNotificationEndpoint = Optional.ofNullable(clientRep.getAttributes()).orElse(Collections.emptyMap()).get(CibaConfig.CIBA_BACKCHANNEL_CLIENT_NOTIFICATION_ENDPOINT);
+-        if (clientNotificationEndpoint != null) confirmSecureUris(Arrays.asList(clientNotificationEndpoint), "cibaClientNotificationEndpoint");
++        if (clientNotificationEndpoint != null) confirmSecureUris(List.of(clientNotificationEndpoint), "cibaClientNotificationEndpoint");
++
++        // OIDC: Post Logout URL
++        List<String> postLogoutRedirectUris = getAttributeMultivalued(clientRep, OIDCConfigAttributes.POST_LOGOUT_REDIRECT_URIS);
++        if (postLogoutRedirectUris != null && !postLogoutRedirectUris.isEmpty()) {
++            List<String> validRedirects = clientRep.getRedirectUris() != null ? clientRep.getRedirectUris() : Collections.emptyList();
++            List<String> resolvedPostLogoutUrls = resolveUrlWithRedirects(postLogoutRedirectUris, validRedirects, clientRep.getRootUrl(), false);
++            confirmSecureUris(resolvedPostLogoutUrls, "postLogoutUris");
++        }
++
++        // logoUri
++        String logoUri = Optional.ofNullable(clientRep.getAttributes()).orElse(Collections.emptyMap()).get(OIDCConfigAttributes.LOGO_URI);
++        if (logoUri != null) confirmSecureUris(List.of(logoUri), "logoUri");
++
++        // termsOfServiceUri
++        String termsOfServiceUri = Optional.ofNullable(clientRep.getAttributes()).orElse(Collections.emptyMap()).get(OIDCConfigAttributes.TOS_URI);
++        if (termsOfServiceUri != null) confirmSecureUris(List.of(termsOfServiceUri), "tosUri");
++
++        // policyUri
++        String policyUri = Optional.ofNullable(clientRep.getAttributes()).orElse(Collections.emptyMap()).get(OIDCConfigAttributes.POLICY_URI);
++        if (policyUri != null) confirmSecureUris(List.of(policyUri), "policyUri");
+     }
+ 
+     private List<String> getAttributeMultivalued(ClientRepresentation clientRep, String attrKey) {
+@@ -140,9 +165,11 @@ private void confirmSecureUris(List<String> uris, String uriType) throws ClientP
+         }
+ 
+         for (String uri : uris) {
+-            logger.tracev("{0} = {1}", uriType, uri);
+-            if (!uri.startsWith("https://")  || uri.contains("*")) {
+-                throw new ClientPolicyException(OAuthErrorException.INVALID_CLIENT_METADATA, "Invalid " + uriType);
++            if (!uri.isEmpty()) {
++                logger.tracev("{0} = {1}", uriType, uri);
++                if (!uri.startsWith("https://") || uri.contains("*")) {
++                    throw new ClientPolicyException(OAuthErrorException.INVALID_CLIENT_METADATA, "Invalid " + uriType);
++                }
+             }
+         }
+     }
+@@ -156,6 +183,14 @@ private void confirmSecureRedirectUri(String redirectUri) throws ClientPolicyExc
+         if (!redirectUri.startsWith("https://") || redirectUri.contains("*")) {
+             throw new ClientPolicyException(OAuthErrorException.INVALID_REQUEST, "Invalid redirect_uri");
+         }
++    }
+ 
++    private List<String> resolveUrlWithRedirects(List<String> originalUrls, List<String> redirectUris,
++                                                 String rootUrl, boolean returnAsOrigins) {
++        if (originalUrls == null || originalUrls.isEmpty()) {
++            return Collections.emptyList();
++        }
++        Set<String> resolvedUrls = RedirectUtils.resolveUrlsWithRedirects(session, originalUrls, rootUrl, redirectUris, returnAsOrigins);
++        return new ArrayList<>(resolvedUrls);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java b/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java
+index bdb2b137b908..43c136c09b4a 100755
+--- a/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java
++++ b/services/src/main/java/org/keycloak/services/managers/AppAuthManager.java
+@@ -17,7 +17,6 @@
+ package org.keycloak.services.managers;
+ 
+ import java.util.List;
+-import java.util.regex.Pattern;
+ 
+ import jakarta.ws.rs.NotAuthorizedException;
+ import jakarta.ws.rs.core.HttpHeaders;
+@@ -43,8 +42,6 @@ public class AppAuthManager extends AuthenticationManager {
+ 
+     public static final String BEARER = "Bearer";
+ 
+-    private static final Pattern WHITESPACES = Pattern.compile("\\s+");
+-
+     @Override
+     public AuthResult authenticateIdentityCookie(KeycloakSession session, RealmModel realm) {
+         AuthResult authResult = super.authenticateIdentityCookie(session, realm);
+@@ -66,26 +63,28 @@ private static AuthHeader extractTokenStringFromAuthHeader(String authHeader) {
+             return null;
+         }
+ 
+-        String[] split = WHITESPACES.split(authHeader.trim());
+-        if (split.length != 2){
++        int indexOfSpace = authHeader.indexOf(' ');
++
++        if (indexOfSpace <= 0) {
+             return null;
+         }
+ 
+-        String typeString = split[0];
++        String typeString = authHeader.substring(0, indexOfSpace);
++        String tokenString = authHeader.substring(indexOfSpace + 1);
+ 
++        boolean isBearerHeader = typeString.equalsIgnoreCase(BEARER);
+         if (!Profile.isFeatureEnabled(Profile.Feature.DPOP)) {
+-            if (!typeString.equalsIgnoreCase(BEARER)) {
++            if (!isBearerHeader) {
+                 return null;
+             }
+         } else {
+             // "Bearer" is case-insensitive for historical reasons. "DPoP" is case-sensitive to follow the spec.
+-            if (!typeString.equalsIgnoreCase(BEARER) && !typeString.equals(TokenUtil.TOKEN_TYPE_DPOP)){
++            if (!isBearerHeader && !typeString.equals(TokenUtil.TOKEN_TYPE_DPOP)) {
+                 return null;
+             }
+         }
+ 
+-        String tokenString = split[1];
+-        if (ObjectUtil.isBlank(tokenString)) {
++        if (ObjectUtil.isBlank(tokenString) || tokenString.contains(" ")) {
+             return null;
+         }
+ 
+diff --git a/services/src/main/java/org/keycloak/services/managers/RealmManager.java b/services/src/main/java/org/keycloak/services/managers/RealmManager.java
+index eb73f05b9faa..695b147f7bb0 100755
+--- a/services/src/main/java/org/keycloak/services/managers/RealmManager.java
++++ b/services/src/main/java/org/keycloak/services/managers/RealmManager.java
+@@ -197,8 +197,8 @@ protected void setupAdminConsole(RealmModel realm) {
+         String baseUrl = "/admin/" + Encode.encodePathAsIs(realm.getName()) + "/console/";
+         adminConsole.setBaseUrl(baseUrl);
+         adminConsole.addRedirectUri(baseUrl + "*");
+-        adminConsole.setAttribute(OIDCConfigAttributes.POST_LOGOUT_REDIRECT_URIS, "+");
+-        adminConsole.setWebOrigins(Collections.singleton("+"));
++        adminConsole.setAttribute(OIDCConfigAttributes.POST_LOGOUT_REDIRECT_URIS, Constants.INCLUDE_REDIRECTS);
++        adminConsole.setWebOrigins(Collections.singleton(Constants.INCLUDE_REDIRECTS));
+ 
+         adminConsole.setEnabled(true);
+         adminConsole.setAlwaysDisplayInConsole(false);
+diff --git a/tests/base/src/test/java/org/keycloak/tests/admin/AppAuthManagerTest.java b/tests/base/src/test/java/org/keycloak/tests/admin/AppAuthManagerTest.java
+new file mode 100644
+index 000000000000..94fe4a5b453f
+--- /dev/null
++++ b/tests/base/src/test/java/org/keycloak/tests/admin/AppAuthManagerTest.java
+@@ -0,0 +1,129 @@
++package org.keycloak.tests.admin;
++
++import java.io.IOException;
++
++import jakarta.ws.rs.core.Response;
++
++import org.keycloak.models.AdminRoles;
++import org.keycloak.models.Constants;
++import org.keycloak.testframework.annotations.InjectHttpClient;
++import org.keycloak.testframework.annotations.InjectKeycloakUrls;
++import org.keycloak.testframework.annotations.InjectRealm;
++import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
++import org.keycloak.testframework.oauth.OAuthClient;
++import org.keycloak.testframework.oauth.annotations.InjectOAuthClient;
++import org.keycloak.testframework.realm.ManagedRealm;
++import org.keycloak.testframework.realm.RealmConfig;
++import org.keycloak.testframework.realm.RealmConfigBuilder;
++import org.keycloak.testframework.server.KeycloakUrls;
++import org.keycloak.testsuite.util.oauth.AccessTokenResponse;
++
++import org.apache.http.client.methods.CloseableHttpResponse;
++import org.apache.http.client.methods.HttpGet;
++import org.apache.http.impl.client.CloseableHttpClient;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.Test;
++
++/**
++ *
++ * @author rmartinc
++ */
++@KeycloakIntegrationTest
++public class AppAuthManagerTest {
++
++    @InjectRealm(config = TestRealmConfig.class)
++    ManagedRealm realm;
++
++    @InjectOAuthClient
++    OAuthClient  oAuthClient;
++
++    @InjectKeycloakUrls
++    KeycloakUrls keycloakUrls;
++
++    @InjectHttpClient
++    CloseableHttpClient client;
++
++    @Test
++    public void testSuccess() throws IOException {
++        test("Bearer ", true);
++    }
++
++    @Test
++    public void testFailure_BearerLowerCase() throws IOException {
++        test("bearer ", true);
++    }
++
++    @Test
++    public void testFailure_BearerUpperCase() throws IOException {
++        test("BEARER ", true);
++    }
++
++    @Test
++    public void testFailure_BearerDiffCase() throws IOException {
++        test("BeArEr ", true);
++    }
++
++    @Test
++    public void testFailure_TwoSpaces() throws IOException {
++        test("Bearer  ", false);
++    }
++
++    @Test
++    public void testFailure_MultiSpaces() throws IOException {
++        test("Bearer     ", false);
++    }
++
++    @Test
++    public void testFailure_TabSymbol() throws IOException {
++        test("Bearer\t", false);
++    }
++
++    private void test(String authPrefix, boolean success) throws IOException {
++        AccessTokenResponse response = accessToken(oAuthClient, Constants.ADMIN_CLI_CLIENT_ID, "secret", "test-admin", "password");
++        Assertions.assertNotNull(response.getAccessToken());
++        try (CloseableHttpResponse res = getHttpJsonResponse(whoAmiUrl(), authPrefix, response.getAccessToken())) {
++            Assertions.assertEquals(
++                    success ? Response.Status.OK.getStatusCode() : Response.Status.UNAUTHORIZED.getStatusCode(),
++                    res.getStatusLine().getStatusCode());
++        }
++        oAuthClient.doLogout(response.getRefreshToken());
++    }
++
++    private AccessTokenResponse accessToken(OAuthClient oAuth, String clientId, String clientSecret, String username, String password) {
++        return oAuth.client(clientId, clientSecret).doPasswordGrantRequest(username, password);
++    }
++
++    private CloseableHttpResponse getHttpJsonResponse(String url, String authPrefix, String accessToken) throws IOException{
++        HttpGet httpGet = new HttpGet(url);
++        httpGet.addHeader("Accept", "application/json");
++        httpGet.addHeader("Authorization", authPrefix + accessToken);
++        return client.execute(httpGet);
++    }
++
++    private String whoAmiUrl() {
++        return new StringBuilder()
++                .append(keycloakUrls.getBaseUrl())
++                .append("/admin/default/console/whoami")
++                .toString();
++    }
++
++    private static class TestRealmConfig implements RealmConfig {
++
++        @Override
++        public RealmConfigBuilder configure(RealmConfigBuilder realm) {
++            realm.internationalizationEnabled(false);
++            realm.addUser("test-admin")
++                    .password("password")
++                    .name("Test", "Admin")
++                    .email("locale-off@email.org")
++                    .emailVerified(true)
++                    .clientRoles(Constants.REALM_MANAGEMENT_CLIENT_ID, AdminRoles.REALM_ADMIN);
++            realm.addClient(Constants.ADMIN_CLI_CLIENT_ID)
++                    .name(Constants.ADMIN_CLI_CLIENT_ID)
++                    .secret("secret")
++                    .attribute(Constants.SECURITY_ADMIN_CONSOLE_ATTR, "true")
++                    .directAccessGrantsEnabled(true);
++            return realm;
++        }
++    }
++}
+diff --git a/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/BaseClientAuthTest.java b/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/BaseClientAuthTest.java
+index eadd0abf44e9..55e910fb84ec 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/BaseClientAuthTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/client/authentication/external/BaseClientAuthTest.java
+@@ -117,6 +117,17 @@ public void testClientIdAllowedAsAudience() {
+         assertFailure(INTERNAL_CLIENT_ID, TOKEN_ISSUER, EXTERNAL_CLIENT_ID, jwt.getId(), events.poll());
+     }
+ 
++    @Test
++    public void testDisabledIdentityProvider() {
++        realm.updateIdentityProvider(IDP_ALIAS, rep -> {
++            rep.setEnabled(false);
++        });
++
++        JsonWebToken jwt = createDefaultToken();
++        assertFailure(doClientGrant(jwt));
++        assertFailure(null, TOKEN_ISSUER, EXTERNAL_CLIENT_ID, jwt.getId(), "client_not_found", events.poll());
++    }
++
+     @Override
+     protected OAuthIdentityProvider getIdentityProvider() {
+         return identityProvider;
+diff --git a/tests/base/src/test/java/org/keycloak/tests/oauth/AbstractJWTAuthorizationGrantTest.java b/tests/base/src/test/java/org/keycloak/tests/oauth/AbstractJWTAuthorizationGrantTest.java
+index c4abe1fa4139..27920dc60aa3 100644
+--- a/tests/base/src/test/java/org/keycloak/tests/oauth/AbstractJWTAuthorizationGrantTest.java
++++ b/tests/base/src/test/java/org/keycloak/tests/oauth/AbstractJWTAuthorizationGrantTest.java
+@@ -298,4 +298,15 @@ public void testSuccessGrant() {
+         AccessTokenResponse response = oAuthClient.jwtAuthorizationGrantRequest(jwt).send();
+         assertSuccess("test-app", response);
+     }
++
++    @Test
++    public void testDisabledIdentityProvider() {
++        realm.updateIdentityProvider(IDP_ALIAS, rep -> {
++            rep.setEnabled(false);
++        });
++
++        String jwt = getIdentityProvider().encodeToken(createDefaultAuthorizationGrantToken());
++        AccessTokenResponse response = oAuthClient.jwtAuthorizationGrantRequest(jwt).send();
++        assertFailure("Identity Provider is not enabled", response, events.poll());
++    }
+ }
+diff --git a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/Endpoints.java b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/Endpoints.java
+index 65ba7697a80b..426aacc452a8 100644
+--- a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/Endpoints.java
++++ b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/Endpoints.java
+@@ -90,8 +90,8 @@ public String getOid4vcNonce() {
+         return asString(getBase().path(RealmsResource.class).path("{realm}/protocol/oid4vc/nonce"));
+     }
+ 
+-    public String getOid4vcCredentialOffer(String nonce) {
+-        return asString(getBase().path(RealmsResource.class).path("{realm}/protocol/oid4vc/credential-offer/").path(nonce));
++    public String getOid4vcCredentialOffer() {
++        return asString(getBase().path(RealmsResource.class).path("{realm}/protocol/oid4vc/credential-offer"));
+     }
+ 
+     public String getOid4vcCredentialOfferUri() {
+diff --git a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferRequest.java b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferRequest.java
+index 7bdd0a4c5750..a839c31b2fdf 100644
+--- a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferRequest.java
++++ b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferRequest.java
+@@ -1,7 +1,9 @@
+ package org.keycloak.testsuite.util.oauth.oid4vc;
+ 
+ import java.io.IOException;
++import java.util.Optional;
+ 
++import org.keycloak.protocol.oid4vc.model.CredentialOfferURI;
+ import org.keycloak.testsuite.util.oauth.AbstractHttpGetRequest;
+ import org.keycloak.testsuite.util.oauth.AbstractOAuthClient;
+ 
+@@ -9,28 +11,25 @@
+ 
+ public class CredentialOfferRequest extends AbstractHttpGetRequest<CredentialOfferRequest, CredentialOfferResponse> {
+ 
+-    private String nonce;
++    private final CredentialOfferURI credOfferURI;
+ 
+-    public CredentialOfferRequest(AbstractOAuthClient<?> client) {
++    public CredentialOfferRequest(AbstractOAuthClient<?> client, CredentialOfferURI credOfferUri) {
+         super(client);
++        this.credOfferURI = credOfferUri;
+     }
+ 
+-    public CredentialOfferRequest(String nonce, AbstractOAuthClient<?> client) {
++    public CredentialOfferRequest(AbstractOAuthClient<?> client, String nonce) {
+         super(client);
+-        this.nonce = nonce;
+-    }
+-
+-    public CredentialOfferRequest nonce(String nonce) {
+-        this.nonce = nonce;
+-        return this;
++        credOfferURI = new CredentialOfferURI();
++        credOfferURI.setIssuer(client.getEndpoints().getOid4vcCredentialOffer());
++        credOfferURI.setNonce(nonce);
+     }
+ 
+     @Override
+     protected String getEndpoint() {
+-        if (nonce == null) {
+-            throw new IllegalStateException("Nonce must be provided either via constructor, nonce() method, or endpoint must be overridden");
+-        }
+-        return client.getEndpoints().getOid4vcCredentialOffer(nonce);
++        return Optional.ofNullable(credOfferURI)
++                .map(CredentialOfferURI::getCredentialOfferUri)
++                .orElseThrow(() -> new IllegalStateException("No credOfferURI"));
+     }
+ 
+     @Override
+diff --git a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferResponse.java b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferResponse.java
+index d1f294676a22..3218fc95def0 100644
+--- a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferResponse.java
++++ b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/CredentialOfferResponse.java
+@@ -1,6 +1,7 @@
+ package org.keycloak.testsuite.util.oauth.oid4vc;
+ 
+ import java.io.IOException;
++import java.util.Optional;
+ 
+ import org.keycloak.protocol.oid4vc.model.CredentialsOffer;
+ import org.keycloak.testsuite.util.oauth.AbstractHttpResponse;
+@@ -21,6 +22,7 @@ protected void parseContent() throws IOException {
+     }
+ 
+     public CredentialsOffer getCredentialsOffer() {
+-        return credentialsOffer;
++        return Optional.ofNullable(credentialsOffer).orElseThrow(() ->
++                new IllegalStateException(String.format("[%s] %s", getError(), getErrorDescription())));
+     }
+ }
+diff --git a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/OID4VCClient.java b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/OID4VCClient.java
+index 56155a92cf45..04d8dccb8e96 100644
+--- a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/OID4VCClient.java
++++ b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/oauth/oid4vc/OID4VCClient.java
+@@ -1,5 +1,6 @@
+ package org.keycloak.testsuite.util.oauth.oid4vc;
+ 
++import org.keycloak.protocol.oid4vc.model.CredentialOfferURI;
+ import org.keycloak.testsuite.util.oauth.AbstractOAuthClient;
+ import org.keycloak.testsuite.util.oauth.AccessTokenResponse;
+ 
+@@ -23,16 +24,12 @@ public CredentialOfferUriRequest credentialOfferUriRequest(String credConfigId)
+         return new CredentialOfferUriRequest(client, credConfigId);
+     }
+ 
+-    public CredentialOfferRequest credentialOfferRequest() {
+-        return new CredentialOfferRequest(client);
++    public CredentialOfferRequest credentialOfferRequest(CredentialOfferURI credOfferUri) {
++        return new CredentialOfferRequest(client, credOfferUri);
+     }
+ 
+     public CredentialOfferRequest credentialOfferRequest(String nonce) {
+-        return new CredentialOfferRequest(nonce, client);
+-    }
+-
+-    public CredentialOfferResponse doCredentialOfferRequest(String nonce) {
+-        return credentialOfferRequest(nonce).send();
++        return new CredentialOfferRequest(client, nonce);
+     }
+ 
+     public Oid4vcCredentialRequest credentialRequest() {
+@@ -50,8 +47,4 @@ public AccessTokenResponse doPreAuthorizedCodeGrant(String preAuthorizedCode) {
+     public Oid4vcNonceRequest nonceRequest() {
+         return new Oid4vcNonceRequest(client);
+     }
+-
+-    public String doNonceRequest() {
+-        return nonceRequest().send().getNonce();
+-    }
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/client/policies/ClientPoliciesExecutorTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/client/policies/ClientPoliciesExecutorTest.java
+index c08f9340f605..5ca41c5e1741 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/client/policies/ClientPoliciesExecutorTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/client/policies/ClientPoliciesExecutorTest.java
+@@ -1216,14 +1216,14 @@ public void testSecureClientRegisteringUriEnforceExecutor() throws Exception {
+                 clientRep.setAdminUrl("https://client.example.com/admin/");
+                 // baseUrl
+                 clientRep.setBaseUrl("https://client.example.com/base/");
++                // OAuth2 : redirectUris
++                clientRep.setRedirectUris(Arrays.asList("https://client.example.com/redirect/", "https://client.example.com/callback/"));
+                 // web origins
+                 clientRep.setWebOrigins(Arrays.asList("https://valid.other.client.example.com/", "https://valid.another.client.example.com/"));
+                 // backchannel logout URL
+                 Map<String, String> attributes = Optional.ofNullable(clientRep.getAttributes()).orElse(new HashMap<>());
+                 attributes.put(OIDCConfigAttributes.BACKCHANNEL_LOGOUT_URL, "https://client.example.com/logout/");
+                 clientRep.setAttributes(attributes);
+-                // OAuth2 : redirectUris
+-                clientRep.setRedirectUris(Arrays.asList("https://client.example.com/redirect/", "https://client.example.com/callback/"));
+                 // OAuth2 : jwks_uri
+                 attributes.put(OIDCConfigAttributes.JWKS_URL, "https://client.example.com/jwks/");
+                 clientRep.setAttributes(attributes);
+@@ -1341,6 +1341,45 @@ public void testSecureClientRegisteringUriEnforceExecutor() throws Exception {
+             assertEquals(OAuthErrorException.INVALID_CLIENT_METADATA, e.getError());
+             assertEquals("Invalid cibaClientNotificationEndpoint", e.getErrorDetail());
+         }
++
++        try {
++            updateClientByAdmin(cid, (ClientRepresentation clientRep) -> {
++                // OIDC: logo_uri
++                Map<String, String> attributes = Optional.ofNullable(clientRep.getAttributes()).orElse(new HashMap<>());
++                attributes.put("logoUri", "http://client.example.com/logo/");
++                clientRep.setAttributes(attributes);
++            });
++            fail();
++        } catch (ClientPolicyException e) {
++            assertEquals(OAuthErrorException.INVALID_CLIENT_METADATA, e.getError());
++            assertEquals("Invalid logoUri", e.getErrorDetail());
++        }
++
++        try {
++            updateClientByAdmin(cid, (ClientRepresentation clientRep) -> {
++                // OIDC: tos_uri (Terms of Service)
++                Map<String, String> attributes = Optional.ofNullable(clientRep.getAttributes()).orElse(new HashMap<>());
++                attributes.put("tosUri", "http://client.example.com/tos/");
++                clientRep.setAttributes(attributes);
++            });
++            fail();
++        } catch (ClientPolicyException e) {
++            assertEquals(OAuthErrorException.INVALID_CLIENT_METADATA, e.getError());
++            assertEquals("Invalid tosUri", e.getErrorDetail());
++        }
++
++        try {
++            updateClientByAdmin(cid, (ClientRepresentation clientRep) -> {
++                // OIDC: policy_uri
++                Map<String, String> attributes = Optional.ofNullable(clientRep.getAttributes()).orElse(new HashMap<>());
++                attributes.put("policyUri", "http://client.example.com/policy/");
++                clientRep.setAttributes(attributes);
++            });
++            fail();
++        } catch (ClientPolicyException e) {
++            assertEquals(OAuthErrorException.INVALID_CLIENT_METADATA, e.getError());
++            assertEquals("Invalid policyUri", e.getErrorDetail());
++        }
+     }
+ 
+     @Test
+@@ -1830,4 +1869,133 @@ private CloseableHttpResponse sendRequest(String requestUrl, List<NameValuePair>
+             return client.execute(post);
+         }
+     }
++
++    @Test
++    public void testSecureClientRegisteringUriEnforceExecutorWithRedirectWildcard() throws Exception {
++        // register profiles
++        String json = (new ClientProfilesBuilder()).addProfile(
++                (new ClientProfileBuilder()).createProfile(PROFILE_NAME, "Ensimmainen Profiili")
++                        .addExecutor(SecureClientUrisExecutorFactory.PROVIDER_ID, null)
++                        .toRepresentation()
++        ).toString();
++        updateProfiles(json);
++
++        // register policies
++        json = (new ClientPoliciesBuilder()).addPolicy(
++                (new ClientPolicyBuilder()).createPolicy(POLICY_NAME, "Ensimmainen Politiikka", Boolean.TRUE)
++                        .addCondition(ClientUpdaterContextConditionFactory.PROVIDER_ID,
++                                createClientUpdateContextConditionConfig(Arrays.asList(
++                                        ClientUpdaterContextConditionFactory.BY_AUTHENTICATED_USER,
++                                        ClientUpdaterContextConditionFactory.BY_INITIAL_ACCESS_TOKEN,
++                                        ClientUpdaterContextConditionFactory.BY_REGISTRATION_ACCESS_TOKEN)))
++                        .addProfile(PROFILE_NAME)
++                        .toRepresentation()
++        ).toString();
++        updatePolicies(json);
++
++
++        String cid = null;
++        String clientId = generateSuffixedName(CLIENT_NAME);
++        try {
++            cid = createClientByAdmin(clientId, (ClientRepresentation clientRep) -> {
++                clientRep.setServiceAccountsEnabled(Boolean.TRUE);
++                clientRep.setRedirectUris(List.of("https://client.example.com/redirect/"));
++            });
++        } catch (Exception e) {
++            fail();
++        }
++
++        try {  // Redirect relative wildcard - '+' as single value
++            updateClientByAdmin(cid, (ClientRepresentation clientRep) -> {
++                // rootUrl
++                clientRep.setRootUrl("https://client.example.com/");
++                // adminUrl
++                clientRep.setAdminUrl("https://client.example.com/admin/");
++                // baseUrl
++                clientRep.setBaseUrl("https://client.example.com/base/");
++                // OAuth2 : redirectUris
++                clientRep.setRedirectUris(Arrays.asList("https://client.example.com/redirect/", "https://client.example.com/callback/"));
++                // web origins
++                clientRep.setWebOrigins(List.of("+"));
++                // backchannel logout URL
++                Map<String, String> attributes = Optional.ofNullable(clientRep.getAttributes()).orElse(new HashMap<>());
++                attributes.put(OIDCConfigAttributes.BACKCHANNEL_LOGOUT_URL, "https://client.example.com/logout/");
++                clientRep.setAttributes(attributes);
++                // OIDC: postLogoutUris
++                setAttributeMultivalued(clientRep, OIDCConfigAttributes.POST_LOGOUT_REDIRECT_URIS, List.of("+"));
++                // OAuth2 : jwks_uri
++                attributes.put(OIDCConfigAttributes.JWKS_URL, "https://client.example.com/jwks/");
++                clientRep.setAttributes(attributes);
++                // OIDC : requestUris
++                setAttributeMultivalued(clientRep, OIDCConfigAttributes.REQUEST_URIS, Arrays.asList("https://client.example.com/request/", "https://client.example.com/reqobj/"));
++                // CIBA Client Notification Endpoint
++                attributes.put(CibaConfig.CIBA_BACKCHANNEL_CLIENT_NOTIFICATION_ENDPOINT, "https://client.example.com/client-notification/");
++                clientRep.setAttributes(attributes);
++            });
++        } catch (Exception e) {
++            fail();
++        }
++
++        try { // Redirect relative wildcard - '+' with multiple values
++            updateClientByAdmin(cid, (ClientRepresentation clientRep) -> {
++                // rootUrl
++                clientRep.setRootUrl("https://client.example.com/");
++                // adminUrl
++                clientRep.setAdminUrl("https://client.example.com/admin/");
++                // baseUrl
++                clientRep.setBaseUrl("https://client.example.com/base/");
++                // OAuth2 : redirectUris
++                clientRep.setRedirectUris(List.of("https://client.example.com/redirect/"));
++                // web origins
++                clientRep.setWebOrigins(Arrays.asList("https://valid.other.client.example.com/", "https://valid.another.client.example.com/", "+"));
++                // backchannel logout URL
++                Map<String, String> attributes = Optional.ofNullable(clientRep.getAttributes()).orElse(new HashMap<>());
++                attributes.put(OIDCConfigAttributes.BACKCHANNEL_LOGOUT_URL, "https://client.example.com/logout/");
++                clientRep.setAttributes(attributes);
++                // OIDC: postLogoutUris
++                setAttributeMultivalued(clientRep, OIDCConfigAttributes.POST_LOGOUT_REDIRECT_URIS, Arrays.asList("https://client.example.com/postlogout/", "+"));
++                // OAuth2 : jwks_uri
++                attributes.put(OIDCConfigAttributes.JWKS_URL, "https://client.example.com/jwks/");
++                clientRep.setAttributes(attributes);
++                // OIDC : requestUris
++                setAttributeMultivalued(clientRep, OIDCConfigAttributes.REQUEST_URIS, Arrays.asList("https://client.example.com/request/", "https://client.example.com/reqobj/"));
++                // CIBA Client Notification Endpoint
++                attributes.put(CibaConfig.CIBA_BACKCHANNEL_CLIENT_NOTIFICATION_ENDPOINT, "https://client.example.com/client-notification/");
++                clientRep.setAttributes(attributes);
++            });
++        } catch (Exception e) {
++            fail();
++        }
++
++        try { // Redirect relative wildcard - '+' with no redirect value added
++            updateClientByAdmin(cid, (ClientRepresentation clientRep) -> {
++                // rootUrl
++                clientRep.setRootUrl("https://client.example.com/");
++                // adminUrl
++                clientRep.setAdminUrl("https://client.example.com/admin/");
++                // baseUrl
++                clientRep.setBaseUrl("https://client.example.com/base/");
++                // OAuth2 : redirectUris
++                clientRep.setRedirectUris(null);
++                // web origins
++                clientRep.setWebOrigins(Arrays.asList("+", "https://valid.other.client.example.com/"));
++                // backchannel logout URL
++                Map<String, String> attributes = Optional.ofNullable(clientRep.getAttributes()).orElse(new HashMap<>());
++                attributes.put(OIDCConfigAttributes.BACKCHANNEL_LOGOUT_URL, "https://client.example.com/logout/");
++                clientRep.setAttributes(attributes);
++                // OIDC: postLogoutUris
++                setAttributeMultivalued(clientRep, OIDCConfigAttributes.POST_LOGOUT_REDIRECT_URIS, Arrays.asList("https://client.example.com/postlogout/", "+"));
++                // OAuth2 : jwks_uri
++                attributes.put(OIDCConfigAttributes.JWKS_URL, "https://client.example.com/jwks/");
++                clientRep.setAttributes(attributes);
++                // OIDC : requestUris
++                setAttributeMultivalued(clientRep, OIDCConfigAttributes.REQUEST_URIS, Arrays.asList("https://client.example.com/request/", "https://client.example.com/reqobj/"));
++                // CIBA Client Notification Endpoint
++                attributes.put(CibaConfig.CIBA_BACKCHANNEL_CLIENT_NOTIFICATION_ENDPOINT, "https://client.example.com/client-notification/");
++                clientRep.setAttributes(attributes);
++            });
++        } catch (Exception e) {
++            fail();
++        }
++    }
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/OID4VCICredentialOfferMatrixTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/OID4VCICredentialOfferMatrixTest.java
+index f4525dad9b91..d65443ebbbc4 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/OID4VCICredentialOfferMatrixTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/OID4VCICredentialOfferMatrixTest.java
+@@ -105,8 +105,8 @@ class TestContext {
+         String appClient;
+         CredentialIssuer issuerMetadata;
+         OIDCConfigurationRepresentation authorizationMetadata;
+-        SupportedCredentialConfiguration supportedCredentialConfiguration;
+-        
++        SupportedCredentialConfiguration credentialConfiguration;
++
+         TestContext(boolean preAuth, String appClient, String appUser) {
+             this.preAuthorized = preAuth;
+             this.issUser = issUsername;
+@@ -115,7 +115,7 @@ class TestContext {
+             this.appClient = appClient;
+             this.issuerMetadata = getCredentialIssuerMetadata();
+             this.authorizationMetadata = getAuthorizationMetadata(this.issuerMetadata.getAuthorizationServers().get(0));
+-            this.supportedCredentialConfiguration = this.issuerMetadata.getCredentialsSupported().get(credConfigId);
++            this.credentialConfiguration = this.issuerMetadata.getCredentialsSupported().get(credConfigId);
+         }
+     }
+ 
+@@ -252,13 +252,12 @@ void runCredentialOfferTest(TestContext ctx) throws Exception {
+         // Exclude scope: <credScope>
+         // Require role: credential-offer-create
+         verifyTokenJwt(ctx, issToken,
+-                List.of(), List.of(ctx.supportedCredentialConfiguration.getScope()),
++                List.of(), List.of(ctx.credentialConfiguration.getScope()),
+                 List.of(CREDENTIAL_OFFER_CREATE.getName()), List.of());
+ 
+         // Retrieving the credential-offer-uri
+         //
+         CredentialOfferURI credOfferUri = getCredentialOfferUri(ctx, issToken);
+-        String offerUri = credOfferUri.getCredentialOfferUri();
+ 
+         // Issuer logout in order to remove unwanted session state
+         //
+@@ -268,7 +267,7 @@ void runCredentialOfferTest(TestContext ctx) throws Exception {
+ 
+             // Using the uri to get the actual credential offer
+             //
+-            CredentialsOffer credOffer = getCredentialsOffer(ctx, offerUri);
++            CredentialsOffer credOffer = getCredentialsOffer(ctx, credOfferUri);
+ 
+             if (credOffer.getCredentialConfigurationIds().size() > 1)
+                 throw new IllegalStateException("Multiple credential configuration ids not supported in: " + JsonSerialization.valueAsString(credOffer));
+@@ -397,7 +396,7 @@ private void logout(String userId) {
+     }
+ 
+     private CredentialOfferURI getCredentialOfferUri(TestContext ctx, String token) throws Exception {
+-        String credConfigId = ctx.supportedCredentialConfiguration.getId();
++        String credConfigId = ctx.credentialConfiguration.getId();
+         CredentialOfferUriResponse credentialOfferURIResponse = oauth.oid4vc()
+                 .credentialOfferUriRequest(credConfigId)
+                 .preAuthorized(ctx.preAuthorized)
+@@ -411,19 +410,12 @@ private CredentialOfferURI getCredentialOfferUri(TestContext ctx, String token)
+         return credentialOfferURI;
+     }
+ 
+-    private CredentialsOffer getCredentialsOffer(TestContext ctx, String offerUri) throws Exception {
++    private CredentialsOffer getCredentialsOffer(TestContext ctx, CredentialOfferURI credOfferUri) throws Exception {
+         CredentialOfferResponse credentialOfferResponse = oauth.oid4vc()
+-                .credentialOfferRequest()
+-                .endpoint(offerUri)
++                .credentialOfferRequest(credOfferUri)
+                 .send();
+-        int statusCode = credentialOfferResponse.getStatusCode();
+-        if (HttpStatus.SC_OK != statusCode) {
+-            throw new IllegalStateException(credentialOfferResponse.getErrorDescription() != null
+-                    ? credentialOfferResponse.getErrorDescription()
+-                    : "Request failed with status " + statusCode);
+-        }
+         CredentialsOffer credOffer = credentialOfferResponse.getCredentialsOffer();
+-        assertEquals(List.of(ctx.supportedCredentialConfiguration.getId()), credOffer.getCredentialConfigurationIds());
++        assertEquals(List.of(ctx.credentialConfiguration.getId()), credOffer.getCredentialConfigurationIds());
+         return credOffer;
+     }
+ 
+@@ -479,7 +471,7 @@ private CredentialResponse getCredentialByOffer(TestContext ctx, String accessTo
+             // No authorization_details, use credential_configuration_id
+             credentialRequest.setCredentialConfigurationId(credConfigIds.get(0));
+         }
+-        
++
+         return sendCredentialRequest(ctx, accessToken, credentialRequest);
+     }
+ 
+@@ -512,7 +504,7 @@ private CredentialResponse sendCredentialRequest(TestContext ctx, String accessT
+ 
+     private void verifyCredentialResponse(TestContext ctx, CredentialResponse credResponse) throws Exception {
+ 
+-        String scope = ctx.supportedCredentialConfiguration.getScope();
++        String scope = ctx.credentialConfiguration.getScope();
+         CredentialResponse.Credential credentialObj = credResponse.getCredentials().get(0);
+         assertNotNull("The first credential in the array should not be null", credentialObj);
+ 
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java
+index 0481459b6b1c..8a4bb0bd48b0 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCAuthorizationDetailsFlowTestBase.java
+@@ -138,8 +138,8 @@ protected Oid4vcTestContext prepareOid4vcTestContext(String token) throws Except
+         // Clear events before credential offer request
+         events.clear();
+ 
+-        CredentialOfferResponse credentialOfferResponse = oauth.oid4vc().credentialOfferRequest()
+-                .endpoint(credentialOfferURI.getIssuer() + "/" + credentialOfferURI.getNonce())
++        CredentialOfferResponse credentialOfferResponse = oauth.oid4vc()
++                .credentialOfferRequest(credentialOfferURI)
+                 .send();
+         assertEquals(HttpStatus.SC_OK, credentialOfferResponse.getStatusCode());
+         ctx.credentialsOffer = credentialOfferResponse.getCredentialsOffer();
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCCredentialOfferCorsTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCCredentialOfferCorsTest.java
+index f5ddbb7278ec..30f38679abb2 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCCredentialOfferCorsTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCCredentialOfferCorsTest.java
+@@ -21,7 +21,6 @@
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.Set;
+-import java.util.concurrent.atomic.AtomicReference;
+ import java.util.stream.Collectors;
+ 
+ import jakarta.ws.rs.core.HttpHeaders;
+@@ -83,7 +82,6 @@ public class OID4VCCredentialOfferCorsTest extends OID4VCIssuerEndpointTest {
+     @Rule
+     public TokenUtil tokenUtil = new TokenUtil();
+ 
+-
+     @Override
+     public void configureTestRealm(RealmRepresentation testRealm) {
+         super.configureTestRealm(testRealm);
+@@ -175,14 +173,14 @@ public void testCredentialOfferUriCorsPreflightInvalidOrigin() throws Exception
+     public void testCredentialOfferSessionCorsValidOrigin() throws Exception {
+         // First get a credential offer URI to obtain a nonce
+         AccessTokenResponse tokenResponse = getAccessToken();
+-        String nonce = getNonceFromOfferUri(tokenResponse.getAccessToken());
++        CredentialOfferURI credOfferUri = getCredentialOfferUri(tokenResponse.getAccessToken());
+ 
+         // Clear events before credential offer request
+         events.clear();
+ 
+         // Test credential offer endpoint with valid origin
+         CredentialOfferResponse response = oauth.oid4vc()
+-                .credentialOfferRequest(nonce)
++                .credentialOfferRequest(credOfferUri)
+                 .header("Origin", VALID_CORS_URL)
+                 .send();
+ 
+@@ -210,14 +208,11 @@ public void testCredentialOfferSessionCorsValidOrigin() throws Exception {
+     public void testCredentialOfferSessionCorsInvalidOrigin() throws Exception {
+         // First get a credential offer URI to obtain a nonce
+         AccessTokenResponse tokenResponse = getAccessToken();
+-        String nonce = getNonceFromOfferUri(tokenResponse.getAccessToken());
++        CredentialOfferURI credOfferUri = getCredentialOfferUri(tokenResponse.getAccessToken());
+ 
+         // Test credential offer endpoint with invalid origin
+-        String offerUrl = getCredentialOfferUrl(nonce);
+-
+         CredentialOfferResponse response = oauth.oid4vc()
+-                .credentialOfferRequest()
+-                .endpoint(offerUrl)
++                .credentialOfferRequest(credOfferUri)
+                 .header("Origin", INVALID_CORS_URL)
+                 .send();
+ 
+@@ -230,10 +225,10 @@ public void testCredentialOfferSessionCorsInvalidOrigin() throws Exception {
+     public void testCredentialOfferSessionCorsPreflightRequest() throws Exception {
+         // First get a credential offer URI to obtain a nonce
+         AccessTokenResponse tokenResponse = getAccessToken();
+-        String nonce = getNonceFromOfferUri(tokenResponse.getAccessToken());
++        CredentialOfferURI credOfferUri = getCredentialOfferUri(tokenResponse.getAccessToken());
+ 
+         // Test preflight request for credential offer endpoint
+-        String offerUrl = getCredentialOfferUrl(nonce);
++        String offerUrl = credOfferUri.getCredentialOfferUri();
+ 
+         try (CloseableHttpResponse response = makePreflightRequest(offerUrl, VALID_CORS_URL)) {
+             assertEquals(HttpStatus.SC_OK, response.getStatusLine().getStatusCode());
+@@ -330,9 +325,8 @@ public void testCredentialOfferWithExpiredNonce() throws Exception {
+ 
+         // Create an expired credential offer using testing client
+         // Use AtomicReference to avoid serialization issues with lambda captures
+-        AtomicReference<String> nonceHolder = new AtomicReference<>();
+-        final String issuerPath = getRealmPath(TEST_REALM_NAME);
+-        testingClient.server(TEST_REALM_NAME).run(session -> {
++        String issuerPath = getRealmPath(TEST_REALM_NAME);
++        String nonce = testingClient.server(TEST_REALM_NAME).fetchString(session -> {
+             CredentialsOffer credOffer = new CredentialsOffer()
+                     .setCredentialIssuer(issuerPath)
+                     .setGrants(new PreAuthorizedGrant().setPreAuthorizedCode(new PreAuthorizedCode().setPreAuthorizedCode("test-code")))
+@@ -344,18 +338,15 @@ public void testCredentialOfferWithExpiredNonce() throws Exception {
+             CredentialOfferState offerState = new CredentialOfferState(credOffer, null, null, Time.currentTime() - 1);
+             offerStorage.putOfferState(session, offerState);
+             session.getTransactionManager().commit();
+-            nonceHolder.set(offerState.getNonce());
++            return offerState.getNonce();
+         });
+-
+-        String nonce = nonceHolder.get();
++        assertNotNull("CredentialOffer nonce not null", nonce);
+ 
+         events.clear();
+ 
+         // Try to fetch the expired credential offer
+-        String offerUrl = getCredentialOfferUrl(nonce);
+         CredentialOfferResponse response = oauth.oid4vc()
+-                .credentialOfferRequest()
+-                .endpoint(offerUrl)
++                .credentialOfferRequest(nonce)
+                 .header("Origin", VALID_CORS_URL)
+                 .send();
+ 
+@@ -401,7 +392,8 @@ private String getCredentialOfferUriUrl(String configId, Boolean preAuthorized,
+         return res;
+     }
+ 
+-    private String getNonceFromOfferUri(String accessToken) throws Exception {
++    private CredentialOfferURI getCredentialOfferUri(String accessToken) throws Exception {
++
+         CredentialOfferUriResponse response = oauth.oid4vc()
+                 .credentialOfferUriRequest(jwtTypeCredentialConfigurationIdName)
+                 .preAuthorized(true)
+@@ -411,8 +403,7 @@ private String getNonceFromOfferUri(String accessToken) throws Exception {
+                 .send();
+ 
+         assertEquals(HttpStatus.SC_OK, response.getStatusCode());
+-        CredentialOfferURI offerUri = response.getCredentialOfferURI();
+-        return offerUri.getNonce();
++        return response.getCredentialOfferURI();
+     }
+ 
+     private CloseableHttpResponse makeCorsRequest(String url, String origin, String accessToken) throws IOException {
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java
+index 0d6b8ba8b067..c0bd9172f684 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCIssuerEndpointTest.java
+@@ -107,7 +107,6 @@
+ import org.keycloak.testsuite.util.AdminClientUtil;
+ import org.keycloak.testsuite.util.oauth.OpenIDProviderConfigurationResponse;
+ import org.keycloak.testsuite.util.oauth.oid4vc.CredentialIssuerMetadataResponse;
+-import org.keycloak.testsuite.util.oauth.oid4vc.Oid4vcCredentialResponse;
+ import org.keycloak.userprofile.DeclarativeUserProfileProviderFactory;
+ import org.keycloak.userprofile.config.UPConfigUtils;
+ import org.keycloak.util.JsonSerialization;
+@@ -617,25 +616,6 @@ protected String getCredentialOfferUrl(String nonce) {
+         return getBasePath("test") + "credential-offer/" + nonce;
+     }
+ 
+-    protected void requestCredential(String token,
+-                                     String credentialEndpoint,
+-                                     SupportedCredentialConfiguration offeredCredential,
+-                                     CredentialResponseHandler responseHandler,
+-                                     ClientScopeRepresentation expectedClientScope) throws IOException, VerificationException {
+-        Oid4vcCredentialResponse credentialRequestResponse = oauth.oid4vc()
+-                .credentialRequest()
+-                .endpoint(credentialEndpoint)
+-                .bearerToken(token)
+-                .credentialConfigurationId(offeredCredential.getId())
+-                .send();
+-
+-        assertEquals(HttpStatus.SC_OK, credentialRequestResponse.getStatusCode());
+-        CredentialResponse credentialResponse = credentialRequestResponse.getCredentialResponse();
+-
+-        // Use response handler to customize checks based on formats.
+-        responseHandler.handleCredentialResponse(credentialResponse, expectedClientScope);
+-    }
+-
+     protected void requestCredentialWithIdentifier(String token,
+                                                    String credentialEndpoint,
+                                                    String credentialIdentifier,
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
+index 7fc271a4376c..7fdbc15bc772 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCJWTIssuerEndpointTest.java
+@@ -463,7 +463,7 @@ public void testCredentialIssuance() throws Exception {
+ 
+         // 2. Using the uri to get the actual credential offer
+         CredentialsOffer credentialsOffer = oauth.oid4vc()
+-                .credentialOfferRequest(credentialOfferURI.getNonce())
++                .credentialOfferRequest(credentialOfferURI)
+                 .bearerToken(token)
+                 .send()
+                 .getCredentialsOffer();
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java
+index fa42902b2f9a..23ebe7af02ea 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oid4vc/issuance/signing/OID4VCSdJwtIssuingEndpointTest.java
+@@ -386,7 +386,7 @@ public void testCredentialIssuance() throws Exception {
+ 
+         // 2. Using the uri to get the actual credential offer
+         CredentialsOffer credentialsOffer = oauth.oid4vc()
+-                .credentialOfferRequest(credentialOfferURI.getNonce())
++                .credentialOfferRequest(credentialOfferURI)
+                 .bearerToken(token)
+                 .send()
+                 .getCredentialsOffer();

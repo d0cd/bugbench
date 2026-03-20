@@ -1,26 +1,3714 @@
-diff --git a/leo/cli/commands/mod.rs b/leo/cli/commands/mod.rs
-index 7db1efe3ae..d22cd8683c 100644
---- a/leo/cli/commands/mod.rs
-+++ b/leo/cli/commands/mod.rs
-@@ -287,7 +287,7 @@ fn handle_broadcast<N: Network>(endpoint: &String, transaction: Transaction<N>,
-         .redirects(0)
-         .build()
-         .post(endpoint)
--        .set(&format!("X-Aleo-Leo-{}", env!("CARGO_PKG_VERSION")), "true")
-+        .set("X-Leo-Version", env!("CARGO_PKG_VERSION"))
-         .send_json(&transaction)
-         .map_err(|err| CliError::broadcast_error(err.to_string()))?;
-     match response.status() {
-diff --git a/utils/retriever/src/retriever/mod.rs b/utils/retriever/src/retriever/mod.rs
-index be3f5059aa..fdd29a1436 100644
---- a/utils/retriever/src/retriever/mod.rs
-+++ b/utils/retriever/src/retriever/mod.rs
-@@ -523,7 +523,7 @@ pub fn fetch_from_network(url: &str) -> Result<String, UtilError> {
-         .redirects(0)
-         .build()
-         .get(url)
--        .set(&format!("X-Aleo-Leo-{}", env!("CARGO_PKG_VERSION")), "true")
-+        .set("X-Leo-Version", env!("CARGO_PKG_VERSION"))
-         .call()
-         .map_err(|err| UtilError::failed_to_retrieve_from_endpoint(err, Default::default()))?;
-     match response.status() {
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index fc4ae82088..6749f22c9f 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -96,6 +96,34 @@ jobs:
+           command: test
+           args: --release --all --features ci_skip --no-fail-fast
+ 
++  test-package:
++    name: Test Package
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        rust:
++          - stable
++          - nightly
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v2
++
++      - name: Install Rust (${{ matrix.rust }})
++        uses: actions-rs/toolchain@v1
++        with:
++          profile: minimal
++          toolchain: ${{ matrix.rust }}
++          override: true
++
++      - name: Install cargo-all-features
++        run: |
++          cargo install cargo-all-features
++
++      - name: Test
++        run: |
++          cd package
++          cargo test-all-features
++
+   codecov:
+     name: Code Coverage
+     runs-on: ubuntu-latest
+diff --git a/Cargo.lock b/Cargo.lock
+index fd7bf5ff52..cece206388 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1234,6 +1234,7 @@ dependencies = [
+  "bincode",
+  "hex",
+  "leo-ast",
++ "leo-core",
+  "leo-gadgets",
+  "leo-input",
+  "leo-package",
+@@ -1245,6 +1246,7 @@ dependencies = [
+  "rand_xorshift",
+  "serde",
+  "sha2",
++ "snarkos-algorithms",
+  "snarkos-curves",
+  "snarkos-dpc",
+  "snarkos-errors",
+@@ -1257,6 +1259,22 @@ dependencies = [
+  "tracing-subscriber",
+ ]
+ 
++[[package]]
++name = "leo-core"
++version = "1.0.1"
++dependencies = [
++ "leo-gadgets",
++ "leo-typed",
++ "rand",
++ "rand_xorshift",
++ "snarkos-curves",
++ "snarkos-errors",
++ "snarkos-gadgets",
++ "snarkos-models",
++ "snarkos-utilities",
++ "thiserror",
++]
++
+ [[package]]
+ name = "leo-gadgets"
+ version = "1.0.3"
+@@ -1299,6 +1317,7 @@ dependencies = [
+  "from-pest",
+  "lazy_static",
+  "leo-compiler",
++ "leo-core",
+  "leo-gadgets",
+  "leo-input",
+  "leo-package",
+diff --git a/Cargo.toml b/Cargo.toml
+index 2a5cf15591..618495c59a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,6 +28,7 @@ path = "leo/main.rs"
+ members = [
+   "ast",
+   "compiler",
++  "core",
+   "gadgets",
+   "input",
+   "linter",
+@@ -40,6 +41,10 @@ members = [
+ path = "./compiler"
+ version = "1.0.3"
+ 
++[dependencies.leo-core]
++path = "./core"
++version = "1.0.1"
++
+ [dependencies.leo-gadgets]
+ path = "./gadgets"
+ version = "1.0.3"
+diff --git a/ast/src/common/assignee.rs b/ast/src/common/assignee.rs
+index a11b442f29..6136b05440 100644
+--- a/ast/src/common/assignee.rs
++++ b/ast/src/common/assignee.rs
+@@ -14,7 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::{access::AssigneeAccess, ast::Rule, common::KeywordOrIdentifier, SpanDef};
++use crate::{access::AssigneeAccess, ast::Rule, common::SelfKeywordOrIdentifier, SpanDef};
+ 
+ use pest::Span;
+ use pest_ast::FromPest;
+@@ -24,7 +24,7 @@ use std::fmt;
+ #[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
+ #[pest_ast(rule(Rule::assignee))]
+ pub struct Assignee<'ast> {
+-    pub name: KeywordOrIdentifier<'ast>,
++    pub name: SelfKeywordOrIdentifier<'ast>,
+     pub accesses: Vec<AssigneeAccess<'ast>>,
+     #[pest_ast(outer())]
+     #[serde(with = "SpanDef")]
+diff --git a/ast/src/common/keyword_or_identifier.rs b/ast/src/common/keyword_or_identifier.rs
+index d5a3c4ac7a..525b64e99f 100644
+--- a/ast/src/common/keyword_or_identifier.rs
++++ b/ast/src/common/keyword_or_identifier.rs
+@@ -14,13 +14,8 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::{
+-    ast::Rule,
+-    common::{Identifier, SelfKeyword},
+-    functions::InputKeyword,
+-};
++use crate::{ast::Rule, common::SelfKeywordOrIdentifier, functions::InputKeyword, types::SelfType};
+ 
+-use crate::types::SelfType;
+ use pest_ast::FromPest;
+ use serde::Serialize;
+ use std::fmt;
+@@ -28,19 +23,17 @@ use std::fmt;
+ #[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
+ #[pest_ast(rule(Rule::keyword_or_identifier))]
+ pub enum KeywordOrIdentifier<'ast> {
+-    SelfKeyword(SelfKeyword<'ast>),
+     SelfType(SelfType<'ast>),
+     Input(InputKeyword<'ast>),
+-    Identifier(Identifier<'ast>),
++    SelfKeywordOrIdentifier(SelfKeywordOrIdentifier<'ast>),
+ }
+ 
+ impl<'ast> fmt::Display for KeywordOrIdentifier<'ast> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         match self {
+-            KeywordOrIdentifier::SelfKeyword(self_keyword) => write!(f, "{}", self_keyword),
+             KeywordOrIdentifier::SelfType(self_type) => write!(f, "{}", self_type),
+             KeywordOrIdentifier::Input(input_keyword) => write!(f, "{}", input_keyword),
+-            KeywordOrIdentifier::Identifier(identifier) => write!(f, "{}", identifier),
++            KeywordOrIdentifier::SelfKeywordOrIdentifier(name) => write!(f, "{}", name),
+         }
+     }
+ }
+diff --git a/ast/src/common/mod.rs b/ast/src/common/mod.rs
+index 7029423a3e..119287f5cc 100644
+--- a/ast/src/common/mod.rs
++++ b/ast/src/common/mod.rs
+@@ -44,6 +44,9 @@ pub use range_or_expression::*;
+ pub mod self_keyword;
+ pub use self_keyword::*;
+ 
++pub mod self_keyword_or_identifier;
++pub use self_keyword_or_identifier::*;
++
+ pub mod spread;
+ pub use spread::*;
+ 
+diff --git a/ast/src/common/self_keyword_or_identifier.rs b/ast/src/common/self_keyword_or_identifier.rs
+new file mode 100644
+index 0000000000..44818d7610
+--- /dev/null
++++ b/ast/src/common/self_keyword_or_identifier.rs
+@@ -0,0 +1,40 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{
++    ast::Rule,
++    common::{Identifier, SelfKeyword},
++};
++
++use pest_ast::FromPest;
++use serde::Serialize;
++use std::fmt;
++
++#[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
++#[pest_ast(rule(Rule::self_keyword_or_identifier))]
++pub enum SelfKeywordOrIdentifier<'ast> {
++    SelfKeyword(SelfKeyword<'ast>),
++    Identifier(Identifier<'ast>),
++}
++
++impl<'ast> fmt::Display for SelfKeywordOrIdentifier<'ast> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        match self {
++            SelfKeywordOrIdentifier::SelfKeyword(self_keyword) => write!(f, "{}", self_keyword),
++            SelfKeywordOrIdentifier::Identifier(identifier) => write!(f, "{}", identifier),
++        }
++    }
++}
+diff --git a/ast/src/leo.pest b/ast/src/leo.pest
+index 5a88b56dcb..69a002f37d 100644
+--- a/ast/src/leo.pest
++++ b/ast/src/leo.pest
+@@ -1,7 +1,7 @@
+ /// Common
+ 
+ // Declared in common/assignee.rs
+-assignee = { keyword_or_identifier ~ access_assignee* }
++assignee = { self_keyword_or_identifier ~ access_assignee* }
+ 
+ // Declared in files/file.rs
+ file = { SOI ~ NEWLINE* ~ definition* ~ NEWLINE* ~ EOI }
+@@ -47,6 +47,19 @@ protected_name = {
+ // Declared in common/self_keyword.rs
+ self_keyword = { "self" }
+ 
++// Declared in common/self_keyword_or_identifier.rs
++self_keyword_or_identifier = {
++    self_keyword
++    | identifier
++}
++
++// Declared in common/keyword_or_identifier.rs
++keyword_or_identifier = {
++    input_keyword
++    | type_self
++    | self_keyword_or_identifier
++}
++
+ // Declared in common/line_end.rs
+ LINE_END = { ";" ~ NEWLINE* }
+ 
+@@ -365,14 +378,6 @@ expression_unary = { operation_unary ~ expression_term }
+ // Declared in expressions/postfix_expression.rs
+ expression_postfix = ${ keyword_or_identifier ~ access+ }
+ 
+-// Declared in expressions/postfix_expression.rs
+-keyword_or_identifier = {
+-    input_keyword
+-    | self_keyword
+-    | type_self
+-    | identifier
+-}
+-
+ /// Statements
+ 
+ // Declared in statements/statement.rs
+diff --git a/compiler/Cargo.toml b/compiler/Cargo.toml
+index 1bb18b9d24..80b22634d2 100644
+--- a/compiler/Cargo.toml
++++ b/compiler/Cargo.toml
+@@ -21,6 +21,10 @@ edition = "2018"
+ path = "../ast"
+ version = "1.0.3"
+ 
++[dependencies.leo-core]
++path = "../core"
++version = "1.0.1"
++
+ [dependencies.leo-gadgets]
+ path = "../gadgets"
+ version = "1.0.3"
+@@ -102,6 +106,10 @@ version = "0.2"
+ [dev-dependencies.num-bigint]
+ version = "0.3"
+ 
++[dev-dependencies.snarkos-algorithms]
++version = "1.1.3"
++default-features = false
++
+ [features]
+ default = [ ]
+ ci_skip = [ "leo-ast/ci_skip", "leo-typed/ci_skip" ]
+diff --git a/compiler/src/errors/expression.rs b/compiler/src/errors/expression.rs
+index 47b4bd15e5..65b8c69bd5 100644
+--- a/compiler/src/errors/expression.rs
++++ b/compiler/src/errors/expression.rs
+@@ -15,6 +15,7 @@
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use crate::errors::{AddressError, BooleanError, FieldError, FunctionError, GroupError, IntegerError, ValueError};
++use leo_core::LeoCoreError;
+ use leo_typed::{Error as FormattedError, Identifier, Span};
+ 
+ use snarkos_errors::gadgets::SynthesisError;
+@@ -43,6 +44,9 @@ pub enum ExpressionError {
+     #[error("{}", _0)]
+     IntegerError(#[from] IntegerError),
+ 
++    #[error("{}", _0)]
++    LeoCoreError(#[from] LeoCoreError),
++
+     #[error("{}", _0)]
+     ValueError(#[from] ValueError),
+ }
+@@ -57,6 +61,7 @@ impl ExpressionError {
+             ExpressionError::FunctionError(error) => error.set_path(path),
+             ExpressionError::GroupError(error) => error.set_path(path),
+             ExpressionError::IntegerError(error) => error.set_path(path),
++            ExpressionError::LeoCoreError(error) => error.set_path(path),
+             ExpressionError::ValueError(error) => error.set_path(path),
+         }
+     }
+diff --git a/compiler/src/errors/function.rs b/compiler/src/errors/function.rs
+index f002e4ddd0..d41af4c915 100644
+--- a/compiler/src/errors/function.rs
++++ b/compiler/src/errors/function.rs
+@@ -106,6 +106,12 @@ impl FunctionError {
+         Self::new_from_span(message, span)
+     }
+ 
++    pub fn return_argument_type(expected: String, actual: String, span: Span) -> Self {
++        let message = format!("Expected function return type `{}`, found `{}`", expected, actual);
++
++        Self::new_from_span(message, span)
++    }
++
+     pub fn input_not_found(expected: String, span: Span) -> Self {
+         let message = format!("main function input {} not found", expected);
+ 
+diff --git a/compiler/src/errors/import.rs b/compiler/src/errors/import.rs
+index 374273114e..42c43e8420 100644
+--- a/compiler/src/errors/import.rs
++++ b/compiler/src/errors/import.rs
+@@ -17,6 +17,7 @@
+ use leo_ast::ParserError;
+ use leo_typed::{Error as FormattedError, Identifier, ImportSymbol, Span};
+ 
++use leo_core::LeoCoreError;
+ use std::{io, path::PathBuf};
+ 
+ #[derive(Debug, Error)]
+@@ -24,6 +25,9 @@ pub enum ImportError {
+     #[error("{}", _0)]
+     Error(#[from] FormattedError),
+ 
++    #[error("{}", _0)]
++    LeoCoreError(#[from] LeoCoreError),
++
+     #[error("{}", _0)]
+     ParserError(#[from] ParserError),
+ }
+diff --git a/compiler/src/expression/expression.rs b/compiler/src/expression/expression.rs
+index 0b63a99002..3304c2725d 100644
+--- a/compiler/src/expression/expression.rs
++++ b/compiler/src/expression/expression.rs
+@@ -292,6 +292,15 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                 arguments,
+                 span,
+             ),
++            Expression::CoreFunctionCall(function, arguments, span) => self.enforce_core_circuit_call_expression(
++                cs,
++                file_scope,
++                function_scope,
++                expected_type,
++                function,
++                arguments,
++                span,
++            ),
+         }
+     }
+ }
+diff --git a/compiler/src/expression/function/core_circuit.rs b/compiler/src/expression/function/core_circuit.rs
+new file mode 100644
+index 0000000000..6dbabbc5e7
+--- /dev/null
++++ b/compiler/src/expression/function/core_circuit.rs
+@@ -0,0 +1,77 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++use crate::{program::ConstrainedProgram, value::ConstrainedValue, GroupType};
++
++use crate::errors::{ExpressionError, FunctionError};
++use leo_core::call_core_circuit;
++use leo_typed::{Expression, Span, Type};
++use snarkos_models::{
++    curves::{Field, PrimeField},
++    gadgets::r1cs::ConstraintSystem,
++};
++
++impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
++    /// Call a default core circuit function with arguments
++    pub fn enforce_core_circuit_call_expression<CS: ConstraintSystem<F>>(
++        &mut self,
++        cs: &mut CS,
++        file_scope: String,
++        function_scope: String,
++        expected_type: Option<Type>,
++        core_circuit: String,
++        arguments: Vec<Expression>,
++        span: Span,
++    ) -> Result<ConstrainedValue<F, G>, ExpressionError> {
++        // Get the value of each core function argument
++        let mut argument_values = vec![];
++        for argument in arguments.into_iter() {
++            let argument_value =
++                self.enforce_expression(cs, file_scope.clone(), function_scope.clone(), None, argument)?;
++            let core_function_argument = argument_value.to_value();
++
++            argument_values.push(core_function_argument);
++        }
++
++        // Call the core function in `leo-core`
++        let res = call_core_circuit(cs, core_circuit, argument_values, span.clone())?;
++
++        // Convert the core function returns into constrained values
++        let returns = res
++            .into_iter()
++            .map(|value| ConstrainedValue::from(value))
++            .collect::<Vec<_>>();
++
++        let return_value = if returns.len() == 1 {
++            // The function has a single return
++            returns[0].clone()
++        } else {
++            // The function has multiple returns
++            ConstrainedValue::Tuple(returns)
++        };
++
++        // Check that function returns expected type
++        if let Some(expected) = expected_type {
++            let actual = return_value.to_type(span.clone())?;
++            if expected.ne(&actual) {
++                return Err(ExpressionError::FunctionError(Box::new(
++                    FunctionError::return_argument_type(expected.to_string(), actual.to_string(), span),
++                )));
++            }
++        }
++
++        return Ok(return_value);
++    }
++}
+diff --git a/compiler/src/expression/function/mod.rs b/compiler/src/expression/function/mod.rs
+index 8fa8badb89..e8f769f2ae 100644
+--- a/compiler/src/expression/function/mod.rs
++++ b/compiler/src/expression/function/mod.rs
+@@ -16,5 +16,8 @@
+ 
+ //! Methods to enforce function call expressions in a compiled Leo program.
+ 
++pub mod core_circuit;
++pub use self::core_circuit::*;
++
+ pub mod function;
+ pub use self::function::*;
+diff --git a/compiler/src/import/parser/core_package.rs b/compiler/src/import/parser/core_package.rs
+new file mode 100644
+index 0000000000..2873eb4346
+--- /dev/null
++++ b/compiler/src/import/parser/core_package.rs
+@@ -0,0 +1,28 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{errors::ImportError, ImportParser};
++use leo_typed::Package;
++
++pub static CORE_PACKAGE_NAME: &str = "core";
++
++impl ImportParser {
++    // import a core package into scope
++    pub fn parse_core_package(&mut self, package: &Package) -> Result<(), ImportError> {
++        self.insert_core_package(package);
++        Ok(())
++    }
++}
+diff --git a/compiler/src/import/parser/import_parser.rs b/compiler/src/import/parser/import_parser.rs
+index 2707208d52..c870f8670f 100644
+--- a/compiler/src/import/parser/import_parser.rs
++++ b/compiler/src/import/parser/import_parser.rs
+@@ -15,7 +15,7 @@
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use crate::errors::ImportError;
+-use leo_typed::Program;
++use leo_typed::{Package, Program};
+ 
+ use std::{collections::HashMap, env::current_dir};
+ 
+@@ -24,24 +24,34 @@ use std::{collections::HashMap, env::current_dir};
+ #[derive(Clone)]
+ pub struct ImportParser {
+     imports: HashMap<String, Program>,
++    core_packages: Vec<Package>,
+ }
+ 
+ impl ImportParser {
+     pub fn new() -> Self {
+         Self {
+             imports: HashMap::new(),
++            core_packages: vec![],
+         }
+     }
+ 
+-    pub(crate) fn insert(&mut self, file_name: String, program: Program) {
++    pub(crate) fn insert_import(&mut self, file_name: String, program: Program) {
+         // todo: handle conflicting versions for duplicate imports here
+         let _res = self.imports.insert(file_name, program);
+     }
+ 
+-    pub fn get(&self, file_name: &String) -> Option<&Program> {
++    pub(crate) fn insert_core_package(&mut self, package: &Package) {
++        let _res = self.core_packages.push(package.clone());
++    }
++
++    pub fn get_import(&self, file_name: &String) -> Option<&Program> {
+         self.imports.get(file_name)
+     }
+ 
++    pub fn core_packages(&self) -> &Vec<Package> {
++        &self.core_packages
++    }
++
+     pub fn parse(program: &Program) -> Result<Self, ImportError> {
+         let mut imports = Self::new();
+ 
+diff --git a/compiler/src/import/parser/mod.rs b/compiler/src/import/parser/mod.rs
+index a3d7851112..4cc48bcdc2 100644
+--- a/compiler/src/import/parser/mod.rs
++++ b/compiler/src/import/parser/mod.rs
+@@ -15,6 +15,9 @@
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ /// The import parser creates a hashmap of import program names -> import program structs
++pub mod core_package;
++pub use self::core_package::*;
++
+ pub mod parse_symbol;
+ pub use self::parse_symbol::*;
+ 
+diff --git a/compiler/src/import/parser/parse_package.rs b/compiler/src/import/parser/parse_package.rs
+index 0471c9dade..3247cb5c29 100644
+--- a/compiler/src/import/parser/parse_package.rs
++++ b/compiler/src/import/parser/parse_package.rs
+@@ -14,7 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::{errors::ImportError, ImportParser};
++use crate::{errors::ImportError, ImportParser, CORE_PACKAGE_NAME};
+ use leo_typed::{Package, PackageAccess};
+ 
+ use std::{fs, fs::DirEntry, path::PathBuf};
+@@ -47,20 +47,23 @@ impl ImportParser {
+         let error_path = path.clone();
+         let package_name = package.name.clone();
+ 
+-        // trim path if importing from another file
++        // Fetch a core package
++        let core_package = package_name.name.eq(CORE_PACKAGE_NAME);
++
++        // Trim path if importing from another file
+         if path.is_file() {
+             path.pop();
+         }
+ 
+-        // search for package name in local directory
++        // Search for package name in local directory
+         let mut source_directory = path.clone();
+         source_directory.push(SOURCE_DIRECTORY_NAME);
+ 
+-        // search for package name in `imports` directory
++        // Search for package name in `imports` directory
+         let mut imports_directory = path.clone();
+         imports_directory.push(IMPORTS_DIRECTORY_NAME);
+ 
+-        // read from local `src` directory or the current path
++        // Read from local `src` directory or the current path
+         if source_directory.exists() {
+             path = source_directory
+         }
+@@ -81,7 +84,10 @@ impl ImportParser {
+                 .eq(&package_name.name)
+         });
+ 
+-        if imports_directory.exists() {
++        if core_package {
++            // Enforce core library package access
++            self.parse_core_package(&package)
++        } else if imports_directory.exists() {
+             let entries = fs::read_dir(imports_directory)
+                 .map_err(|error| ImportError::directory_error(error, package_name.span.clone(), error_path.clone()))?
+                 .into_iter()
+diff --git a/compiler/src/import/parser/parse_symbol.rs b/compiler/src/import/parser/parse_symbol.rs
+index e0b7f4e156..0d8f869b4f 100644
+--- a/compiler/src/import/parser/parse_symbol.rs
++++ b/compiler/src/import/parser/parse_symbol.rs
+@@ -88,7 +88,7 @@ impl ImportParser {
+                 .into_string()
+                 .unwrap(); // the file exists so these will not fail
+ 
+-            self.insert(file_name, program);
++            self.insert_import(file_name, program);
+ 
+             Ok(())
+         } else {
+@@ -117,7 +117,7 @@ impl ImportParser {
+             .into_string()
+             .unwrap(); // the file exists so these will not fail
+ 
+-        self.insert(file_name, program);
++        self.insert_import(file_name, program);
+ 
+         Ok(())
+     }
+diff --git a/compiler/src/import/store/core_package.rs b/compiler/src/import/store/core_package.rs
+new file mode 100644
+index 0000000000..1fb723da07
+--- /dev/null
++++ b/compiler/src/import/store/core_package.rs
+@@ -0,0 +1,40 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{new_scope, ConstrainedProgram, ConstrainedValue, GroupType};
++use leo_typed::Package;
++
++use leo_core::{CorePackageList, LeoCoreError};
++use snarkos_models::curves::{Field, PrimeField};
++
++impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
++    pub(crate) fn store_core_package(&mut self, scope: String, package: Package) -> Result<(), LeoCoreError> {
++        // Create list of imported core packages.
++        let list = CorePackageList::from_package_access(package.access)?;
++
++        // Fetch core packages from `leo-core`.
++        let symbol_list = list.to_symbols()?;
++
++        for (symbol, circuit) in symbol_list.symbols() {
++            let symbol_name = new_scope(scope.clone(), symbol);
++
++            // store packages
++            self.store(symbol_name, ConstrainedValue::CircuitDefinition(circuit))
++        }
++
++        Ok(())
++    }
++}
+diff --git a/compiler/src/import/store/import.rs b/compiler/src/import/store/import.rs
+index b2adb22402..a9aec1f1c7 100644
+--- a/compiler/src/import/store/import.rs
++++ b/compiler/src/import/store/import.rs
+@@ -26,19 +26,31 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         import: &Import,
+         imported_programs: &ImportParser,
+     ) -> Result<(), ImportError> {
+-        // fetch dependencies for the current import
++        // Fetch core dependencies
++        let core_dependency = imported_programs
++            .core_packages()
++            .iter()
++            .find(|package| import.package.eq(package));
++
++        if let Some(package) = core_dependency {
++            self.store_core_package(scope.clone(), package.clone())?;
++
++            return Ok(());
++        }
++
++        // Fetch dependencies for the current import
+         let imported_symbols = ImportedSymbols::from(import);
+ 
+         for (package, symbol) in imported_symbols.symbols {
+-            // find imported program
++            // Find imported program
+             let program = imported_programs
+-                .get(&package)
++                .get_import(&package)
+                 .ok_or(ImportError::unknown_package(import.package.name.clone()))?;
+ 
+-            // parse imported program
++            // Parse imported program
+             self.store_definitions(program.clone(), imported_programs)?;
+ 
+-            // store the imported symbol
++            // Store the imported symbol
+             self.store_symbol(scope.clone(), package, &symbol, program)?;
+         }
+ 
+diff --git a/compiler/src/import/store/mod.rs b/compiler/src/import/store/mod.rs
+index cc9702a572..7633655956 100644
+--- a/compiler/src/import/store/mod.rs
++++ b/compiler/src/import/store/mod.rs
+@@ -15,6 +15,9 @@
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ /// The import store brings an imported symbol into the main program from an import program struct
++pub mod core_package;
++pub use self::core_package::*;
++
+ pub mod import;
+ pub use self::import::*;
+ 
+diff --git a/compiler/src/statement/return_/return_.rs b/compiler/src/statement/return_/return_.rs
+index 53c2817279..686c22af35 100644
+--- a/compiler/src/statement/return_/return_.rs
++++ b/compiler/src/statement/return_/return_.rs
+@@ -30,6 +30,8 @@ fn check_return_type(expected: Option<Type>, actual: Type, span: Span) -> Result
+             if expected.ne(&actual) {
+                 if expected.is_self() && actual.is_circuit() {
+                     return Ok(());
++                } else if expected.match_array_types(&actual) {
++                    return Ok(());
+                 } else {
+                     return Err(StatementError::arguments_type(&expected, &actual, span));
+                 }
+diff --git a/compiler/src/value/integer/integer.rs b/compiler/src/value/integer/integer.rs
+index 7d7bc32c22..40b1a6634b 100644
+--- a/compiler/src/value/integer/integer.rs
++++ b/compiler/src/value/integer/integer.rs
+@@ -60,7 +60,7 @@ impl fmt::Display for Integer {
+         let integer = self;
+         let option = match_integer!(integer => integer.get_value());
+         match option {
+-            Some(number) => write!(f, "{}{}", number, self.get_type()),
++            Some(number) => write!(f, "{}", number),
+             None => write!(f, "[input]{}", self.get_type()),
+         }
+     }
+diff --git a/compiler/src/value/value.rs b/compiler/src/value/value.rs
+index 57e4df3f89..48a5139580 100644
+--- a/compiler/src/value/value.rs
++++ b/compiler/src/value/value.rs
+@@ -26,6 +26,7 @@ use crate::{
+     GroupType,
+     Integer,
+ };
++use leo_core::Value;
+ use leo_typed::{Circuit, Function, GroupValue, Identifier, Span, Type};
+ 
+ use snarkos_errors::gadgets::SynthesisError;
+@@ -108,18 +109,17 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedValue<F, G> {
+             ConstrainedValue::Integer(integer) => Type::IntegerType(integer.get_type()),
+ 
+             // Data type wrappers
+-            ConstrainedValue::Array(types) => {
+-                let array_type = types[0].to_type(span.clone())?;
+-                let count = types.len();
++            ConstrainedValue::Array(array) => {
++                let array_type = array[0].to_type(span.clone())?;
++                let mut dimensions = vec![array.len()];
+ 
+                 // Nested array type
+                 if let Type::Array(inner_type, inner_dimensions) = &array_type {
+-                    let mut dimensions = inner_dimensions.clone();
+-                    dimensions.push(count);
++                    dimensions.append(&mut inner_dimensions.clone());
+                     return Ok(Type::Array(inner_type.clone(), dimensions));
+                 }
+ 
+-                Type::Array(Box::new(array_type), vec![count])
++                Type::Array(Box::new(array_type), dimensions)
+             }
+             ConstrainedValue::Tuple(tuple) => {
+                 let mut types = vec![];
+@@ -137,6 +137,37 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedValue<F, G> {
+         })
+     }
+ 
++    /// Returns the `ConstrainedValue` in intermediate `Value` format (for core circuits)
++    pub(crate) fn to_value(&self) -> Value {
++        match self.clone() {
++            ConstrainedValue::Boolean(boolean) => Value::Boolean(boolean),
++            ConstrainedValue::Integer(integer) => match integer {
++                Integer::U8(u8) => Value::U8(u8),
++                Integer::U16(u16) => Value::U16(u16),
++                Integer::U32(u32) => Value::U32(u32),
++                Integer::U64(u64) => Value::U64(u64),
++                Integer::U128(u128) => Value::U128(u128),
++
++                Integer::I8(i8) => Value::I8(i8),
++                Integer::I16(i16) => Value::I16(i16),
++                Integer::I32(i32) => Value::I32(i32),
++                Integer::I64(i64) => Value::I64(i64),
++                Integer::I128(i128) => Value::I128(i128),
++            },
++            ConstrainedValue::Array(array) => {
++                let array_value = array.into_iter().map(|element| element.to_value()).collect();
++
++                Value::Array(array_value)
++            }
++            ConstrainedValue::Tuple(tuple) => {
++                let tuple_value = tuple.into_iter().map(|element| element.to_value()).collect();
++
++                Value::Tuple(tuple_value)
++            }
++            _ => unimplemented!(),
++        }
++    }
++
+     pub(crate) fn resolve_type(&mut self, type_: Option<Type>, span: Span) -> Result<(), ValueError> {
+         if let ConstrainedValue::Unresolved(ref string) = self {
+             if type_.is_some() {
+@@ -334,9 +365,9 @@ impl<F: Field + PrimeField, G: GroupType<F>> fmt::Display for ConstrainedValue<F
+                 write!(f, "function {{ {}() }}", function.identifier)
+             }
+             ConstrainedValue::Import(_, ref value) => write!(f, "{}", value),
+-            ConstrainedValue::Mutable(ref value) => write!(f, "mut {}", value),
+-            ConstrainedValue::Static(ref value) => write!(f, "static {}", value),
+-            ConstrainedValue::Unresolved(ref value) => write!(f, "unresolved {}", value),
++            ConstrainedValue::Mutable(ref value) => write!(f, "{}", value),
++            ConstrainedValue::Static(ref value) => write!(f, "{}", value),
++            ConstrainedValue::Unresolved(ref value) => write!(f, "{}", value),
+         }
+     }
+ }
+@@ -497,3 +528,35 @@ impl<F: Field + PrimeField, G: GroupType<F>> CondSelectGadget<F> for Constrained
+         unimplemented!()
+     }
+ }
++
++impl<F: Field + PrimeField, G: GroupType<F>> From<Value> for ConstrainedValue<F, G> {
++    fn from(v: Value) -> Self {
++        match v {
++            Value::Boolean(boolean) => ConstrainedValue::Boolean(boolean),
++            Value::U8(u8) => ConstrainedValue::Integer(Integer::U8(u8)),
++            Value::U16(u16) => ConstrainedValue::Integer(Integer::U16(u16)),
++            Value::U32(u32) => ConstrainedValue::Integer(Integer::U32(u32)),
++            Value::U64(u64) => ConstrainedValue::Integer(Integer::U64(u64)),
++            Value::U128(u128) => ConstrainedValue::Integer(Integer::U128(u128)),
++
++            Value::I8(i8) => ConstrainedValue::Integer(Integer::I8(i8)),
++            Value::I16(i16) => ConstrainedValue::Integer(Integer::I16(i16)),
++            Value::I32(i32) => ConstrainedValue::Integer(Integer::I32(i32)),
++            Value::I64(i64) => ConstrainedValue::Integer(Integer::I64(i64)),
++            Value::I128(i128) => ConstrainedValue::Integer(Integer::I128(i128)),
++
++            Value::Array(array) => ConstrainedValue::Array(
++                array
++                    .into_iter()
++                    .map(|element| ConstrainedValue::from(element))
++                    .collect(),
++            ),
++            Value::Tuple(tuple) => ConstrainedValue::Tuple(
++                tuple
++                    .into_iter()
++                    .map(|element| ConstrainedValue::from(element))
++                    .collect(),
++            ),
++        }
++    }
++}
+diff --git a/compiler/tests/array/output/registers_ones.out b/compiler/tests/array/output/registers_ones.out
+index d7aaafed88..c6a97c7fd7 100644
+--- a/compiler/tests/array/output/registers_ones.out
++++ b/compiler/tests/array/output/registers_ones.out
+@@ -1,2 +1,2 @@
+ [registers]
+-r: [u8; (3)] = [1u8, 1u8, 1u8];
++r: [u8; (3)] = [1, 1, 1];
+diff --git a/compiler/tests/array/output/registers_zeros.out b/compiler/tests/array/output/registers_zeros.out
+index d6278e3b69..e8c21bb46a 100644
+--- a/compiler/tests/array/output/registers_zeros.out
++++ b/compiler/tests/array/output/registers_zeros.out
+@@ -1,2 +1,2 @@
+ [registers]
+-r: [u8; (3)] = [0u8, 0u8, 0u8];
++r: [u8; (3)] = [0, 0, 0];
+diff --git a/compiler/tests/core/core_circuit_invalid.leo b/compiler/tests/core/core_circuit_invalid.leo
+new file mode 100644
+index 0000000000..4a42bda032
+--- /dev/null
++++ b/compiler/tests/core/core_circuit_invalid.leo
+@@ -0,0 +1,3 @@
++import core.unstable.blake2s.BadCircuit; // `BadCircuit` is not included in the blake2s package
++
++function main() {}
+diff --git a/compiler/tests/core/core_circuit_star_fail.leo b/compiler/tests/core/core_circuit_star_fail.leo
+new file mode 100644
+index 0000000000..14b54b0d69
+--- /dev/null
++++ b/compiler/tests/core/core_circuit_star_fail.leo
+@@ -0,0 +1,3 @@
++import core.*; // You cannot import all dependencies from core at once
++
++function main() {}
+diff --git a/compiler/tests/core/core_package_invalid.leo b/compiler/tests/core/core_package_invalid.leo
+new file mode 100644
+index 0000000000..7cbcf93ecc
+--- /dev/null
++++ b/compiler/tests/core/core_package_invalid.leo
+@@ -0,0 +1,3 @@
++import core.bad_circuit; // `bad_circuit` is not a core package
++
++function main() {}
+diff --git a/compiler/tests/core/core_unstable_package_invalid.leo b/compiler/tests/core/core_unstable_package_invalid.leo
+new file mode 100644
+index 0000000000..35e6c0d1ba
+--- /dev/null
++++ b/compiler/tests/core/core_unstable_package_invalid.leo
+@@ -0,0 +1,3 @@
++import core.unstable.bad_circuit; // `bad_circuit` is not a core unstable package
++
++function main() {}
+diff --git a/compiler/tests/core/mod.rs b/compiler/tests/core/mod.rs
+new file mode 100644
+index 0000000000..a520d60ac5
+--- /dev/null
++++ b/compiler/tests/core/mod.rs
+@@ -0,0 +1,59 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod packages;
++
++use crate::{assert_satisfied, expect_compiler_error, parse_program};
++
++#[test]
++fn test_core_circuit_invalid() {
++    let program_bytes = include_bytes!("core_package_invalid.leo");
++    let program = parse_program(program_bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_core_circuit_star_fail() {
++    let program_bytes = include_bytes!("core_circuit_star_fail.leo");
++    let program = parse_program(program_bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_core_package_invalid() {
++    let program_bytes = include_bytes!("core_package_invalid.leo");
++    let program = parse_program(program_bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_core_unstable_package_invalid() {
++    let program_bytes = include_bytes!("core_unstable_package_invalid.leo");
++    let program = parse_program(program_bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_unstable_blake2s_sanity() {
++    let program_bytes = include_bytes!("unstable_blake2s.leo");
++    let program = parse_program(program_bytes).unwrap();
++
++    assert_satisfied(program);
++}
+diff --git a/compiler/tests/core/packages/mod.rs b/compiler/tests/core/packages/mod.rs
+new file mode 100644
+index 0000000000..d92a5f8b8f
+--- /dev/null
++++ b/compiler/tests/core/packages/mod.rs
+@@ -0,0 +1,17 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod unstable;
+diff --git a/compiler/tests/core/packages/unstable/blake2s/arguments_length_fail.leo b/compiler/tests/core/packages/unstable/blake2s/arguments_length_fail.leo
+new file mode 100644
+index 0000000000..ccdd4c5af9
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/blake2s/arguments_length_fail.leo
+@@ -0,0 +1,9 @@
++import core.unstable.blake2s.Blake2s;
++
++function main() {
++    let seed: [u8; 32] = [0; 32];
++
++    let result = Blake2s::hash(seed); // function `hash` takes 2 arguments
++
++    console.log("Result: {}", result);
++}
+diff --git a/compiler/tests/core/packages/unstable/blake2s/arguments_type_fail.leo b/compiler/tests/core/packages/unstable/blake2s/arguments_type_fail.leo
+new file mode 100644
+index 0000000000..13c7e9735e
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/blake2s/arguments_type_fail.leo
+@@ -0,0 +1,10 @@
++import core.unstable.blake2s.Blake2s;
++
++function main() {
++    let seed: [u8; 32] = [0; 32];
++    let message: [u16; 32] = [0; 32]; // message should be type [u8; 32]
++
++    let result = Blake2s::hash(seed, message);
++
++    console.log("Result: {}", result);
++}
+diff --git a/compiler/tests/core/packages/unstable/blake2s/blake2s_input.leo b/compiler/tests/core/packages/unstable/blake2s/blake2s_input.leo
+new file mode 100644
+index 0000000000..6044795c3d
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/blake2s/blake2s_input.leo
+@@ -0,0 +1,5 @@
++import core.unstable.blake2s.Blake2s;
++
++function main(seed: [u8; 32], message: [u8; 32]) -> [u8; 32] {
++    return Blake2s::hash(seed, message)
++}
+diff --git a/compiler/tests/core/packages/unstable/blake2s/blake2s_random.leo b/compiler/tests/core/packages/unstable/blake2s/blake2s_random.leo
+new file mode 100644
+index 0000000000..72aef44932
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/blake2s/blake2s_random.leo
+@@ -0,0 +1,7 @@
++import core.unstable.blake2s.Blake2s;
++
++function main(seed: [u8; 32], message: [u8; 32], expected: [u8; 32]) {
++    let actual = Blake2s::hash(seed, message);
++
++    console.assert(expected == actual);
++}
+diff --git a/compiler/tests/core/packages/unstable/blake2s/inputs/valid_input.in b/compiler/tests/core/packages/unstable/blake2s/inputs/valid_input.in
+new file mode 100644
+index 0000000000..6f5064f41d
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/blake2s/inputs/valid_input.in
+@@ -0,0 +1,6 @@
++[main]
++seed: [u8; 32] = [0; 32];
++message: [u8; 32] = [0; 32];
++
++[registers]
++r0: [u8; 32] = [0; 32];
+\ No newline at end of file
+diff --git a/compiler/tests/core/packages/unstable/blake2s/mod.rs b/compiler/tests/core/packages/unstable/blake2s/mod.rs
+new file mode 100644
+index 0000000000..13de62b45a
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/blake2s/mod.rs
+@@ -0,0 +1,107 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{
++    assert_satisfied,
++    expect_compiler_error,
++    generate_main_input,
++    get_output,
++    parse_program,
++    parse_program_with_input,
++};
++
++use leo_input::types::{IntegerType, U8Type, UnsignedIntegerType};
++use leo_typed::InputValue;
++use rand::{Rng, SeedableRng};
++use rand_xorshift::XorShiftRng;
++use snarkos_algorithms::prf::blake2s::Blake2s as B2SPRF;
++use snarkos_models::algorithms::PRF;
++
++#[test]
++fn test_arguments_length_fail() {
++    let program_bytes = include_bytes!("arguments_length_fail.leo");
++    let program = parse_program(program_bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_arguments_type_fail() {
++    let program_bytes = include_bytes!("arguments_type_fail.leo");
++    let program = parse_program(program_bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_blake2s_input() {
++    let input_bytes = include_bytes!("inputs/valid_input.in");
++    let program_bytes = include_bytes!("blake2s_input.leo");
++    let expected_bytes = include_bytes!("outputs/valid_output.out");
++
++    let program = parse_program_with_input(program_bytes, input_bytes).unwrap();
++
++    let expected = std::str::from_utf8(expected_bytes).unwrap();
++    let actual_bytes = get_output(program);
++    let actual = std::str::from_utf8(actual_bytes.bytes().as_slice()).unwrap();
++
++    assert_eq!(expected, actual)
++}
++
++#[test]
++fn test_blake2s_random() {
++    let mut rng = XorShiftRng::seed_from_u64(1231275789u64);
++
++    let mut seed = [0u8; 32];
++    rng.fill(&mut seed);
++
++    let mut message = [0u8; 32];
++    rng.fill(&mut message);
++
++    // Use snarkos-algorithms blake2s evaluate to get expected value
++    let expected = B2SPRF::evaluate(&seed, &message).unwrap().to_vec();
++
++    // Create program input values for seed, message, and expected values
++    let seed_input_value = bytes_gadget_to_input(seed.to_vec());
++    let message_input_value = bytes_gadget_to_input(message.to_vec());
++    let expected_value = bytes_gadget_to_input(expected);
++
++    // The `blake2s_random.leo` program will compute a blake2s hash digest and compare it against
++    // the expected value
++    let bytes = include_bytes!("blake2s_random.leo");
++    let mut program = parse_program(bytes).unwrap();
++
++    let main_input = generate_main_input(vec![
++        ("seed", Some(seed_input_value)),
++        ("message", Some(message_input_value)),
++        ("expected", Some(expected_value)),
++    ]);
++
++    // Load input values into Leo program
++    program.set_main_input(main_input);
++
++    assert_satisfied(program);
++}
++
++fn bytes_gadget_to_input(bytes: Vec<u8>) -> InputValue {
++    let u8_type = IntegerType::Unsigned(UnsignedIntegerType::U8Type(U8Type {}));
++    let bytes = bytes
++        .into_iter()
++        .map(|byte| InputValue::Integer(u8_type.clone(), byte.to_string()))
++        .collect::<Vec<_>>();
++
++    InputValue::Array(bytes)
++}
+diff --git a/compiler/tests/core/packages/unstable/blake2s/outputs/valid_output.out b/compiler/tests/core/packages/unstable/blake2s/outputs/valid_output.out
+new file mode 100644
+index 0000000000..b521d46757
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/blake2s/outputs/valid_output.out
+@@ -0,0 +1,2 @@
++[registers]
++r0: [u8; (32)] = [174u8, 9u8, 219u8, 124u8, 213u8, 79u8, 66u8, 180u8, 144u8, 239u8, 9u8, 182u8, 188u8, 84u8, 26u8, 246u8, 136u8, 228u8, 149u8, 155u8, 184u8, 197u8, 63u8, 53u8, 154u8, 111u8, 86u8, 227u8, 138u8, 180u8, 84u8, 163u8];
+diff --git a/compiler/tests/core/packages/unstable/mod.rs b/compiler/tests/core/packages/unstable/mod.rs
+new file mode 100644
+index 0000000000..7143446cfe
+--- /dev/null
++++ b/compiler/tests/core/packages/unstable/mod.rs
+@@ -0,0 +1,17 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod blake2s;
+diff --git a/compiler/tests/core/unstable_blake2s.leo b/compiler/tests/core/unstable_blake2s.leo
+new file mode 100644
+index 0000000000..ca7db13892
+--- /dev/null
++++ b/compiler/tests/core/unstable_blake2s.leo
+@@ -0,0 +1,10 @@
++import core.unstable.blake2s.Blake2s;
++
++function main() {
++    let seed: [u8; 32] = [0; 32];
++    let message: [u8; 32] = [0; 32];
++
++    let result = Blake2s::hash(seed, message);
++
++    console.log("Result: {}", result);
++}
+diff --git a/compiler/tests/function/mod.rs b/compiler/tests/function/mod.rs
+index 43f8a39f80..d5a3c3548b 100644
+--- a/compiler/tests/function/mod.rs
++++ b/compiler/tests/function/mod.rs
+@@ -141,3 +141,37 @@ fn test_value_unchanged() {
+ 
+     assert_satisfied(program);
+ }
++
++// Test return multidimensional arrays
++
++#[test]
++fn test_return_array_nested_fail() {
++    let bytes = include_bytes!("return_array_nested_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_return_array_nested_pass() {
++    let bytes = include_bytes!("return_array_nested_pass.leo");
++    let program = parse_program(bytes).unwrap();
++
++    assert_satisfied(program);
++}
++
++#[test]
++fn test_return_array_tuple_fail() {
++    let bytes = include_bytes!("return_array_tuple_fail.leo");
++    let program = parse_program(bytes).unwrap();
++
++    expect_compiler_error(program);
++}
++
++#[test]
++fn test_return_array_tuple_pass() {
++    let bytes = include_bytes!("return_array_tuple_pass.leo");
++    let program = parse_program(bytes).unwrap();
++
++    assert_satisfied(program);
++}
+diff --git a/compiler/tests/function/output/newlines.out b/compiler/tests/function/output/newlines.out
+index e6563e6a1b..197a64cc63 100644
+--- a/compiler/tests/function/output/newlines.out
++++ b/compiler/tests/function/output/newlines.out
+@@ -1,3 +1,3 @@
+ [registers]
+-a: u32 = 0u32;
+-b: u32 = 0u32;
++a: u32 = 0;
++b: u32 = 0;
+diff --git a/compiler/tests/function/return_array_nested_fail.leo b/compiler/tests/function/return_array_nested_fail.leo
+new file mode 100644
+index 0000000000..dca001d9cc
+--- /dev/null
++++ b/compiler/tests/function/return_array_nested_fail.leo
+@@ -0,0 +1,7 @@
++function array_3x2_tuple() -> [[u8; 2]; 3] {
++    return [0u8; (2, 3)] // The correct 3x2 array tuple is `[0u8; (3, 2)]`
++}
++
++function main() {
++    let b = array_3x2_tuple();
++}
+\ No newline at end of file
+diff --git a/compiler/tests/function/return_array_nested_pass.leo b/compiler/tests/function/return_array_nested_pass.leo
+new file mode 100644
+index 0000000000..dda5b4342b
+--- /dev/null
++++ b/compiler/tests/function/return_array_nested_pass.leo
+@@ -0,0 +1,12 @@
++function array_3x2_nested() -> [[u8; 2]; 3] {
++    return [[0u8; 2]; 3]
++}
++
++function array_3x2_tuple() -> [[u8; 2]; 3] {
++    return [0u8; (3, 2)]
++}
++
++function main() {
++    let a = array_3x2_nested();
++    let b = array_3x2_tuple();
++}
+\ No newline at end of file
+diff --git a/compiler/tests/function/return_array_tuple_fail.leo b/compiler/tests/function/return_array_tuple_fail.leo
+new file mode 100644
+index 0000000000..4b7377e327
+--- /dev/null
++++ b/compiler/tests/function/return_array_tuple_fail.leo
+@@ -0,0 +1,7 @@
++function array_3x2_nested() -> [u8; (3, 2)] {
++    return [[0u8; 3]; 2] // The correct 3x2 nested array is `[0u8; 2]; 3]`
++}
++
++function main() {
++    let a = array_3x2_nested();
++}
+\ No newline at end of file
+diff --git a/compiler/tests/function/return_array_tuple_pass.leo b/compiler/tests/function/return_array_tuple_pass.leo
+new file mode 100644
+index 0000000000..a700bcabad
+--- /dev/null
++++ b/compiler/tests/function/return_array_tuple_pass.leo
+@@ -0,0 +1,12 @@
++function array_3x2_nested() -> [u8; (3, 2)] {
++    return [[0u8; 2]; 3]
++}
++
++function array_3x2_tuple() -> [u8; (3, 2)] {
++    return [0u8; (3, 2)]
++}
++
++function main() {
++    let a = array_3x2_nested();
++    let b = array_3x2_tuple();
++}
+\ No newline at end of file
+diff --git a/compiler/tests/mod.rs b/compiler/tests/mod.rs
+index b6cfd689de..015c2e272a 100644
+--- a/compiler/tests/mod.rs
++++ b/compiler/tests/mod.rs
+@@ -19,6 +19,7 @@ pub mod array;
+ pub mod boolean;
+ pub mod circuits;
+ pub mod console;
++pub mod core;
+ pub mod definition;
+ // pub mod field;
+ pub mod function;
+diff --git a/compiler/tests/statements/conditional/mod.rs b/compiler/tests/statements/conditional/mod.rs
+index 532dbbff7d..9b6ae2fe2b 100644
+--- a/compiler/tests/statements/conditional/mod.rs
++++ b/compiler/tests/statements/conditional/mod.rs
+@@ -190,14 +190,14 @@ fn test_nested() {
+ }
+ 
+ fn output_one(program: EdwardsTestCompiler) {
+-    let expected = include_bytes!("output_/registers_one.out");
++    let expected = include_bytes!("output/registers_one.out");
+     let actual = get_output(program);
+ 
+     assert_eq!(expected, actual.bytes().as_slice());
+ }
+ 
+ fn output_zero(program: EdwardsTestCompiler) {
+-    let expected = include_bytes!("output_/registers_zero.out");
++    let expected = include_bytes!("output/registers_zero.out");
+     let actual = get_output(program);
+ 
+     assert_eq!(expected, actual.bytes().as_slice());
+diff --git a/compiler/tests/statements/conditional/output/registers_one.out b/compiler/tests/statements/conditional/output/registers_one.out
+new file mode 100644
+index 0000000000..be39f343fa
+--- /dev/null
++++ b/compiler/tests/statements/conditional/output/registers_one.out
+@@ -0,0 +1,2 @@
++[registers]
++a: u32 = 1;
+diff --git a/compiler/tests/statements/conditional/output/registers_zero.out b/compiler/tests/statements/conditional/output/registers_zero.out
+new file mode 100644
+index 0000000000..ae20e35199
+--- /dev/null
++++ b/compiler/tests/statements/conditional/output/registers_zero.out
+@@ -0,0 +1,2 @@
++[registers]
++a: u32 = 0;
+diff --git a/compiler/tests/statements/conditional/output_/registers_one.out b/compiler/tests/statements/conditional/output_/registers_one.out
+deleted file mode 100644
+index 663014ef39..0000000000
+--- a/compiler/tests/statements/conditional/output_/registers_one.out
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[registers]
+-a: u32 = 1u32;
+diff --git a/compiler/tests/statements/conditional/output_/registers_zero.out b/compiler/tests/statements/conditional/output_/registers_zero.out
+deleted file mode 100644
+index fb12d4d334..0000000000
+--- a/compiler/tests/statements/conditional/output_/registers_zero.out
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[registers]
+-a: u32 = 0u32;
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+new file mode 100644
+index 0000000000..111ce74559
+--- /dev/null
++++ b/core/Cargo.toml
+@@ -0,0 +1,59 @@
++[package]
++name = "leo-core"
++version = "1.0.1"
++authors = [ "The Aleo Team <hello@aleo.org>" ]
++description = "Core package dependencies of the Leo programming language"
++homepage = "https://aleo.org"
++repository = "https://github.com/AleoHQ/leo"
++keywords = [
++  "aleo",
++  "cryptography",
++  "leo",
++  "programming-language",
++  "zero-knowledge"
++]
++categories = [ "cryptography::cryptocurrencies", "web-programming" ]
++include = [ "Cargo.toml", "src", "README.md", "LICENSE.md" ]
++license = "GPL-3.0"
++edition = "2018"
++
++[dependencies.leo-gadgets]
++path = "../gadgets"
++version = "1.0.3"
++
++[dependencies.leo-typed]
++path = "../typed"
++version = "1.0.3"
++
++[dependencies.snarkos-errors]
++version = "1.1.3"
++default-features = false
++
++[dependencies.snarkos-gadgets]
++version = "1.1.3"
++default-features = false
++
++[dependencies.snarkos-models]
++version = "1.1.3"
++default-features = false
++
++[dependencies.snarkos-utilities]
++version = "1.1.3"
++
++[dependencies.rand]
++version = "0.7"
++default-features = false
++
++[dependencies.rand_xorshift]
++version = "0.2"
++default-features = false
++
++[dependencies.thiserror]
++version = "1.0"
++
++[dev-dependencies.snarkos-utilities]
++version = "1.1.3"
++
++[dev-dependencies.snarkos-curves]
++version = "1.1.3"
++default-features = false
+diff --git a/core/src/errors/core_circuit.rs b/core/src/errors/core_circuit.rs
+new file mode 100644
+index 0000000000..5826cfd317
+--- /dev/null
++++ b/core/src/errors/core_circuit.rs
+@@ -0,0 +1,79 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::Value;
++use leo_typed::{Error as FormattedError, Span};
++
++use snarkos_errors::gadgets::SynthesisError;
++
++use std::path::PathBuf;
++
++#[derive(Debug, Error, Eq, PartialEq)]
++pub enum CoreCircuitError {
++    #[error("{}", _0)]
++    Error(#[from] FormattedError),
++}
++
++impl CoreCircuitError {
++    pub fn set_path(&mut self, path: PathBuf) {
++        match self {
++            CoreCircuitError::Error(error) => error.set_path(path),
++        }
++    }
++
++    fn new_from_span(message: String, span: Span) -> Self {
++        CoreCircuitError::Error(FormattedError::new_from_span(message, span))
++    }
++
++    pub fn arguments_length(expected: usize, actual: usize, span: Span) -> Self {
++        let message = format!("Core circuit expected {} arguments, found {}", expected, actual);
++
++        CoreCircuitError::new_from_span(message, span)
++    }
++
++    pub fn array_length(expected: usize, actual: usize, span: Span) -> Self {
++        let message = format!(
++            "Core circuit expected an array of length {}, found an array of length {}",
++            expected, actual
++        );
++
++        CoreCircuitError::new_from_span(message, span)
++    }
++
++    pub fn cannot_enforce(operation: String, error: SynthesisError, span: Span) -> Self {
++        let message = format!(
++            "The gadget operation `{}` failed due to synthesis error `{:?}`",
++            operation, error,
++        );
++
++        Self::new_from_span(message, span)
++    }
++
++    pub fn invalid_array(actual: Value, span: Span) -> Self {
++        let message = format!("Core circuit expected an array argument, found `{}`", actual);
++
++        Self::new_from_span(message, span)
++    }
++
++    pub fn invalid_array_bytes(actual: Value, span: Span) -> Self {
++        let message = format!(
++            "Core circuit expected an array of UInt8 gadgets, found an array of `{}`",
++            actual
++        );
++
++        Self::new_from_span(message, span)
++    }
++}
+diff --git a/core/src/errors/core_package.rs b/core/src/errors/core_package.rs
+new file mode 100644
+index 0000000000..133b4aec65
+--- /dev/null
++++ b/core/src/errors/core_package.rs
+@@ -0,0 +1,54 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++use leo_typed::{Error as FormattedError, Span};
++
++use std::path::PathBuf;
++
++#[derive(Debug, Error)]
++pub enum CorePackageError {
++    #[error("{}", _0)]
++    Error(#[from] FormattedError),
++}
++
++impl CorePackageError {
++    pub fn set_path(&mut self, path: PathBuf) {
++        match self {
++            CorePackageError::Error(error) => error.set_path(path),
++        }
++    }
++
++    fn new_from_span(message: String, span: Span) -> Self {
++        CorePackageError::Error(FormattedError::new_from_span(message, span))
++    }
++
++    pub fn core_package_star(span: Span) -> Self {
++        let message = format!("Cannot import star from leo-core");
++
++        Self::new_from_span(message, span)
++    }
++
++    pub fn undefined_core_circuit(name: String, span: Span) -> Self {
++        let message = format!("Core circuit `{}` not found in leo-core", name);
++
++        Self::new_from_span(message, span)
++    }
++
++    pub fn undefined_unstable_core_circuit(name: String, span: Span) -> Self {
++        let message = format!("Unstable core circuit `{}` not found in leo-core", name);
++
++        Self::new_from_span(message, span)
++    }
++}
+diff --git a/core/src/errors/core_package_list.rs b/core/src/errors/core_package_list.rs
+new file mode 100644
+index 0000000000..b31ae0bdc7
+--- /dev/null
++++ b/core/src/errors/core_package_list.rs
+@@ -0,0 +1,55 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use leo_typed::{Error as FormattedError, ImportSymbol, Span};
++
++use crate::CorePackageError;
++use std::path::PathBuf;
++
++#[derive(Debug, Error)]
++pub enum CorePackageListError {
++    #[error("{}", _0)]
++    CorePackageError(#[from] CorePackageError),
++
++    #[error("{}", _0)]
++    Error(#[from] FormattedError),
++}
++
++impl CorePackageListError {
++    pub fn set_path(&mut self, path: PathBuf) {
++        match self {
++            CorePackageListError::CorePackageError(error) => error.set_path(path),
++            CorePackageListError::Error(error) => error.set_path(path),
++        }
++    }
++
++    fn new_from_span(message: String, span: Span) -> Self {
++        CorePackageListError::Error(FormattedError::new_from_span(message, span))
++    }
++
++    pub fn invalid_core_package(symbol: ImportSymbol) -> Self {
++        let message = format!("No package `{}` in leo-core", symbol);
++        let span = symbol.span;
++
++        Self::new_from_span(message, span)
++    }
++
++    pub fn core_package_star(span: Span) -> Self {
++        let message = format!("Cannot import star from leo-core");
++
++        Self::new_from_span(message, span)
++    }
++}
+diff --git a/core/src/errors/leo_core.rs b/core/src/errors/leo_core.rs
+new file mode 100644
+index 0000000000..90aecef934
+--- /dev/null
++++ b/core/src/errors/leo_core.rs
+@@ -0,0 +1,52 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{CoreCircuitError, CorePackageListError};
++use leo_typed::{Error as FormattedError, Span};
++
++use std::path::PathBuf;
++
++#[derive(Debug, Error)]
++pub enum LeoCoreError {
++    #[error("{}", _0)]
++    CoreCircuitError(#[from] CoreCircuitError),
++
++    #[error("{}", _0)]
++    CorePackageListError(#[from] CorePackageListError),
++
++    #[error("{}", _0)]
++    Error(#[from] FormattedError),
++}
++
++impl LeoCoreError {
++    pub fn set_path(&mut self, path: PathBuf) {
++        match self {
++            LeoCoreError::CoreCircuitError(error) => error.set_path(path),
++            LeoCoreError::CorePackageListError(error) => error.set_path(path),
++            LeoCoreError::Error(error) => error.set_path(path),
++        }
++    }
++
++    fn new_from_span(message: String, span: Span) -> Self {
++        LeoCoreError::Error(FormattedError::new_from_span(message, span))
++    }
++
++    pub fn undefined_core_circuit(circuit_name: String, span: Span) -> Self {
++        let message = format!("Core circuit `{}` not found in `leo-core`", circuit_name);
++
++        Self::new_from_span(message, span)
++    }
++}
+diff --git a/core/src/errors/mod.rs b/core/src/errors/mod.rs
+new file mode 100644
+index 0000000000..9bfb03c2ba
+--- /dev/null
++++ b/core/src/errors/mod.rs
+@@ -0,0 +1,27 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod core_circuit;
++pub use self::core_circuit::*;
++
++pub mod core_package;
++pub use self::core_package::*;
++
++pub mod core_package_list;
++pub use self::core_package_list::*;
++
++pub mod leo_core;
++pub use self::leo_core::*;
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+new file mode 100644
+index 0000000000..73317cc472
+--- /dev/null
++++ b/core/src/lib.rs
+@@ -0,0 +1,49 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++#[macro_use]
++extern crate thiserror;
++
++pub mod packages;
++pub use self::packages::*;
++
++pub mod errors;
++pub use self::errors::*;
++
++pub mod types;
++pub use self::types::*;
++
++use crate::CoreCircuit;
++use leo_typed::Span;
++use snarkos_models::{
++    curves::{Field, PrimeField},
++    gadgets::r1cs::ConstraintSystem,
++};
++
++/// Calls a core circuit by it's given name.
++/// This function should be called by the compiler when enforcing a core circuit function expression.
++pub fn call_core_circuit<F: Field + PrimeField, CS: ConstraintSystem<F>>(
++    cs: CS,
++    circuit_name: String,
++    arguments: Vec<Value>,
++    span: Span,
++) -> Result<Vec<Value>, LeoCoreError> {
++    // Match core circuit name
++    Ok(match circuit_name.as_str() {
++        CORE_UNSTABLE_BLAKE2S_NAME => Blake2sCircuit::call(cs, arguments, span)?,
++        _ => return Err(LeoCoreError::undefined_core_circuit(circuit_name, span)),
++    })
++}
+diff --git a/core/src/packages/mod.rs b/core/src/packages/mod.rs
+new file mode 100644
+index 0000000000..be0ea4f96c
+--- /dev/null
++++ b/core/src/packages/mod.rs
+@@ -0,0 +1,18 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod unstable;
++pub use self::unstable::*;
+diff --git a/core/src/packages/unstable/blake2s.rs b/core/src/packages/unstable/blake2s.rs
+new file mode 100644
+index 0000000000..4c2a6f7426
+--- /dev/null
++++ b/core/src/packages/unstable/blake2s.rs
+@@ -0,0 +1,275 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{CoreCircuit, CoreCircuitError, Value};
++
++use leo_typed::{
++    Circuit,
++    CircuitMember,
++    Expression,
++    Function,
++    FunctionInput,
++    Identifier,
++    InputVariable,
++    IntegerType,
++    Span,
++    Statement,
++    Type,
++};
++use snarkos_gadgets::algorithms::prf::Blake2sGadget;
++use snarkos_models::{
++    curves::{Field, PrimeField},
++    gadgets::{
++        algorithms::PRFGadget,
++        r1cs::ConstraintSystem,
++        utilities::{uint::UInt8, ToBytesGadget},
++    },
++};
++
++pub const CORE_UNSTABLE_BLAKE2S_NAME: &str = "Blake2s";
++
++#[derive(Clone, PartialEq, Eq)]
++pub struct Blake2sCircuit {}
++
++impl CoreCircuit for Blake2sCircuit {
++    fn name() -> String {
++        CORE_UNSTABLE_BLAKE2S_NAME.to_owned()
++    }
++
++    /* Blake2s circuit ast
++     * circuit Blake2s {
++     *     static function hash(seed: [u8; 32], message: [u8; 32]) -> [u8; 32] {
++     *         // call `check_eval_gadget` in snarkOS
++     *         return check_eval_gadget(seed, message)
++     *     }
++     */
++    fn ast(circuit_name: Identifier, span: Span) -> Circuit {
++        Circuit {
++            circuit_name,
++            members: vec![CircuitMember::CircuitFunction(
++                true, // static function
++                Function {
++                    identifier: Identifier {
++                        name: "hash".to_owned(),
++                        span: span.clone(),
++                    },
++                    input: vec![
++                        InputVariable::FunctionInput(FunctionInput {
++                            identifier: Identifier {
++                                name: "seed".to_owned(),
++                                span: span.clone(),
++                            },
++                            mutable: false,
++                            type_: Type::Array(Box::new(Type::IntegerType(IntegerType::U8)), vec![32usize]),
++                            span: span.clone(),
++                        }),
++                        InputVariable::FunctionInput(FunctionInput {
++                            identifier: Identifier {
++                                name: "message".to_owned(),
++                                span: span.clone(),
++                            },
++                            mutable: false,
++                            type_: Type::Array(Box::new(Type::IntegerType(IntegerType::U8)), vec![32usize]),
++                            span: span.clone(),
++                        }),
++                    ],
++                    returns: Some(Type::Array(Box::new(Type::IntegerType(IntegerType::U8)), vec![32usize])),
++                    statements: vec![Statement::Return(
++                        Expression::CoreFunctionCall(
++                            Self::name(),
++                            vec![
++                                Expression::Identifier(Identifier {
++                                    name: "seed".to_owned(),
++                                    span: span.clone(),
++                                }),
++                                Expression::Identifier(Identifier {
++                                    name: "message".to_owned(),
++                                    span: span.clone(),
++                                }),
++                            ],
++                            span.clone(),
++                        ),
++                        span.clone(),
++                    )],
++                    span: span.clone(),
++                },
++            )],
++        }
++    }
++
++    /// Calls the native `Blake2sGadget` on the given constraint system with the given arguments
++    fn call<F: Field + PrimeField, CS: ConstraintSystem<F>>(
++        mut cs: CS,
++        arguments: Vec<Value>,
++        span: Span,
++    ) -> Result<Vec<Value>, CoreCircuitError> {
++        // The blake2s check evaluation gadget has two arguments: seed and input
++        let expected_length = 2usize;
++        let actual_length = arguments.len();
++
++        if expected_length != actual_length {
++            return Err(CoreCircuitError::arguments_length(expected_length, actual_length, span));
++        }
++
++        let seed_value = arguments[0].to_owned();
++        let input_value = arguments[1].to_owned();
++
++        let seed = check_array_bytes(seed_value, 32, span.clone())?;
++        let input = check_array_bytes(input_value, 32, span.clone())?;
++
++        // Call blake2s gadget
++        let digest =
++            Blake2sGadget::check_evaluation_gadget(cs.ns(|| "blake2s hash"), &seed[..], &input[..]).map_err(|e| {
++                CoreCircuitError::cannot_enforce("Blake2s check evaluation gadget".to_owned(), e, span.clone())
++            })?;
++
++        // Convert digest to bytes
++        let bytes = digest
++            .to_bytes(cs)
++            .map_err(|e| CoreCircuitError::cannot_enforce("Vec<UInt8> ToBytes".to_owned(), e, span.clone()))?;
++
++        let return_value = bytes.into_iter().map(|byte| Value::U8(byte)).collect();
++
++        // Return one array digest value
++        Ok(vec![Value::Array(return_value)])
++    }
++}
++
++fn check_array_bytes(value: Value, size: usize, span: Span) -> Result<Vec<UInt8>, CoreCircuitError> {
++    let array_value = match value {
++        Value::Array(array) => array,
++        value => return Err(CoreCircuitError::invalid_array(value, span)),
++    };
++
++    if size != array_value.len() {
++        return Err(CoreCircuitError::array_length(size, array_value.len(), span));
++    }
++
++    let mut array_bytes = vec![];
++
++    for value in array_value {
++        let byte = match value {
++            Value::U8(u8) => u8,
++            value => return Err(CoreCircuitError::invalid_array_bytes(value, span)),
++        };
++
++        array_bytes.push(byte)
++    }
++
++    Ok(array_bytes)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use snarkos_curves::bls12_377::Fr;
++    use snarkos_models::gadgets::{
++        r1cs::TestConstraintSystem,
++        utilities::{boolean::Boolean, uint::UInt8},
++    };
++
++    #[test]
++    fn test_call_arguments_length_fail() {
++        let cs = TestConstraintSystem::<Fr>::new();
++
++        let seed = Value::Array(vec![]);
++        let dummy_span = Span {
++            text: "".to_string(),
++            line: 0,
++            start: 0,
++            end: 0,
++        };
++
++        let err = Blake2sCircuit::call(cs, vec![seed], dummy_span.clone()).err();
++
++        assert!(err.is_some());
++
++        let expected = CoreCircuitError::arguments_length(2, 1, dummy_span);
++        let actual = err.unwrap();
++
++        assert_eq!(expected, actual);
++    }
++
++    #[test]
++    fn test_array_length_fail() {
++        let cs = TestConstraintSystem::<Fr>::new();
++
++        let seed = Value::Array(vec![]);
++        let input = Value::Array(vec![]);
++        let dummy_span = Span {
++            text: "".to_string(),
++            line: 0,
++            start: 0,
++            end: 0,
++        };
++
++        let err = Blake2sCircuit::call(cs, vec![seed, input], dummy_span.clone()).err();
++
++        assert!(err.is_some());
++
++        let expected = CoreCircuitError::array_length(32, 0, dummy_span);
++        let actual = err.unwrap();
++
++        assert_eq!(expected, actual);
++    }
++
++    #[test]
++    fn test_invalid_array() {
++        let cs = TestConstraintSystem::<Fr>::new();
++
++        let seed = Value::U8(UInt8::constant(0));
++        let input = Value::Array(vec![]);
++        let dummy_span = Span {
++            text: "".to_string(),
++            line: 0,
++            start: 0,
++            end: 0,
++        };
++
++        let err = Blake2sCircuit::call(cs, vec![seed.clone(), input], dummy_span.clone()).err();
++
++        assert!(err.is_some());
++
++        let expected = CoreCircuitError::invalid_array(seed, dummy_span);
++        let actual = err.unwrap();
++
++        assert_eq!(expected, actual);
++    }
++
++    #[test]
++    fn test_invalid_array_bytes() {
++        let cs = TestConstraintSystem::<Fr>::new();
++
++        let invalid_byte = Value::Boolean(Boolean::Constant(true));
++        let seed = Value::Array(vec![invalid_byte.clone(); 32]);
++        let input = Value::Array(vec![Value::U8(UInt8::constant(0)); 32]);
++        let dummy_span = Span {
++            text: "".to_string(),
++            line: 0,
++            start: 0,
++            end: 0,
++        };
++
++        let err = Blake2sCircuit::call(cs, vec![seed, input], dummy_span.clone()).err();
++
++        assert!(err.is_some());
++
++        let expected = CoreCircuitError::invalid_array_bytes(invalid_byte, dummy_span);
++        let actual = err.unwrap();
++
++        assert_eq!(expected, actual);
++    }
++}
+diff --git a/core/src/packages/unstable/mod.rs b/core/src/packages/unstable/mod.rs
+new file mode 100644
+index 0000000000..e50f072527
+--- /dev/null
++++ b/core/src/packages/unstable/mod.rs
+@@ -0,0 +1,18 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod blake2s;
++pub use self::blake2s::*;
+diff --git a/core/src/types/core_circuit.rs b/core/src/types/core_circuit.rs
+new file mode 100644
+index 0000000000..e1c3096e71
+--- /dev/null
++++ b/core/src/types/core_circuit.rs
+@@ -0,0 +1,41 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{CoreCircuitError, Value};
++use leo_typed::{Circuit, Identifier, Span};
++
++use snarkos_models::{
++    curves::{Field, PrimeField},
++    gadgets::r1cs::ConstraintSystem,
++};
++
++/// A core circuit type, accessible to all Leo programs by default.
++/// To access a `CoreCircuit`, import its symbol from a `CorePackage`.
++pub trait CoreCircuit {
++    /// The name of the core circuit function
++    fn name() -> String;
++
++    /// Return the abstract syntax tree representation of the core circuit for compiler parsing.
++    fn ast(circuit_name: Identifier, span: Span) -> Circuit;
++
++    /// Call the gadget associated with this core circuit with arguments.
++    /// Generate constraints on the given `ConstraintSystem`.
++    fn call<F: Field + PrimeField, CS: ConstraintSystem<F>>(
++        cs: CS,
++        arguments: Vec<Value>,
++        span: Span,
++    ) -> Result<Vec<Value>, CoreCircuitError>;
++}
+diff --git a/core/src/types/core_circuit_struct_list.rs b/core/src/types/core_circuit_struct_list.rs
+new file mode 100644
+index 0000000000..46b432e956
+--- /dev/null
++++ b/core/src/types/core_circuit_struct_list.rs
+@@ -0,0 +1,38 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use leo_typed::Circuit;
++
++/// List of imported core circuit structs.
++/// This struct is created from a `CorePackageList`
++pub struct CoreCircuitStructList {
++    /// [(circuit_name, circuit_struct)]
++    symbols: Vec<(String, Circuit)>,
++}
++
++impl CoreCircuitStructList {
++    pub(crate) fn new() -> Self {
++        Self { symbols: vec![] }
++    }
++
++    pub(crate) fn push(&mut self, name: String, circuit: Circuit) {
++        self.symbols.push((name, circuit))
++    }
++
++    pub fn symbols(&self) -> Vec<(String, Circuit)> {
++        self.symbols.clone()
++    }
++}
+diff --git a/core/src/types/core_package.rs b/core/src/types/core_package.rs
+new file mode 100644
+index 0000000000..339a048cc9
+--- /dev/null
++++ b/core/src/types/core_package.rs
+@@ -0,0 +1,114 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{
++    unstable::blake2s::{Blake2sCircuit, CORE_UNSTABLE_BLAKE2S_NAME},
++    CoreCircuit,
++    CoreCircuitStructList,
++    CorePackageError,
++};
++use leo_typed::{Identifier, ImportSymbol, Package, PackageAccess};
++use std::convert::TryFrom;
++
++/// A core package dependency to be imported into a Leo program.
++/// Each `CorePackage` contains one or more `CoreCircuit`s that can be accessed by name.
++#[derive(Debug, Clone)]
++pub struct CorePackage {
++    name: Identifier,
++    unstable: bool,
++    circuits: Vec<ImportSymbol>,
++}
++
++impl CorePackage {
++    pub(crate) fn new(name: Identifier) -> Self {
++        Self {
++            name,
++            unstable: false,
++            circuits: vec![],
++        }
++    }
++
++    // Set the `unstable` flag to true if we are importing an unstable core package
++    pub(crate) fn set_unstable(&mut self) {
++        self.unstable = true;
++    }
++
++    // Stores all `CoreCircuit` names that are being accessed in the current `CorePackage`
++    fn get_circuit_names(&mut self, access: PackageAccess) -> Result<(), CorePackageError> {
++        match access {
++            PackageAccess::SubPackage(package) => return self.get_circuit_names(package.access),
++            PackageAccess::Star(span) => return Err(CorePackageError::core_package_star(span)),
++            PackageAccess::Multiple(accesses) => {
++                for access in accesses {
++                    self.get_circuit_names(access)?;
++                }
++            }
++            PackageAccess::Symbol(symbol) => self.circuits.push(symbol),
++        }
++        Ok(())
++    }
++
++    // Stores all `CoreCircuit` structs that are being accessed in the current `CorePackage`
++    pub(crate) fn get_circuit_structs(
++        &self,
++        circuit_structs: &mut CoreCircuitStructList,
++    ) -> Result<(), CorePackageError> {
++        for circuit in &self.circuits {
++            let circuit_name = circuit.symbol.name.as_str();
++            let span = circuit.span.clone();
++
++            // take the alias if it is present
++            let id = circuit.alias.clone().unwrap_or(circuit.symbol.clone());
++            let name = id.name.clone();
++
++            let circuit = if self.unstable {
++                // match unstable core circuit
++                match circuit_name {
++                    CORE_UNSTABLE_BLAKE2S_NAME => Blake2sCircuit::ast(circuit.symbol.clone(), span),
++                    name => {
++                        return Err(CorePackageError::undefined_unstable_core_circuit(
++                            name.to_string(),
++                            span,
++                        ));
++                    }
++                }
++            } else {
++                // match core circuit
++                match circuit_name {
++                    name => return Err(CorePackageError::undefined_core_circuit(name.to_string(), span)),
++                }
++            };
++
++            circuit_structs.push(name, circuit)
++        }
++
++        Ok(())
++    }
++}
++
++impl TryFrom<Package> for CorePackage {
++    type Error = CorePackageError;
++
++    fn try_from(package: Package) -> Result<Self, Self::Error> {
++        // Create new core package
++        let mut core_package = Self::new(package.name);
++
++        // Fetch all circuit symbols imported from core package
++        core_package.get_circuit_names(package.access)?;
++
++        Ok(core_package)
++    }
++}
+diff --git a/core/src/types/core_package_list.rs b/core/src/types/core_package_list.rs
+new file mode 100644
+index 0000000000..142e9f9089
+--- /dev/null
++++ b/core/src/types/core_package_list.rs
+@@ -0,0 +1,88 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::{CoreCircuitStructList, CorePackage, CorePackageListError, UNSTABLE_CORE_PACKAGE_KEYWORD};
++use leo_typed::PackageAccess;
++use std::convert::TryFrom;
++
++/// A list of core package dependencies.
++/// This struct is created when the compiler parses a core import statement.
++#[derive(Debug)]
++pub struct CorePackageList {
++    packages: Vec<CorePackage>,
++}
++
++impl CorePackageList {
++    pub(crate) fn new() -> Self {
++        Self { packages: vec![] }
++    }
++
++    pub(crate) fn push(&mut self, package: CorePackage) {
++        self.packages.push(package);
++    }
++
++    // Parse all dependencies after `import core.`
++    pub fn from_package_access(access: PackageAccess) -> Result<Self, CorePackageListError> {
++        let mut new = Self::new();
++
++        package_access_helper(&mut new, access, false)?;
++
++        Ok(new)
++    }
++
++    // Return a list of all symbols that need to be stored in the current function
++    pub fn to_symbols(&self) -> Result<CoreCircuitStructList, CorePackageListError> {
++        let mut symbols = CoreCircuitStructList::new();
++
++        for package in &self.packages {
++            package.get_circuit_structs(&mut symbols)?;
++        }
++
++        Ok(symbols)
++    }
++}
++
++fn package_access_helper(
++    list: &mut CorePackageList,
++    access: PackageAccess,
++    is_unstable: bool,
++) -> Result<(), CorePackageListError> {
++    match access {
++        PackageAccess::Symbol(symbol) => return Err(CorePackageListError::invalid_core_package(symbol)),
++        PackageAccess::Multiple(core_functions) => {
++            for access in core_functions {
++                package_access_helper(list, access, is_unstable)?;
++            }
++        }
++        PackageAccess::SubPackage(package) => {
++            // Set the `unstable` flag to true if we are importing an unstable core package
++            if package.name.name.eq(UNSTABLE_CORE_PACKAGE_KEYWORD) {
++                package_access_helper(list, package.access, true)?;
++            } else {
++                let mut core_package = CorePackage::try_from(*package)?;
++
++                if is_unstable {
++                    core_package.set_unstable()
++                }
++
++                list.push(core_package);
++            }
++        }
++        PackageAccess::Star(span) => return Err(CorePackageListError::core_package_star(span)),
++    }
++
++    Ok(())
++}
+diff --git a/core/src/types/mod.rs b/core/src/types/mod.rs
+new file mode 100644
+index 0000000000..e7a3bd1012
+--- /dev/null
++++ b/core/src/types/mod.rs
+@@ -0,0 +1,32 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod core_circuit;
++pub use self::core_circuit::*;
++
++pub mod core_circuit_struct_list;
++pub use self::core_circuit_struct_list::*;
++
++pub mod core_package;
++pub use self::core_package::*;
++
++pub mod core_package_list;
++pub use self::core_package_list::*;
++
++pub mod value;
++pub use self::value::*;
++
++pub static UNSTABLE_CORE_PACKAGE_KEYWORD: &str = "unstable";
+diff --git a/core/src/types/value.rs b/core/src/types/value.rs
+new file mode 100644
+index 0000000000..1a511e3ec0
+--- /dev/null
++++ b/core/src/types/value.rs
+@@ -0,0 +1,78 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use leo_gadgets::signed_integer::*;
++
++use snarkos_models::gadgets::utilities::{boolean::Boolean, uint::*};
++use std::fmt;
++
++/// An intermediate value format that can be converted into a `ConstrainedValue` for the compiler
++/// TODO(collinc97): implement other constrained values
++#[derive(Clone)]
++pub enum Value {
++    Boolean(Boolean),
++
++    U8(UInt8),
++    U16(UInt16),
++    U32(UInt32),
++    U64(UInt64),
++    U128(UInt128),
++
++    I8(Int8),
++    I16(Int16),
++    I32(Int32),
++    I64(Int64),
++    I128(Int128),
++
++    Array(Vec<Value>),
++    Tuple(Vec<Value>),
++}
++
++impl fmt::Display for Value {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        let string_option = match self {
++            Value::Boolean(value) => value.get_value().map(|v| v.to_string()),
++            Value::U8(value) => value.value.map(|v| v.to_string()),
++            Value::U16(value) => value.value.map(|v| v.to_string()),
++            Value::U32(value) => value.value.map(|v| v.to_string()),
++            Value::U64(value) => value.value.map(|v| v.to_string()),
++            Value::U128(value) => value.value.map(|v| v.to_string()),
++            Value::I8(value) => value.value.map(|v| v.to_string()),
++            Value::I16(value) => value.value.map(|v| v.to_string()),
++            Value::I32(value) => value.value.map(|v| v.to_string()),
++            Value::I64(value) => value.value.map(|v| v.to_string()),
++            Value::I128(value) => value.value.map(|v| v.to_string()),
++            Value::Array(values) => {
++                let string = values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
++
++                write!(f, "[{}]", string)?;
++
++                Some("".to_owned())
++            }
++            Value::Tuple(values) => {
++                let string = values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
++
++                write!(f, "[{}]", string)?;
++
++                Some("".to_owned())
++            }
++        };
++
++        let string = string_option.unwrap_or("[input]".to_owned());
++
++        write!(f, "{}", string)
++    }
++}
+diff --git a/examples/fibonacci/Leo.toml b/examples/fibonacci/Leo.toml
+index 85cc1b1916..74409f8b14 100644
+--- a/examples/fibonacci/Leo.toml
++++ b/examples/fibonacci/Leo.toml
+@@ -1,4 +1,4 @@
+-[package]
++[project]
+ name = "fibonacci"
+ version = "0.1.0"
+ description = "Returns a fibonnaci sequence"
+diff --git a/examples/fibonacci/README.md b/examples/fibonacci/README.md
+new file mode 100644
+index 0000000000..be8c859831
+--- /dev/null
++++ b/examples/fibonacci/README.md
+@@ -0,0 +1 @@
++# fibonacci
+diff --git a/examples/hello-world/Leo.toml b/examples/hello-world/Leo.toml
+index b3cde2b151..7255a801f9 100644
+--- a/examples/hello-world/Leo.toml
++++ b/examples/hello-world/Leo.toml
+@@ -1,4 +1,4 @@
+-[package]
++[project]
+ name = "hello-world"
+ version = "0.1.0"
+ description = "Returns the sum of two u32 integers"
+diff --git a/examples/hello-world/README.md b/examples/hello-world/README.md
+new file mode 100644
+index 0000000000..1534e6cdf3
+--- /dev/null
++++ b/examples/hello-world/README.md
+@@ -0,0 +1 @@
++# hello-world
+diff --git a/examples/pedersen-hash/Leo.toml b/examples/pedersen-hash/Leo.toml
+index 13b7d80257..5076066fa2 100644
+--- a/examples/pedersen-hash/Leo.toml
++++ b/examples/pedersen-hash/Leo.toml
+@@ -1,4 +1,4 @@
+-[package]
++[project]
+ name = "pedersen-hash"
+ version = "0.1.0"
+ description = "A 256bit hash function"
+diff --git a/examples/pedersen-hash/README.md b/examples/pedersen-hash/README.md
+new file mode 100644
+index 0000000000..341d98f707
+--- /dev/null
++++ b/examples/pedersen-hash/README.md
+@@ -0,0 +1 @@
++# pedersen-hash
+diff --git a/examples/square-root/Leo.toml b/examples/square-root/Leo.toml
+index 00235bcba1..9717d86062 100644
+--- a/examples/square-root/Leo.toml
++++ b/examples/square-root/Leo.toml
+@@ -1,4 +1,4 @@
+-[package]
++[project]
+ name = "square-root"
+ version = "0.1.0"
+ description = "prove knowledge of the square root `a` of a number `b`"
+diff --git a/examples/square-root/README.md b/examples/square-root/README.md
+new file mode 100644
+index 0000000000..8536c68b02
+--- /dev/null
++++ b/examples/square-root/README.md
+@@ -0,0 +1 @@
++# square-root
+diff --git a/package/Cargo.toml b/package/Cargo.toml
+index 5edfb9df1f..54804fb86b 100644
+--- a/package/Cargo.toml
++++ b/package/Cargo.toml
+@@ -41,3 +41,9 @@ version = "0.5"
+ 
+ [dev-dependencies.lazy_static]
+ version = "1.3.0"
++
++[features]
++default = [ "manifest_refactors" ]
++manifest_refactors = [ "manifest_refactor_project", "manifest_refactor_remote" ]
++manifest_refactor_project = [ ]
++manifest_refactor_remote = [ ]
+diff --git a/package/src/root/manifest.rs b/package/src/root/manifest.rs
+index bb33dd63ac..485516c06d 100644
+--- a/package/src/root/manifest.rs
++++ b/package/src/root/manifest.rs
+@@ -33,14 +33,14 @@ pub struct Remote {
+ 
+ #[derive(Deserialize)]
+ pub struct Manifest {
+-    pub package: Package,
++    pub project: Package,
+     pub remote: Option<Remote>,
+ }
+ 
+ impl Manifest {
+     pub fn new(package_name: &str) -> Self {
+         Self {
+-            package: Package::new(package_name),
++            project: Package::new(package_name),
+             remote: None,
+         }
+     }
+@@ -58,19 +58,19 @@ impl Manifest {
+     }
+ 
+     pub fn get_package_name(&self) -> String {
+-        self.package.name.clone()
++        self.project.name.clone()
+     }
+ 
+     pub fn get_package_version(&self) -> String {
+-        self.package.version.clone()
++        self.project.version.clone()
+     }
+ 
+     pub fn get_package_description(&self) -> Option<String> {
+-        self.package.description.clone()
++        self.project.description.clone()
+     }
+ 
+     pub fn get_package_license(&self) -> Option<String> {
+-        self.package.license.clone()
++        self.project.license.clone()
+     }
+ 
+     pub fn get_package_remote(&self) -> Option<Remote> {
+@@ -90,7 +90,7 @@ impl Manifest {
+ 
+     fn template(&self) -> String {
+         format!(
+-            r#"[package]
++            r#"[project]
+ name = "{name}"
+ version = "0.1.0"
+ description = "The {name} package"
+@@ -99,7 +99,7 @@ license = "MIT"
+ [remote]
+ author = "[AUTHOR]" # Add your Aleo Package Manager username, team's name, or organization's name.
+ "#,
+-            name = self.package.name
++            name = self.project.name
+         )
+     }
+ }
+@@ -128,7 +128,11 @@ impl TryFrom<&PathBuf> for Manifest {
+         let mut old_remote_format: Option<&str> = None;
+         let mut new_remote_format_exists = false;
+ 
+-        let mut new_toml = "".to_owned();
++        // Toml file adhering to the new format.
++        let mut final_toml = "".to_owned();
++
++        // New Toml file format that should be written based on feature flags.
++        let mut refactored_toml = "".to_owned();
+ 
+         // Read each individual line of the toml file
+         for line in buffer.lines() {
+@@ -138,6 +142,12 @@ impl TryFrom<&PathBuf> for Manifest {
+                     .split("=") // Split the line as 'remote' = '"{author}/{package_name}"'
+                     .collect::<Vec<&str>>()[1]; // Fetch just '"{author}/{package_name}"'
+                 old_remote_format = Some(remote);
++
++                // Retain the old remote format if the `manifest_refactor_remote` is not enabled
++                if cfg!(not(feature = "manifest_refactor_remote")) {
++                    refactored_toml += line;
++                    refactored_toml += "\n";
++                }
+                 continue;
+             }
+ 
+@@ -145,8 +155,24 @@ impl TryFrom<&PathBuf> for Manifest {
+             if line.starts_with("[remote]") {
+                 new_remote_format_exists = true;
+             }
+-            new_toml += line;
+-            new_toml += "\n";
++
++            // If the old project format is being being used, update the toml file
++            // to use the new format instead.
++            if line.starts_with("[package]") {
++                final_toml += "[project]";
++
++                // Refactor the old project format if the `manifest_refactor_project` is enabled
++                match cfg!(feature = "manifest_refactor_project") {
++                    true => refactored_toml += "[project]",
++                    false => refactored_toml += line,
++                }
++            } else {
++                final_toml += line;
++                refactored_toml += line;
++            }
++
++            final_toml += "\n";
++            refactored_toml += "\n";
+         }
+ 
+         // Update the remote format
+@@ -170,18 +196,23 @@ author = "{author}"
+                 );
+ 
+                 // Append the new remote to the bottom of the manifest file.
+-                new_toml += &new_remote;
++                final_toml += &new_remote;
++
++                // Add the new remote format if the `manifest_refactor_remote` is enabled
++                if cfg!(feature = "manifest_refactor_remote") {
++                    refactored_toml += &new_remote;
++                }
+             }
+         }
+ 
+         // Rewrite the toml file if it has been updated
+-        if buffer != new_toml {
++        if buffer != refactored_toml {
+             let mut file = File::create(&path).map_err(|error| ManifestError::Creating(MANIFEST_FILENAME, error))?;
+-            file.write_all(new_toml.as_bytes())
++            file.write_all(refactored_toml.as_bytes())
+                 .map_err(|error| ManifestError::Writing(MANIFEST_FILENAME, error))?;
+         }
+ 
+         // Read the toml file
+-        Ok(toml::from_str(&new_toml).map_err(|error| ManifestError::Parsing(MANIFEST_FILENAME, error))?)
++        Ok(toml::from_str(&final_toml).map_err(|error| ManifestError::Parsing(MANIFEST_FILENAME, error))?)
+     }
+ }
+diff --git a/package/tests/initialize.rs b/package/tests/initialize.rs
+deleted file mode 100644
+index 62dc23eb85..0000000000
+--- a/package/tests/initialize.rs
++++ /dev/null
+@@ -1,192 +0,0 @@
+-// Copyright (C) 2019-2020 Aleo Systems Inc.
+-// This file is part of the Leo library.
+-
+-// The Leo library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The Leo library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+-
+-use lazy_static::lazy_static;
+-use std::{
+-    cell::RefCell,
+-    env,
+-    fs,
+-    path::PathBuf,
+-    sync::atomic::{AtomicUsize, Ordering},
+-};
+-
+-const PACKAGE_TEST_DIRECTORY: &str = "package-testing";
+-
+-thread_local! {
+-    /// Establish a test id for each test.
+-    static TEST_ID: RefCell<Option<usize>> = RefCell::new(None);
+-}
+-
+-lazy_static! {
+-    /// Create a testing directory for packages in `target/`
+-    static ref TEST_DIR: PathBuf = {
+-        let mut path = env::current_exe().unwrap();
+-        path.pop(); // Remove executable name
+-        path.pop(); // Remove 'debug'
+-
+-        // Attempt to point at the `target` directory
+-        if path.file_name().and_then(|s| s.to_str()) != Some("target") {
+-            path.pop();
+-        }
+-
+-        path.push(PACKAGE_TEST_DIRECTORY);
+-        fs::create_dir_all(&path).unwrap();
+-
+-        path
+-    };
+-}
+-
+-/// Create a new directory for each test based on the ID of the test.
+-fn test_dir() -> PathBuf {
+-    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+-
+-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+-    TEST_ID.with(|n| *n.borrow_mut() = Some(id));
+-
+-    let path: PathBuf = TEST_DIR.join(&format!("t{}", id)).into();
+-
+-    if path.exists() {
+-        if let Err(e) = fs::remove_dir_all(&path) {
+-            panic!("failed to remove {:?}: {:?}", &path, e)
+-        }
+-    }
+-
+-    fs::create_dir_all(&path).unwrap();
+-
+-    path
+-}
+-
+-// Tests for package initialization
+-mod initialize_package {
+-    use super::*;
+-    use leo_package::{
+-        inputs::{InputFile, InputsDirectory, StateFile},
+-        package::Package,
+-        root::Manifest,
+-        source::{LibraryFile, MainFile, SourceDirectory},
+-    };
+-
+-    const TEST_PACKAGE_NAME: &str = "test-package";
+-
+-    #[test]
+-    fn initialize_valid_package() {
+-        let test_directory = test_dir();
+-
+-        // Ensure a package can be initialized at the `test_directory`
+-        assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
+-
+-        // Initialize a package at the `test_directory`
+-        assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_ok());
+-
+-        // Ensure a package is initialized at the `test_directory`
+-        assert!(Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
+-    }
+-
+-    #[test]
+-    #[ignore]
+-    fn initialize_fails_with_invalid_package_names() {
+-        unimplemented!()
+-    }
+-
+-    #[test]
+-    fn initialize_fails_with_existing_manifest() {
+-        let test_directory = test_dir();
+-
+-        // Ensure a package can be initialized at the `test_directory`
+-        assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
+-
+-        // Manually add a manifest file to the `test_directory`
+-        Manifest::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
+-
+-        // Attempt to initialize a package at the `test_directory`
+-        assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
+-
+-        // Ensure package is not initialized at the `test_directory`
+-        assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
+-    }
+-
+-    #[test]
+-    fn initialize_fails_with_existing_library_file() {
+-        let test_directory = test_dir();
+-
+-        // Ensure a package can be initialized at the `test_directory`
+-        assert!(Package::can_initialize(TEST_PACKAGE_NAME, true, &test_directory));
+-
+-        // Manually add a source directory and a library file to the `test_directory`
+-        SourceDirectory::create(&test_directory).unwrap();
+-        LibraryFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
+-
+-        // Attempt to initialize a package at the `test_directory`
+-        assert!(Package::initialize(TEST_PACKAGE_NAME, true, &test_directory).is_err());
+-
+-        // Ensure package is not initialized at the `test_directory`
+-        assert!(!Package::is_initialized(TEST_PACKAGE_NAME, true, &test_directory));
+-    }
+-
+-    #[test]
+-    fn initialize_fails_with_existing_input_file() {
+-        let test_directory = test_dir();
+-
+-        // Ensure a package can be initialized at the `test_directory`
+-        assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
+-
+-        // Manually add an inputs directory and an input file to the `test_directory`
+-        InputsDirectory::create(&test_directory).unwrap();
+-        InputFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
+-
+-        // Attempt to initialize a package at the `test_directory`
+-        assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
+-
+-        // Ensure package is not initialized at the `test_directory`
+-        assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
+-    }
+-
+-    #[test]
+-    fn initialize_fails_with_existing_state_file() {
+-        let test_directory = test_dir();
+-
+-        // Ensure a package can be initialized at the `test_directory`
+-        assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
+-
+-        // Manually add an inputs directory and a state file to the `test_directory`
+-        InputsDirectory::create(&test_directory).unwrap();
+-        StateFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
+-
+-        // Attempt to initialize a package at the `test_directory`
+-        assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
+-
+-        // Ensure package is not initialized at the `test_directory`
+-        assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
+-    }
+-
+-    #[test]
+-    fn initialize_fails_with_existing_main_file() {
+-        let test_directory = test_dir();
+-
+-        // Ensure a package can be initialized at the `test_directory`
+-        assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
+-
+-        // Manually add a source directory and a main file to the `test_directory`
+-        SourceDirectory::create(&test_directory).unwrap();
+-        MainFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
+-
+-        // Attempt to initialize a package at the `test_directory`
+-        assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
+-
+-        // Ensure package is not initialized at the `test_directory`
+-        assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
+-    }
+-}
+diff --git a/package/tests/initialize/initialize.rs b/package/tests/initialize/initialize.rs
+new file mode 100644
+index 0000000000..82763d4124
+--- /dev/null
++++ b/package/tests/initialize/initialize.rs
+@@ -0,0 +1,134 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::test_dir;
++use leo_package::{
++    inputs::{InputFile, InputsDirectory, StateFile},
++    package::Package,
++    root::Manifest,
++    source::{LibraryFile, MainFile, SourceDirectory},
++};
++
++const TEST_PACKAGE_NAME: &str = "test-package";
++
++#[test]
++fn initialize_valid_package() {
++    let test_directory = test_dir();
++
++    // Ensure a package can be initialized at the `test_directory`
++    assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
++
++    // Initialize a package at the `test_directory`
++    assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_ok());
++
++    // Ensure a package is initialized at the `test_directory`
++    assert!(Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
++}
++
++#[test]
++#[ignore]
++fn initialize_fails_with_invalid_package_names() {
++    unimplemented!()
++}
++
++#[test]
++fn initialize_fails_with_existing_manifest() {
++    let test_directory = test_dir();
++
++    // Ensure a package can be initialized at the `test_directory`
++    assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
++
++    // Manually add a manifest file to the `test_directory`
++    Manifest::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
++
++    // Attempt to initialize a package at the `test_directory`
++    assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
++
++    // Ensure package is not initialized at the `test_directory`
++    assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
++}
++
++#[test]
++fn initialize_fails_with_existing_library_file() {
++    let test_directory = test_dir();
++
++    // Ensure a package can be initialized at the `test_directory`
++    assert!(Package::can_initialize(TEST_PACKAGE_NAME, true, &test_directory));
++
++    // Manually add a source directory and a library file to the `test_directory`
++    SourceDirectory::create(&test_directory).unwrap();
++    LibraryFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
++
++    // Attempt to initialize a package at the `test_directory`
++    assert!(Package::initialize(TEST_PACKAGE_NAME, true, &test_directory).is_err());
++
++    // Ensure package is not initialized at the `test_directory`
++    assert!(!Package::is_initialized(TEST_PACKAGE_NAME, true, &test_directory));
++}
++
++#[test]
++fn initialize_fails_with_existing_input_file() {
++    let test_directory = test_dir();
++
++    // Ensure a package can be initialized at the `test_directory`
++    assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
++
++    // Manually add an inputs directory and an input file to the `test_directory`
++    InputsDirectory::create(&test_directory).unwrap();
++    InputFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
++
++    // Attempt to initialize a package at the `test_directory`
++    assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
++
++    // Ensure package is not initialized at the `test_directory`
++    assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
++}
++
++#[test]
++fn initialize_fails_with_existing_state_file() {
++    let test_directory = test_dir();
++
++    // Ensure a package can be initialized at the `test_directory`
++    assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
++
++    // Manually add an inputs directory and a state file to the `test_directory`
++    InputsDirectory::create(&test_directory).unwrap();
++    StateFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
++
++    // Attempt to initialize a package at the `test_directory`
++    assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
++
++    // Ensure package is not initialized at the `test_directory`
++    assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
++}
++
++#[test]
++fn initialize_fails_with_existing_main_file() {
++    let test_directory = test_dir();
++
++    // Ensure a package can be initialized at the `test_directory`
++    assert!(Package::can_initialize(TEST_PACKAGE_NAME, false, &test_directory));
++
++    // Manually add a source directory and a main file to the `test_directory`
++    SourceDirectory::create(&test_directory).unwrap();
++    MainFile::new(TEST_PACKAGE_NAME).write_to(&test_directory).unwrap();
++
++    // Attempt to initialize a package at the `test_directory`
++    assert!(Package::initialize(TEST_PACKAGE_NAME, false, &test_directory).is_err());
++
++    // Ensure package is not initialized at the `test_directory`
++    assert!(!Package::is_initialized(TEST_PACKAGE_NAME, false, &test_directory));
++}
+diff --git a/package/tests/initialize/mod.rs b/package/tests/initialize/mod.rs
+new file mode 100644
+index 0000000000..c0fbdb773b
+--- /dev/null
++++ b/package/tests/initialize/mod.rs
+@@ -0,0 +1,17 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod initialize;
+diff --git a/package/tests/manifest/manifest.rs b/package/tests/manifest/manifest.rs
+new file mode 100644
+index 0000000000..afce5bfa0a
+--- /dev/null
++++ b/package/tests/manifest/manifest.rs
+@@ -0,0 +1,169 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++// Tests for package manifest
++
++use crate::test_dir;
++use leo_package::root::{Manifest, MANIFEST_FILENAME};
++
++use std::{
++    convert::TryFrom,
++    fs::File,
++    io::{Read, Write},
++    path::PathBuf,
++};
++
++const OLD_MANIFEST_FORMAT: &str = r#"[package]
++name = "test-package"
++version = "0.1.0"
++description = "Testing manifest updates."
++license = "MIT"
++remote = "author/test-package"
++"#;
++
++const NEW_REMOTE_FORMAT: &str = r#"
++[remote]
++author = "author"
++"#;
++
++const OLD_PROJECT_FORMAT: &str = "[package]";
++const NEW_PROJECT_FORMAT: &str = "[project]";
++
++/// Create a manifest file with outdated formatting.
++fn create_outdated_manifest_file(path: PathBuf) -> PathBuf {
++    let mut path = path.to_owned();
++    if path.is_dir() {
++        path.push(PathBuf::from(MANIFEST_FILENAME));
++    }
++
++    let mut file = File::create(&path).unwrap();
++    file.write_all(OLD_MANIFEST_FORMAT.as_bytes()).unwrap();
++
++    path
++}
++
++/// Read the manifest file into a string.
++fn read_manifest_file(path: &PathBuf) -> String {
++    let mut file = File::open(path.clone()).unwrap();
++    let size = file.metadata().unwrap().len() as usize;
++
++    let mut buffer = String::with_capacity(size);
++    file.read_to_string(&mut buffer).unwrap();
++
++    buffer
++}
++
++/// Read the manifest file and check that the remote format is updated.
++fn remote_is_updated(path: &PathBuf) -> bool {
++    let manifest_string = read_manifest_file(&path);
++    for line in manifest_string.lines() {
++        if line.starts_with("remote") {
++            return false;
++        }
++    }
++
++    manifest_string.contains(NEW_REMOTE_FORMAT)
++}
++
++/// Read the manifest file and check that the project format is updated.
++fn project_is_updated(path: &PathBuf) -> bool {
++    let manifest_string = read_manifest_file(&path);
++
++    !manifest_string.contains(OLD_PROJECT_FORMAT) && manifest_string.contains(NEW_PROJECT_FORMAT)
++}
++
++#[test]
++#[cfg_attr(
++    any(feature = "manifest_refactor_project", feature = "manifest_refactor_remote"),
++    ignore
++)]
++fn test_manifest_no_refactors() {
++    // Create an outdated manifest file.
++    let test_directory = test_dir();
++    let manifest_path = create_outdated_manifest_file(test_directory);
++
++    // Load the manifest file, and discard the new struct.
++    let _manifest = Manifest::try_from(&manifest_path).unwrap();
++
++    // Check that the manifest file project has NOT been updated.
++    assert!(!project_is_updated(&manifest_path));
++
++    // Check that the manifest file remote has NOT been updated.
++    assert!(!remote_is_updated(&manifest_path));
++}
++
++#[test]
++#[cfg_attr(
++    any(feature = "manifest_refactor_project", not(feature = "manifest_refactor_remote")),
++    ignore
++)]
++fn test_manifest_refactor_remote() {
++    // Create an outdated manifest file.
++    let test_directory = test_dir();
++    let manifest_path = create_outdated_manifest_file(test_directory);
++
++    // Load the manifest file, and discard the new struct.
++    let _manifest = Manifest::try_from(&manifest_path).unwrap();
++
++    // Check that the manifest file project has NOT been updated.
++    assert!(!project_is_updated(&manifest_path));
++
++    // Check that the manifest file remote has been updated.
++    assert!(remote_is_updated(&manifest_path));
++}
++
++#[test]
++#[cfg_attr(
++    any(not(feature = "manifest_refactor_project"), feature = "manifest_refactor_remote"),
++    ignore
++)]
++fn test_manifest_refactor_project() {
++    // Create an outdated manifest file.
++    let test_directory = test_dir();
++    let manifest_path = create_outdated_manifest_file(test_directory);
++
++    // Load the manifest file, and discard the new struct.
++    let _manifest = Manifest::try_from(&manifest_path).unwrap();
++
++    // Check that the manifest file project has been updated.
++    assert!(project_is_updated(&manifest_path));
++
++    // Check that the manifest file remote has NOT been updated.
++    assert!(!remote_is_updated(&manifest_path));
++}
++
++#[test]
++#[cfg_attr(
++    any(
++        not(feature = "manifest_refactor_project"),
++        not(feature = "manifest_refactor_remote")
++    ),
++    ignore
++)]
++fn test_manifest_refactors() {
++    // Create an outdated manifest file.
++    let test_directory = test_dir();
++    let manifest_path = create_outdated_manifest_file(test_directory);
++
++    // Load the manifest file, and discard the new struct.
++    let _manifest = Manifest::try_from(&manifest_path).unwrap();
++
++    // Check that the manifest file project has been updated.
++    assert!(project_is_updated(&manifest_path));
++
++    // Check that the manifest file remote has been updated.
++    assert!(remote_is_updated(&manifest_path));
++}
+diff --git a/package/tests/manifest/mod.rs b/package/tests/manifest/mod.rs
+new file mode 100644
+index 0000000000..10d357ff78
+--- /dev/null
++++ b/package/tests/manifest/mod.rs
+@@ -0,0 +1,17 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod manifest;
+diff --git a/package/tests/mod.rs b/package/tests/mod.rs
+new file mode 100644
+index 0000000000..0fe5d2f794
+--- /dev/null
++++ b/package/tests/mod.rs
+@@ -0,0 +1,73 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++pub mod initialize;
++pub mod manifest;
++
++use lazy_static::lazy_static;
++use std::{
++    cell::RefCell,
++    env,
++    fs,
++    path::PathBuf,
++    sync::atomic::{AtomicUsize, Ordering},
++};
++
++const PACKAGE_TEST_DIRECTORY: &str = "package-testing";
++
++thread_local! {
++    /// Establish a test id for each test.
++    pub static TEST_ID: RefCell<Option<usize>> = RefCell::new(None);
++}
++
++lazy_static! {
++    /// Create a testing directory for packages in `target/`
++    pub static ref TEST_DIR: PathBuf = {
++        let mut path = env::current_exe().unwrap();
++        path.pop(); // Remove executable name
++        path.pop(); // Remove 'debug'
++
++        // Attempt to point at the `target` directory
++        if path.file_name().and_then(|s| s.to_str()) != Some("target") {
++            path.pop();
++        }
++
++        path.push(PACKAGE_TEST_DIRECTORY);
++        fs::create_dir_all(&path).unwrap();
++
++        path
++    };
++}
++
++/// Create a new directory for each test based on the ID of the test.
++pub(crate) fn test_dir() -> PathBuf {
++    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
++
++    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++    TEST_ID.with(|n| *n.borrow_mut() = Some(id));
++
++    let path: PathBuf = TEST_DIR.join(&format!("t{}", id)).into();
++
++    if path.exists() {
++        if let Err(e) = fs::remove_dir_all(&path) {
++            panic!("failed to remove {:?}: {:?}", &path, e)
++        }
++    }
++
++    fs::create_dir_all(&path).unwrap();
++
++    path
++}
+diff --git a/typed/src/circuits/circuit.rs b/typed/src/circuits/circuit.rs
+index 512feaa491..ef29f140d1 100644
+--- a/typed/src/circuits/circuit.rs
++++ b/typed/src/circuits/circuit.rs
+@@ -49,13 +49,6 @@ impl Circuit {
+     }
+ }
+ 
+-// TODO (Collin): Uncomment when we no longer print out Program
+-// impl fmt::Display for Circuit {
+-//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-//         self.format(f)
+-//     }
+-// }
+-
+ impl fmt::Debug for Circuit {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         self.format(f)
+diff --git a/typed/src/common/assignee.rs b/typed/src/common/assignee.rs
+index b5e0a54920..afa7f1c460 100644
+--- a/typed/src/common/assignee.rs
++++ b/typed/src/common/assignee.rs
+@@ -17,7 +17,7 @@
+ use crate::{Expression, Identifier, RangeOrExpression};
+ use leo_ast::{
+     access::AssigneeAccess as AstAssigneeAccess,
+-    common::{Assignee as AstAssignee, Identifier as AstIdentifier, KeywordOrIdentifier},
++    common::{Assignee as AstAssignee, Identifier as AstIdentifier, SelfKeywordOrIdentifier},
+ };
+ 
+ use serde::{Deserialize, Serialize};
+@@ -38,8 +38,8 @@ impl<'ast> From<AstIdentifier<'ast>> for Assignee {
+     }
+ }
+ 
+-impl<'ast> From<KeywordOrIdentifier<'ast>> for Assignee {
+-    fn from(name: KeywordOrIdentifier<'ast>) -> Self {
++impl<'ast> From<SelfKeywordOrIdentifier<'ast>> for Assignee {
++    fn from(name: SelfKeywordOrIdentifier<'ast>) -> Self {
+         Assignee::Identifier(Identifier::from(name))
+     }
+ }
+diff --git a/typed/src/common/identifier.rs b/typed/src/common/identifier.rs
+index 9d71fe5350..c10474e62c 100644
+--- a/typed/src/common/identifier.rs
++++ b/typed/src/common/identifier.rs
+@@ -17,17 +17,14 @@
+ use crate::Span;
+ use leo_ast::{
+     annotations::AnnotationArgument,
+-    common::Identifier as AstIdentifier,
+-    imports::PackageName as AstPackageName,
+-};
+-use leo_input::common::Identifier as InputAstIdentifier;
+-
+-use leo_ast::{
+-    common::{KeywordOrIdentifier, SelfKeyword},
++    common::{Identifier as AstIdentifier, KeywordOrIdentifier, SelfKeyword, SelfKeywordOrIdentifier},
+     expressions::CircuitName,
+     functions::InputKeyword,
++    imports::PackageName as AstPackageName,
+     types::SelfType,
+ };
++use leo_input::common::Identifier as InputAstIdentifier;
++
+ use serde::{
+     de::{self, Visitor},
+     Deserialize,
+@@ -93,10 +90,18 @@ impl<'ast> From<AnnotationArgument<'ast>> for Identifier {
+ impl<'ast> From<KeywordOrIdentifier<'ast>> for Identifier {
+     fn from(name: KeywordOrIdentifier<'ast>) -> Self {
+         match name {
+-            KeywordOrIdentifier::SelfKeyword(keyword) => Identifier::from(keyword),
++            KeywordOrIdentifier::SelfKeywordOrIdentifier(keyword) => Identifier::from(keyword),
+             KeywordOrIdentifier::SelfType(self_type) => Identifier::from(self_type),
+             KeywordOrIdentifier::Input(keyword) => Identifier::from(keyword),
+-            KeywordOrIdentifier::Identifier(identifier) => Identifier::from(identifier),
++        }
++    }
++}
++
++impl<'ast> From<SelfKeywordOrIdentifier<'ast>> for Identifier {
++    fn from(name: SelfKeywordOrIdentifier<'ast>) -> Self {
++        match name {
++            SelfKeywordOrIdentifier::Identifier(identifier) => Identifier::from(identifier),
++            SelfKeywordOrIdentifier::SelfKeyword(keyword) => Identifier::from(keyword),
+         }
+     }
+ }
+diff --git a/typed/src/expression.rs b/typed/src/expression.rs
+index 4371f55175..5fc2543c1a 100644
+--- a/typed/src/expression.rs
++++ b/typed/src/expression.rs
+@@ -87,23 +87,34 @@ pub enum Expression {
+     Lt(Box<Expression>, Box<Expression>, Span),
+ 
+     // Conditionals
+-    IfElse(Box<Expression>, Box<Expression>, Box<Expression>, Span), // (conditional, first_value, second_value)
++    // (conditional, first_value, second_value, span)
++    IfElse(Box<Expression>, Box<Expression>, Box<Expression>, Span),
+ 
+     // Arrays
++    // (array_elements, span)
+     Array(Vec<Box<SpreadOrExpression>>, Span),
+-    ArrayAccess(Box<Expression>, Box<RangeOrExpression>, Span), // (array name, range)
++    // (array_name, range, span)
++    ArrayAccess(Box<Expression>, Box<RangeOrExpression>, Span),
+ 
+     // Tuples
++    // (tuple_elements, span)
+     Tuple(Vec<Expression>, Span),
++    // (tuple_name, index, span)
+     TupleAccess(Box<Expression>, usize, Span),
+ 
+     // Circuits
++    // (defined_circuit_name, circuit_members, span)
+     Circuit(Identifier, Vec<CircuitVariableDefinition>, Span),
+-    CircuitMemberAccess(Box<Expression>, Identifier, Span), // (declared circuit name, circuit member name)
+-    CircuitStaticFunctionAccess(Box<Expression>, Identifier, Span), // (defined circuit name, circuit static member name)
++    // (declared_circuit name, circuit_member_name, span)
++    CircuitMemberAccess(Box<Expression>, Identifier, Span),
++    // (defined_circuit name, circuit_static_function_name, span)
++    CircuitStaticFunctionAccess(Box<Expression>, Identifier, Span),
+ 
+     // Functions
++    // (declared_function_name, function_arguments, span)
+     FunctionCall(Box<Expression>, Vec<Expression>, Span),
++    // (core_function_name, function_arguments, span)
++    CoreFunctionCall(String, Vec<Expression>, Span),
+ }
+ 
+ impl Expression {
+@@ -139,6 +150,7 @@ impl Expression {
+             Expression::CircuitStaticFunctionAccess(_, _, old_span) => *old_span = new_span.clone(),
+ 
+             Expression::FunctionCall(_, _, old_span) => *old_span = new_span.clone(),
++            Expression::CoreFunctionCall(_, _, old_span) => *old_span = new_span.clone(),
+             _ => {}
+         }
+     }
+@@ -269,6 +281,16 @@ impl<'ast> fmt::Display for Expression {
+                 }
+                 write!(f, ")")
+             }
++            Expression::CoreFunctionCall(ref function, ref arguments, ref _span) => {
++                write!(f, "{}(", function,)?;
++                for (i, param) in arguments.iter().enumerate() {
++                    write!(f, "{}", param)?;
++                    if i < arguments.len() - 1 {
++                        write!(f, ", ")?;
++                    }
++                }
++                write!(f, ")")
++            }
+         }
+     }
+ }
+diff --git a/typed/src/types/type_.rs b/typed/src/types/type_.rs
+index 70a3d107b0..6f017f7ed4 100644
+--- a/typed/src/types/type_.rs
++++ b/typed/src/types/type_.rs
+@@ -58,6 +58,26 @@ impl Type {
+         false
+     }
+ 
++    pub fn match_array_types(&self, other: &Type) -> bool {
++        // Check that both `self` and `other` are of type array
++        let (type_1, dimensions_1) = match self {
++            Type::Array(type_, dimensions) => (type_, dimensions),
++            _ => return false,
++        };
++
++        let (type_2, dimensions_2) = match other {
++            Type::Array(type_, dimensions) => (type_, dimensions),
++            _ => return false,
++        };
++
++        // Expand multidimensional array syntax
++        let (type_1_expanded, dimensions_1_expanded) = expand_array_type(type_1, dimensions_1);
++        let (type_2_expanded, dimensions_2_expanded) = expand_array_type(type_2, dimensions_2);
++
++        // Return true if expanded array types and dimensions match
++        type_1_expanded.eq(&type_2_expanded) && dimensions_1_expanded.eq(&dimensions_2_expanded)
++    }
++
+     pub fn outer_dimension(&self, dimensions: &Vec<usize>) -> Self {
+         let type_ = self.clone();
+ 
+@@ -85,6 +105,19 @@ impl Type {
+     }
+ }
+ 
++fn expand_array_type(type_: &Type, dimensions: &Vec<usize>) -> (Type, Vec<usize>) {
++    if let Type::Array(nested_type, nested_dimensions) = type_ {
++        // Expand nested array type
++        let mut expanded_dimensions = dimensions.clone();
++        expanded_dimensions.append(&mut nested_dimensions.clone());
++
++        return expand_array_type(nested_type, &expanded_dimensions);
++    } else {
++        // Array type is fully expanded
++        (type_.clone(), dimensions.clone())
++    }
++}
++
+ /// pest ast -> Explicit Type for defining circuit members and function params
+ 
+ impl From<DataType> for Type {

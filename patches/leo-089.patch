@@ -1,87 +1,678 @@
-diff --git a/errors/src/errors/cli/cli_errors.rs b/errors/src/errors/cli/cli_errors.rs
-index ef60068e87..65a2f8bc1d 100644
---- a/errors/src/errors/cli/cli_errors.rs
-+++ b/errors/src/errors/cli/cli_errors.rs
-@@ -288,15 +288,15 @@ create_messages!(
+diff --git a/ast/src/circuits/circuit_variable_definition.rs b/ast/src/circuits/circuit_variable_definition.rs
+index 533fff7455..8bd462a099 100644
+--- a/ast/src/circuits/circuit_variable_definition.rs
++++ b/ast/src/circuits/circuit_variable_definition.rs
+@@ -14,7 +14,12 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
  
-     @backtraced
-     constraint_limit_exceeded {
--        args: (program: impl Display, limit: u64, network: impl Display),
--        msg: format!("Program `{program}` exceeds the constraint limit {limit} for deployment on network {network}."),
-+        args: (program: impl Display, actual: u64, limit: u64, network: impl Display),
-+        msg: format!("Program `{program}` has {actual} constraints, which exceeds the limit of {limit} for deployment on network {network}."),
-         help: Some("Reduce the number of constraints in the program by reducing the number of instructions in transition functions.".to_string()),
+-use crate::{ast::Rule, common::Identifier, types::Type, SpanDef};
++use crate::{
++    ast::Rule,
++    common::{Identifier, Mutable},
++    types::Type,
++    SpanDef,
++};
+ 
+ use pest::Span;
+ use pest_ast::FromPest;
+@@ -23,8 +28,9 @@ use serde::Serialize;
+ #[derive(Clone, Debug, FromPest, PartialEq, Serialize)]
+ #[pest_ast(rule(Rule::circuit_variable_definition))]
+ pub struct CircuitVariableDefinition<'ast> {
++    pub mutable: Option<Mutable>,
+     pub identifier: Identifier<'ast>,
+-    pub _type: Type<'ast>,
++    pub type_: Type<'ast>,
+     #[pest_ast(outer())]
+     #[serde(with = "SpanDef")]
+     pub span: Span<'ast>,
+diff --git a/ast/src/expressions/array_initializer_expression.rs b/ast/src/expressions/array_initializer_expression.rs
+index a003501a93..87ea73cec3 100644
+--- a/ast/src/expressions/array_initializer_expression.rs
++++ b/ast/src/expressions/array_initializer_expression.rs
+@@ -14,7 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::{ast::Rule, expressions::Expression, types::ArrayDimensions, SpanDef};
++use crate::{ast::Rule, expressions::Expression, values::PositiveNumber, SpanDef};
+ 
+ use pest::Span;
+ use pest_ast::FromPest;
+@@ -24,7 +24,7 @@ use serde::Serialize;
+ #[pest_ast(rule(Rule::expression_array_initializer))]
+ pub struct ArrayInitializerExpression<'ast> {
+     pub expression: Box<Expression<'ast>>,
+-    pub dimensions: ArrayDimensions<'ast>,
++    pub count: PositiveNumber<'ast>,
+     #[pest_ast(outer())]
+     #[serde(with = "SpanDef")]
+     pub span: Span<'ast>,
+diff --git a/ast/src/expressions/expression.rs b/ast/src/expressions/expression.rs
+index 49801461f8..47cb5d92e0 100644
+--- a/ast/src/expressions/expression.rs
++++ b/ast/src/expressions/expression.rs
+@@ -101,7 +101,7 @@ impl<'ast> fmt::Display for Expression<'ast> {
+                 write!(f, "")
+             }
+             Expression::ArrayInitializer(ref expression) => {
+-                write!(f, "[{} ; ({})]", expression.expression, expression.dimensions)
++                write!(f, "[{} ; {}]", expression.expression, expression.count)
+             }
+             Expression::CircuitInline(ref expression) => write!(f, "{}", expression.span.as_str()),
+             Expression::Postfix(ref expression) => write!(f, "{}", expression.span.as_str()),
+diff --git a/ast/src/leo.pest b/ast/src/leo.pest
+index 5af328b93b..eb410a93ed 100644
+--- a/ast/src/leo.pest
++++ b/ast/src/leo.pest
+@@ -311,7 +311,7 @@ circuit = { "circuit " ~ identifier ~ "{" ~ NEWLINE* ~ circuit_member* ~ NEWLINE
+ circuit_variable = { identifier ~ ":" ~ expression }
+ 
+ // Declared in circuits/circuit_variable_definition.rs
+-circuit_variable_definition = { identifier ~ ":" ~ type_ ~ ","?}
++circuit_variable_definition = { mutable? ~ identifier ~ ":" ~ type_ ~ ","?}
+ 
+ // Declared in circuits/circuit_function.rs
+ circuit_function = { static_? ~ function }
+@@ -346,7 +346,7 @@ expression = { expression_term ~ (operation_binary ~ expression_term)* }
+ expression_tuple = { "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
+ 
+ // Declared in expressions/array_initializer_expression.rs
+-expression_array_initializer = { "[" ~ expression ~ ";" ~ array_dimensions ~ "]" }
++expression_array_initializer = { "[" ~ expression ~ ";" ~ number_positive ~ "]" }
+ 
+ // Declared in expressions/array_inline_expression.rs
+ expression_array_inline = { "[" ~ NEWLINE* ~ inline_array_inner ~ NEWLINE* ~ "]"}
+diff --git a/ast/src/types/array_dimensions.rs b/ast/src/types/array_dimensions.rs
+index c01a740d35..f75f141a15 100644
+--- a/ast/src/types/array_dimensions.rs
++++ b/ast/src/types/array_dimensions.rs
+@@ -44,12 +44,3 @@ pub struct Multiple<'ast> {
+     #[serde(with = "SpanDef")]
+     pub span: Span<'ast>,
+ }
+-
+-impl<'ast> std::fmt::Display for ArrayDimensions<'ast> {
+-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+-        match *self {
+-            ArrayDimensions::Single(ref single) => write!(f, "{}", single.number),
+-            ArrayDimensions::Multiple(ref multiple) => write!(f, "{:?}", multiple.numbers),
+-        }
+-    }
+-}
+diff --git a/compiler/src/errors/statement.rs b/compiler/src/errors/statement.rs
+index 84ae11c969..2c4f483b97 100644
+--- a/compiler/src/errors/statement.rs
++++ b/compiler/src/errors/statement.rs
+@@ -96,6 +96,12 @@ impl StatementError {
+         Self::new_from_span(message, span)
      }
  
-     @backtraced
-     variable_limit_exceeded {
--        args: (program: impl Display, limit: u64, network: impl Display),
--        msg: format!("Program `{program}` exceeds the variable limit {limit} for deployment on network {network}."),
-+        args: (program: impl Display, actual: u64, limit: u64, network: impl Display),
-+        msg: format!("Program `{program}` has {actual} variables, which exceeds the limit of {limit} for deployment on network {network}."),
-         help: Some("Reduce the number of variables in the program by reducing the number of instructions in transition functions.".to_string()),
++    pub fn immutable_circuit_variable(name: String, span: Span) -> Self {
++        let message = format!("Circuit member variable `{}` is immutable", name);
++
++        Self::new_from_span(message, span)
++    }
++
+     pub fn indicator_calculation(name: String, span: Span) -> Self {
+         let message = format!(
+             "Constraint system failed to evaluate branch selection indicator `{}`",
+@@ -168,8 +174,8 @@ impl StatementError {
+         Self::new_from_span(message, span)
      }
  
-diff --git a/leo/cli/commands/deploy.rs b/leo/cli/commands/deploy.rs
-index 10ab8f2ca7..13cef55ac2 100644
---- a/leo/cli/commands/deploy.rs
-+++ b/leo/cli/commands/deploy.rs
-@@ -195,15 +195,9 @@ fn handle_deploy<N: Network>(
-             let deployment = transaction.deployment().expect("Expected a deployment in the transaction");
-             // Print the deployment stats.
-             print_deployment_stats(&program_id.to_string(), deployment, priority_fee)?;
--            // Check if the number of variables and constraints are within the limits.
--            if deployment.num_combined_variables()? > N::MAX_DEPLOYMENT_VARIABLES {
--                return Err(CliError::variable_limit_exceeded(program_id, N::MAX_DEPLOYMENT_VARIABLES, network).into());
--            }
--            if deployment.num_combined_constraints()? > N::MAX_DEPLOYMENT_CONSTRAINTS {
--                return Err(
--                    CliError::constraint_limit_exceeded(program_id, N::MAX_DEPLOYMENT_CONSTRAINTS, network).into()
--                );
--            }
+-    pub fn undefined_circuit_object(name: String, span: Span) -> Self {
+-        let message = format!("Attempted to assign to unknown circuit object `{}`", name);
++    pub fn undefined_circuit_variable(name: String, span: Span) -> Self {
++        let message = format!("Attempted to assign to unknown circuit member variable `{}`", name);
+ 
+         Self::new_from_span(message, span)
+     }
+diff --git a/compiler/src/expression/circuit/access.rs b/compiler/src/expression/circuit/access.rs
+index 716ff73dba..7ad1eb5653 100644
+--- a/compiler/src/expression/circuit/access.rs
++++ b/compiler/src/expression/circuit/access.rs
+@@ -77,9 +77,9 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                         for stored_member in members {
+                             let circuit_scope = new_scope(file_scope.clone(), circuit_name.to_string());
+                             let self_keyword = new_scope(circuit_scope, SELF_KEYWORD.to_string());
+-                            let field = new_scope(self_keyword, stored_member.0.to_string());
++                            let variable = new_scope(self_keyword, stored_member.0.to_string());
+ 
+-                            self.store(field, stored_member.1.clone());
++                            self.store(variable, stored_member.1.clone());
+                         }
+                     }
+                     ConstrainedValue::Static(value) => {
+diff --git a/compiler/src/expression/circuit/circuit.rs b/compiler/src/expression/circuit/circuit.rs
+index b27196e49c..b180428ae4 100644
+--- a/compiler/src/expression/circuit/circuit.rs
++++ b/compiler/src/expression/circuit/circuit.rs
+@@ -55,22 +55,27 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+ 
+         for member in circuit.members.clone().into_iter() {
+             match member {
+-                CircuitMember::CircuitVariable(identifier, _type) => {
++                CircuitMember::CircuitVariable(is_mutable, identifier, type_) => {
+                     let matched_variable = members
+                         .clone()
+                         .into_iter()
+                         .find(|variable| variable.identifier.eq(&identifier));
+                     match matched_variable {
+                         Some(variable) => {
+-                            // Resolve and enforce circuit object
+-                            let variable_value = self.enforce_expression(
++                            // Resolve and enforce circuit variable
++                            let mut variable_value = self.enforce_expression(
+                                 cs,
+                                 file_scope.clone(),
+                                 function_scope.clone(),
+-                                Some(_type.clone()),
++                                Some(type_.clone()),
+                                 variable.expression,
+                             )?;
+ 
++                            // Add mutability to circuit variable
++                            if is_mutable {
++                                variable_value = ConstrainedValue::Mutable(Box::new(variable_value))
++                            }
 +
-+            validate_deployment_limits(deployment, &program_id, &network)?;
-+
-             // Save the transaction.
-             transactions.push((program_id, transaction));
+                             resolved_members.push(ConstrainedCircuitMember(identifier, variable_value))
+                         }
+                         None => return Err(ExpressionError::expected_circuit_member(identifier.to_string(), span)),
+diff --git a/compiler/src/statement/assign/circuit_variable.rs b/compiler/src/statement/assign/circuit_variable.rs
+index 82b08f0d31..8848261e39 100644
+--- a/compiler/src/statement/assign/circuit_variable.rs
++++ b/compiler/src/statement/assign/circuit_variable.rs
+@@ -33,19 +33,20 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+         cs: &mut CS,
+         indicator: Option<Boolean>,
+         circuit_name: String,
+-        object_name: Identifier,
++        variable_name: Identifier,
+         mut new_value: ConstrainedValue<F, G>,
+         span: Span,
+     ) -> Result<(), StatementError> {
+         let condition = indicator.unwrap_or(Boolean::Constant(true));
+ 
++        // Get the mutable circuit by name
+         match self.get_mutable_assignee(circuit_name, span.clone())? {
+             ConstrainedValue::CircuitExpression(_variable, members) => {
+                 // Modify the circuit variable in place
+-                let matched_variable = members.into_iter().find(|object| object.0 == object_name);
++                let matched_variable = members.into_iter().find(|member| member.0 == variable_name);
+ 
+                 match matched_variable {
+-                    Some(object) => match &object.1 {
++                    Some(member) => match &member.1 {
+                         ConstrainedValue::Function(_circuit_identifier, function) => {
+                             return Err(StatementError::immutable_circuit_function(
+                                 function.identifier.to_string(),
+@@ -55,27 +56,35 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+                         ConstrainedValue::Static(_value) => {
+                             return Err(StatementError::immutable_circuit_function("static".into(), span));
+                         }
+-                        _ => {
+-                            new_value.resolve_type(Some(object.1.to_type(span.clone())?), span.clone())?;
++                        ConstrainedValue::Mutable(value) => {
++                            new_value.resolve_type(Some(value.to_type(span.clone())?), span.clone())?;
+ 
+                             let name_unique = format!("select {} {}:{}", new_value, span.line, span.start);
+                             let selected_value = ConstrainedValue::conditionally_select(
+                                 cs.ns(|| name_unique),
+                                 &condition,
+                                 &new_value,
+-                                &object.1,
++                                &member.1,
+                             )
+                             .map_err(|_| {
+-                                StatementError::select_fail(new_value.to_string(), object.1.to_string(), span)
++                                StatementError::select_fail(new_value.to_string(), member.1.to_string(), span)
+                             })?;
+ 
+-                            object.1 = selected_value.to_owned();
++                            member.1 = selected_value.to_owned();
++                        }
++                        _ => {
++                            return Err(StatementError::immutable_circuit_variable(variable_name.name, span));
+                         }
+                     },
+-                    None => return Err(StatementError::undefined_circuit_object(object_name.to_string(), span)),
++                    None => {
++                        return Err(StatementError::undefined_circuit_variable(
++                            variable_name.to_string(),
++                            span,
++                        ));
++                    }
+                 }
+             }
+-            _ => return Err(StatementError::undefined_circuit(object_name.to_string(), span)),
++            _ => return Err(StatementError::undefined_circuit(variable_name.to_string(), span)),
          }
-@@ -332,6 +326,39 @@ fn check_tasks_for_warnings<N: Network>(
-     warnings
+ 
+         Ok(())
+diff --git a/compiler/src/value/value.rs b/compiler/src/value/value.rs
+index b4452d4195..c229fa2e9c 100644
+--- a/compiler/src/value/value.rs
++++ b/compiler/src/value/value.rs
+@@ -132,6 +132,7 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedValue<F, G> {
+                 Type::Tuple(types)
+             }
+             ConstrainedValue::CircuitExpression(id, _members) => Type::Circuit(id.clone()),
++            ConstrainedValue::Mutable(value) => return value.to_type(span),
+             value => return Err(ValueError::implicit(value.to_string(), span)),
+         })
+     }
+diff --git a/compiler/tests/array/initializer_input.leo b/compiler/tests/array/initializer_input.leo
+deleted file mode 100644
+index 4b886159dc..0000000000
+--- a/compiler/tests/array/initializer_input.leo
++++ /dev/null
+@@ -1,3 +0,0 @@
+-function main(a: [u8; (3, 2)]) {
+-    console.assert(a == [0u8; (3, 2)]);
+-}
+\ No newline at end of file
+diff --git a/compiler/tests/array/input/initializer_fail.in b/compiler/tests/array/input/initializer_fail.in
+deleted file mode 100644
+index cf991c79b6..0000000000
+--- a/compiler/tests/array/input/initializer_fail.in
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[main]
+-a: [u8; (3, 2)] = [0; (2, 2)];
+\ No newline at end of file
+diff --git a/compiler/tests/array/input/six_zeros.in b/compiler/tests/array/input/six_zeros.in
+index 9f9880807c..b6f6bd4b65 100644
+--- a/compiler/tests/array/input/six_zeros.in
++++ b/compiler/tests/array/input/six_zeros.in
+@@ -1,2 +1,2 @@
+ [main]
+-a: [u8; (3, 2)] = [0; (3, 2)];
+\ No newline at end of file
++a: [u8; (3, 2)] = [[0; 3]; 2];
+\ No newline at end of file
+diff --git a/compiler/tests/array/mod.rs b/compiler/tests/array/mod.rs
+index 3878ff6703..e97e487047 100644
+--- a/compiler/tests/array/mod.rs
++++ b/compiler/tests/array/mod.rs
+@@ -18,7 +18,6 @@ use crate::{
+     assert_satisfied,
+     expect_compiler_error,
+     get_output,
+-    integers::{expect_computation_error, expect_parsing_error},
+     parse_program,
+     parse_program_with_input,
+     EdwardsTestCompiler,
+@@ -102,24 +101,6 @@ fn test_initializer_fail() {
+     assert!(syntax_error);
  }
  
-+/// Check if the number of variables and constraints are within the limits.
-+fn validate_deployment_limits<N: Network>(
-+    deployment: &Deployment<N>,
-+    program_id: &ProgramID<N>,
-+    network: &NetworkName,
-+) -> Result<()> {
-+    // Check if the number of variables is within the limits.
-+    let combined_variables = deployment.num_combined_variables()?;
-+    if combined_variables > N::MAX_DEPLOYMENT_VARIABLES {
-+        return Err(CliError::variable_limit_exceeded(
-+            program_id,
-+            combined_variables,
-+            N::MAX_DEPLOYMENT_VARIABLES,
-+            network,
-+        )
-+        .into());
-+    }
+-#[test]
+-fn test_initializer_input() {
+-    let program_bytes = include_bytes!("initializer_input.leo");
+-    let input_bytes = include_bytes!("input/six_zeros.in");
+-    let program = parse_program_with_input(program_bytes, input_bytes).unwrap();
+-
+-    assert_satisfied(program);
+-}
+-
+-#[test]
+-fn test_initializer_input_fail() {
+-    let program_bytes = include_bytes!("initializer_input.leo");
+-    let input_bytes = include_bytes!("input/initializer_fail.in");
+-    let syntax_error = parse_program_with_input(program_bytes, input_bytes).is_err();
+-
+-    assert!(syntax_error);
+-}
+-
+ #[test]
+ fn test_spread() {
+     let program_bytes = include_bytes!("spread.leo");
+@@ -147,7 +128,7 @@ fn test_multi() {
+ }
+ 
+ #[test]
+-fn test_multi_fail() {
++fn test_multi_initializer_fail() {
+     let program_bytes = include_bytes!("multi_fail_initializer.leo");
+     let program = parse_program(program_bytes).unwrap();
+ 
+@@ -161,19 +142,3 @@ fn test_multi_inline_fail() {
+ 
+     expect_compiler_error(program);
+ }
+-
+-#[test]
+-fn test_multi_initializer() {
+-    let program_bytes = include_bytes!("multi_initializer.leo");
+-    let program = parse_program(program_bytes).unwrap();
+-
+-    assert_satisfied(program);
+-}
+-
+-#[test]
+-fn test_multi_initializer_fail() {
+-    let program_bytes = include_bytes!("multi_initializer_fail.leo");
+-    let program = parse_program(program_bytes).unwrap();
+-
+-    expect_compiler_error(program);
+-}
+diff --git a/compiler/tests/array/multi_initializer.leo b/compiler/tests/array/multi_initializer.leo
+deleted file mode 100644
+index 6133542ef0..0000000000
+--- a/compiler/tests/array/multi_initializer.leo
++++ /dev/null
+@@ -1,7 +0,0 @@
+-function main() {
+-    const a: [u8; (2, 2, 2)] = [1u8; (2, 2, 2)];
+-
+-    const b: [u8; (2, 2, 2)] = [[[1u8; 2]; 2]; 2];
+-
+-    console.assert(a == b);
+-}
+\ No newline at end of file
+diff --git a/compiler/tests/array/multi_initializer_fail.leo b/compiler/tests/array/multi_initializer_fail.leo
+deleted file mode 100644
+index 0bd76acffa..0000000000
+--- a/compiler/tests/array/multi_initializer_fail.leo
++++ /dev/null
+@@ -1,3 +0,0 @@
+-function main() {
+-    let arr: [u8; (2, 2)] = [1u8; (2, 1)]; // incorrect dimensions
+-}
+\ No newline at end of file
+diff --git a/input/src/errors/parser.rs b/input/src/errors/parser.rs
+index d808b61b51..7f3f8ad24e 100644
+--- a/input/src/errors/parser.rs
++++ b/input/src/errors/parser.rs
+@@ -17,7 +17,7 @@
+ use crate::{
+     ast::Rule,
+     errors::SyntaxError as InputSyntaxError,
+-    expressions::{ArrayInlineExpression, Expression},
++    expressions::{ArrayInitializerExpression, ArrayInlineExpression, Expression},
+     sections::Header,
+     tables::Table,
+     types::{DataType, Type},
+@@ -71,22 +71,14 @@ impl InputParserError {
+     }
+ 
+     pub fn data_type_mismatch(data_type: DataType, value: Value) -> Self {
+-        let message = format!(
+-            "expected data type `{}`, found `{}`",
+-            data_type.to_string(),
+-            value.to_string()
+-        );
++        let message = format!("expected `{}`, found `{}`", data_type.to_string(), value.to_string());
+         let span = value.span().to_owned();
+ 
+         Self::new_from_span(message, span)
+     }
+ 
+     pub fn expression_type_mismatch(type_: Type, expression: Expression) -> Self {
+-        let message = format!(
+-            "expected expression type `{}`, found `{}`",
+-            type_.to_string(),
+-            expression.to_string()
+-        );
++        let message = format!("expected `{}`, found `{}`", type_.to_string(), expression.to_string());
+         let span = expression.span().to_owned();
+ 
+         Self::new_from_span(message, span)
+@@ -103,11 +95,12 @@ impl InputParserError {
+         Self::new_from_span(message, span)
+     }
+ 
+-    pub fn array_init_length(expected: Vec<usize>, actual: Vec<usize>, span: Span) -> Self {
++    pub fn array_init_length(number: usize, array: ArrayInitializerExpression) -> Self {
+         let message = format!(
+-            "expected an array with a fixed size of {:?} elements, found one with {:?} elements",
+-            expected, actual
++            "expected an array with a fixed size of {} elements, found one with {} elements",
++            number, array.count
+         );
++        let span = array.span.to_owned();
+ 
+         Self::new_from_span(message, span)
+     }
+diff --git a/input/src/expressions/array_initializer_expression.rs b/input/src/expressions/array_initializer_expression.rs
+index 0a01c4e90d..b8ba714780 100644
+--- a/input/src/expressions/array_initializer_expression.rs
++++ b/input/src/expressions/array_initializer_expression.rs
+@@ -14,7 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::{ast::Rule, expressions::Expression, types::ArrayDimensions};
++use crate::{ast::Rule, expressions::Expression, values::PositiveNumber};
+ 
+ use pest::Span;
+ use pest_ast::FromPest;
+@@ -23,7 +23,7 @@ use pest_ast::FromPest;
+ #[pest_ast(rule(Rule::expression_array_initializer))]
+ pub struct ArrayInitializerExpression<'ast> {
+     pub expression: Box<Expression<'ast>>,
+-    pub dimensions: ArrayDimensions<'ast>,
++    pub count: PositiveNumber<'ast>,
+     #[pest_ast(outer())]
+     pub span: Span<'ast>,
+ }
+diff --git a/input/src/expressions/expression.rs b/input/src/expressions/expression.rs
+index c58bc66490..e533ffc93c 100644
+--- a/input/src/expressions/expression.rs
++++ b/input/src/expressions/expression.rs
+@@ -44,7 +44,7 @@ impl<'ast> fmt::Display for Expression<'ast> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         match *self {
+             Expression::ArrayInitializer(ref expression) => {
+-                write!(f, "array [{} ; {}]", expression.expression, expression.dimensions)
++                write!(f, "array [{} ; {}]", expression.expression, expression.count)
+             }
+             Expression::ArrayInline(ref array) => {
+                 let values = array
+diff --git a/input/src/leo-input.pest b/input/src/leo-input.pest
+index ec2574644b..4a27b1a8b0 100644
+--- a/input/src/leo-input.pest
++++ b/input/src/leo-input.pest
+@@ -179,7 +179,7 @@ value_address = {address | address_typed}
+ /// Expressions
+ 
+ // Declared in expressions/array_initializer_expression.rs
+-expression_array_initializer = { "[" ~ expression ~ ";" ~ array_dimensions ~ "]" }
++expression_array_initializer = { "[" ~ expression ~ ";" ~ number_positive ~ "]" }
+ 
+ // Declared in expressions/array_inline_expression.rs
+ expression_array_inline = { "[" ~ NEWLINE* ~ inline_array_inner ~ NEWLINE* ~ "]"}
+diff --git a/input/src/types/array_dimensions.rs b/input/src/types/array_dimensions.rs
+index 3cb19adc1e..5ddac86af4 100644
+--- a/input/src/types/array_dimensions.rs
++++ b/input/src/types/array_dimensions.rs
+@@ -53,7 +53,7 @@ impl<'ast> ArrayDimensions<'ast> {
+                 let old_dimension = multiple.numbers.clone();
+ 
+                 ArrayDimensions::Multiple(Multiple {
+-                    numbers: old_dimension[..old_dimension.len() - 1].to_vec(),
++                    numbers: old_dimension[..old_dimension.len() - 2].to_vec(),
+                     span: multiple.span.clone(),
+                 })
+             }
+@@ -65,16 +65,7 @@ impl<'ast> std::fmt::Display for ArrayDimensions<'ast> {
+     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+         match *self {
+             ArrayDimensions::Single(ref single) => write!(f, "{}", single.number),
+-            ArrayDimensions::Multiple(ref multiple) => {
+-                let string = multiple
+-                    .numbers
+-                    .iter()
+-                    .map(|x| x.value.clone())
+-                    .collect::<Vec<_>>()
+-                    .join(", ");
+-
+-                write!(f, "{}", string)
+-            }
++            ArrayDimensions::Multiple(ref multiple) => write!(f, "{:?}", multiple.numbers),
+         }
+     }
+ }
+diff --git a/input/src/types/array_type.rs b/input/src/types/array_type.rs
+index 0110d7c030..82e2ec688f 100644
+--- a/input/src/types/array_type.rs
++++ b/input/src/types/array_type.rs
+@@ -33,6 +33,6 @@ pub struct ArrayType<'ast> {
+ 
+ impl<'ast> std::fmt::Display for ArrayType<'ast> {
+     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+-        write!(f, "[{}; ({})]", self.type_, self.dimensions)
++        write!(f, "[{}; {}]", self.type_, self.dimensions)
+     }
+ }
+diff --git a/typed/src/circuits/circuit_member.rs b/typed/src/circuits/circuit_member.rs
+index 9434fa9e9a..008806d3d3 100644
+--- a/typed/src/circuits/circuit_member.rs
++++ b/typed/src/circuits/circuit_member.rs
+@@ -26,15 +26,18 @@ use std::fmt;
+ 
+ #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum CircuitMember {
+-    CircuitVariable(Identifier, Type),
++    // (is_mutable, variable_name, variable_type)
++    CircuitVariable(bool, Identifier, Type),
++    // (is_static, function)
+     CircuitFunction(bool, Function),
+ }
+ 
+ impl<'ast> From<AstCircuitVariableDefinition<'ast>> for CircuitMember {
+     fn from(circuit_value: AstCircuitVariableDefinition<'ast>) -> Self {
+         CircuitMember::CircuitVariable(
++            circuit_value.mutable.is_some(),
+             Identifier::from(circuit_value.identifier),
+-            Type::from(circuit_value._type),
++            Type::from(circuit_value.type_),
+         )
+     }
+ }
+@@ -60,9 +63,14 @@ impl<'ast> From<AstCircuitMember<'ast>> for CircuitMember {
+ impl fmt::Display for CircuitMember {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         match self {
+-            CircuitMember::CircuitVariable(ref identifier, ref _type) => write!(f, "{}: {}", identifier, _type),
+-            CircuitMember::CircuitFunction(ref _static, ref function) => {
+-                if *_static {
++            CircuitMember::CircuitVariable(ref mutable, ref identifier, ref type_) => {
++                if *mutable {
++                    write!(f, "mut ")?;
++                }
++                write!(f, "{}: {}", identifier, type_)
++            }
++            CircuitMember::CircuitFunction(ref static_, ref function) => {
++                if *static_ {
+                     write!(f, "static ")?;
+                 }
+                 write!(f, "{}", function)
+diff --git a/typed/src/expression.rs b/typed/src/expression.rs
+index f3d7f63891..679a2f68b2 100644
+--- a/typed/src/expression.rs
++++ b/typed/src/expression.rs
+@@ -493,28 +493,10 @@ impl<'ast> From<ArrayInlineExpression<'ast>> for Expression {
+ 
+ impl<'ast> From<ArrayInitializerExpression<'ast>> for Expression {
+     fn from(array: ArrayInitializerExpression<'ast>) -> Self {
+-        let dimensions = Expression::get_array_dimensions(array.dimensions);
++        let count = Expression::get_count_from_ast(array.count);
+         let expression = Box::new(SpreadOrExpression::from(*array.expression));
+ 
+-        let mut elements = vec![];
+-
+-        // Initializes an arrays elements using the rust `vec!` macro.
+-        // If there are multiple array dimensions, then `elements` is used as the first expression in a `vec!` macro.
+-        // This creates a multi-dimensional array by chaining `vec!` macros.
+-        for (i, dimension) in dimensions.into_iter().enumerate() {
+-            if i == 0 {
+-                elements = vec![expression.clone(); dimension];
+-            } else {
+-                let element = Box::new(SpreadOrExpression::Expression(Expression::Array(
+-                    elements,
+-                    Span::from(array.span.clone()),
+-                )));
+-
+-                elements = vec![element; dimension];
+-            }
+-        }
+-
+-        Expression::Array(elements, Span::from(array.span))
++        Expression::Array(vec![expression; count], Span::from(array.span))
+     }
+ }
+ 
+diff --git a/typed/src/input/input_value.rs b/typed/src/input/input_value.rs
+index 6f9ad83eee..f1bb3670ad 100644
+--- a/typed/src/input/input_value.rs
++++ b/typed/src/input/input_value.rs
+@@ -139,40 +139,40 @@ impl InputValue {
+     }
+ 
+     pub(crate) fn from_array_initializer(
+-        array_type: ArrayType,
++        mut array_type: ArrayType,
+         initializer: ArrayInitializerExpression,
+     ) -> Result<Self, InputParserError> {
+-        let array_dimensions = TypedExpression::get_input_array_dimensions(array_type.dimensions.clone());
+-        let initializer_dimensions = TypedExpression::get_input_array_dimensions(initializer.dimensions.clone());
+-
+-        // Return an error if the array type does not equal the array expression
+-        if array_dimensions.ne(&initializer_dimensions) {
+-            return Err(InputParserError::array_init_length(
+-                array_dimensions,
+-                initializer_dimensions,
+-                initializer.span,
+-            ));
++        let mut array_dimensions = TypedExpression::get_input_array_dimensions(array_type.dimensions.clone());
++        let initializer_count = initializer.count.to_string().parse::<usize>()?;
 +
-+    // Check if the number of constraints is within the limits.
-+    let constraints = deployment.num_combined_constraints()?;
-+    if constraints > N::MAX_DEPLOYMENT_CONSTRAINTS {
-+        return Err(CliError::constraint_limit_exceeded(
-+            program_id,
-+            constraints,
-+            N::MAX_DEPLOYMENT_CONSTRAINTS,
-+            network,
-+        )
-+        .into());
-+    }
++        // Return an error if the outer array dimension does not equal the number of array elements
++        if let Some(outer_dimension) = array_dimensions.pop() {
++            array_type.dimensions = array_type.dimensions.next_dimension();
 +
-+    Ok(())
-+}
-+
- /// Pretty‑print the deployment plan without using a table.
- #[allow(clippy::too_many_arguments)]
- fn print_deployment_plan<N: Network>(
++            if outer_dimension != initializer_count {
++                return Err(InputParserError::array_init_length(outer_dimension, initializer));
++            }
+         }
+ 
+-        let type_ = match array_type.type_ {
+-            ArrayElement::Basic(basic) => Type::Basic(basic),
+-            ArrayElement::Tuple(tuple) => Type::Tuple(tuple),
++        let inner_array_type = if array_dimensions.len() == 0 {
++            // this is a single array
++            match array_type.type_ {
++                ArrayElement::Basic(basic) => Type::Basic(basic),
++                ArrayElement::Tuple(tuple) => Type::Tuple(tuple),
++            }
++        } else {
++            // this is a multi-dimensional array
++            Type::Array(array_type)
+         };
+ 
+-        let value = InputValue::from_expression(type_, *initializer.expression.clone())?;
+-        let mut elements = vec![];
+-
+-        for (i, dimension) in initializer_dimensions.into_iter().enumerate() {
+-            if i == 0 {
+-                elements = vec![value.clone(); dimension];
+-            } else {
+-                let element = InputValue::Array(elements.clone());
++        let mut values = vec![];
++        for _ in 0..initializer_count {
++            let value = InputValue::from_expression(inner_array_type.clone(), *initializer.expression.clone())?;
+ 
+-                elements = vec![element; dimension];
+-            }
++            values.push(value)
+         }
+ 
+-        Ok(InputValue::Array(elements))
++        Ok(InputValue::Array(values))
+     }
+ 
+     pub(crate) fn from_tuple(tuple_type: TupleType, tuple: TupleExpression) -> Result<Self, InputParserError> {

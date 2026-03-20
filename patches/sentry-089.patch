@@ -1,0 +1,1105 @@
+diff --git a/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts b/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
+index ce2702b3339093..474e12d1f7aab2 100644
+--- a/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
++++ b/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
+@@ -6,8 +6,8 @@ import {
+ } from 'sentry/components/events/autofix/preferences/hooks/useProjectSeerPreferences';
+ import type {ProjectSeerPreferences} from 'sentry/components/events/autofix/types';
+ import type {Project} from 'sentry/types/project';
+-import apiFetch from 'sentry/utils/api/apiFetch';
+ import {
++  fetchDataQuery,
+   fetchMutation,
+   getApiQueryData,
+   setApiQueryData,
+@@ -32,12 +32,12 @@ export function useFetchProjectSeerPreferences({project}: {project: Project}) {
+   const queryKey = makeProjectSeerPreferencesQueryKey(organization.slug, project.slug);
+ 
+   return useCallback(async () => {
+-    const response = await queryClient.fetchQuery({
++    const [data] = await queryClient.fetchQuery({
+       queryKey,
+-      queryFn: apiFetch<SeerPreferencesResponse>,
++      queryFn: fetchDataQuery<SeerPreferencesResponse>,
+       staleTime: 0,
+     });
+-    return response.json.preference;
++    return data?.preference;
+   }, [queryClient, queryKey]);
+ }
+ 
+diff --git a/static/app/stores/projectsStore.tsx b/static/app/stores/projectsStore.tsx
+index bac6ca04e86ce8..34950e406cec7c 100644
+--- a/static/app/stores/projectsStore.tsx
++++ b/static/app/stores/projectsStore.tsx
+@@ -13,8 +13,6 @@ type State = {
+   projects: Project[];
+ };
+ 
+-type StatsData = Record<string, Project['stats']>;
+-
+ /**
+  * Attributes that need typing but aren't part of the external interface,
+  */
+@@ -35,7 +33,6 @@ interface ProjectsStoreDefinition
+   onDeleteProject(projectSlug: string): void;
+   onDeleteTeam(slug: string): void;
+   onRemoveTeam(teamSlug: string, projectSlug: string): void;
+-  onStatsLoadSuccess(data: StatsData): void;
+   onUpdateSuccess(data: Partial<Project>): void;
+   reset(): void;
+ }
+@@ -117,18 +114,6 @@ const storeConfig: ProjectsStoreDefinition = {
+     clearQueryCache();
+   },
+ 
+-  onStatsLoadSuccess(data) {
+-    const statsData = data || {};
+-
+-    // Assign stats into projects
+-    const newProjects = this.state.projects.map(project =>
+-      statsData[project.id] ? {...project, stats: data[project.id]} : project
+-    );
+-    this.state = {...this.state, projects: newProjects};
+-
+-    this.trigger(new Set(Object.keys(data)));
+-  },
+-
+   onDeleteProject(projectSlug: string) {
+     const project = this.getBySlug(projectSlug);
+     if (!project) {
+diff --git a/static/app/utils/discover/fieldRenderers.tsx b/static/app/utils/discover/fieldRenderers.tsx
+index 83dcee57ba980d..80999ea3412af0 100644
+--- a/static/app/utils/discover/fieldRenderers.tsx
++++ b/static/app/utils/discover/fieldRenderers.tsx
+@@ -822,9 +822,10 @@ const SPECIAL_FIELDS: Record<string, SpecialField> = {
+     sortField: null,
+     renderFunc: data => (
+       <StarredSegmentCell
+-        projectSlug={data.project}
+-        segmentName={data.transaction}
+-        isStarred={data.is_starred_transaction}
++        projectSlug={data[SpanFields.PROJECT]}
++        projectId={data[SpanFields.PROJECT_ID]?.toString()}
++        segmentName={data[SpanFields.TRANSACTION]}
++        isStarred={data[SpanFields.IS_STARRED_TRANSACTION]}
+       />
+     ),
+   },
+diff --git a/static/app/views/dashboards/components/genericOnboarding.tsx b/static/app/views/dashboards/components/genericOnboarding.tsx
+new file mode 100644
+index 00000000000000..71ad22e426145d
+--- /dev/null
++++ b/static/app/views/dashboards/components/genericOnboarding.tsx
+@@ -0,0 +1,47 @@
++import emptyStateImg from 'sentry-images/spot/performance-waiting-for-span.svg';
++
++import {LinkButton} from '@sentry/scraps/button';
++import {Image} from '@sentry/scraps/image';
++import {Flex} from '@sentry/scraps/layout';
++import {Heading, Text} from '@sentry/scraps/text';
++
++import Panel from 'sentry/components/panels/panel';
++import {t} from 'sentry/locale';
++
++interface OverviewOnboardingPanelProps {
++  heading: string;
++}
++
++export function GenericOnboarding({heading}: OverviewOnboardingPanelProps) {
++  return (
++    <Panel>
++      <Flex justify="center">
++        <Flex padding="xl" align="center" wrap="wrap-reverse" gap="3xl" maxWidth="1000px">
++          <Flex direction="column" gap="xl" flex="5" align="start">
++            <Heading as="h3" size="xl">
++              {heading}
++            </Heading>
++
++            <Text as="p" size="md">
++              {t(
++                'Send telemetry data to Sentry for this project to start using this dashboard. Set up your SDK to begin monitoring your application.'
++              )}
++            </Text>
++
++            <LinkButton
++              priority="primary"
++              external
++              href="https://docs.sentry.io/product/dashboards/"
++            >
++              {t('Read the Docs')}
++            </LinkButton>
++          </Flex>
++
++          <Flex flex="3" justify="center">
++            <Image src={emptyStateImg} alt="" width="100%" />
++          </Flex>
++        </Flex>
++      </Flex>
++    </Panel>
++  );
++}
+diff --git a/static/app/views/dashboards/components/prebuiltDashboardOnboardingGate.tsx b/static/app/views/dashboards/components/prebuiltDashboardOnboardingGate.tsx
+new file mode 100644
+index 00000000000000..0fe6448b94d48f
+--- /dev/null
++++ b/static/app/views/dashboards/components/prebuiltDashboardOnboardingGate.tsx
+@@ -0,0 +1,91 @@
++import usePageFilters from 'sentry/components/pageFilters/usePageFilters';
++import {getSelectedProjectList} from 'sentry/utils/project/useSelectedProjectsHaveField';
++import useOrganization from 'sentry/utils/useOrganization';
++import useProjects from 'sentry/utils/useProjects';
++import type {PrebuiltDashboardId} from 'sentry/views/dashboards/utils/prebuiltConfigs';
++import {PREBUILT_DASHBOARDS} from 'sentry/views/dashboards/utils/prebuiltConfigs';
++import * as ModuleLayout from 'sentry/views/insights/common/components/moduleLayout';
++import {ModulesOnboardingPanel} from 'sentry/views/insights/common/components/modulesOnboarding';
++import {useHasFirstSpan} from 'sentry/views/insights/common/queries/useHasFirstSpan';
++import {useOnboardingProject} from 'sentry/views/insights/common/queries/useOnboardingProject';
++import {Onboarding as AgentOnboarding} from 'sentry/views/insights/pages/agents/onboarding';
++import {Onboarding as MCPOnboarding} from 'sentry/views/insights/pages/mcp/onboarding';
++import {ModuleName} from 'sentry/views/insights/types';
++import {LegacyOnboarding} from 'sentry/views/performance/onboarding';
++
++import {GenericOnboarding} from './genericOnboarding';
++
++interface PrebuiltDashboardOnboardingGateProps {
++  children: React.ReactNode;
++  prebuiltId?: PrebuiltDashboardId;
++}
++
++export function PrebuiltDashboardOnboardingGate({
++  prebuiltId,
++  children,
++}: PrebuiltDashboardOnboardingGateProps) {
++  const organization = useOrganization();
++  const {projects} = useProjects();
++  const pageFilters = usePageFilters();
++
++  const onboarding = prebuiltId ? PREBUILT_DASHBOARDS[prebuiltId]?.onboarding : undefined;
++
++  const moduleName =
++    onboarding?.type === 'module' ? onboarding.moduleName : ModuleName.OTHER;
++
++  // First project that doesn't have any span data at all
++  const onboardingProject = useOnboardingProject();
++  const hasAnySpanData = !onboardingProject;
++
++  // Whether the selected projects have span of the required type
++  const hasFirstSpan = useHasFirstSpan(moduleName);
++
++  if (!onboarding) {
++    return children;
++  }
++
++  // If the dashboard uses module-specific onboarding, check whether
++  // module-specific data is available
++  if (onboarding.type === 'module') {
++    if (!hasAnySpanData) {
++      return (
++        <ModuleLayout.Full>
++          <LegacyOnboarding organization={organization} project={onboardingProject} />
++        </ModuleLayout.Full>
++      );
++    }
++
++    if (!hasFirstSpan) {
++      return (
++        <ModuleLayout.Full>
++          <ModulesOnboardingPanel moduleName={onboarding.moduleName} />
++        </ModuleLayout.Full>
++      );
++    }
++
++    return children;
++  }
++
++  const selectedProjects = getSelectedProjectList(
++    pageFilters.selection.projects,
++    projects
++  );
++
++  const hasData = onboarding.requiredProjectFlags.some(flag =>
++    selectedProjects.some(p => p[flag] === true)
++  );
++
++  if (hasData) {
++    return children;
++  }
++
++  if (onboarding.type === 'custom') {
++    if (onboarding.componentId === 'agent-monitoring') {
++      return <AgentOnboarding />;
++    }
++
++    return <MCPOnboarding />;
++  }
++
++  return <GenericOnboarding heading={onboarding.description} />;
++}
+diff --git a/static/app/views/dashboards/detail.tsx b/static/app/views/dashboards/detail.tsx
+index 4856b8c42d7c37..d4ab49092b5538 100644
+--- a/static/app/views/dashboards/detail.tsx
++++ b/static/app/views/dashboards/detail.tsx
+@@ -78,6 +78,7 @@ import {MetricsDataSwitcher} from 'sentry/views/performance/landing/metricsDataS
+ import {MetricsDataSwitcherAlert} from 'sentry/views/performance/landing/metricsDataSwitcherAlert';
+ import {DiscoverQueryPageSource} from 'sentry/views/performance/utils';
+ 
++import {PrebuiltDashboardOnboardingGate} from './components/prebuiltDashboardOnboardingGate';
+ import Controls from './controls';
+ import Dashboard from './dashboard';
+ import {DEFAULT_STATS_PERIOD} from './data';
+@@ -997,17 +998,21 @@ class DashboardDetail extends Component<Props, State> {
+                         location={location}
+                         forceTransactions={metricsDataSide.forceTransactionsOnly}
+                       >
+-                        <Dashboard
+-                          dashboard={modifiedDashboard ?? dashboard}
+-                          isEditingDashboard={this.isEditingDashboard}
+-                          widgetLimitReached={widgetLimitReached}
+-                          onUpdate={this.handleUpdateEditStateWidgets}
+-                          handleUpdateWidgetList={this.handleUpdateWidgetList}
+-                          handleAddCustomWidget={this.handleAddCustomWidget}
+-                          isEmbedded={this.isEmbedded}
+-                          isPreview={this.isPreview}
+-                          widgetLegendState={this.state.widgetLegendState}
+-                        />
++                        <PrebuiltDashboardOnboardingGate
++                          prebuiltId={dashboard.prebuiltId}
++                        >
++                          <Dashboard
++                            dashboard={modifiedDashboard ?? dashboard}
++                            isEditingDashboard={this.isEditingDashboard}
++                            widgetLimitReached={widgetLimitReached}
++                            onUpdate={this.handleUpdateEditStateWidgets}
++                            handleUpdateWidgetList={this.handleUpdateWidgetList}
++                            handleAddCustomWidget={this.handleAddCustomWidget}
++                            isEmbedded={this.isEmbedded}
++                            isPreview={this.isPreview}
++                            widgetLegendState={this.state.widgetLegendState}
++                          />
++                        </PrebuiltDashboardOnboardingGate>
+                       </MEPSettingProvider>
+                     )}
+                   </MetricsDataSwitcher>
+@@ -1224,24 +1229,28 @@ class DashboardDetail extends Component<Props, State> {
+ 
+                           <Fragment>
+                             <WidgetQueryQueueProvider>
+-                              <Dashboard
+-                                dashboard={modifiedDashboard ?? dashboard}
+-                                isEditingDashboard={this.isEditingDashboard}
+-                                widgetLimitReached={widgetLimitReached}
+-                                onUpdate={this.handleUpdateEditStateWidgets}
+-                                handleUpdateWidgetList={this.handleUpdateWidgetList}
+-                                handleAddCustomWidget={this.handleAddCustomWidget}
+-                                onAddWidget={this.onAddWidget}
+-                                isEmbedded={this.isEmbedded}
+-                                isPreview={this.isPreview}
+-                                widgetLegendState={this.state.widgetLegendState}
+-                                onEditWidget={this.onEditWidget}
+-                                newlyAddedWidget={newlyAddedWidget}
+-                                onNewWidgetScrollComplete={
+-                                  this.handleScrollToNewWidgetComplete
+-                                }
+-                                widgetInterval={this.props.widgetInterval}
+-                              />
++                              <PrebuiltDashboardOnboardingGate
++                                prebuiltId={dashboard.prebuiltId}
++                              >
++                                <Dashboard
++                                  dashboard={modifiedDashboard ?? dashboard}
++                                  isEditingDashboard={this.isEditingDashboard}
++                                  widgetLimitReached={widgetLimitReached}
++                                  onUpdate={this.handleUpdateEditStateWidgets}
++                                  handleUpdateWidgetList={this.handleUpdateWidgetList}
++                                  handleAddCustomWidget={this.handleAddCustomWidget}
++                                  onAddWidget={this.onAddWidget}
++                                  isEmbedded={this.isEmbedded}
++                                  isPreview={this.isPreview}
++                                  widgetLegendState={this.state.widgetLegendState}
++                                  onEditWidget={this.onEditWidget}
++                                  newlyAddedWidget={newlyAddedWidget}
++                                  onNewWidgetScrollComplete={
++                                    this.handleScrollToNewWidgetComplete
++                                  }
++                                  widgetInterval={this.props.widgetInterval}
++                                />
++                              </PrebuiltDashboardOnboardingGate>
+                             </WidgetQueryQueueProvider>
+ 
+                             <WidgetBuilderV2
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs.tsx b/static/app/views/dashboards/utils/prebuiltConfigs.tsx
+index d57df569bfbaf2..f5ef68c59578b5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs.tsx
++++ b/static/app/views/dashboards/utils/prebuiltConfigs.tsx
+@@ -1,3 +1,4 @@
++import type {Project} from 'sentry/types/project';
+ import {type DashboardDetails} from 'sentry/views/dashboards/types';
+ import {AI_AGENTS_MODELS_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels';
+ import {AI_AGENTS_OVERVIEW_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview';
+@@ -27,6 +28,7 @@ import {QUEUE_SUMMARY_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebu
+ import {SESSION_HEALTH_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/sessionHealth';
+ import {WEB_VITALS_SUMMARY_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary';
+ import {WEB_VITALS_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals';
++import type {ModulesWithOnboarding} from 'sentry/views/insights/common/components/modulesOnboarding';
+ 
+ export enum PrebuiltDashboardId {
+   FRONTEND_SESSION_HEALTH = 1,
+@@ -59,7 +61,36 @@ export enum PrebuiltDashboardId {
+   BACKEND_CACHES = 28,
+ }
+ 
+-export type PrebuiltDashboard = Omit<DashboardDetails, 'id'>;
++/** Boolean flags on Project that indicate whether telemetry data has been received. */
++type ProjectTelemetryFlag = Extract<
++  keyof Project,
++  `hasInsights${string}` | 'hasSessions'
++>;
++
++export type OnboardingConfig =
++  | {
++      moduleName: ModulesWithOnboarding;
++      // Single-module onboarding: shows ModulesOnboardingPanel
++      type: 'module';
++      requiredProjectFlags?: ProjectTelemetryFlag[];
++    }
++  | {
++      componentId: 'agent-monitoring' | 'mcp';
++      requiredProjectFlags: ProjectTelemetryFlag[];
++      // Custom onboarding component (AI Agents, MCP)
++      type: 'custom';
++    }
++  | {
++      description: string;
++      requiredProjectFlags: ProjectTelemetryFlag[];
++      // Overview dashboard onboarding: shows a generic onboarding panel
++      // when NONE of the listed project flags are set
++      type: 'overview';
++    };
++
++export type PrebuiltDashboard = Omit<DashboardDetails, 'id'> & {
++  onboarding?: OnboardingConfig;
++};
+ 
+ // NOTE: These configs must be in sync with the prebuilt dashboards declared in
+ // the backend in the `PREBUILT_DASHBOARDS` constant.
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts
+index f2fe57a2a503f5..19fc8befedce15 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts
+@@ -172,4 +172,9 @@ export const AI_AGENTS_MODELS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, MODELS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'agent-monitoring',
++    requiredProjectFlags: ['hasInsightsAgentMonitoring'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
+index febe4a7a77ec59..df246c52e555f5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
+@@ -215,4 +215,9 @@ export const AI_AGENTS_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     globalFilter: DEFAULT_GLOBAL_FILTERS,
+   },
+   widgets: [...FIRST_ROW_WIDGETS, ...SECOND_ROW_WIDGETS, AGENTS_TRACES_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'agent-monitoring',
++    requiredProjectFlags: ['hasInsightsAgentMonitoring'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts
+index 942a2e1194ebc6..51c5c36c72fcff 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts
+@@ -109,4 +109,9 @@ export const AI_AGENTS_TOOLS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, TOOLS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'agent-monitoring',
++    requiredProjectFlags: ['hasInsightsAgentMonitoring'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts
+index 72b491f5d0b538..6ae6acd1ae986f 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts
+@@ -214,4 +214,9 @@ export const MCP_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+   title: 'MCP Overview',
+   filters: {},
+   widgets: [...FIRST_ROW_WIDGETS, ...SECOND_ROW_WIDGETS, OVERVIEW_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts
+index b96a251c202cb3..c16868690dfc37 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts
+@@ -138,4 +138,9 @@ export const MCP_PROMPTS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, PROMPTS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts
+index 72feb12c870818..fc9a64ee00c4c1 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts
+@@ -138,4 +138,9 @@ export const MCP_RESOURCES_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, RESOURCES_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts
+index f0fa7cd0e02ddf..b58719881ec187 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts
+@@ -138,4 +138,9 @@ export const MCP_TOOLS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, TOOLS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts
+index 3a694a730c902e..c9aabf89aef7f1 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts
+@@ -301,4 +301,9 @@ export const BACKEND_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ...BACKEND_OVERVIEW_SECOND_ROW_WIDGETS,
+     TRANSACTIONS_TABLE,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsDb', 'hasInsightsHttp'],
++    description: 'Get started with backend tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts b/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
+index c15acecc305dbe..3fbf0280cb8c16 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
+@@ -4,7 +4,7 @@ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConf
+ import {DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/caches/settings';
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const BASE_CONDITION = `${SpanFields.SPAN_OP}:[cache.get,cache.get_item]`;
+ 
+@@ -112,4 +112,5 @@ export const CACHES_PREBUILT_CONFIG: PrebuiltDashboard = {
+   title: DASHBOARD_TITLE,
+   filters: {},
+   widgets: [...FIRST_ROW_WIDGETS, TRANSACTION_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.CACHE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts
+index 91466a3f226bd8..6fcd2b2c984d13 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts
+@@ -7,7 +7,7 @@ import {DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/fro
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import {DEFAULT_RESOURCE_TYPES} from 'sentry/views/insights/browser/resources/settings';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_QUERY = MutableSearch.fromQueryObject({
+   has: SpanFields.NORMALIZED_DESCRIPTION,
+@@ -167,4 +167,5 @@ export const FRONTEND_ASSETS_PREBUILT_CONFIG: PrebuiltDashboard = {
+   },
+   title: DASHBOARD_TITLE,
+   widgets: [...FIRST_ROW_WIDGETS, ASSETS_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.RESOURCE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts
+index 7bd16547f7c293..79aa12a2adcae6 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts
+@@ -5,7 +5,7 @@ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConf
+ import {SUMMARY_DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/frontendAssets/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import type {DefaultDetailWidgetFields} from 'sentry/views/dashboards/widgets/detailsWidget/types';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const ASSET_DESCRIPTION_WIDGET: Widget = {
+   id: 'domain-widget',
+@@ -302,4 +302,5 @@ export const FRONTEND_ASSETS_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ...THIRD_ROW_WIDGETS,
+     ASSETS_TABLE_WIDGET,
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.RESOURCE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts
+index c3cab19156a77c..90063e327f4e70 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts
+@@ -255,4 +255,9 @@ export const FRONTEND_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, ...SECOND_ROW_WIDGETS, TRANSACTIONS_TABLE],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsVitals', 'hasInsightsAssets'],
++    description: 'Get started with frontend tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
+index d3b9bb144f0ac5..49628fa49ce7bb 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
+@@ -19,7 +19,7 @@ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/se
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import type {DefaultDetailWidgetFields} from 'sentry/views/dashboards/widgets/detailsWidget/types';
+ import {DataTitles} from 'sentry/views/insights/common/views/spans/types';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_STRING = MutableSearch.fromQueryObject(BASE_FILTERS).formatString();
+ 
+@@ -330,4 +330,5 @@ export const HTTP_DOMAIN_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ...CHART_ROW_WIDGETS,
+     TRANSACTIONS_TABLE,
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.HTTP},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts b/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts
+index 14be625dbb8875..d2bb7dd58c9cbe 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts
+@@ -19,7 +19,7 @@ import {
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import {DataTitles} from 'sentry/views/insights/common/views/spans/types';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_STRING = MutableSearch.fromQueryObject(BASE_FILTERS).formatString();
+ 
+@@ -192,4 +192,5 @@ export const HTTP_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, DOMAIN_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.HTTP},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts
+index 5aa3a6a40ce18b..8b09ad8e571501 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts
+@@ -179,4 +179,9 @@ export const LARAVEL_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     COMMANDS_TABLE,
+     JOBS_TABLE,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsDb', 'hasInsightsHttp'],
++    description: 'Get started with Laravel tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts
+index 4b10045c329d10..2686e41c1d28d5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts
+@@ -200,4 +200,9 @@ export const MOBILE_SESSION_HEALTH_PREBUILT_CONFIG: PrebuiltDashboard = {
+     CRASH_RATE_TABLE,
+     RELEASE_TABLE,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasSessions'],
++    description: 'Get started with mobile session health',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
+index 393559d59c27a5..8c413903fa7abb 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
+@@ -3,7 +3,7 @@ import {FieldKind} from 'sentry/utils/fields';
+ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const TRANSACTION_OP_CONDITION = `${SpanFields.TRANSACTION_OP}:[ui.load,navigation]`;
+ const COLD_START_CONDITION = `${SpanFields.SPAN_OP}:app.start.cold ${SpanFields.SPAN_DESCRIPTION}:["Cold Start","Cold App Start"]`;
+@@ -363,4 +363,5 @@ export const MOBILE_VITALS_APP_STARTS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.APP_START},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
+index cef665ba590dcb..f844d42ea8c276 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
+@@ -4,7 +4,7 @@ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const TRANSACTION_OP_CONDITION = `${SpanFields.TRANSACTION_OP}:[ui.load,navigation]`;
+ 
+@@ -474,4 +474,5 @@ export const MOBILE_VITALS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.MOBILE_VITALS},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+index 5762a455132f88..a2a1882974545a 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+@@ -3,7 +3,7 @@ import {FieldKind} from 'sentry/utils/fields';
+ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const TRANSACTION_CONDITION = `is_transaction:true ${SpanFields.TRANSACTION_OP}:[ui.load,navigation]`;
+ const SPAN_OPERATIONS_CONDITION = `${SpanFields.TRANSACTION_OP}:[ui.load,navigation] has:${SpanFields.SPAN_DESCRIPTION} ${SpanFields.SPAN_OP}:[file.read,file.write,ui.load,navigation,http.client,db,db.sql.room,db.sql.query,db.sql.transaction]`;
+@@ -337,4 +337,5 @@ export const MOBILE_VITALS_SCREEN_LOADS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.SCREEN_LOAD},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts
+index f71eba378a5d4d..a0c43f2939302b 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts
+@@ -3,7 +3,7 @@ import {FieldKind} from 'sentry/utils/fields';
+ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const SPAN_OPERATIONS_CONDITION = `${SpanFields.SPAN_OP}:[app.start.cold,app.start.warm,contentprovider.load,application.load,activity.load,ui.load,process.load]`;
+ 
+@@ -111,4 +111,5 @@ export const MOBILE_VITALS_SCREEN_RENDERING_PREBUILT_CONFIG: PrebuiltDashboard =
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.SCREEN_RENDERING},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts
+index 7e40a6a1a5888b..3d16421c62d67e 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts
+@@ -267,4 +267,9 @@ export const NEXTJS_FRONTEND_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     SERVER_TRANSACTIONS_TABLE,
+     SERVER_TREE_WIDGET,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsVitals', 'hasInsightsAssets'],
++    description: 'Get started with Next.js tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts
+index 533034ca895a84..3a6c17497ddc32 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts
+@@ -150,4 +150,5 @@ export const QUERIES_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.DB},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts
+index ee78d9a5f434d9..a36f1b855b4554 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts
+@@ -8,7 +8,7 @@ import {
+   QUERIES_PER_MINUTE_TEXT,
+ } from 'sentry/views/dashboards/utils/prebuiltConfigs/queries/constants';
+ import {BASE_FILTERS} from 'sentry/views/dashboards/utils/prebuiltConfigs/queries/queries';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_STRING = MutableSearch.fromQueryObject(BASE_FILTERS).formatString();
+ 
+@@ -189,4 +189,5 @@ export const QUERIES_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+       layout: {y: 3, x: 3, h: 2, w: 3, minH: 2},
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.DB},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts
+index 49927d0eff768f..1c5dd46846b9c0 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts
+@@ -4,7 +4,7 @@ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConf
+ import {QUEUE_CHARTS} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues/queueCharts';
+ import {SUMMARY_DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const SPAN_OP_FILTER = `${SpanFields.SPAN_OP}:[queue.process,queue.publish]`;
+ 
+@@ -224,4 +224,5 @@ export const QUEUE_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+   title: SUMMARY_DASHBOARD_TITLE,
+   filters: {},
+   widgets: [...FIRST_ROW_WIDGTS, ...SECOND_ROW_WIDGETS, CONSUMER_TABLE, PRODUCER_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.QUEUE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts
+index e07b4164e84123..3adfbaf715b564 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts
+@@ -6,7 +6,7 @@ import {QUEUE_CHARTS} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues
+ import {DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues/settings';
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FIRST_ROW_WIDGETS = spaceWidgetsEquallyOnRow([...QUEUE_CHARTS], 0);
+ 
+@@ -93,4 +93,5 @@ export const QUEUES_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, DESTINATION_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.QUEUE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts b/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts
+index 7fdad9a15ff601..62be6c86405ccb 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts
+@@ -155,4 +155,9 @@ export const SESSION_HEALTH_PREBUILT_CONFIG: PrebuiltDashboard = {
+       layout: {x: 4, y: 5, w: 2, h: 3, minH: 2},
+     },
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasSessions'],
++    description: 'Get started with session health',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
+index 1bd509f861a8fc..3a1d8cd8d170db 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
+@@ -3,6 +3,7 @@ import {DisplayType, SlideoutId, WidgetType} from 'sentry/views/dashboards/types
+ import {type PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+ import {ISSUE_TYPES} from 'sentry/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals';
+ import {DEFAULT_QUERY_FILTER} from 'sentry/views/insights/browser/webVitals/settings';
++import {ModuleName} from 'sentry/views/insights/types';
+ 
+ export const WEB_VITALS_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+   dateCreated: '',
+@@ -433,4 +434,5 @@ export const WEB_VITALS_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.VITAL},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts
+index 6c17df4da2370d..f38dcbcecf6f10 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts
+@@ -4,7 +4,7 @@ import {DisplayType, SlideoutId, WidgetType} from 'sentry/views/dashboards/types
+ import {type PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+ import {SCORE_BREAKDOWN_WHEEL_WIDGET} from 'sentry/views/dashboards/widgetLibrary/webVitalsWidgets';
+ import {DEFAULT_QUERY_FILTER} from 'sentry/views/insights/browser/webVitals/settings';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ export const ISSUE_TYPES = [
+   'web_vitals',
+@@ -326,4 +326,5 @@ export const WEB_VITALS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.VITAL},
+ };
+diff --git a/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx b/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx
+index b538d04ed0b002..eb37b1f50705dd 100644
+--- a/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx
++++ b/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx
+@@ -116,6 +116,22 @@ type SupportedPriorityLevel = Extract<
+   DetectorPriorityLevel.HIGH | DetectorPriorityLevel.LOW
+ >;
+ 
++function validateAtLeastOneThreshold({
++  id,
++  form,
++}: {
++  form: Record<string, any>;
++  id: string;
++}): Array<[string, string]> {
++  const high = form[PREPROD_DETECTOR_FORM_FIELDS.highThreshold];
++  const low = form[PREPROD_DETECTOR_FORM_FIELDS.lowThreshold];
++
++  if (!high && !low) {
++    return [[id, t('At least one threshold is required')]];
++  }
++  return [];
++}
++
+ function PriorityRow({
+   priority,
+   isPercentage,
+@@ -123,19 +139,16 @@ function PriorityRow({
+   isPercentage: boolean;
+   priority: SupportedPriorityLevel;
+ }) {
+-  let required: boolean;
+   let priorityLabel: string;
+   let thresholdFieldName: string;
+   switch (priority) {
+     case DetectorPriorityLevel.HIGH:
+       priorityLabel = t('High priority');
+       thresholdFieldName = PREPROD_DETECTOR_FORM_FIELDS.highThreshold;
+-      required = true;
+       break;
+     case DetectorPriorityLevel.LOW:
+       priorityLabel = t('Low priority');
+       thresholdFieldName = PREPROD_DETECTOR_FORM_FIELDS.lowThreshold;
+-      required = false;
+       break;
+     default:
+       return null;
+@@ -144,17 +157,19 @@ function PriorityRow({
+   return (
+     <Flex align="center" gap="md">
+       <PriorityDot priority={DETECTOR_PRIORITY_LEVEL_TO_PRIORITY_LEVEL[priority]} />
+-      <PriorityLabel>
+-        {priorityLabel}
+-        {required && <RequiredAsterisk>*</RequiredAsterisk>}
+-      </PriorityLabel>
++      <PriorityLabel>{priorityLabel}</PriorityLabel>
+       <Flex align="center" gap="md">
+         <ThresholdField
+           name={thresholdFieldName}
+           placeholder="-"
+           hideLabel
+           inline
+-          required={required}
++          required={false}
++          validate={
++            priority === DetectorPriorityLevel.HIGH
++              ? validateAtLeastOneThreshold
++              : undefined
++          }
+           preserveOnUnmount
+         />
+         <ThresholdSuffix>{isPercentage ? '%' : 'MB'}</ThresholdSuffix>
+@@ -200,11 +215,6 @@ const PriorityLabel = styled('span')`
+   font-weight: ${p => p.theme.font.weight.sans.regular};
+ `;
+ 
+-const RequiredAsterisk = styled('span')`
+-  color: ${p => p.theme.tokens.content.danger};
+-  margin-left: ${p => p.theme.space['2xs']};
+-`;
+-
+ const ThresholdField = styled(NumberField)`
+   padding: 0;
+   margin: 0;
+diff --git a/static/app/views/explore/constants.tsx b/static/app/views/explore/constants.tsx
+index 2116ebe2911e96..db009892b8758c 100644
+--- a/static/app/views/explore/constants.tsx
++++ b/static/app/views/explore/constants.tsx
+@@ -72,6 +72,14 @@ export const SENTRY_SPAN_NUMBER_TAGS: string[] = [...SENTRY_SEARCHABLE_SPAN_NUMB
+ export const SENTRY_SPAN_BOOLEAN_TAGS: string[] = [
+   // duplicating until we've fully rolled out boolean attributes
+   SpanFields.IS_TRANSACTION,
++  SpanFields.IS_STARRED_TRANSACTION,
++];
++
++// Span attributes that should only appear in dashboards, not in Explore.
++// is_starred_transaction relies on the dashboard widget query cache for
++// starring mutations and is not supported in Explore.
++export const DASHBOARD_ONLY_SPAN_ATTRIBUTES: string[] = [
++  SpanFields.IS_STARRED_TRANSACTION,
+ ];
+ 
+ export const SENTRY_LOG_STRING_TAGS: string[] = [
+diff --git a/static/app/views/explore/contexts/traceItemAttributeContext.tsx b/static/app/views/explore/contexts/traceItemAttributeContext.tsx
+index b6341d4f4f842e..3fe5405c53e7b6 100644
+--- a/static/app/views/explore/contexts/traceItemAttributeContext.tsx
++++ b/static/app/views/explore/contexts/traceItemAttributeContext.tsx
+@@ -5,6 +5,7 @@ import type {Project} from 'sentry/types/project';
+ import {FieldKind} from 'sentry/utils/fields';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {
++  DASHBOARD_ONLY_SPAN_ATTRIBUTES,
+   SENTRY_LOG_BOOLEAN_TAGS,
+   SENTRY_LOG_NUMBER_TAGS,
+   SENTRY_LOG_STRING_TAGS,
+@@ -264,7 +265,19 @@ export function useSpanItemAttributes(
+   type?: TraceItemAttributeType,
+   hiddenKeys?: string[]
+ ): TraceItemAttributeResult {
+-  return useTraceItemDatasetAttributes(TraceItemDataset.SPANS, options, type, hiddenKeys);
++  const mergedHiddenKeys = useMemo(() => {
++    if (!hiddenKeys?.length) {
++      return DASHBOARD_ONLY_SPAN_ATTRIBUTES;
++    }
++    return [...hiddenKeys, ...DASHBOARD_ONLY_SPAN_ATTRIBUTES];
++  }, [hiddenKeys]);
++
++  return useTraceItemDatasetAttributes(
++    TraceItemDataset.SPANS,
++    options,
++    type,
++    mergedHiddenKeys
++  );
+ }
+ 
+ export function useLogItemAttributes(
+diff --git a/static/app/views/insights/common/components/modulesOnboarding.tsx b/static/app/views/insights/common/components/modulesOnboarding.tsx
+index a8b694d9be0751..a82a3a1f4e2848 100644
+--- a/static/app/views/insights/common/components/modulesOnboarding.tsx
++++ b/static/app/views/insights/common/components/modulesOnboarding.tsx
+@@ -38,7 +38,7 @@ import {
+ import {ModuleName} from 'sentry/views/insights/types';
+ import {LegacyOnboarding} from 'sentry/views/performance/onboarding';
+ 
+-type ModulesWithOnboarding = Exclude<
++export type ModulesWithOnboarding = Exclude<
+   ModuleName,
+   | ModuleName.AGENT_MODELS
+   | ModuleName.AGENT_TOOLS
+diff --git a/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx b/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
+index 43b00e8f080fa5..b4c923c68098c8 100644
+--- a/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
++++ b/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
+@@ -13,8 +13,9 @@ import type {SpanResponse} from 'sentry/views/insights/types';
+ 
+ interface Props {
+   isStarred: boolean;
+-  projectSlug: string;
+   segmentName: string;
++  projectId?: string;
++  projectSlug?: string;
+ }
+ 
+ type TableRow = Simplify<
+@@ -26,18 +27,23 @@ type TableResponse = [{confidence: any; meta: EventsMetaType; data?: TableRow[]}
+ // The query key used for the starred segments table request, this key is used to reference that query and update the starred segment state
+ export const STARRED_SEGMENT_TABLE_QUERY_KEY = ['starred-segment-table'];
+ 
+-export function StarredSegmentCell({segmentName, isStarred, projectSlug}: Props) {
++export function StarredSegmentCell({
++  segmentName,
++  isStarred,
++  projectSlug,
++  projectId,
++}: Props) {
+   const queryClient = useQueryClient();
+   const {projects} = useProjects();
+   const project = projects.find(p => p.slug === projectSlug);
+ 
+   const {setStarredSegment, isPending} = useStarredSegment({
+-    projectId: project?.id,
++    projectId: project?.id || projectId,
+     segmentName,
+     onError: () => updateTableData(!isStarred),
+   });
+ 
+-  const disabled = !project || !segmentName || isPending;
++  const disabled = (!project && !projectId) || !segmentName || isPending;
+ 
+   const updateTableData = (newIsStarred: boolean) => {
+     queryClient.setQueriesData(
+diff --git a/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx b/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
+index fbbb131f9a06b1..e74baa04f4b568 100644
+--- a/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
++++ b/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
+@@ -77,7 +77,7 @@ export default function AutofixAgent({canWrite, preference, project}: Props) {
+ 
+   return (
+     <PanelNoMargin>
+-      <PanelHeader>{t('Autofix Agent')}</PanelHeader>
++      <PanelHeader>{t('Autofix Handoff')}</PanelHeader>
+       <PanelBody>
+         {isPending ? (
+           <Flex justify="center" align="center" padding="xl">
+@@ -92,9 +92,9 @@ export default function AutofixAgent({canWrite, preference, project}: Props) {
+               disabled={Boolean(disabledReason)}
+               disabledReason={disabledReason}
+               name="autofixAgent"
+-              label={t('Autofix Agent')}
++              label={t('Autofix Handoff')}
+               help={tct(
+-                'Seer will orchestrate the autofix process, and automatically hand off issue data coding agent for processing. You can choose to automatically process Issues, and which agent to use here. You can also manually trigger autofix with different agents from the Issue Details page. [docsLink:Read the docs] to learn more.',
++                'Seer will orchestrate the autofix process, and automatically hand off issue data to the coding agent for processing. You can choose to automatically process Issues, and which agent to use here. You can also manually trigger autofix with different agents from the Issue Details page. [docsLink:Read the docs] to learn more.',
+                 {
+                   docsLink: (
+                     <ExternalLink href="https://docs.sentry.io/product/ai-in-sentry/" />
+diff --git a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+index 09806c531d2d47..4bdb9c5b494658 100644
+--- a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
++++ b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+@@ -30,14 +30,14 @@ interface Props {
+ 
+ const COLUMNS = [
+   {title: t('Project'), key: 'project', sortKey: 'project'},
+-  {title: t('Autofix Agent'), key: 'fixes'},
++  {title: t('Autofix Handoff'), key: 'fixes'},
+   {
+     title: (
+       <Flex gap="sm" align="center">
+         {t('PR Creation')}
+         <InfoTip
+           title={t(
+-            'This setting only applies when an Autofix Agent is configured to run automatically.'
++            'This setting only applies when an Autofix Handoff is configured to run automatically.'
+           )}
+         />
+       </Flex>
+diff --git a/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx b/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
+index b1b3c1e727b364..80aea1f2069603 100644
+--- a/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
++++ b/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
+@@ -51,7 +51,7 @@ describe('seerAgentHooks', () => {
+       expect(options[0]).toEqual({value: 'seer', label: expect.any(String)});
+       expect(options[1]).toMatchObject({
+         value: {id: '42', name: 'Cursor', provider: 'cursor'},
+-        label: 'Cursor (42)',
++        label: 'Cursor',
+       });
+       expect(options[2]).toEqual({value: 'none', label: expect.any(String)});
+     });
+diff --git a/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx b/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
+index a6c21914805cfb..02d20203a46df3 100644
+--- a/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
++++ b/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
+@@ -30,7 +30,7 @@ export function useAgentOptions({
+         .filter(integration => integration.id)
+         .map(integration => ({
+           value: integration,
+-          label: `${integration.name} (${integration.id})`,
++          label: integration.name,
+         })),
+       {value: 'none' as const, label: t('Manual Agent Selection')},
+     ];

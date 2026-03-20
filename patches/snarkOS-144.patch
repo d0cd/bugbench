@@ -1,128 +1,533 @@
-diff --git a/consensus/src/miner.rs b/consensus/src/miner.rs
-index 6243f8fc6..0c621671f 100644
---- a/consensus/src/miner.rs
-+++ b/consensus/src/miner.rs
-@@ -44,27 +44,17 @@ pub struct MineContext {
-     address: Address<Components>,
-     /// The sync parameters for the network of this miner.
-     pub consensus: Arc<Consensus>,
--    block_height: usize,
--    canon_header: SerialBlockHeader,
+diff --git a/.ci/devnet_ci.sh b/.ci/devnet_ci.sh
+index 41f28c0ca..900554b5d 100755
+--- a/.ci/devnet_ci.sh
++++ b/.ci/devnet_ci.sh
+@@ -16,14 +16,15 @@ network_id=$3
+ min_height=$4
+ 
+ # The verobsity of snarkos nodes.
+-NODE_VERBOSITY=1
++NODE_VERBOSITY=3
+ 
+ # Default values if not provided
+ : "${total_validators:=4}"
+-: "${total_clients:=2}"
++: "${total_clients:=4}" # need at least 4 clients, so each validator has at least one client connected to it.
+ : "${network_id:=0}"
+ : "${min_height:=60}" # To likely go past the 100 round garbage collection limit.
+ 
++# shellcheck source=SCRIPTDIR/utils.sh
+ . ./.ci/utils.sh
+ 
+ # Determine network name based on network_id
+@@ -57,20 +58,9 @@ trap 'echo "⛔️ Error in $BASH_SOURCE at line $LINENO: \"$BASH_COMMAND\" fail
+ # Flags used by all nodes.
+ common_flags=(
+   --nodisplay --nobanner --noupdater "--network=$network_id" "--verbosity=$NODE_VERBOSITY"
+-  "--dev-num-validators=$total_validators"
++  "--dev-num-validators=$total_validators"  "--dev-num-clients=$total_clients"
+ )
+ 
+-# Set the trusted peers for the validators as they will not allow connections from unknown peers.
+-trusted_peers=""
+-for ((client_index = 0; client_index < total_clients; client_index++)); do
+-  node_index=$((client_index + total_validators))
+-  if (( client_index == 0 )); then
+-    trusted_peers+="$localhost:$((4130+node_index))"
+-  else
+-    trusted_peers+=",$localhost:$((4130+node_index))"
+-  fi
+-done
+-
+ # Start all validator nodes in the background
+ for ((validator_index = 0; validator_index < total_validators; validator_index++)); do
+   snarkos clean "--dev=$validator_index" "--network=$network_id"
+@@ -78,10 +68,10 @@ for ((validator_index = 0; validator_index < total_validators; validator_index++
+   log_file="$log_dir/validator-$validator_index.log"
+   if [ $validator_index -eq 0 ]; then
+     snarkos start "${common_flags[@]}" "--dev=$validator_index" \
+-      --validator "--logfile=$log_file" --metrics --no-dev-txs "--peers=$trusted_peers" &
++      --validator "--logfile=$log_file" --metrics --no-dev-txs &
+   else
+     snarkos start "${common_flags[@]}" "--dev=$validator_index" \
+-      --validator "--logfile=$log_file" "--peers=$trusted_peers" &
++      --validator "--logfile=$log_file" &
+   fi
+   PIDS[validator_index]=$!
+   echo "Started validator $validator_index with PID ${PIDS[$validator_index]}"
+@@ -111,6 +101,16 @@ done
+ # Ensure all nodes are up and running.
+ wait_for_nodes "$total_validators" "$total_clients"
+ 
++# Ensure all nodes have at least one peer
++echo "ℹ️ Waiting for all nodes to have at least one peer..."
++SECONDS=0
++for node_index in $(seq 0 $((total_clients+total_validators))); do
++  if ! (wait_for_peers "$node_index" 1); then
++    exit 1
++  fi
++done
++echo "✅ All nodes have at least one peer"
++
+ last_seen_consensus_version=0
+ last_seen_height=0
+ 
+@@ -118,7 +118,14 @@ last_seen_height=0
+ function consensus_version_stable() {
+   consensus_version=$(curl -s "http://$localhost:3030/v2/$network_name/consensus_version")
+   height=$(curl -s "http://$localhost:3030/v2/$network_name/block/height/latest")
+-  if (is_integer "$consensus_version") && (is_integer "$height"); then
++
++  if (! is_integer "$consensus_version"); then
++    echo "❌ Failed to retrieve consensus version: $consensus_version"
++    return 1
++  elif (! is_integer "$height"); then
++    echo "❌ Failed to retrieve height: $height"
++    return 1
++  else
+     # If the consensus version is greater than the last seen, we update it.
+     if (( consensus_version > last_seen_consensus_version )); then
+       echo "✅ Consensus version updated to $consensus_version"
+@@ -129,19 +136,21 @@ function consensus_version_stable() {
+         return 0
+       fi
+     fi
+-  else
+-    echo "❌ Failed to retrieve consensus version or height: $consensus_version, $height"
+-    exit 1
++
++    last_seen_consensus_version=$consensus_version
++    last_seen_height=$height
+   fi
+-  last_seen_consensus_version=$consensus_version
+-  last_seen_height=$height
++
+   return 1
  }
  
- impl MineContext {
-     pub async fn prepare(address: Address<Components>, consensus: Arc<Consensus>) -> Result<Self, ConsensusError> {
--        let canon = consensus.storage.canon().await?;
--
--        let canon_header = consensus.storage.get_block_header(&canon.hash).await?;
--
--        Ok(Self {
--            address,
--            consensus,
--            block_height: canon.block_height,
--            canon_header,
--        })
-+        Ok(Self { address, consensus })
+ # Check consensus versions periodically with a timeout
++echo "ℹ️ Waiting for consensus version to stabilize..."
+ total_wait=0
++version_stable=false
+ while (( total_wait < 300 )); do  # 5 minutes max
+   if consensus_version_stable; then
++    version_stable=true
+     break
+   fi
+ 
+@@ -151,7 +160,17 @@ while (( total_wait < 300 )); do  # 5 minutes max
+   echo "Waited $total_wait seconds so far..."
+ done
+ 
++if ! $version_stable; then
++  echo "❌ Test failed! Consensus version did not stabilize within 5 minutes."
++  exit 1
++fi
++
+ # Creates a test program.
++
++if ! $version_stable; then
++  echo "❌ Test failed! Consensus version did not stabilize within 5 minutes."
++  exit 1
++fi
+ mkdir -p program
+ program_name="test_program.aleo"
+ echo "program ${program_name};
+diff --git a/.ci/utils.sh b/.ci/utils.sh
+index 7cf561788..26c015c85 100644
+--- a/.ci/utils.sh
++++ b/.ci/utils.sh
+@@ -251,6 +251,9 @@ function wait_for_nodes() {
+       echo "All nodes are ready!"
+       return 0
+     fi
++
++    # Pause to give the nodes time to start up.
++    sleep 1
+   done
+ }
+ 
+diff --git a/cli/src/commands/start.rs b/cli/src/commands/start.rs
+index c35a9bcd7..4ffa7ebb2 100644
+--- a/cli/src/commands/start.rs
++++ b/cli/src/commands/start.rs
+@@ -62,7 +62,7 @@ use tokio::{
+     sync::mpsc,
+     task,
+ };
+-use tracing::warn;
++use tracing::{debug, info, warn};
+ use ureq::http;
+ 
+ /// The recommended minimum number of 'open files' limit for a validator.
+@@ -70,7 +70,7 @@ use ureq::http;
+ #[cfg(target_family = "unix")]
+ const RECOMMENDED_MIN_NOFILES_LIMIT: u64 = 2048;
+ 
+-/// A mapping of `staker_address` to `(validator_address, withdrawal_address, amount)`.
++// A mapping of `staker_address` to `(validator_address, withdrawal_address, amount)`.
+ #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+ pub struct BondedBalances(IndexMap<String, (String, String, u64)>);
+ 
+@@ -82,7 +82,7 @@ impl FromStr for BondedBalances {
+     }
+ }
+ 
+-/// Starts the snarkOS node.
++// Starts the snarkOS node.
+ #[derive(Clone, Debug, Parser)]
+ #[command(
+     // Use kebab-case for all arguments (e.g., use the `private-key` flag for the `private_key` field).
+@@ -256,15 +256,20 @@ pub struct Start {
+     pub dev: Option<u16>,
+ 
+     /// If development mode is enabled, specify the number of genesis validator.
+-    #[clap(long, group = "dev-flags", default_value_t=DEVELOPMENT_MODE_NUM_GENESIS_COMMITTEE_MEMBERS)]
++    #[clap(long, group = "dev_flags", default_value_t=DEVELOPMENT_MODE_NUM_GENESIS_COMMITTEE_MEMBERS)]
+     pub dev_num_validators: u16,
+ 
++    /// If development mode is enabled, specify the number of clients.
++    /// This is only used by validators to automatically populate their set of trusted peers.
++    #[clap(long, group = "dev_flags")]
++    pub dev_num_clients: Option<u16>,
++
+     /// If development mode is enabled, specify whether node 0 should generate traffic to drive the network.
+-    #[clap(long, group = "dev-flag")]
++    #[clap(long, group = "dev_flag")]
+     pub no_dev_txs: bool,
+ 
+     /// If development mode is enabled, specify the custom bonded balances as a JSON object.
+-    #[clap(long, group = "dev-flags")]
++    #[clap(long, group = "dev_flags")]
+     pub dev_bonded_balances: Option<BondedBalances>,
+ }
+ 
+@@ -384,43 +389,95 @@ impl Start {
      }
  
-     /// Add a coinbase transaction to a list of candidate block transactions
--    pub async fn add_coinbase_transaction(
-+    async fn add_coinbase_transaction(
-         &self,
-+        block_number: u32,
-         transactions: &mut Vec<SerialTransaction>,
-     ) -> Result<Vec<SerialRecord>, ConsensusError> {
-         let program_vk_hash = self.consensus.dpc.noop_program.id();
-@@ -85,7 +75,7 @@ impl MineContext {
-         let response = self
-             .consensus
-             .create_coinbase_transaction(
--                self.block_height as u32 + 1,
-+                block_number,
-                 transactions.clone(),
-                 program_vk_hash,
-                 new_birth_programs,
-@@ -105,9 +95,10 @@ impl MineContext {
-     #[allow(clippy::type_complexity)]
-     pub async fn establish_block(
-         &self,
-+        block_number: u32,
-         mut transactions: Vec<SerialTransaction>,
-     ) -> Result<(Vec<SerialTransaction>, Vec<SerialRecord>), ConsensusError> {
--        let coinbase_records = self.add_coinbase_transaction(&mut transactions).await?;
-+        let coinbase_records = self.add_coinbase_transaction(block_number, &mut transactions).await?;
- 
-         // Verify transactions
-         // assert!(Testnet1DPC::verify_transactions(
-@@ -179,25 +170,32 @@ impl MineContext {
-         terminator: Arc<AtomicBool>,
-     ) -> Result<(SerialBlock, Vec<SerialRecord>), ConsensusError> {
-         let candidate_transactions = self.consensus.fetch_memory_pool().await;
--        debug!("Miner@{}: creating a block", self.block_height);
- 
--        let (transactions, coinbase_records) = self.establish_block(candidate_transactions).await?;
-+        let canon = self.consensus.storage.canon().await?;
+     /// Updates the configurations if the node is in development mode.
+-    fn parse_development(&mut self, trusted_peers: &mut Vec<SocketAddr>, trusted_validators: &mut Vec<SocketAddr>) {
++    fn parse_development(
++        &mut self,
++        trusted_peers: &mut Vec<SocketAddr>,
++        trusted_validators: &mut Vec<SocketAddr>,
++    ) -> Result<()> {
++        // If `--dev` is not set, return early.
++        let Some(dev) = self.dev else {
++            return Ok(());
++        };
 +
-+        let canon_header = self.consensus.storage.get_block_header(&canon.hash).await?;
++        // Determine the number of development validators.
++        let num_validators = self.dev_num_validators;
++        ensure!(num_validators >= 4, "Value for `dev_num_validators` is too low. Needs to be at least 4.");
 +
-+        debug!("Miner@{}: creating a block", canon.block_height);
+         // If `--dev` is set, assume the dev nodes are initialized from 0 to `dev`,
+         // and add each of them to the trusted peers. In addition, set the node IP to `4130 + dev`,
+         // and the REST port to `3030 + dev`.
++        info!("Development mode enabled with index={dev} and num_validators={num_validators}.");
 +
-+        let (transactions, coinbase_records) = self
-+            .establish_block(canon.block_height as u32 + 1, candidate_transactions)
-+            .await?;
++        // Nodes only start as validators if the `--validator` flag is set, because the default mode is "client".
++        let is_validator = self.validator;
  
--        debug!("Miner@{}: generated a coinbase transaction", self.block_height);
-+        debug!("Miner@{}: generated a coinbase transaction", canon.block_height);
+-        if let Some(dev) = self.dev {
+-            // Add the dev nodes to the trusted peers.
+-            if trusted_peers.is_empty() {
+-                for i in 0..dev {
+-                    trusted_peers.push(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEFAULT_NODE_PORT + i)));
++        // Ensure the node type and `dev_num_validators` are compatible.
++        if is_validator {
++            ensure!(
++                dev < num_validators,
++                "Development validator index is too high (dev={dev}, dev_num_validators={num_validators})",
++            );
++        } else {
++            ensure!(
++                dev >= self.dev_num_validators,
++                "Development prover/client index is too low (dev={dev}, dev_num_validators={num_validators})",
++            );
++        }
++
++        // Add the dev nodes to the trusted validators.
++        if trusted_validators.is_empty() && is_validator {
++            // Validators add all other validators as trusted.
++            for idx in 0..num_validators {
++                if idx == dev {
++                    continue;
+                 }
++                trusted_validators.push(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, MEMORY_POOL_PORT + idx)));
+             }
+-            // Add the dev nodes to the trusted validators.
+-            if trusted_validators.is_empty() {
+-                // To avoid ambiguity, we define the first few nodes to be the trusted validators to connect to.
+-                for i in 0..2 {
+-                    // Don't connect to yourself.
+-                    if i == dev {
+-                        continue;
+-                    }
++        }
  
-         for (index, record) in coinbase_records.iter().enumerate() {
-             let record_commitment = hex::encode(&to_bytes_le![record.commitment]?);
-             debug!(
-                 "Miner@{}: Coinbase record {:?} commitment: {:?}",
--                self.block_height, index, record_commitment
-+                canon.block_height, index, record_commitment
-             );
+-                    trusted_validators
+-                        .push(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, MEMORY_POOL_PORT + i)));
++        // Determine if we need to populate `trusted_peers`.
++        if trusted_peers.is_empty() {
++            if is_validator {
++                if let Some(num_clients) = self.dev_num_clients {
++                    // Ensure the clients that added this validator as a trusted peer are able to connect to it.
++                    for client_idx in 0..num_clients {
++                        if get_devnet_validators_for_client(client_idx, num_validators).contains(&dev) {
++                            let node_idx = num_validators + client_idx;
++                            trusted_peers.push(get_devnet_router_address_for_node(node_idx));
++                        }
++                    }
++                } else {
++                    warn!(
++                        "Development validator started without trusted peers or `--dev-num-clients`. No clients will be able to connect to it."
++                    );
++                }
++            } else {
++                // Clients/provers add two validators to connect to.
++                for validator_idx in get_devnet_validators_for_client(dev, num_validators) {
++                    trusted_peers.push(get_devnet_router_address_for_node(validator_idx));
+                 }
+             }
+-            // Set the node IP to `4130 + dev`.
+-            //
+-            // Note: the `node` flag is an option to detect remote devnet testing.
+-            if self.node.is_none() {
+-                self.node = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_NODE_PORT + dev)));
+-            }
++        } else {
++            debug!("Trusted peers/validators was set manually. Will not populate them with development addresses.")
++        }
+ 
+-            // If the `norest` flag is not set and the REST IP is not already specified set the REST IP to `3030 + dev`.
+-            if !self.norest && self.rest.is_none() {
+-                self.rest = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_REST_PORT + dev)));
+-            }
++        // Set the node's listening port to `4130 + dev`.
++        //
++        // Note: the `node` flag is an option to detect remote devnet testing.
++        if self.node.is_none() {
++            let address = get_devnet_router_address_for_node(dev);
++            debug!("Setting node address to {address} due to dev={dev}");
++            self.node = Some(address);
++        }
++
++        // If the `norest` flag is not set and the REST IP is not already specified set the REST IP to `3030 + dev`.
++        if !self.norest && self.rest.is_none() {
++            let port = DEFAULT_REST_PORT + dev;
++            debug!("Setting REST port to {port} due to dev={dev}");
++            self.rest = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)));
+         }
++
++        Ok(())
+     }
+ 
+     /// Returns an alternative genesis block if the node is in development mode.
+@@ -599,7 +656,7 @@ impl Start {
          }
  
-         let ctx = self.clone();
-         let txs = transactions.clone();
--        let header = task::spawn_blocking(move || ctx.find_block(&txs, &ctx.canon_header, &terminator)).await??;
-+        let header = task::spawn_blocking(move || ctx.find_block(&txs, &canon_header, &terminator)).await??;
+         // Parse the development configurations.
+-        self.parse_development(&mut trusted_peers, &mut trusted_validators);
++        self.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
  
--        debug!("Miner@{}: found a block", self.block_height);
-+        debug!("Miner@{}: found a block", canon.block_height);
+         // Parse the CDN.
+         let cdn = self.parse_cdn::<N>().with_context(|| "Failed to parse given CDN URL")?;
+@@ -1065,7 +1122,7 @@ mod tests {
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+         let mut config = Start::try_parse_from(["snarkos"].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         let candidate_genesis = config.parse_genesis::<CurrentNetwork>().unwrap();
+         assert_eq!(trusted_peers.len(), 0);
+         assert_eq!(trusted_validators.len(), 0);
+@@ -1073,78 +1130,89 @@ mod tests {
  
-         let block = SerialBlock { header, transactions };
+         let _config = Start::try_parse_from(["snarkos", "--dev", ""].iter()).unwrap_err();
  
-diff --git a/consensus/tests/consensus_dpc.rs b/consensus/tests/consensus_dpc.rs
-index 2fc215786..c4fff847c 100644
---- a/consensus/tests/consensus_dpc.rs
-+++ b/consensus/tests/consensus_dpc.rs
-@@ -40,8 +40,10 @@ mod consensus_dpc {
-             .await
-             .unwrap();
++        // Validator dev mode with default settings.
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+-        let mut config = Start::try_parse_from(["snarkos", "--dev", "1"].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++        let mut config = Start::try_parse_from(["snarkos", "--dev", "1", "--validator"].iter()).unwrap();
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3031").unwrap()));
++        assert_eq!(trusted_validators.len(), 3);
  
-+        let canon_height = consensus.storage.canon().await?.block_height as u32;
++        // Validator dev mode with `--rest` flag.
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+-        let mut config = Start::try_parse_from(["snarkos", "--dev", "1", "--rest", "127.0.0.1:8080"].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++        let mut config =
++            Start::try_parse_from(["snarkos", "--dev", "1", "--rest", "127.0.0.1:8080", "--validator"].iter()).unwrap();
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         assert_eq!(config.rest, Some(SocketAddr::from_str("127.0.0.1:8080").unwrap()));
++        assert_eq!(trusted_validators.len(), 3);
+ 
++        // Validator dev mode with `--norest` flag.
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+-        let mut config = Start::try_parse_from(["snarkos", "--dev", "1", "--norest"].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++        let mut config = Start::try_parse_from(["snarkos", "--dev", "1", "--norest", "--validator"].iter()).unwrap();
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         assert!(config.rest.is_none());
++        assert_eq!(trusted_validators.len(), 3);
+ 
++        // Client dev node.
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+-        let mut config = Start::try_parse_from(["snarkos", "--dev", "0"].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++        let mut config = Start::try_parse_from(["snarkos", "--dev", "5"].iter()).unwrap();
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         let expected_genesis = config.parse_genesis::<CurrentNetwork>().unwrap();
+-        assert_eq!(config.node, Some(SocketAddr::from_str("0.0.0.0:4130").unwrap()));
+-        assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3030").unwrap()));
+-        assert_eq!(trusted_peers.len(), 0);
+-        assert_eq!(trusted_validators.len(), 1);
++        assert_eq!(config.node, Some(SocketAddr::from_str("0.0.0.0:4135").unwrap()));
++        assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3035").unwrap()));
++        assert_eq!(trusted_peers.len(), 2);
++        assert_eq!(trusted_validators.len(), 0);
+         assert!(!config.validator);
+         assert!(!config.prover);
+         assert!(!config.client);
+         assert_ne!(expected_genesis, prod_genesis);
+ 
++        // Validator dev node with `--private-key` flag.
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+         let mut config =
+             Start::try_parse_from(["snarkos", "--dev", "1", "--validator", "--private-key", ""].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         let genesis = config.parse_genesis::<CurrentNetwork>().unwrap();
+         assert_eq!(config.node, Some(SocketAddr::from_str("0.0.0.0:4131").unwrap()));
+         assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3031").unwrap()));
+-        assert_eq!(trusted_peers.len(), 1);
+-        assert_eq!(trusted_validators.len(), 1);
++        assert_eq!(trusted_peers.len(), 0);
++        assert_eq!(trusted_validators.len(), 3);
+         assert!(config.validator);
+         assert!(!config.prover);
+         assert!(!config.client);
+         assert_eq!(genesis, expected_genesis);
+ 
++        // Prover dev node with `--private-key` flag.
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+         let mut config =
+-            Start::try_parse_from(["snarkos", "--dev", "2", "--prover", "--private-key", ""].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++            Start::try_parse_from(["snarkos", "--dev", "6", "--prover", "--private-key", ""].iter()).unwrap();
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         let genesis = config.parse_genesis::<CurrentNetwork>().unwrap();
+-        assert_eq!(config.node, Some(SocketAddr::from_str("0.0.0.0:4132").unwrap()));
+-        assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3032").unwrap()));
++        assert_eq!(config.node, Some(SocketAddr::from_str("0.0.0.0:4136").unwrap()));
++        assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3036").unwrap()));
+         assert_eq!(trusted_peers.len(), 2);
+-        assert_eq!(trusted_validators.len(), 2);
++        assert_eq!(trusted_validators.len(), 0);
+         assert!(!config.validator);
+         assert!(config.prover);
+         assert!(!config.client);
+         assert_eq!(genesis, expected_genesis);
+ 
++        // Client dev node with `--private-key` flag.
+         let mut trusted_peers = vec![];
+         let mut trusted_validators = vec![];
+         let mut config =
+-            Start::try_parse_from(["snarkos", "--dev", "3", "--client", "--private-key", ""].iter()).unwrap();
+-        config.parse_development(&mut trusted_peers, &mut trusted_validators);
++            Start::try_parse_from(["snarkos", "--dev", "10", "--client", "--private-key", ""].iter()).unwrap();
++        config.parse_development(&mut trusted_peers, &mut trusted_validators).unwrap();
+         let genesis = config.parse_genesis::<CurrentNetwork>().unwrap();
+-        assert_eq!(config.node, Some(SocketAddr::from_str("0.0.0.0:4133").unwrap()));
+-        assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3033").unwrap()));
+-        assert_eq!(trusted_peers.len(), 3);
+-        assert_eq!(trusted_validators.len(), 2);
++        assert_eq!(config.node, Some(SocketAddr::from_str("0.0.0.0:4140").unwrap()));
++        assert_eq!(config.rest, Some(SocketAddr::from_str("0.0.0.0:3040").unwrap()));
++        assert_eq!(trusted_peers.len(), 2);
++        assert_eq!(trusted_validators.len(), 0);
+         assert!(!config.validator);
+         assert!(!config.prover);
+         assert!(config.client);
+@@ -1188,6 +1256,24 @@ mod tests {
+         assert_eq!(start.validators, Some("IP1,IP2,IP3".to_string()));
+     }
+ 
++    /// Ensure two clients do not connect to the same validators.
++    #[test]
++    fn test_parse_development_client_validators() {
++        let mut client1_config =
++            Start::try_parse_from(["snarkos", "--dev", "10", "--client", "--private-key", ""].iter()).unwrap();
++        let mut trusted_peers1 = vec![];
++        let mut trusted_validators1 = vec![];
++        client1_config.parse_development(&mut trusted_peers1, &mut trusted_validators1).unwrap();
 +
-         println!("Creating block with coinbase transaction");
--        let (transactions, coinbase_records) = miner.establish_block(vec![]).await.unwrap();
-+        let (transactions, coinbase_records) = miner.establish_block(canon_height + 1, vec![]).await.unwrap();
-         let previous_block_header = genesis().header.into();
-         let header = miner
-             .find_block(&transactions, &previous_block_header, &AtomicBool::new(false))
-diff --git a/consensus/tests/miner.rs b/consensus/tests/miner.rs
-index 63e6c011b..17ddd218c 100644
---- a/consensus/tests/miner.rs
-+++ b/consensus/tests/miner.rs
-@@ -101,7 +101,11 @@ mod miner {
-                 let candidate_transactions = miner.consensus.fetch_memory_pool().await;
-                 println!("creating a block");
- 
--                let (transactions, _coinbase_records) = miner.establish_block(candidate_transactions).await?;
-+                let canon_height = miner.consensus.storage.canon().await?.block_height;
++        let mut client2_config =
++            Start::try_parse_from(["snarkos", "--dev", "11", "--client", "--private-key", ""].iter()).unwrap();
++        let mut trusted_peers2 = vec![];
++        let mut trusted_validators2 = vec![];
++        client2_config.parse_development(&mut trusted_peers2, &mut trusted_validators2).unwrap();
 +
-+                let (transactions, _coinbase_records) = miner
-+                    .establish_block(canon_height as u32 + 1, candidate_transactions)
-+                    .await?;
++        assert_ne!(trusted_peers1, trusted_peers2);
++    }
++
+     #[test]
+     fn parse_peers_when_ips() {
+         let arg_vec = vec!["snarkos", "start", "--peers", "127.0.0.1:3030,127.0.0.2:3030"];
+diff --git a/cli/src/helpers/dev.rs b/cli/src/helpers/dev.rs
+index 38169912e..cde7be1ac 100644
+--- a/cli/src/helpers/dev.rs
++++ b/cli/src/helpers/dev.rs
+@@ -13,11 +13,14 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
  
-                 println!("generated a coinbase transaction");
-                 sender_clone.try_send("started").ok().unwrap();
++use snarkos_node::{bft::MEMORY_POOL_PORT, router::DEFAULT_NODE_PORT};
++
+ use snarkvm::{console::network::Network, prelude::PrivateKey};
+ 
+ use anyhow::Result;
+ use rand::SeedableRng;
+ use rand_chacha::ChaChaRng;
++use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+ 
+ /// The development mode RNG seed.
+ pub const DEVELOPMENT_MODE_RNG_SEED: u64 = 1234567890u64;
+@@ -25,6 +28,9 @@ pub const DEVELOPMENT_MODE_RNG_SEED: u64 = 1234567890u64;
+ /// The development mode number of genesis committee members.
+ pub const DEVELOPMENT_MODE_NUM_GENESIS_COMMITTEE_MEMBERS: u16 = 4;
+ 
++/// The number of validators a devnet client connects to by default.
++pub const DEVNET_NUM_VALIDATORS_PER_CLIENT: u16 = 2;
++
+ /// Get the private key for a validator in development mode.
+ pub fn get_development_key<N: Network>(index: u16) -> Result<PrivateKey<N>> {
+     // Sample the private key of this node.
+@@ -37,3 +43,18 @@ pub fn get_development_key<N: Network>(index: u16) -> Result<PrivateKey<N>> {
+ 
+     PrivateKey::<N>::new(&mut rng)
+ }
++
++/// Returns the indicies of validators a particular devnet client will connect to.
++pub fn get_devnet_validators_for_client(dev: u16, num_validators: u16) -> Vec<u16> {
++    (0..DEVNET_NUM_VALIDATORS_PER_CLIENT).map(|i| (dev + i) % num_validators).collect()
++}
++
++/// Returns the gateway address a particular devnet validator will listen on.
++pub fn get_devnet_gateway_address_for_validator(dev: u16) -> SocketAddr {
++    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, MEMORY_POOL_PORT + dev))
++}
++
++/// Returns the router address a particular devnet validator will list on.
++pub fn get_devnet_router_address_for_node(dev: u16) -> SocketAddr {
++    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEFAULT_NODE_PORT + dev))
++}

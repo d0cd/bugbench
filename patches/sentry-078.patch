@@ -1,0 +1,831 @@
+diff --git a/src/sentry/hybridcloud/tasks/deliver_webhooks.py b/src/sentry/hybridcloud/tasks/deliver_webhooks.py
+index 72edf0a71c9f99..0d22b4b2452916 100644
+--- a/src/sentry/hybridcloud/tasks/deliver_webhooks.py
++++ b/src/sentry/hybridcloud/tasks/deliver_webhooks.py
+@@ -280,7 +280,14 @@ def drain_mailbox(payload_id: int, mailbox_name: str | None = None) -> None:
+ 
+     _set_webhook_delivery_sentry_context(payload)
+ 
++    skip_on_failure_providers = frozenset(
++        options.get("hybridcloud.webhookpayload.skip_on_failure_providers") or ()
++    )
++    skip_on_failure = payload.provider in skip_on_failure_providers
++
+     delivered = 0
++    failed = 0
++    current_id = payload.id
+     deadline = timezone.now() + BATCH_SCHEDULE_OFFSET
+     try:
+         while True:
+@@ -302,12 +309,15 @@ def drain_mailbox(payload_id: int, mailbox_name: str | None = None) -> None:
+             # Fetch records from the batch in slices of 100. This avoids reading
+             # redundant data should we hit an error and should help keep query duration low.
+             query = WebhookPayloadReplica.filter(
+-                id__gte=payload.id, mailbox_name=payload.mailbox_name
++                id__gte=current_id, mailbox_name=payload.mailbox_name
+             ).order_by("id")
+ 
+             batch_count = 0
+             for record in query[:100]:
+                 batch_count += 1
++                # Advance past this record regardless of outcome so that failed
++                # messages are not re-attempted in subsequent batches of this drain.
++                current_id = record.id + 1
+                 # Refresh the lock on each delivery so a slow HTTP response in the
+                 # inner loop (up to 30s timeout × 100 records) cannot outlast the
+                 # 15s TTL and let the key expire mid-batch.
+@@ -317,18 +327,36 @@ def drain_mailbox(payload_id: int, mailbox_name: str | None = None) -> None:
+                     deliver_message(record)
+                     delivered += 1
+                 except DeliveryFailed:
++                    failed += 1
+                     metrics.incr("hybridcloud.deliver_webhooks.delivery", tags={"outcome": "retry"})
+-                    return
++                    if not skip_on_failure:
++                        # For providers that require strict ordering, stop on the
++                        # first failure so subsequent messages are not delivered
++                        # out of order.
++                        return
++                    # For allowlisted providers: skip the failed message and
++                    # continue. It has already been rescheduled by deliver_message.
++                    continue
+ 
+             # No more messages to deliver
+             if batch_count < 1:
+-                logger.debug(
+-                    "deliver_webhook.delivery_complete",
+-                    extra={
+-                        **payload.as_dict(),
+-                        "delivered": delivered,
+-                    },
+-                )
++                if failed > 0:
++                    logger.info(
++                        "deliver_webhook.delivery_complete_with_failures",
++                        extra={
++                            **payload.as_dict(),
++                            "delivered": delivered,
++                            "failed": failed,
++                        },
++                    )
++                else:
++                    logger.debug(
++                        "deliver_webhook.delivery_complete",
++                        extra={
++                            **payload.as_dict(),
++                            "delivered": delivered,
++                        },
++                    )
+                 return
+     finally:
+         # Only release the lock if this is a push-triggered drain (mailbox_name is
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index d5a1071d847b7c..89d126a98e739f 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -711,7 +711,7 @@
+ 
+ # Coding Workflows
+ register(
+-    "coding_workflows.code_review.github.check_run.rerun.enabled",
++    "coding_workflows.code_review.seer.use_new_endpoints",
+     default=False,
+     type=Bool,
+     flags=FLAG_AUTOMATOR_MODIFIABLE,
+@@ -2506,6 +2506,12 @@
+     default=False,
+     flags=FLAG_AUTOMATOR_MODIFIABLE,
+ )
++register(
++    "hybridcloud.webhookpayload.skip_on_failure_providers",
++    type=Sequence,
++    default=["github"],
++    flags=FLAG_ALLOW_EMPTY | FLAG_AUTOMATOR_MODIFIABLE,
++)
+ # Break glass controls
+ register(
+     "hybrid_cloud.rpc.disabled-service-methods",
+diff --git a/src/sentry/seer/code_review/utils.py b/src/sentry/seer/code_review/utils.py
+index c7725c436494da..0f52c3ef45c700 100644
+--- a/src/sentry/seer/code_review/utils.py
++++ b/src/sentry/seer/code_review/utils.py
+@@ -11,7 +11,7 @@
+ from django.conf import settings
+ from urllib3.exceptions import HTTPError
+ 
+-from sentry import features
++from sentry import features, options
+ from sentry.integrations.github.client import GitHubReaction
+ from sentry.integrations.github.utils import is_github_rate_limit_sensitive
+ from sentry.integrations.github.webhook_types import GithubWebhookType
+@@ -71,25 +71,30 @@ def convert_enum_keys_to_strings(obj: Any) -> Any:
+ 
+ # These values need to match the value defined in the Seer API.
+ class SeerEndpoint(StrEnum):
+-    # https://github.com/getsentry/seer/blob/main/src/seer/routes/automation_request.py#L57
++    # Legacy; used when coding_workflows.code_review.seer.use_new_endpoints is False
+     OVERWATCH_REQUEST = "/v1/automation/overwatch-request"
+     # https://github.com/getsentry/seer/blob/main/src/seer/routes/codegen.py
+-    PR_REVIEW_RERUN = "/v1/automation/codegen/pr-review/rerun"
++    PR_REVIEW_RERUN = "/v1/code_review/check/rerun"
++    # New dedicated endpoints (used when use_new_endpoints is True)
++    CODE_REVIEW_REVIEW_REQUEST = "/v1/code_review/review-request"
++    CODE_REVIEW_PR_CLOSED = "/v1/code_review/pr-closed"
+ 
+ 
+-def get_seer_endpoint_for_event(github_event: str) -> SeerEndpoint:
++def get_seer_path_for_request(github_event: str, payload: Mapping[str, Any]) -> str:
+     """
+-    Get the appropriate Seer endpoint for a given GitHub webhook event.
++    Get the Seer API path for a webhook request based on event type and option.
+ 
+-    Args:
+-        github_event: The GitHub webhook event type (as string, after Celery deserialization)
+-
+-    Returns:
+-        The SeerEndpoint to use for the event
++    When coding_workflows.code_review.seer.use_new_endpoints is False, PR/issue_comment
++    events use the legacy overwatch-request endpoint. When True, they use the dedicated
++    review-request or pr-closed endpoints. CHECK_RUN always uses the rerun endpoint.
+     """
+     if github_event == GithubWebhookType.CHECK_RUN.value:
+-        return SeerEndpoint.PR_REVIEW_RERUN
+-    return SeerEndpoint.OVERWATCH_REQUEST
++        return SeerEndpoint.PR_REVIEW_RERUN.value
++    if not options.get("coding_workflows.code_review.seer.use_new_endpoints"):
++        return SeerEndpoint.OVERWATCH_REQUEST.value
++    if payload.get("request_type") == "pr-closed":
++        return SeerEndpoint.CODE_REVIEW_PR_CLOSED.value
++    return SeerEndpoint.CODE_REVIEW_REVIEW_REQUEST.value
+ 
+ 
+ def make_seer_request(
+@@ -337,8 +342,8 @@ def transform_pull_request_to_codegen_request(
+     config = payload["data"]["config"]
+     trigger_metadata = _get_trigger_metadata_for_pull_request(event_payload)
+     # In Seer, used here:
+-    # src/seer/automation/codegen/tasks.py
+-    # src/seer/automation/codegen/pr_review_step.py
++    # src/code_review/tasks.py
++    # src/code_review/pr_review_step.py
+     config["trigger"] = review_request_trigger.value
+     config["trigger_user"] = trigger_metadata["trigger_user"]
+     config["trigger_user_id"] = trigger_metadata["trigger_user_id"]
+diff --git a/src/sentry/seer/code_review/webhooks/task.py b/src/sentry/seer/code_review/webhooks/task.py
+index 0b9dd10adaae3f..dcaad7865d1ddf 100644
+--- a/src/sentry/seer/code_review/webhooks/task.py
++++ b/src/sentry/seer/code_review/webhooks/task.py
+@@ -27,7 +27,7 @@
+ from ..metrics import WebhookFilteredReason, record_webhook_enqueued, record_webhook_filtered
+ from ..utils import (
+     convert_enum_keys_to_strings,
+-    get_seer_endpoint_for_event,
++    get_seer_path_for_request,
+     make_seer_request,
+ )
+ 
+@@ -131,10 +131,11 @@ def process_github_webhook_event(
+     try:
+         if tags:
+             sentry_sdk.set_tags(tags)
+-        path = get_seer_endpoint_for_event(github_event).value
+         viewer_context: SeerViewerContext | None = None
+         if tags and (org_id := tags.get("sentry_organization_id")):
+             viewer_context = SeerViewerContext(organization_id=int(org_id))
++
++        path = get_seer_path_for_request(github_event, event_payload)
+         make_seer_request(path=path, payload=event_payload, viewer_context=viewer_context)
+     except Exception as e:
+         status = e.__class__.__name__
+diff --git a/static/app/components/pageFilters/project/projectPageFilter.spec.tsx b/static/app/components/pageFilters/project/projectPageFilter.spec.tsx
+index 5142abcfc02bbb..971c84e37c7fcc 100644
+--- a/static/app/components/pageFilters/project/projectPageFilter.spec.tsx
++++ b/static/app/components/pageFilters/project/projectPageFilter.spec.tsx
+@@ -532,6 +532,119 @@ describe('ProjectPageFilter', () => {
+     });
+   });
+ 
++  it('shows selection limit warning when clicking All Projects then unchecking a single project', async () => {
++    // 51 members + 1 non-member = 52 total so the "All Projects" sentinel appears
++    const manyProjects = [
++      ...Array.from({length: 51}, (_, index) =>
++        ProjectFixture({
++          id: String(index + 1),
++          slug: `project-${index + 1}`,
++          isMember: true,
++        })
++      ),
++      ProjectFixture({id: '52', slug: 'project-52', isMember: false}),
++    ];
++    ProjectsStore.loadInitialData(manyProjects);
++
++    // Start with a single project selected
++    PageFiltersStore.onInitializeUrlState({
++      projects: [1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {
++          pathname: '/organizations/org-slug/issues/',
++          query: {project: '1'},
++        },
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
++
++    // Click "All Projects" to stage all 52 projects
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
++
++    // Uncheck project-1 — should be unchecked and leave 51 selections, exceeding the limit
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-1'}));
++
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
++    expect(
++      screen.getByText(/only up to 50 can be selected at a time/i)
++    ).toBeInTheDocument();
++    expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
++  });
++
++  it.each([
++    {
++      label: 'My Projects',
++      // 52 members + 1 non-member so the "My Projects" sentinel appears
++      // (requires memberProjectList.length < projects.length)
++      memberCount: 52,
++      nonMemberCount: 1,
++      urlProjects: [] as number[],
++      urlQuery: {} as Record<string, string>,
++      triggerName: 'My Projects',
++    },
++    {
++      label: 'All Projects',
++      // 51 members + 1 non-member so the "All Projects" sentinel appears
++      // (requires nonMemberProjectList.length > 0)
++      memberCount: 51,
++      nonMemberCount: 1,
++      urlProjects: [-1],
++      urlQuery: {project: '-1'},
++      triggerName: 'All Projects',
++    },
++  ])(
++    'shows selection limit warning when $label is active and a single project is unchecked',
++    async ({memberCount, nonMemberCount, urlProjects, urlQuery, triggerName}) => {
++      const manyProjects = [
++        ...Array.from({length: memberCount}, (_, index) =>
++          ProjectFixture({
++            id: String(index + 1),
++            slug: `project-${index + 1}`,
++            isMember: true,
++          })
++        ),
++        ...Array.from({length: nonMemberCount}, (_, index) =>
++          ProjectFixture({
++            id: String(memberCount + index + 1),
++            slug: `project-${memberCount + index + 1}`,
++            isMember: false,
++          })
++        ),
++      ];
++      ProjectsStore.loadInitialData(manyProjects);
++
++      PageFiltersStore.onInitializeUrlState({
++        projects: urlProjects,
++        environments: [],
++        datetime: {start: null, end: null, period: '14d', utc: null},
++      });
++
++      render(<ProjectPageFilter />, {
++        organization,
++        initialRouterConfig: {
++          location: {pathname: '/organizations/org-slug/issues/', query: urlQuery},
++        },
++      });
++
++      await userEvent.click(screen.getByRole('button', {name: triggerName}));
++
++      // Unchecking one project leaves memberCount explicit selections, which exceeds the limit of 50
++      await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-1'}));
++
++      expect(
++        screen.getByText(/only up to 50 can be selected at a time/i)
++      ).toBeInTheDocument();
++      expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
++    }
++  );
++
+   it('shows selection limit warning after editing All Projects sentinel selection', async () => {
+     const manyProjects = Array.from({length: 52}, (_, index) =>
+       ProjectFixture({
+diff --git a/static/app/components/pageFilters/project/projectPageFilter.tsx b/static/app/components/pageFilters/project/projectPageFilter.tsx
+index 47ce403ff9d7ea..bd26623c25692b 100644
+--- a/static/app/components/pageFilters/project/projectPageFilter.tsx
++++ b/static/app/components/pageFilters/project/projectPageFilter.tsx
+@@ -128,7 +128,26 @@ export function ProjectPageFilter({
+                 ? true
+                 : isSelected
+             }
+-            onChange={() => toggleOptionRef.current?.(parseInt(project.id, 10))}
++            onChange={() => {
++              const projectId = parseInt(project.id, 10);
++              // When a sentinel is staged, the checkbox appears checked via the
++              // `checked` override above — but toggleOption would just add the
++              // ID alongside the sentinel (e.g. [-1, 1]), keeping kind='all'.
++              // Instead, expand to explicit IDs first, then remove this project.
++              if (optionSelectionIntent.kind === 'all') {
++                dispatchRef.current?.({
++                  type: 'set staged',
++                  value: allProjectIds(projects).filter(id => id !== projectId),
++                });
++              } else if (optionSelectionIntent.kind === 'my' && project.isMember) {
++                dispatchRef.current?.({
++                  type: 'set staged',
++                  value: memberProjectIds(projects).filter(id => id !== projectId),
++                });
++              } else {
++                toggleOptionRef.current?.(projectId);
++              }
++            }}
+             aria-label={t('Select %s', project.slug)}
+             tabIndex={-1}
+           />
+diff --git a/static/app/views/issueDetails/metricIssues/metricIssueChart.tsx b/static/app/views/issueDetails/metricIssues/metricIssueChart.tsx
+index 840c8a6014ff12..bd6ef3fd6fea56 100644
+--- a/static/app/views/issueDetails/metricIssues/metricIssueChart.tsx
++++ b/static/app/views/issueDetails/metricIssues/metricIssueChart.tsx
+@@ -18,7 +18,6 @@ import {
+   useOpenPeriods,
+ } from 'sentry/views/detectors/hooks/useOpenPeriods';
+ import {useIssueDetails} from 'sentry/views/issueDetails/streamline/context';
+-import {GraphAlert} from 'sentry/views/issueDetails/streamline/eventGraph';
+ 
+ interface MetricIssueChartProps {
+   event: Event | undefined;
+@@ -58,7 +57,7 @@ export function MetricIssueChart({group, event}: MetricIssueChartProps) {
+   if (isDetectorError) {
+     return (
+       <Container width="100%">
+-        <GraphAlert variant="danger">{getDetectorErrorMessage(detectorError)}</GraphAlert>
++        <Alert variant="danger">{getDetectorErrorMessage(detectorError)}</Alert>
+       </Container>
+     );
+   }
+@@ -121,9 +120,9 @@ function MetricIssueChartContent({
+   if (chartError) {
+     return (
+       <Container width="100%">
+-        <GraphAlert variant="danger">
++        <Alert variant="danger">
+           {t('Error loading metric monitor: %s', chartError?.message)}
+-        </GraphAlert>
++        </Alert>
+       </Container>
+     );
+   }
+diff --git a/static/app/views/issueDetails/streamline/eventDetailsHeader.tsx b/static/app/views/issueDetails/streamline/eventDetailsHeader.tsx
+index adef18ce3c670d..ac1a8ae688d94d 100644
+--- a/static/app/views/issueDetails/streamline/eventDetailsHeader.tsx
++++ b/static/app/views/issueDetails/streamline/eventDetailsHeader.tsx
+@@ -215,12 +215,7 @@ export function EventDetailsHeader({group, event, project}: EventDetailsHeaderPr
+         {issueTypeConfig.header.graph.enabled && (
+           <GraphSection>
+             {issueTypeConfig.header.graph.type === 'discover-events' && (
+-              <EventGraph
+-                event={event}
+-                group={group}
+-                showReleasesAs="bubble"
+-                style={{flex: 1}}
+-              />
++              <EventGraph event={event} group={group} showReleasesAs="bubble" />
+             )}
+             {issueTypeConfig.header.graph.type === 'detector-history' && (
+               <MetricIssueChart group={group} event={event} />
+diff --git a/static/app/views/issueDetails/streamline/eventGraph.tsx b/static/app/views/issueDetails/streamline/eventGraph.tsx
+index 4e856d26d0f96a..5b620920c97966 100644
+--- a/static/app/views/issueDetails/streamline/eventGraph.tsx
++++ b/static/app/views/issueDetails/streamline/eventGraph.tsx
+@@ -1,11 +1,4 @@
+-import {
+-  useCallback,
+-  useEffect,
+-  useMemo,
+-  useRef,
+-  useState,
+-  type CSSProperties,
+-} from 'react';
++import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+ import {useTheme} from '@emotion/react';
+ import styled from '@emotion/styled';
+ import {mergeRefs, useResizeObserver} from '@react-aria/utils';
+@@ -82,7 +75,6 @@ interface EventGraphProps {
+    * Enable/disables showing the event and user summary
+    */
+   showSummary?: boolean;
+-  style?: CSSProperties;
+ }
+ 
+ function createSeriesAndCount(stats: EventsStats) {
+@@ -474,9 +466,9 @@ export function EventGraph({
+ 
+   if (error) {
+     return (
+-      <GraphAlert variant="danger" {...styleProps}>
++      <Alert variant="danger">
+         {tct('Graph Query Error: [message]', {message: error.message})}
+-      </GraphAlert>
++      </Alert>
+     );
+   }
+ 
+@@ -630,10 +622,3 @@ const ChartContainer = styled('div')`
+     padding: ${p => p.theme.space.sm} ${p => p.theme.space.md} ${p => p.theme.space.sm} 0;
+   }
+ `;
+-
+-export const GraphAlert = styled(Alert)`
+-  padding-left: ${p => p.theme.space['2xl']};
+-  margin: 0 0 0 -${p => p.theme.space['2xl']};
+-  border: 0;
+-  border-radius: 0;
+-`;
+diff --git a/static/gsApp/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData.ts b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData.ts
+index a8f6686a796c7b..c5658bdeee70e1 100644
+--- a/static/gsApp/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData.ts
++++ b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData.ts
+@@ -32,7 +32,7 @@ export function useScmIntegrationTreeData(): ScmIntegrationTreeData {
+       '/organizations/$organizationIdOrSlug/config/integrations/',
+       {
+         path: {organizationIdOrSlug: organization.slug},
+-        staleTime: 60_000,
++        staleTime: 0,
+       }
+     )
+   );
+diff --git a/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py b/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
+index cf0e332da7fe4d..65c24a5aca50fd 100644
+--- a/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
++++ b/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
+@@ -121,7 +121,8 @@ def test_schedule_mailbox_with_more_than_batch_size_records(self) -> None:
+         with self.tasks():
+             schedule_webhook_delivery()
+ 
+-        # First attempt will fail rescheduling messages.
++        # First attempt fails. provider=None is not in the skip-on-failure allowlist
++        # so processing stops after the first message, preserving mailbox ordering.
+         assert len(responses.calls) == 1
+         assert WebhookPayload.objects.count() == num_records
+         head = WebhookPayload.objects.all().order_by("id").first()
+@@ -129,6 +130,7 @@ def test_schedule_mailbox_with_more_than_batch_size_records(self) -> None:
+         assert head.schedule_for > timezone.now()
+ 
+         # Do another scheduled run. This should not make any forwarding requests
++        # because the head is still in backoff.
+         with self.tasks():
+             schedule_webhook_delivery()
+         assert len(responses.calls) == 1
+@@ -261,12 +263,13 @@ def test_schedule_handles_null_provider(self, mock_deliver: MagicMock) -> None:
+         assert call_args_list[1] == null_provider_webhook.id
+ 
+ 
+-def create_payloads(num: int, mailbox: str) -> list[WebhookPayload]:
++def create_payloads(num: int, mailbox: str, provider: str | None = None) -> list[WebhookPayload]:
+     created = []
+     for _ in range(0, num):
+         hook = Factories.create_webhook_payload(
+             mailbox_name=mailbox,
+             region_name="us",
++            provider=provider,
+         )
+         created.append(hook)
+     return created
+@@ -306,35 +309,66 @@ def test_drain_unknown_region(self) -> None:
+     @responses.activate
+     @override_regions(region_config)
+     def test_drain_success_partial(self) -> None:
+-        responses.add(
+-            responses.POST,
+-            "http://us.testserver/extensions/github/webhook/",
+-            status=200,
+-            body="",
+-        )
+-        responses.add(
+-            responses.POST,
+-            "http://us.testserver/extensions/github/webhook/",
+-            status=500,
+-            body="",
+-        )
+-        records = create_payloads(5, "github:123")
++        url = "http://us.testserver/extensions/github/webhook/"
++        responses.add(responses.POST, url, status=200, body="")
++        responses.add(responses.POST, url, status=500, body="")
++        responses.add(responses.POST, url, status=200, body="")
++        responses.add(responses.POST, url, status=200, body="")
++        responses.add(responses.POST, url, status=200, body="")
++        records = create_payloads(5, "github:123", provider="github")
+         drain_mailbox(records[0].id)
+ 
+-        # Attempts should stop as soon as the first delivery
+-        # fails. This retains mailbox ordering while yielding this
+-        # worker for new work
++        # github is in the skip-on-failure allowlist: failed messages are skipped
++        # and processing continues. All 5 messages are attempted.
++        assert len(responses.calls) == 5
++
++        # Only the failed message remains in the mailbox.
++        assert WebhookPayload.objects.count() == 1
++
++        # Failed record should be scheduled to run later.
++        first = WebhookPayload.objects.order_by("id").first()
++        assert first
++        assert first.attempts == 1
++        assert first.schedule_for > timezone.now()
++
++    @responses.activate
++    @override_regions(region_config)
++    def test_drain_stops_on_failure_for_non_allowlisted_provider(self) -> None:
++        url = "http://us.testserver/extensions/github/webhook/"
++        responses.add(responses.POST, url, status=200, body="")
++        responses.add(responses.POST, url, status=500, body="")
++        records = create_payloads(5, "jira:123", provider="jira")
++        drain_mailbox(records[0].id)
++
++        # jira is not in the allowlist: processing stops on the first failure
++        # to preserve strict mailbox ordering.
+         assert len(responses.calls) == 2
+ 
+-        # Mailbox should have 4 records left
++        # The failed message and all subsequent messages remain.
+         assert WebhookPayload.objects.count() == 4
+ 
+-        # Remaining record should be scheduled to run later.
+         first = WebhookPayload.objects.order_by("id").first()
+         assert first
+         assert first.attempts == 1
+         assert first.schedule_for > timezone.now()
+ 
++    @responses.activate
++    @override_regions(region_config)
++    def test_drain_mailbox_multiple_consecutive_failures(self) -> None:
++        url = "http://us.testserver/extensions/github/webhook/"
++        responses.add(responses.POST, url, status=500, body="")
++        records = create_payloads(5, "github:123", provider="github")
++        drain_mailbox(records[0].id)
++
++        # All 5 messages are attempted even though all fail.
++        assert len(responses.calls) == 5
++
++        # All 5 messages remain with incremented attempts and a future schedule_for.
++        assert WebhookPayload.objects.count() == 5
++        for record in WebhookPayload.objects.all():
++            assert record.attempts == 1
++            assert record.schedule_for > timezone.now()
++
+     @responses.activate
+     @override_regions(region_config)
+     def test_drain_success(self) -> None:
+diff --git a/tests/sentry/seer/code_review/test_webhooks.py b/tests/sentry/seer/code_review/test_webhooks.py
+index 53a564eace4d40..a3515f55293778 100644
+--- a/tests/sentry/seer/code_review/test_webhooks.py
++++ b/tests/sentry/seer/code_review/test_webhooks.py
+@@ -1,6 +1,7 @@
+ from datetime import datetime, timedelta, timezone
+ from unittest.mock import MagicMock, patch
+ 
++import orjson
+ import pytest
+ from sentry_protos.taskbroker.v1.taskbroker_pb2 import RetryState
+ from urllib3 import BaseHTTPResponse
+@@ -21,6 +22,7 @@
+     process_github_webhook_event,
+ )
+ from sentry.testutils.cases import TestCase
++from sentry.testutils.helpers.options import override_options
+ 
+ 
+ class ProcessGitHubWebhookEventTest(TestCase):
+@@ -419,7 +421,7 @@ def test_latency_tracking_on_max_retries_with_failures(
+ 
+     @patch("sentry.seer.code_review.utils.make_signed_seer_api_request")
+     def test_check_run_and_pr_events_processed_separately(self, mock_request: MagicMock) -> None:
+-        """Test that CHECK_RUN events use rerun endpoint while PR events use overwatch-request."""
++        """Test that CHECK_RUN uses rerun endpoint; PR events use overwatch-request when option off."""
+         mock_request.return_value = self._mock_response(200, b"{}")
+ 
+         process_github_webhook_event._func(
+@@ -430,7 +432,7 @@ def test_check_run_and_pr_events_processed_separately(self, mock_request: MagicM
+ 
+         assert mock_request.call_count == 1
+         check_run_call = mock_request.call_args
+-        assert check_run_call[1]["path"] == "/v1/automation/codegen/pr-review/rerun"
++        assert check_run_call[1]["path"] == "/v1/code_review/check/rerun"
+ 
+         mock_request.reset_mock()
+ 
+@@ -474,6 +476,60 @@ def test_check_run_and_pr_events_processed_separately(self, mock_request: MagicM
+         pr_call = mock_request.call_args
+         assert pr_call[1]["path"] == "/v1/automation/overwatch-request"
+ 
++    @patch("sentry.seer.code_review.utils.make_signed_seer_api_request")
++    def test_pr_event_uses_new_endpoints_when_option_enabled(self, mock_request: MagicMock) -> None:
++        """Test that with use_new_endpoints option, PR review uses review-request and pr-closed uses pr-closed."""
++        mock_request.return_value = self._mock_response(200, b"{}")
++
++        pr_review_payload = {
++            "request_type": "pr-review",
++            "external_owner_id": "456",
++            "data": {
++                "repo": {
++                    "provider": "github",
++                    "owner": "test-owner",
++                    "name": "test-repo",
++                    "external_id": "123456",
++                    "base_commit_sha": "abc123",
++                },
++                "pr_id": 123,
++                "bug_prediction_specific_information": {
++                    "organization_id": 789,
++                    "organization_slug": "test-org",
++                },
++                "config": {
++                    "features": {"bug_prediction": True},
++                    "trigger": "on_new_commit",
++                    "trigger_comment_id": None,
++                    "trigger_comment_type": None,
++                    "trigger_user": None,
++                },
++            },
++        }
++
++        with override_options({"coding_workflows.code_review.seer.use_new_endpoints": True}):
++            process_github_webhook_event._func(
++                github_event=GithubWebhookType.PULL_REQUEST,
++                event_payload=pr_review_payload,
++                enqueued_at_str=self.enqueued_at_str,
++            )
++
++        assert mock_request.call_count == 1
++        assert mock_request.call_args[1]["path"] == "/v1/code_review/review-request"
++
++        mock_request.reset_mock()
++        pr_closed_payload = {**pr_review_payload, "request_type": "pr-closed"}
++
++        with override_options({"coding_workflows.code_review.seer.use_new_endpoints": True}):
++            process_github_webhook_event._func(
++                github_event=GithubWebhookType.PULL_REQUEST,
++                event_payload=pr_closed_payload,
++                enqueued_at_str=self.enqueued_at_str,
++            )
++
++        assert mock_request.call_count == 1
++        assert mock_request.call_args[1]["path"] == "/v1/code_review/pr-closed"
++
+     @patch("sentry.seer.code_review.utils.make_signed_seer_api_request")
+     def test_validation_converts_enum_keys_to_strings(self, mock_request: MagicMock) -> None:
+         """Test that validation converts enum keys to strings for JSON serialization.
+@@ -525,7 +581,6 @@ def test_validation_converts_enum_keys_to_strings(self, mock_request: MagicMock)
+         assert mock_request.call_count == 1
+ 
+         # Get the actual payload that was sent
+-        import orjson
+ 
+         sent_body = mock_request.call_args[1]["body"]
+         sent_payload = orjson.loads(sent_body)
+diff --git a/tests/sentry/seer/code_review/webhooks/test_issue_comment.py b/tests/sentry/seer/code_review/webhooks/test_issue_comment.py
+index 646246efe23594..d9a71a1302be5f 100644
+--- a/tests/sentry/seer/code_review/webhooks/test_issue_comment.py
++++ b/tests/sentry/seer/code_review/webhooks/test_issue_comment.py
+@@ -142,8 +142,8 @@ def test_skips_when_not_pr_comment(self) -> None:
+             assert response.status_code == 204
+             self.mock_seer.assert_not_called()
+ 
+-    def test_success_case(self) -> None:
+-        """Test that Seer request includes trigger metadata from the comment."""
++    def test_success_case_uses_legacy_endpoint_by_default(self) -> None:
++        """Test that with option disabled, issue comment uses overwatch-request."""
+         with self.code_review_setup(), self.tasks():
+             event_dict = orjson.loads(
+                 self._build_issue_comment_event(f"Please {SENTRY_REVIEW_COMMAND} this PR")
+@@ -172,3 +172,25 @@ def test_success_case(self) -> None:
+             )
+             # sentry_received_trigger_at is set to current time when transform happens
+             assert isinstance(payload["data"]["config"]["sentry_received_trigger_at"], datetime)
++
++    def test_success_case_uses_new_endpoint_when_option_enabled(self) -> None:
++        """Test that with use_new_endpoints option, issue comment uses review-request."""
++        with (
++            self.code_review_setup(),
++            self.tasks(),
++            self.options({"coding_workflows.code_review.seer.use_new_endpoints": True}),
++        ):
++            event_dict = orjson.loads(
++                self._build_issue_comment_event(f"Please {SENTRY_REVIEW_COMMAND} this PR")
++            )
++            event_dict["comment"]["user"] = {"login": "test-user"}
++            event = orjson.dumps(event_dict)
++
++            response = self._send_issue_comment_event(event)
++            assert response.status_code == 204
++            self.mock_seer.assert_called_once()
++            call_args = self.mock_seer.call_args
++            assert call_args[1]["path"] == "/v1/code_review/review-request"
++            payload = call_args[1]["payload"]
++            assert payload["data"]["repo"]["base_commit_sha"] == "abc123"
++            assert payload["data"]["config"]["trigger_user"] == "test-user"
+diff --git a/tests/sentry/seer/code_review/webhooks/test_pull_request.py b/tests/sentry/seer/code_review/webhooks/test_pull_request.py
+index 39a7b8be723a96..b836c811f4d4e1 100644
+--- a/tests/sentry/seer/code_review/webhooks/test_pull_request.py
++++ b/tests/sentry/seer/code_review/webhooks/test_pull_request.py
+@@ -60,8 +60,8 @@ def mock_seer_request(self) -> Generator[None]:
+             self.mock_seer = mock_seer
+             yield
+ 
+-    def test_pull_request_opened(self) -> None:
+-        """Test that opened action triggers Seer request and adds reaction."""
++    def test_pull_request_opened_uses_legacy_endpoint_by_default(self) -> None:
++        """Test that with option disabled, opened action uses overwatch-request."""
+         with self.code_review_setup(), self.tasks():
+             event = orjson.loads(PULL_REQUEST_OPENED_EVENT_EXAMPLE)
+             assert event["action"] == "opened"
+@@ -83,6 +83,35 @@ def test_pull_request_opened(self) -> None:
+                 GitHubReaction.EYES,
+             )
+ 
++    def test_pull_request_opened_uses_new_endpoint_when_option_enabled(self) -> None:
++        """Test that with use_new_endpoints option, opened action uses review-request."""
++        with (
++            self.code_review_setup(),
++            self.tasks(),
++            self.options({"coding_workflows.code_review.seer.use_new_endpoints": True}),
++        ):
++            event = orjson.loads(PULL_REQUEST_OPENED_EVENT_EXAMPLE)
++            assert event["action"] == "opened"
++
++            self._send_webhook_event(
++                GithubWebhookType.PULL_REQUEST,
++                orjson.dumps(event),
++            )
++
++            self.mock_seer.assert_called_once()
++            call_kwargs = self.mock_seer.call_args[1]
++            assert call_kwargs["path"] == "/v1/code_review/review-request"
++            payload = call_kwargs["payload"]
++            assert "request_type" in payload
++            assert "external_owner_id" in payload
++            assert "data" in payload
++
++            self.mock_reaction.assert_called_once_with(
++                event["repository"]["full_name"],
++                str(event["pull_request"]["number"]),
++                GitHubReaction.EYES,
++            )
++
+     def test_pull_request_skips_draft(self) -> None:
+         """Test that draft PRs are skipped."""
+         with self.code_review_setup(), self.tasks():
+@@ -234,8 +263,8 @@ def test_pull_request_blocks_draft_for_synchronize_action(self) -> None:
+             self.mock_seer.assert_not_called()
+             self.mock_reaction.assert_not_called()
+ 
+-    def test_pull_request_closed_action(self) -> None:
+-        """Test that closed action triggers Seer request with pr-closed request type and skips reaction."""
++    def test_pull_request_closed_uses_legacy_endpoint_by_default(self) -> None:
++        """Test that with option disabled, closed action uses overwatch-request."""
+         with self.code_review_setup(), self.tasks():
+             event = orjson.loads(PULL_REQUEST_OPENED_EVENT_EXAMPLE)
+             event["action"] = "closed"
+@@ -262,6 +291,31 @@ def test_pull_request_closed_action(self) -> None:
+             assert isinstance(payload["data"]["config"]["sentry_received_trigger_at"], datetime)
+             self.mock_reaction.assert_not_called()
+ 
++    def test_pull_request_closed_uses_new_endpoint_when_option_enabled(self) -> None:
++        """Test that with use_new_endpoints option, closed action uses pr-closed endpoint."""
++        with (
++            self.code_review_setup(),
++            self.tasks(),
++            self.options({"coding_workflows.code_review.seer.use_new_endpoints": True}),
++        ):
++            event = orjson.loads(PULL_REQUEST_OPENED_EVENT_EXAMPLE)
++            event["action"] = "closed"
++
++            self._send_webhook_event(
++                GithubWebhookType.PULL_REQUEST,
++                orjson.dumps(event),
++            )
++
++            self.mock_seer.assert_called_once()
++            call_kwargs = self.mock_seer.call_args[1]
++            assert call_kwargs["path"] == "/v1/code_review/pr-closed"
++            payload = call_kwargs["payload"]
++            assert "request_type" in payload
++            assert "external_owner_id" in payload
++            assert "data" in payload
++            assert payload["data"]["config"]["trigger"] == SeerCodeReviewTrigger.UNKNOWN.value
++            self.mock_reaction.assert_not_called()
++
+     def test_pull_request_opened_filtered_when_trigger_disabled_post_ga(self) -> None:
+         triggers = [CodeReviewTrigger.ON_NEW_COMMIT]
+         features = {"organizations:gen-ai-features", "organizations:seat-based-seer-enabled"}

@@ -1,89 +1,4273 @@
+diff --git a/.github/workflows/release-build.yml b/.github/workflows/release-build.yml
+index 44c5140b413a7..fcbd555c48097 100644
+--- a/.github/workflows/release-build.yml
++++ b/.github/workflows/release-build.yml
+@@ -109,11 +109,16 @@ jobs:
+           github-token: ${{ steps.generate_token.outputs.token }}
+           script: |
+             const {REF, VERSION, BUILD_ID, BUCKET, GRAFANA_COMMIT, SOURCE_EVENT, REPO} = process.env;
++            let workflow = 'release-build.yml';
++
++            if (REF == 'main') {
++              workflow = 'release-build-pro.yml';
++            }
+ 
+             await github.rest.actions.createWorkflowDispatch({
+                 owner: 'grafana',
+                 repo: 'grafana-enterprise',
+-                workflow_id: 'release-build.yml',
++                workflow_id: workflow,
+                 ref:  REF,
+                 inputs: {
+                   "version": VERSION,
 diff --git a/Makefile b/Makefile
-index 82cddd58c50..06d9a8af788 100644
+index b0714f8f3a382..8e965186ac576 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -23,7 +23,8 @@ BUILD_STAMP := $(shell echo $${SOURCE_DATE_EPOCH:-$$(date +%s 2>/dev/null)})
+@@ -17,13 +17,14 @@ GO_RACE_FLAG := $(if $(GO_RACE),-race)
+ # Backend build version and ldflags (aligned with pkg/build/daggerbuild/backend).
+ BUILD_NUMBER ?= local
+ BUILD_VERSION := $(shell sed -n 's/.*"version": *"\(.*\)".*/\1/p' package.json | sed 's/-pre/-$(BUILD_NUMBER)/')
+-BUILD_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+-BUILD_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
++BUILD_COMMIT := $(if $(COMMIT_SHA),$(COMMIT_SHA),$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown"))
++BUILD_BRANCH := $(if $(BUILD_BRANCH),$(BUILD_BRANCH),$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main"))
+ BUILD_STAMP := $(or $(SOURCE_DATE_EPOCH),$(shell date +%s 2>/dev/null))
  GO_LDFLAGS = -X main.version=$(BUILD_VERSION) \
  	-X main.commit=$(BUILD_COMMIT) \
  	-X main.buildBranch=$(BUILD_BRANCH) \
--	-X main.buildstamp=$(BUILD_STAMP)
-+	-X main.buildstamp=$(BUILD_STAMP) \
-+	$(if $(LDFLAGS),-extldflags \"$(LDFLAGS)\")
+ 	-X main.buildstamp=$(BUILD_STAMP) \
++	$(if $(ENTERPRISE_COMMIT_SHA),-X main.enterpriseCommit=$(ENTERPRISE_COMMIT_SHA)) \
+ 	$(if $(LDFLAGS),-extldflags \"$(LDFLAGS)\")
  GO_TEST_FLAGS += $(if $(GO_BUILD_TAGS),-tags=$(GO_BUILD_TAGS))
  GIT_BASE = remotes/origin/main
+diff --git a/conf/defaults.ini b/conf/defaults.ini
+index 2baf5cf11117e..d3deb04180f2c 100644
+--- a/conf/defaults.ini
++++ b/conf/defaults.ini
+@@ -2331,6 +2331,12 @@ allow_image_rendering = true
+ # The minimum value is 10 seconds.
+ min_sync_interval = 10s
  
-@@ -285,7 +286,7 @@ update-workspace: gen-go
- .PHONY: build-go
- build-go: gen-themes ## Build all Go binaries (grafana, grafana-server, grafana-cli).
- 	@echo "build go binaries"
--	$(if $(GO_BUILD_OS),GOOS=$(GO_BUILD_OS)) $(if $(GO_BUILD_ARCH),GOARCH=$(GO_BUILD_ARCH)) $(GO) build -buildvcs=false -trimpath $(GO_RACE_FLAG) $(if $(GO_BUILD_TAGS),-tags $(GO_BUILD_TAGS)) $(if $(GO_BUILD_GCFLAGS),-gcflags "$(GO_BUILD_GCFLAGS)") -ldflags "$(GO_LDFLAGS)" -o ./bin/grafana ./pkg/cmd/grafana
-+	$(if $(CGO_ENABLED),CGO_ENABLED=$(CGO_ENABLED)) $(if $(GO_BUILD_OS),GOOS=$(GO_BUILD_OS)) $(if $(GO_BUILD_ARCH),GOARCH=$(GO_BUILD_ARCH)) $(GO) build -buildvcs=false -trimpath $(GO_RACE_FLAG) $(if $(GO_BUILD_TAGS),-tags $(GO_BUILD_TAGS)) $(if $(GO_BUILD_GCFLAGS),-gcflags "$(GO_BUILD_GCFLAGS)") -ldflags "$(GO_LDFLAGS)" -o ./bin/grafana ./pkg/cmd/grafana
- 
- .PHONY: build-backend
- build-backend: build-go
-diff --git a/contribute/developer-guide.md b/contribute/developer-guide.md
-index d50047f87ac..d66bc038aaf 100644
---- a/contribute/developer-guide.md
-+++ b/contribute/developer-guide.md
-@@ -9,7 +9,7 @@ Make sure you have the following dependencies installed before setting up your d
- - [Git](https://git-scm.com/)
- - [Go](https://golang.org/dl/) (see [go.mod](../go.mod#L3) for minimum required version)
- - [Node.js (Long Term Support)](https://nodejs.org), with [corepack enabled](https://nodejs.org/api/corepack.html#enabling-the-feature). See [.nvmrc](../.nvmrc) for supported version. We recommend that you use a version manager such as [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), or similar.
--- [GCC](https://gcc.gnu.org/) (required for Cgo] dependencies)
-+- [GCC](https://gcc.gnu.org/) (optional, not recommded; enables CGO for smaller, dynamically linked binaries)
- 
- ### macOS
- 
-@@ -154,6 +154,22 @@ Log in using the default credentials:
- 
- When you log in for the first time, Grafana asks you to change your password.
- 
-+#### CGO and static builds
++# List of enabled repository types, separated by |.
++# When empty, defaults are applied by each subsystem.
++# Supported types: local, git, github.
++# Grafana Enterprise additionally supports bitbucket and gitlab.
++repository_types =
 +
-+By default, `make build-go` (and `make run`) does **not** set `CGO_ENABLED`. Go's default behavior is to enable CGO when a C compiler (GCC) is detected on the system, and disable it otherwise. For local development this is fine — CGO gives you a working SQLite driver for the embedded database.
-+
-+In **production**, Grafana is built with `CGO_ENABLED=0` to produce a fully static, pure Go binary. This is important because the build environment and the runtime environment are often different (for example, building on Debian but running on Alpine or a scratch container).
-+
-+You can control both `CGO_ENABLED` and `LDFLAGS` when invoking Make:
-+
-+```sh
-+# Static build without CGO (production-style)
-+CGO_ENABLED=0 make build-go
-+
-+# Build with Go defaults
-+unset CGO_ENABLED && make build-go
-+```
-+
- #### Build on Windows
+ #################################### Unified Storage ####################################
+ [unified_storage]
+ # index_path is the path where unified storage can store its index files for search.
+diff --git a/docs/sources/developer-resources/api-reference/http-api/data_source.md b/docs/sources/developer-resources/api-reference/http-api/data_source.md
+index 8d4a529a8178d..02766a53e7183 100644
+--- a/docs/sources/developer-resources/api-reference/http-api/data_source.md
++++ b/docs/sources/developer-resources/api-reference/http-api/data_source.md
+@@ -82,67 +82,6 @@ Content-Type: application/json
+ ]
+ ```
  
- The Grafana backend includes SQLite, a database which requires GCC to compile. So in order to compile Grafana on Windows you need to install GCC with binutils version 2.37 or later.
-diff --git a/docs/sources/setup-grafana/configure-grafana/_index.md b/docs/sources/setup-grafana/configure-grafana/_index.md
-index 79c9d8441a8..4c1304b24f7 100644
---- a/docs/sources/setup-grafana/configure-grafana/_index.md
-+++ b/docs/sources/setup-grafana/configure-grafana/_index.md
-@@ -370,6 +370,10 @@ Grafana needs a database to store users and dashboards (and other
- things). By default it is configured to use [`sqlite3`](https://www.sqlite.org/index.html) which is an
- embedded database (included in the main Grafana binary).
+-## Get a single data source by id
+-
+-`GET /api/datasources/:datasourceId`
+-
+-{{< admonition type="warning" >}}
+-This API is deprecated since Grafana v9.0.0 and will be removed in a future release.
+-Refer to the [API for getting a single data source by UID](#get-a-single-data-source-by-uid)
+-{{< /admonition >}}
+-
+-**Required permissions**
+-
+-See note in the [introduction](#data-source-api) for an explanation.
+-
+-| Action           | Scope                                                                        |
+-| ---------------- | ---------------------------------------------------------------------------- |
+-| datasources:read | datasources:\*<br>datasources:id:\*<br>datasources:id:1 (single data source) |
+-
+-### Examples
+-
+-**Example Request**:
+-
+-```http
+-GET /api/datasources/1 HTTP/1.1
+-Accept: application/json
+-Content-Type: application/json
+-Authorization: Bearer eyJrIjoiT0tTcG1pUlY2RnVKZTFVaDFsNFZXdE9ZWmNrMkZYbk
+-```
+-
+-**Example Response**:
+-
+-```http
+-HTTP/1.1 200
+-Content-Type: application/json
+-
+-{
+-  "id": 1,
+-  "uid": "kLtEtcRGk",
+-  "orgId": 1,
+-  "name": "test_datasource",
+-  "type": "graphite",
+-  "typeLogoUrl": "",
+-  "access": "proxy",
+-  "url": "http://mydatasource.com",
+-  "password": "",
+-  "user": "",
+-  "database": "",
+-  "basicAuth": false,
+-  "basicAuthUser": "",
+-  "basicAuthPassword": "",
+-  "withCredentials": false,
+-  "isDefault": false,
+-  "jsonData": {
+-    "graphiteType": "default",
+-    "graphiteVersion": "1.1"
+-  },
+-  "secureJsonFields": {},
+-  "version": 1,
+-  "readOnly": false
+-}
+-```
+-
+ ## Get a single data source by uid
  
-+{{< admonition type="caution" >}}
-+SQLite isn't recommended for production environments; use MySQL or PostgreSQL for production deployments.
-+{{< /admonition >}}
-+
- #### `type`
+ `GET /api/datasources/uid/:uid`
+@@ -447,96 +386,6 @@ Authorization: Bearer eyJrIjoiT0tTcG1pUlY2RnVKZTFVaDFsNFZXdE9ZWmNrMkZYbk
+ }
+ ```
  
- Either `mysql`, `postgres` or `sqlite3`, it's your choice.
-diff --git a/docs/sources/setup-grafana/installation/_index.md b/docs/sources/setup-grafana/installation/_index.md
-index 75577d3aed1..20ca825460d 100644
---- a/docs/sources/setup-grafana/installation/_index.md
-+++ b/docs/sources/setup-grafana/installation/_index.md
-@@ -66,8 +66,8 @@ Grafana supports the following databases:
- 
- By default Grafana uses an embedded SQLite database, which is stored in the Grafana installation location. If you need to migrate to a different database later, note that database schema and data migrations are customer-managed operations and fall outside the scope of Grafana Support.
- 
+-## Update an existing data source by id
+-
+-`PUT /api/datasources/:datasourceId`
+-
+-{{< admonition type="warning" >}}
+-This API is deprecated since Grafana v9.0.0 and will be removed in a future release.
+-Refer to the [new data source update API](#update-an-existing-data-source).
+-{{< /admonition >}}
+-
+-**Required permissions**
+-
+-See note in the [introduction](#data-source-api) for an explanation.
+-
+-| Action            | Scope                                                                        |
+-| ----------------- | ---------------------------------------------------------------------------- |
+-| datasources:write | datasources:\*<br>datasources:id:\*<br>datasources:id:1 (single data source) |
+-
+-### Examples
+-
+-**Example Request**:
+-
+-```http
+-PUT /api/datasources/1 HTTP/1.1
+-Accept: application/json
+-Content-Type: application/json
+-Authorization: Bearer eyJrIjoiT0tTcG1pUlY2RnVKZTFVaDFsNFZXdE9ZWmNrMkZYbk
+-
+-{
+-  "id":1,
+-  "orgId":1,
+-  "name":"test_datasource",
+-  "type":"graphite",
+-  "access":"proxy",
+-  "url":"http://mydatasource.com",
+-  "password":"",
+-  "user":"",
+-  "database":"",
+-  "basicAuth":true,
+-  "basicAuthUser":"basicuser",
+-  "secureJsonData": {
+-    "basicAuthPassword": "basicpassword"
+-  },
+-  "isDefault":false,
+-  "jsonData":null
+-}
+-```
+-
+-Note that the UID cannot be modified.
+-
+-**Example Response**:
+-
+-```http
+-HTTP/1.1 200
+-Content-Type: application/json
+-
+-{
+-  "datasource": {
+-    "id": 1,
+-    "uid": "kLtEtcRGk",
+-    "orgId": 1,
+-    "name": "test_datasource",
+-    "type": "graphite",
+-    "typeLogoUrl": "",
+-    "access": "proxy",
+-    "url": "http://mydatasource.com",
+-    "password": "",
+-    "user": "",
+-    "database": "",
+-    "basicAuth": true,
+-    "basicAuthUser": "basicuser",
+-    "basicAuthPassword": "",
+-    "withCredentials": false,
+-    "isDefault": false,
+-    "jsonData": {},
+-    "secureJsonFields": {
+-      "basicAuthPassword": true
+-    },
+-    "version": 1,
+-    "readOnly": false
+-  },
+-  "id": 102,
+-  "message": "Datasource updated",
+-  "name": "test_datasource"
+-}
+-```
+-
 -{{< admonition type="note" >}}
--SQLite works well if your environment is small, but is not recommended when your environment starts growing. For more information about the limitations of SQLite, refer to [Appropriate Uses For SQLite](https://www.sqlite.org/whentouse.html). If you want [high availability](/docs/grafana/latest/setup-grafana/set-up-for-high-availability), you must use either a MySQL or PostgreSQL database. For information about how to define the database configuration parameters inside the `grafana.ini` file, refer to [[database]](/docs/grafana/latest/setup-grafana/configure-grafana/#database).
-+{{< admonition type="caution" >}}
-+SQLite isn't recommended for production environments. It works well for local development and small evaluation instances, but it doesn't scale for production workloads. If you want [high availability](/docs/grafana/latest/setup-grafana/set-up-for-high-availability), you must use either a MySQL or PostgreSQL database. For information about how to define the database configuration parameters inside the `grafana.ini` file, refer to [[database]](/docs/grafana/latest/setup-grafana/configure-grafana/#database).
+-Similar to [creating a data source](#create-a-data-source), `password` and `basicAuthPassword` should be defined under `secureJsonData` in order to be stored securely as an encrypted blob in the database. Then, the encrypted fields are listed under `secureJsonFields` section in the response.
+-{{< /admonition >}}
+-
+ ## Update an existing data source
+ 
+ `PUT /api/datasources/uid/:uid`
+@@ -623,43 +472,6 @@ Content-Type: application/json
+ Similar to [creating a data source](#create-a-data-source), `password` and `basicAuthPassword` should be defined under `secureJsonData` in order to be stored securely as an encrypted blob in the database. Then, the encrypted fields are listed under `secureJsonFields` section in the response.
  {{< /admonition >}}
  
- Grafana supports the versions of these databases that are officially supported by the project at the time a version of Grafana is released. When a Grafana version becomes unsupported, Grafana Labs might also drop support for that database version. See the links above for the support policies for each project.
+-## Delete an existing data source by id
+-
+-`DELETE /api/datasources/:datasourceId`
+-
+-{{< admonition type="warning" >}}
+-This API is deprecated since Grafana v9.0.0 and will be removed in a future release.
+-Refer to the [API for deleting an existing data source by UID](#delete-an-existing-data-source-by-uid)
+-{{< /admonition >}}
+-
+-**Required permissions**
+-
+-See note in the [introduction](#data-source-api) for an explanation.
+-
+-| Action             | Scope                                                                        |
+-| ------------------ | ---------------------------------------------------------------------------- |
+-| datasources:delete | datasources:\*<br>datasources:id:\*<br>datasources:id:1 (single data source) |
+-
+-### Examples
+-
+-**Example Request**:
+-
+-```http
+-DELETE /api/datasources/1 HTTP/1.1
+-Accept: application/json
+-Content-Type: application/json
+-Authorization: Bearer eyJrIjoiT0tTcG1pUlY2RnVKZTFVaDFsNFZXdE9ZWmNrMkZYbk
+-```
+-
+-**Example Response**:
+-
+-```http
+-HTTP/1.1 200
+-Content-Type: application/json
+-
+-{"message":"Data source deleted"}
+-```
+-
+ ## Delete an existing data source by uid
+ 
+ `DELETE /api/datasources/uid/:uid`
+@@ -734,57 +546,12 @@ Content-Type: application/json
+ }
+ ```
+ 
+-## Data source proxy calls by id
+-
+-{{< admonition type="warning" >}}
+-This API is deprecated since Grafana v9.0.0 and will be removed in a future release.
+-Refer to the [new data source API for proxying requests](#data-source-proxy-calls).
+-{{< /admonition >}}
+-
+-`GET /api/datasources/proxy/:datasourceId/*`
+-
+-Proxies all calls to the actual data source identified by the `datasourceId`.
+-
+ ## Data source proxy calls
+ 
+ `GET /api/datasources/proxy/uid/:uid/*`
+ 
+ Proxies all calls to the actual data source identified by the `uid`.
+ 
+-## Check data source health by id
+-
+-{{< admonition type="warning" >}}
+-This API is deprecated since Grafana v9.0.0 and will be removed in a future release.
+-Refer to the [new data source health check API](#check-data-source-health).
+-{{< /admonition >}}
+-
+-`GET /api/datasources/:datasourceId/health`
+-
+-Makes a call to the health endpoint of data source identified by the given `datasourceId`. This is not mandatory - every plugin author has to <a href="https://grafana.com/tutorials/build-a-data-source-backend-plugin/#add-support-for-health-checks" target="_blank">implement support for health checks</a> in their plugin themselves.
+-
+-### Examples
+-
+-**Example Request**:
+-
+-```http
+-GET api/datasources/112/health HTTP/1.1
+-Accept: application/json
+-Content-Type: application/json
+-Authorization: Bearer eyJrIjoiT0tTcG1pUlY2RnVKZTFVaDFsNFZXdE9ZWmNrMkZYbk
+-```
+-
+-**Example Response**:
+-
+-```http
+-HTTP/1.1 200
+-Content-Type: application/json
+-
+-{
+-  "message": "1. Successfully queried the CloudWatch metrics API.\n2. Successfully queried the CloudWatch logs API.",
+-  "status": "OK"
+-}
+-```
+-
+ ## Check data source health
+ 
+ `GET /api/datasources/uid/:uid/health`
+@@ -814,58 +581,6 @@ Content-Type: application/json
+ }
+ ```
+ 
+-## Fetch data source resources by id
+-
+-{{< admonition type="warning" >}}
+-This API is deprecated since Grafana v9.0.0 and will be removed in a future release.
+-Refer to the [new data source resources API](#fetch-data-source-resources).
+-{{< /admonition >}}
+-
+-`GET /api/datasources/:datasourceId/resources/*`
+-
+-Makes a call to the resources endpoint of data source identified by the given `dashboardId`.
+-
+-### Examples
+-
+-**Example Request**:
+-
+-```http
+-GET api/datasources/112/resources/dimension-keys?region=us-east-2&namespace=AWS%2FEC2&dimensionFilters=%7B%7D&metricName=CPUUtilization HTTP/1.1
+-Accept: application/json
+-Content-Type: application/json
+-Authorization: Bearer eyJrIjoiT0tTcG1pUlY2RnVKZTFVaDFsNFZXdE9ZWmNrMkZYbk
+-```
+-
+-**Example Response**:
+-
+-```http
+-HTTP/1.1 200
+-Content-Type: application/json
+-
+-[
+-	{
+-		"text": "AutoScalingGroupName",
+-		"value": "AutoScalingGroupName",
+-		"label": "AutoScalingGroupName"
+-	},
+-	{
+-		"text": "ImageId",
+-		"value": "ImageId",
+-		"label": "ImageId"
+-	},
+-	{
+-		"text": "InstanceId",
+-		"value": "InstanceId",
+-		"label": "InstanceId"
+-	},
+-	{
+-		"text": "InstanceType",
+-		"value": "InstanceType",
+-		"label": "InstanceType"
+-	}
+-]
+-```
+-
+ ## Fetch data source resources
+ 
+ `GET /api/datasources/uid/:uid/resources/*`
+diff --git a/docs/sources/setup-grafana/configure-grafana/_index.md b/docs/sources/setup-grafana/configure-grafana/_index.md
+index 4c1304b24f798..60638f04b07f7 100644
+--- a/docs/sources/setup-grafana/configure-grafana/_index.md
++++ b/docs/sources/setup-grafana/configure-grafana/_index.md
+@@ -2756,6 +2756,28 @@ ha_engine_password: $__file{/your/redis/password/secret/mount}
+ 
+ <hr>
+ 
++### `[provisioning]`
++
++#### `allowed_targets`
++
++Comma-separated list of targets that a repository can control. `folder` by default. Use `folder` if you want the repository to only control a folder within the Grafana instance. Use `instance` if you want the repository to control the whole Grafana instance.
++
++#### `allow_image_rendering`
++
++Whether image rendering is allowed for dashboard previews. Requires the image rendering service to be configured. Default is `true`.
++
++#### `min_sync_interval`
++
++The minimum sync interval that you can set for a repository. Indicates how often the controller will check for changes in the repository that were not propagated by a webhook. The minimum value is `10s`. Default is `10s`.
++
++#### `repository_types`
++
++List of enabled repository types, separated by `|`. When empty, defaults are applied by each subsystem.
++
++Supported types: `local`, `git`, `github`. Grafana Enterprise additionally supports `bitbucket` and `gitlab`.
++
++<hr>
++
+ ### `[plugin.plugin_id]`
+ 
+ This section can be used to configure plugin-specific settings. Replace the `plugin_id` attribute with the plugin ID present in `plugin.json`.
+diff --git a/e2e-playwright/various-suite/frontend-sandbox-app.spec.ts b/e2e-playwright/various-suite/frontend-sandbox-app.spec.ts
+index 15fcdb8016c2d..0ff6a806d2303 100644
+--- a/e2e-playwright/various-suite/frontend-sandbox-app.spec.ts
++++ b/e2e-playwright/various-suite/frontend-sandbox-app.spec.ts
+@@ -18,7 +18,7 @@ test.describe(
+ 
+     test.describe('App Page', () => {
+       test('Loads the app page with the sandbox div wrapper', async ({ page }) => {
+-        await page.goto(`/a/${APP_ID}`);
++        await page.goto(`/a/${APP_ID}`, { waitUntil: 'networkidle' });
+ 
+         const sandboxDiv = page.locator('div[data-plugin-sandbox="sandbox-app-test"]');
+         await expect(sandboxDiv).toBeVisible();
+@@ -28,7 +28,7 @@ test.describe(
+       });
+ 
+       test('Loads the app configuration with the sandbox div wrapper', async ({ page }) => {
+-        await page.goto(`/plugins/${APP_ID}`);
++        await page.goto(`/plugins/${APP_ID}`, { waitUntil: 'networkidle' });
+ 
+         const sandboxDiv = page.locator('div[data-plugin-sandbox="sandbox-app-test"]');
+         await expect(sandboxDiv).toBeVisible();
+diff --git a/package.json b/package.json
+index 0da828213281f..03f5d42b5f6ad 100644
+--- a/package.json
++++ b/package.json
+@@ -299,7 +299,7 @@
+     "@grafana/google-sdk": "0.3.5",
+     "@grafana/i18n": "workspace:*",
+     "@grafana/lezer-logql": "0.2.9",
+-    "@grafana/llm": "1.0.2",
++    "@grafana/llm": "1.0.3",
+     "@grafana/monaco-logql": "^0.0.8",
+     "@grafana/o11y-ds-frontend": "workspace:*",
+     "@grafana/plugin-ui": "^0.13.1",
+diff --git a/packages/grafana-data/src/types/featureToggles.gen.ts b/packages/grafana-data/src/types/featureToggles.gen.ts
+index 4861aaa28619b..2e7894d2f1b2e 100644
+--- a/packages/grafana-data/src/types/featureToggles.gen.ts
++++ b/packages/grafana-data/src/types/featureToggles.gen.ts
+@@ -314,10 +314,10 @@ export interface FeatureToggles {
+   */
+   datasourceQueryTypes?: boolean;
+   /**
+-  * Does not register datasource apis that use the numeric id
++  * Register legacy datasource apis that use the numeric id
+   * @default false
+   */
+-  datasourceDisableIdApi?: boolean;
++  datasourceLegacyIdApi?: boolean;
+   /**
+   * Register /apis/query.grafana.app/ -- will eventually replace /api/ds/query
+   * @default false
+@@ -419,6 +419,11 @@ export interface FeatureToggles {
+   */
+   unlimitedLayoutsNesting?: boolean;
+   /**
++  * Enables CSV export using scenes dashboard architecture
++  * @default false
++  */
++  sceneCsvExport?: boolean;
++  /**
+   * Enables showing recently used drilldowns or recommendations given by the datasource in the AdHocFilters and GroupBy variables
+   * @default false
+   */
+diff --git a/packages/grafana-openapi/src/api/openapi3.json b/packages/grafana-openapi/src/api/openapi3.json
+index 68afc3c8b5f41..7555c08249cf2 100644
+--- a/packages/grafana-openapi/src/api/openapi3.json
++++ b/packages/grafana-openapi/src/api/openapi3.json
+@@ -18111,155 +18111,6 @@
+         "tags": ["datasources"]
+       }
+     },
+-    "/datasources/proxy/{id}/{datasource_proxy_route}": {
+-      "delete": {
+-        "deprecated": true,
+-        "description": "Proxies all calls to the actual data source.\n\nPlease refer to [updated API](#/datasources/datasourceProxyDELETEByUIDcalls) instead",
+-        "operationId": "datasourceProxyDELETEcalls",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "202": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Data source proxy DELETE calls.",
+-        "tags": ["datasources"]
+-      },
+-      "get": {
+-        "deprecated": true,
+-        "description": "Proxies all calls to the actual data source.\n\nPlease refer to [updated API](#/datasources/datasourceProxyGETByUIDcalls) instead",
+-        "operationId": "datasourceProxyGETcalls",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Data source proxy GET calls.",
+-        "tags": ["datasources"]
+-      },
+-      "post": {
+-        "deprecated": true,
+-        "description": "Proxies all calls to the actual data source. The data source should support POST methods for the specific path and role as defined\n\nPlease refer to [updated API](#/datasources/datasourceProxyPOSTByUIDcalls) instead",
+-        "operationId": "datasourceProxyPOSTcalls",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "requestBody": {
+-          "content": {
+-            "application/json": {
+-              "schema": {}
+-            }
+-          },
+-          "required": true,
+-          "x-originalParamName": "DatasourceProxyParam"
+-        },
+-        "responses": {
+-          "201": {
+-            "description": "(empty)"
+-          },
+-          "202": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Data source proxy POST calls.",
+-        "tags": ["datasources"]
+-      }
+-    },
+     "/datasources/uid/{sourceUID}/correlations": {
+       "get": {
+         "operationId": "getCorrelationsBySourceUID",
+@@ -18947,204 +18798,6 @@
+         "tags": ["enterprise"]
+       }
+     },
+-    "/datasources/{id}": {
+-      "delete": {
+-        "deprecated": true,
+-        "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:delete` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/deleteDataSourceByUID) instead",
+-        "operationId": "deleteDataSourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/okResponse"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Delete an existing data source by id.",
+-        "tags": ["datasources"]
+-      },
+-      "get": {
+-        "deprecated": true,
+-        "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:read` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/getDataSourceByUID) instead",
+-        "operationId": "getDataSourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/getDataSourceResponse"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Get a single data source by Id.",
+-        "tags": ["datasources"]
+-      },
+-      "put": {
+-        "deprecated": true,
+-        "description": "Similar to creating a data source, `password` and `basicAuthPassword` should be defined under\nsecureJsonData in order to be stored securely as an encrypted blob in the database. Then, the\nencrypted fields are listed under secureJsonFields section in the response.\n\nIf you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:write` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/updateDataSourceByUID) instead",
+-        "operationId": "updateDataSourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "requestBody": {
+-          "content": {
+-            "application/json": {
+-              "schema": {
+-                "$ref": "#/components/schemas/UpdateDataSourceCommand"
+-              }
+-            }
+-          },
+-          "required": true,
+-          "x-originalParamName": "Body"
+-        },
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/createOrUpdateDatasourceResponse"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Update an existing data source by its sequential ID.",
+-        "tags": ["datasources"]
+-      }
+-    },
+-    "/datasources/{id}/health": {
+-      "get": {
+-        "deprecated": true,
+-        "description": "Please refer to [updated API](#/datasources/checkDatasourceHealthWithUID) instead",
+-        "operationId": "checkDatasourceHealthByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/okResponse"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Sends a health check request to the plugin datasource identified by the ID.",
+-        "tags": ["datasources", "health"]
+-      }
+-    },
+-    "/datasources/{id}/resources/{datasource_proxy_route}": {
+-      "get": {
+-        "deprecated": true,
+-        "description": "Please refer to [updated API](#/datasources/callDatasourceResourceWithUID) instead",
+-        "operationId": "callDatasourceResourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/okResponse"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Fetch data source resources by Id.",
+-        "tags": ["datasources"]
+-      }
+-    },
+     "/ds/query": {
+       "post": {
+         "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:query`.",
+diff --git a/packages/grafana-ui/src/components/Combobox/Combobox.tsx b/packages/grafana-ui/src/components/Combobox/Combobox.tsx
+index 1eb0171b75a9d..749b3a208dae6 100644
+--- a/packages/grafana-ui/src/components/Combobox/Combobox.tsx
++++ b/packages/grafana-ui/src/components/Combobox/Combobox.tsx
+@@ -242,6 +242,7 @@ export const Combobox = <T extends string | number>(props: ComboboxProps<T>) =>
+       }
+       return itemHeight;
+     },
++    getItemKey: (index: number) => filteredOptions[index]?.value ?? index,
+     overscan: VIRTUAL_OVERSCAN_ITEMS,
+     rangeExtractor,
+   });
+diff --git a/packages/grafana-ui/src/components/Combobox/ComboboxList.tsx b/packages/grafana-ui/src/components/Combobox/ComboboxList.tsx
+index 3c787040b6f6f..f43cf32061a05 100644
+--- a/packages/grafana-ui/src/components/Combobox/ComboboxList.tsx
++++ b/packages/grafana-ui/src/components/Combobox/ComboboxList.tsx
+@@ -63,6 +63,7 @@ export const ComboboxList = <T extends string | number>({
+     count: options.length,
+     getScrollElement: () => scrollRef.current,
+     estimateSize,
++    getItemKey: (index: number) => options[index]?.value ?? index,
+     overscan: VIRTUAL_OVERSCAN_ITEMS,
+   });
+ 
+diff --git a/pkg/api/api.go b/pkg/api/api.go
+index cb48534af0540..46c278177d3e8 100644
+--- a/pkg/api/api.go
++++ b/pkg/api/api.go
+@@ -429,7 +429,7 @@ func (hs *HTTPServer) registerRoutes() {
+ 			datasourceRoute.Any("/proxy/uid/:uid/*", requestmeta.SetSLOGroup(requestmeta.SLOGroupHighSlow), authorize(ac.EvalPermission(datasources.ActionQuery)), hs.ProxyDataSourceRequestWithUID)
+ 
+ 			//nolint:staticcheck // not yet migrated to OpenFeature
+-			if !hs.Features.IsEnabledGlobally(featuremgmt.FlagDatasourceDisableIdApi) {
++			if hs.Features.IsEnabledGlobally(featuremgmt.FlagDatasourceLegacyIdApi) {
+ 				// Deprecated Access by internal ID
+ 				datasourceRoute.Get("/:id", authorize(ac.EvalPermission(datasources.ActionRead, idScope)), routing.Wrap(hs.GetDataSourceById))
+ 				datasourceRoute.Put("/:id", authorize(ac.EvalPermission(datasources.ActionWrite, idScope)), routing.Wrap(hs.UpdateDataSourceByID))
+diff --git a/pkg/api/dataproxy.go b/pkg/api/dataproxy.go
+index bf205bdbaae8d..7ecfa41fc6312 100644
+--- a/pkg/api/dataproxy.go
++++ b/pkg/api/dataproxy.go
+@@ -2,8 +2,6 @@ package api
+ 
+ import contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
+ 
+-// swagger:route GET /datasources/proxy/{id}/{datasource_proxy_route} datasources datasourceProxyGETcalls
+-//
+ // Data source proxy GET calls.
+ //
+ // Proxies all calls to the actual data source.
+@@ -20,8 +18,6 @@ import contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/mode
+ // 404: notFoundError
+ // 500: internalServerError
+ 
+-// swagger:route POST /datasources/proxy/{id}/{datasource_proxy_route} datasources datasourceProxyPOSTcalls
+-//
+ // Data source proxy POST calls.
+ //
+ // Proxies all calls to the actual data source. The data source should support POST methods for the specific path and role as defined
+@@ -39,8 +35,6 @@ import contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/mode
+ // 404: notFoundError
+ // 500: internalServerError
+ 
+-// swagger:route DELETE /datasources/proxy/{id}/{datasource_proxy_route} datasources datasourceProxyDELETEcalls
+-//
+ // Data source proxy DELETE calls.
+ //
+ // Proxies all calls to the actual data source.
+diff --git a/pkg/api/datasources.go b/pkg/api/datasources.go
+index d85d3866ad83a..1bc3b3be9bc4e 100644
+--- a/pkg/api/datasources.go
++++ b/pkg/api/datasources.go
+@@ -89,8 +89,6 @@ func (hs *HTTPServer) GetDataSources(c *contextmodel.ReqContext) response.Respon
+ 	return response.JSON(http.StatusOK, &result)
+ }
+ 
+-// swagger:route GET /datasources/{id} datasources getDataSourceByID
+-//
+ // Get a single data source by Id.
+ //
+ // If you are running Grafana Enterprise and have Fine-grained access control enabled
+@@ -136,8 +134,6 @@ func (hs *HTTPServer) GetDataSourceById(c *contextmodel.ReqContext) response.Res
+ 	return response.JSON(http.StatusOK, &dto)
+ }
+ 
+-// swagger:route DELETE /datasources/{id} datasources deleteDataSourceByID
+-//
+ // Delete an existing data source by id.
+ //
+ // If you are running Grafana Enterprise and have Fine-grained access control enabled
+@@ -442,8 +438,6 @@ func (hs *HTTPServer) AddDataSource(c *contextmodel.ReqContext) response.Respons
+ 	})
+ }
+ 
+-// swagger:route PUT /datasources/{id} datasources updateDataSourceByID
+-//
+ // Update an existing data source by its sequential ID.
+ //
+ // Similar to creating a data source, `password` and `basicAuthPassword` should be defined under
+@@ -671,10 +665,6 @@ func (hs *HTTPServer) GetDataSourceIdByName(c *contextmodel.ReqContext) response
+ 	return response.JSON(http.StatusOK, &dtos)
+ }
+ 
+-// swagger:route GET /datasources/{id}/resources/{datasource_proxy_route} datasources callDatasourceResourceByID
+-//
+-// Fetch data source resources by Id.
+-//
+ // Please refer to [updated API](#/datasources/callDatasourceResourceWithUID) instead
+ //
+ // Deprecated: true
+@@ -819,8 +809,6 @@ func (hs *HTTPServer) CheckDatasourceHealthWithUID(c *contextmodel.ReqContext) r
+ 	return hs.checkDatasourceHealth(c, ds)
+ }
+ 
+-// swagger:route GET /datasources/{id}/health datasources health checkDatasourceHealthByID
+-//
+ // Sends a health check request to the plugin datasource identified by the ID.
+ //
+ // Please refer to [updated API](#/datasources/checkDatasourceHealthWithUID) instead
+diff --git a/pkg/api/datasources_test.go b/pkg/api/datasources_test.go
+index 81db355152de4..854076e012e2c 100644
+--- a/pkg/api/datasources_test.go
++++ b/pkg/api/datasources_test.go
+@@ -448,6 +448,9 @@ func TestAPI_datasources_AccessControl(t *testing.T) {
+ 		t.Run(tt.desc, func(t *testing.T) {
+ 			server := SetupAPITestServer(t, func(hs *HTTPServer) {
+ 				hs.Cfg = setting.NewCfg()
++				// id-based datasource apis are disabled by default, to be able to use them,
++				// we need to enable this feaure-flag
++				hs.Features = featuremgmt.WithFeatures(featuremgmt.FlagDatasourceLegacyIdApi)
+ 				hs.DataSourcesService = &dataSourcesServiceMock{expectedDatasource: &datasources.DataSource{}}
+ 				hs.accesscontrolService = actest.FakeService{}
+ 				hs.Live = newTestLive(t)
+diff --git a/pkg/operators/provisioning/jobs_operator.go b/pkg/operators/provisioning/jobs_operator.go
+index ec91095126761..84a8f0a8fa22f 100644
+--- a/pkg/operators/provisioning/jobs_operator.go
++++ b/pkg/operators/provisioning/jobs_operator.go
+@@ -305,7 +305,7 @@ func setupWorkers(
+ 	moveWorker := move.NewWorker(syncWorker, stageIfPossible, repositoryResources, metrics)
+ 	workers = append(workers, moveWorker)
+ 
+-	// Fix Metadata (no-op placeholder)
++	// Fix Metadata
+ 	fixMetadataWorker := fixfoldermetadata.NewWorker()
+ 	workers = append(workers, fixMetadataWorker)
+ 
+diff --git a/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker.go b/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker.go
+index ec58f46a2c698..bc41943e20895 100644
+--- a/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker.go
++++ b/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker.go
+@@ -10,12 +10,16 @@ import (
+ 	"github.com/grafana/grafana-app-sdk/logging"
+ 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
+ 	"github.com/grafana/grafana/apps/provisioning/pkg/repository"
++	"github.com/grafana/grafana/apps/provisioning/pkg/safepath"
+ 	"github.com/grafana/grafana/pkg/infra/tracing"
+ 	"github.com/grafana/grafana/pkg/registry/apis/provisioning/jobs"
++	"github.com/grafana/grafana/pkg/registry/apis/provisioning/resources"
++	"github.com/grafana/grafana/pkg/util"
+ )
+ 
+ // Worker implements the fix-folder-metadata job type.
+-// It creates a marker commit on the specified branch to document when folder metadata was fixed.
++// It scans the repository tree and writes a _folder.json metadata file for
++// every directory that does not already have one, using a hash-derived UID.
+ type Worker struct{}
+ 
+ func NewWorker() *Worker {
+@@ -46,9 +50,9 @@ func (w *Worker) Process(ctx context.Context, repo repository.Repository, job pr
+ 	ref := options.Ref
+ 	logger.Info("starting folder metadata fix job")
+ 	if ref == "" {
+-		progress.SetMessage(ctx, "Creating marker commit on default branch")
++		progress.SetMessage(ctx, "Writing folder metadata files on default branch")
+ 	} else {
+-		progress.SetMessage(ctx, fmt.Sprintf("Creating marker commit on branch %s", ref))
++		progress.SetMessage(ctx, fmt.Sprintf("Writing folder metadata files on branch %s", ref))
+ 	}
+ 
+ 	// Configure staging options to commit everything at once
+@@ -57,44 +61,69 @@ func (w *Worker) Process(ctx context.Context, repo repository.Repository, job pr
+ 		Timeout:               5 * time.Minute,
+ 		PushOnWrites:          false,
+ 		Mode:                  repository.StageModeCommitOnlyOnce,
+-		CommitOnlyOnceMessage: fmt.Sprintf("Fix folder metadata\n\nTriggered by job %s at %s", job.Name, time.Now().UTC().Format(time.RFC3339)),
++		CommitOnlyOnceMessage: fmt.Sprintf("Add folder metadata files\n\nTriggered by job %s at %s", job.Name, time.Now().UTC().Format(time.RFC3339)),
+ 	}
+ 
+-	// Create a marker file to document when the fix was run
+ 	fn := func(stagedRepo repository.Repository, staged bool) error {
+ 		rw, ok := stagedRepo.(repository.ReaderWriter)
+ 		if !ok {
+ 			return fmt.Errorf("repository does not support read/write operations")
+ 		}
+ 
+-		// Write a marker file with timestamp
+-		markerPath := fmt.Sprintf(".grafana/folder-metadata-fixed-%d", time.Now().Unix())
+-		markerContent := []byte(fmt.Sprintf("Folder metadata fixed by job %s\nTimestamp: %s\n",
+-			job.Name,
+-			time.Now().UTC().Format(time.RFC3339),
+-		))
+-		if ref != "" {
+-			markerContent = []byte(fmt.Sprintf("Folder metadata fixed by job %s\nTimestamp: %s\nRef: %s\n",
+-				job.Name,
+-				time.Now().UTC().Format(time.RFC3339),
+-				ref,
+-			))
++		entries, err := rw.ReadTree(ctx, ref)
++		if err != nil {
++			return fmt.Errorf("read repository tree: %w", err)
+ 		}
+ 
+-		// Write the marker file
+-		// For staged repos, this will be committed and pushed
+-		// For local repos, this will be written directly to the filesystem
+-		if err := rw.Write(ctx, markerPath, ref, markerContent, "Add folder metadata fix marker"); err != nil {
+-			return fmt.Errorf("failed to write marker file: %w", err)
++		repoName := rw.Config().GetName()
++
++		// Collect dirs with existing metadata and parse all folder entries.
++		hasMetadata := make(map[string]struct{}, len(entries))
++		folders := make([]resources.Folder, 0, len(entries))
++		for _, entry := range entries {
++			if entry.Blob {
++				if resources.IsFolderMetadataFile(entry.Path) {
++					hasMetadata[safepath.Dir(entry.Path)] = struct{}{}
++				}
++				continue
++			}
++			dirPath := entry.Path
++			if !safepath.IsDir(dirPath) {
++				dirPath += "/"
++			}
++			folders = append(folders, resources.ParseFolder(dirPath, repoName))
++		}
++
++		totalMissing := len(folders) - len(hasMetadata)
++		progress.SetTotal(ctx, totalMissing)
++
++		for _, folder := range folders {
++			if _, ok := hasMetadata[folder.Path]; ok {
++				continue
++			}
++
++			manifest := resources.NewFolderManifest(util.GenerateShortUID(), safepath.Base(folder.Path))
++			_, writeErr := resources.WriteFolderMetadata(ctx, rw, folder.Path, manifest, ref,
++				fmt.Sprintf("Add folder metadata for %s", folder.Path))
++
++			rb := jobs.NewFolderResult(folder.Path).
++				WithName(folder.ID).
++				WithAction(repository.FileActionCreated)
++			if writeErr != nil {
++				wrappedErr := fmt.Errorf("writing folder metadata for %s: %w", folder.Path, writeErr)
++				rb.WithError(wrappedErr)
++				progress.Record(ctx, rb.Build())
++				return wrappedErr
++			}
++			progress.Record(ctx, rb.Build())
+ 		}
+ 
+-		logger.Info("marker file written", "path", markerPath, "staged", staged)
+ 		return nil
+ 	}
+ 
+ 	// Execute the staging operation
+ 	if err := repository.WrapWithStageAndPushIfPossible(ctx, repo, stageOptions, fn); err != nil {
+-		logger.Error("failed to create marker commit", "error", err)
++		logger.Error("failed to write folder metadata files", "error", err)
+ 		progress.SetFinalMessage(ctx, fmt.Sprintf("Failed to fix folder metadata: %s", err.Error()))
+ 		return err
+ 	}
+@@ -102,7 +131,6 @@ func (w *Worker) Process(ctx context.Context, repo repository.Repository, job pr
+ 	// Set RefURLs if the repository supports it and a ref was used
+ 	// For empty ref (default branch), we need to get the actual branch name that was used
+ 	if repoWithURLs, ok := repo.(repository.RepositoryWithURLs); ok {
+-		// If ref is empty, try to get the default branch to use for URLs
+ 		actualRef := ref
+ 		if actualRef == "" {
+ 			if branchHandler, ok := repo.(repository.BranchHandler); ok {
+diff --git a/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker_test.go b/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker_test.go
+index 40590aa0f7b3e..57c4bcd8cf474 100644
+--- a/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker_test.go
++++ b/pkg/registry/apis/provisioning/jobs/fixfoldermetadata/worker_test.go
+@@ -3,7 +3,6 @@ package fixfoldermetadata
+ import (
+ 	"context"
+ 	"fmt"
+-	"strings"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/mock"
+@@ -13,6 +12,7 @@ import (
+ 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
+ 	"github.com/grafana/grafana/apps/provisioning/pkg/repository"
+ 	"github.com/grafana/grafana/pkg/registry/apis/provisioning/jobs"
++	"github.com/grafana/grafana/pkg/registry/apis/provisioning/resources"
+ )
+ 
+ func TestWorker_IsSupported(t *testing.T) {
+@@ -39,130 +39,306 @@ func TestWorker_IsSupported(t *testing.T) {
+ 	}
+ }
+ 
++// mockStageableRepo implements repository.Repository and repository.StageableRepository
++type mockStageableRepo struct {
++	*repository.MockStageableRepository
++}
++
++func (m *mockStageableRepo) Config() *provisioning.Repository {
++	return &provisioning.Repository{}
++}
++
++func (m *mockStageableRepo) Test(ctx context.Context) (*provisioning.TestResults, error) {
++	return &provisioning.TestResults{}, nil
++}
++
++// mockStageableRepoWithURLs combines StageableRepository and RepositoryWithURLs
++type mockStageableRepoWithURLs struct {
++	mockStageableRepo
++	*repository.MockRepositoryWithURLs
++}
++
++func (m *mockStageableRepoWithURLs) Config() *provisioning.Repository {
++	return &provisioning.Repository{}
++}
++
++func (m *mockStageableRepoWithURLs) Test(ctx context.Context) (*provisioning.TestResults, error) {
++	return &provisioning.TestResults{}, nil
++}
++
++// mockNonRWRepo implements only repository.Repository (no staging, no read/write)
++type mockNonRWRepo struct{}
++
++func (m *mockNonRWRepo) Config() *provisioning.Repository { return &provisioning.Repository{} }
++func (m *mockNonRWRepo) Test(_ context.Context) (*provisioning.TestResults, error) {
++	return &provisioning.TestResults{}, nil
++}
++
++func makeTestJob(ref string) provisioning.Job {
++	return provisioning.Job{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "test-job",
++			Namespace: "default",
++		},
++		Spec: provisioning.JobSpec{
++			Action:     provisioning.JobActionFixFolderMetadata,
++			Repository: "test-repo",
++			FixFolderMetadata: &provisioning.FixFolderMetadataJobOptions{
++				Ref: ref,
++			},
++		},
++	}
++}
++
++func treeEntry(path string, blob bool) repository.FileTreeEntry {
++	return repository.FileTreeEntry{Path: path, Blob: blob}
++}
++
++func repoConfig(name string) *provisioning.Repository {
++	return &provisioning.Repository{
++		ObjectMeta: metav1.ObjectMeta{Name: name},
++	}
++}
++
+ func TestWorker_Process(t *testing.T) {
+-	t.Run("creates marker commit with empty ref (uses repository default)", func(t *testing.T) {
+-		w := NewWorker()
++	t.Run("creates _folder.json for directories without metadata", func(t *testing.T) {
+ 		ctx := context.Background()
++		w := NewWorker()
+ 
+-		mockRepo := &mockStageableRepo{
+-			MockStageableRepository: repository.NewMockStageableRepository(t),
+-		}
++		mockRepo := &mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)}
+ 		mockStaged := repository.NewMockStagedRepository(t)
+ 		mockProgress := jobs.NewMockJobProgressRecorder(t)
+ 
+-		job := provisioning.Job{
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name:      "test-job",
+-				Namespace: "default",
+-			},
+-			Spec: provisioning.JobSpec{
+-				Action:            provisioning.JobActionFixFolderMetadata,
+-				Repository:        "test-repo",
+-				FixFolderMetadata: &provisioning.FixFolderMetadataJobOptions{},
+-			},
++		job := makeTestJob("feature-branch")
++
++		tree := []repository.FileTreeEntry{
++			treeEntry("parent", false),
++			treeEntry("parent/child", false),
+ 		}
+ 
+-		// Expect staging to be called with empty ref (repository determines default)
++		parentFolder := resources.ParseFolder("parent/", "test-repo")
++		childFolder := resources.ParseFolder("parent/child/", "test-repo")
++
+ 		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.MatchedBy(func(opts repository.StageOptions) bool {
+-			return opts.Ref == "" &&
+-				opts.Mode == repository.StageModeCommitOnlyOnce &&
+-				strings.Contains(opts.CommitOnlyOnceMessage, "Fix folder metadata")
++			return opts.Ref == "feature-branch" && opts.Mode == repository.StageModeCommitOnlyOnce
+ 		})).Return(mockStaged, nil)
+ 
+-		// Expect a marker file to be written with empty ref
+-		mockStaged.EXPECT().Write(mock.Anything, mock.MatchedBy(func(path string) bool {
+-			return strings.HasPrefix(path, ".grafana/folder-metadata-fixed-")
+-		}), "", mock.Anything, mock.Anything).Return(nil)
++		mockStaged.EXPECT().ReadTree(mock.Anything, "feature-branch").Return(tree, nil)
++		mockStaged.EXPECT().Config().Return(repoConfig("test-repo"))
++		mockStaged.EXPECT().Create(mock.Anything, "parent/_folder.json", "feature-branch", mock.Anything, mock.Anything).Return(nil)
++		mockStaged.EXPECT().Create(mock.Anything, "parent/child/_folder.json", "feature-branch", mock.Anything, mock.Anything).Return(nil)
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on branch feature-branch").Return()
++		mockProgress.EXPECT().SetTotal(mock.Anything, 2).Return()
++		mockProgress.EXPECT().Record(mock.Anything, mock.MatchedBy(func(r jobs.JobResourceResult) bool {
++			return r.Action() == repository.FileActionCreated && r.Name() == parentFolder.ID
++		})).Return()
++		mockProgress.EXPECT().Record(mock.Anything, mock.MatchedBy(func(r jobs.JobResourceResult) bool {
++			return r.Action() == repository.FileActionCreated && r.Name() == childFolder.ID
++		})).Return()
++		mockProgress.EXPECT().SetFinalMessage(mock.Anything, "Folder metadata fixed on branch feature-branch").Return()
+ 
+-		// Expect push to be called
+ 		mockStaged.EXPECT().Push(mock.Anything).Return(nil)
+-
+-		// Expect cleanup
+ 		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
+ 
+-		// Expect progress updates with "default branch" message
+-		mockProgress.EXPECT().SetMessage(mock.Anything, "Creating marker commit on default branch").Return()
++		err := w.Process(ctx, mockRepo, job, mockProgress)
++		require.NoError(t, err)
++	})
++
++	t.Run("skips directories that already have _folder.json", func(t *testing.T) {
++		ctx := context.Background()
++		w := NewWorker()
++
++		mockRepo := &mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)}
++		mockStaged := repository.NewMockStagedRepository(t)
++		mockProgress := jobs.NewMockJobProgressRecorder(t)
++
++		job := makeTestJob("")
++
++		tree := []repository.FileTreeEntry{
++			treeEntry("myfolder", false),
++			treeEntry("myfolder/_folder.json", true),
++		}
++
++		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.Anything).Return(mockStaged, nil)
++
++		mockStaged.EXPECT().ReadTree(mock.Anything, "").Return(tree, nil)
++		mockStaged.EXPECT().Config().Return(repoConfig("test-repo"))
++		// No Create expected — the file already exists
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on default branch").Return()
++		mockProgress.EXPECT().SetTotal(mock.Anything, 0).Return()
+ 		mockProgress.EXPECT().SetFinalMessage(mock.Anything, "Folder metadata fixed on default branch").Return()
+ 
++		mockStaged.EXPECT().Push(mock.Anything).Return(nil)
++		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
++
+ 		err := w.Process(ctx, mockRepo, job, mockProgress)
+ 		require.NoError(t, err)
+ 	})
+ 
+-	t.Run("creates marker commit with custom ref", func(t *testing.T) {
++	t.Run("mixed: creates missing metadata and skips existing", func(t *testing.T) {
++		ctx := context.Background()
+ 		w := NewWorker()
++
++		mockRepo := &mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)}
++		mockStaged := repository.NewMockStagedRepository(t)
++		mockProgress := jobs.NewMockJobProgressRecorder(t)
++
++		job := makeTestJob("")
++
++		tree := []repository.FileTreeEntry{
++			treeEntry("has-meta", false),
++			treeEntry("has-meta/_folder.json", true),
++			treeEntry("no-meta", false),
++		}
++
++		noMetaFolder := resources.ParseFolder("no-meta/", "test-repo")
++
++		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.Anything).Return(mockStaged, nil)
++
++		mockStaged.EXPECT().ReadTree(mock.Anything, "").Return(tree, nil)
++		mockStaged.EXPECT().Config().Return(repoConfig("test-repo"))
++		mockStaged.EXPECT().Create(mock.Anything, "no-meta/_folder.json", "", mock.Anything, mock.Anything).Return(nil)
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on default branch").Return()
++		mockProgress.EXPECT().SetTotal(mock.Anything, 1).Return()
++		mockProgress.EXPECT().Record(mock.Anything, mock.MatchedBy(func(r jobs.JobResourceResult) bool {
++			return r.Action() == repository.FileActionCreated && r.Name() == noMetaFolder.ID
++		})).Return()
++		mockProgress.EXPECT().SetFinalMessage(mock.Anything, "Folder metadata fixed on default branch").Return()
++
++		mockStaged.EXPECT().Push(mock.Anything).Return(nil)
++		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
++
++		err := w.Process(ctx, mockRepo, job, mockProgress)
++		require.NoError(t, err)
++	})
++
++	t.Run("fails immediately when Create returns an error", func(t *testing.T) {
+ 		ctx := context.Background()
++		w := NewWorker()
++
++		mockRepo := &mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)}
++		mockStaged := repository.NewMockStagedRepository(t)
++		mockProgress := jobs.NewMockJobProgressRecorder(t)
++
++		job := makeTestJob("")
++		createErr := fmt.Errorf("disk full")
+ 
+-		mockRepo := &mockStageableRepo{
+-			MockStageableRepository: repository.NewMockStageableRepository(t),
++		tree := []repository.FileTreeEntry{
++			treeEntry("myfolder", false),
++			treeEntry("other", false),
+ 		}
++
++		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.Anything).Return(mockStaged, nil)
++
++		mockStaged.EXPECT().ReadTree(mock.Anything, "").Return(tree, nil)
++		mockStaged.EXPECT().Config().Return(repoConfig("test-repo"))
++		// Only the first folder is attempted; second is never reached.
++		mockStaged.EXPECT().Create(mock.Anything, "myfolder/_folder.json", "", mock.Anything, mock.Anything).Return(createErr)
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on default branch").Return()
++		mockProgress.EXPECT().SetTotal(mock.Anything, 2).Return()
++		mockProgress.EXPECT().Record(mock.Anything, mock.MatchedBy(func(r jobs.JobResourceResult) bool {
++			return r.Action() == repository.FileActionCreated && r.Error() != nil
++		})).Return()
++		mockProgress.EXPECT().SetFinalMessage(mock.Anything, mock.MatchedBy(func(s string) bool { return s != "" })).Return()
++
++		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
++
++		err := w.Process(ctx, mockRepo, job, mockProgress)
++		require.ErrorContains(t, err, "disk full")
++		require.ErrorContains(t, err, "myfolder")
++	})
++
++	t.Run("uses default branch when options are nil", func(t *testing.T) {
++		ctx := context.Background()
++		w := NewWorker()
++
++		mockRepo := &mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)}
+ 		mockStaged := repository.NewMockStagedRepository(t)
+ 		mockProgress := jobs.NewMockJobProgressRecorder(t)
+ 
+-		customRef := "feature-branch"
+ 		job := provisioning.Job{
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name:      "test-job",
+-				Namespace: "default",
+-			},
++			ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default"},
+ 			Spec: provisioning.JobSpec{
+-				Action:     provisioning.JobActionFixFolderMetadata,
+-				Repository: "test-repo",
+-				FixFolderMetadata: &provisioning.FixFolderMetadataJobOptions{
+-					Ref: customRef,
+-				},
++				Action:            provisioning.JobActionFixFolderMetadata,
++				Repository:        "test-repo",
++				FixFolderMetadata: nil,
+ 			},
+ 		}
+ 
+-		// Expect staging to be called with custom ref
+ 		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.MatchedBy(func(opts repository.StageOptions) bool {
+-			return opts.Ref == customRef
++			return opts.Ref == ""
+ 		})).Return(mockStaged, nil)
+ 
+-		// Expect a marker file to be written
+-		mockStaged.EXPECT().Write(mock.Anything, mock.Anything, customRef, mock.Anything, mock.Anything).Return(nil)
++		mockStaged.EXPECT().ReadTree(mock.Anything, "").Return([]repository.FileTreeEntry{}, nil)
++		mockStaged.EXPECT().Config().Return(repoConfig("test-repo"))
+ 
+-		// Expect push to be called
+-		mockStaged.EXPECT().Push(mock.Anything).Return(nil)
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on default branch").Return()
++		mockProgress.EXPECT().SetTotal(mock.Anything, 0).Return()
++		mockProgress.EXPECT().SetFinalMessage(mock.Anything, "Folder metadata fixed on default branch").Return()
+ 
+-		// Expect cleanup
++		mockStaged.EXPECT().Push(mock.Anything).Return(nil)
+ 		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
+ 
+-		// Expect progress updates
+-		mockProgress.EXPECT().SetMessage(mock.Anything, fmt.Sprintf("Creating marker commit on branch %s", customRef)).Return()
+-		mockProgress.EXPECT().SetFinalMessage(mock.Anything, fmt.Sprintf("Folder metadata fixed on branch %s", customRef)).Return()
+-
+ 		err := w.Process(ctx, mockRepo, job, mockProgress)
+ 		require.NoError(t, err)
+ 	})
+ 
+-	t.Run("sets ref URLs when repository supports it and ref is specified", func(t *testing.T) {
++	t.Run("returns error when ReadTree fails", func(t *testing.T) {
++		ctx := context.Background()
++		w := NewWorker()
++
++		mockRepo := &mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)}
++		mockStaged := repository.NewMockStagedRepository(t)
++		mockProgress := jobs.NewMockJobProgressRecorder(t)
++
++		job := makeTestJob("")
++
++		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.Anything).Return(mockStaged, nil)
++		mockStaged.EXPECT().ReadTree(mock.Anything, "").Return(nil, fmt.Errorf("git error"))
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on default branch").Return()
++		mockProgress.EXPECT().SetFinalMessage(mock.Anything, mock.MatchedBy(func(s string) bool { return s != "" })).Return()
++
++		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
++
++		err := w.Process(ctx, mockRepo, job, mockProgress)
++		require.ErrorContains(t, err, "read repository tree")
++	})
++
++	t.Run("returns error when repository does not support read/write operations", func(t *testing.T) {
++		ctx := context.Background()
+ 		w := NewWorker()
++
++		// mockNonRWRepo is not stageable, so WrapWithStageAndPushIfPossible calls fn with the original repo.
++		// The original repo does not implement ReaderWriter, so the cast fails.
++		mockProgress := jobs.NewMockJobProgressRecorder(t)
++
++		job := makeTestJob("")
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on default branch").Return()
++		mockProgress.EXPECT().SetFinalMessage(mock.Anything, mock.MatchedBy(func(s string) bool { return s != "" })).Return()
++
++		err := w.Process(ctx, &mockNonRWRepo{}, job, mockProgress)
++		require.ErrorContains(t, err, "does not support read/write operations")
++	})
++
++	t.Run("sets ref URLs when repository supports it and ref is specified", func(t *testing.T) {
+ 		ctx := context.Background()
++		w := NewWorker()
+ 
+-		// Create a mock that implements both interfaces
+ 		mockRepo := &mockStageableRepoWithURLs{
+-			mockStageableRepo: mockStageableRepo{
+-				MockStageableRepository: repository.NewMockStageableRepository(t),
+-			},
++			mockStageableRepo:      mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)},
+ 			MockRepositoryWithURLs: repository.NewMockRepositoryWithURLs(t),
+ 		}
+ 		mockStaged := repository.NewMockStagedRepository(t)
+ 		mockProgress := jobs.NewMockJobProgressRecorder(t)
+ 
+ 		customRef := "feature-branch"
+-		job := provisioning.Job{
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name:      "test-job",
+-				Namespace: "default",
+-			},
+-			Spec: provisioning.JobSpec{
+-				Action:     provisioning.JobActionFixFolderMetadata,
+-				Repository: "test-repo",
+-				FixFolderMetadata: &provisioning.FixFolderMetadataJobOptions{
+-					Ref: customRef,
+-				},
+-			},
+-		}
++		job := makeTestJob(customRef)
+ 
+ 		expectedURLs := &provisioning.RepositoryURLs{
+ 			RepositoryURL:     "https://github.com/test/repo",
+@@ -171,13 +347,17 @@ func TestWorker_Process(t *testing.T) {
+ 		}
+ 
+ 		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.Anything).Return(mockStaged, nil)
+-		mockStaged.EXPECT().Write(mock.Anything, mock.Anything, customRef, mock.Anything, mock.Anything).Return(nil)
++
++		mockStaged.EXPECT().ReadTree(mock.Anything, customRef).Return([]repository.FileTreeEntry{}, nil)
++		mockStaged.EXPECT().Config().Return(repoConfig("test-repo"))
++
+ 		mockStaged.EXPECT().Push(mock.Anything).Return(nil)
+ 		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
+-		mockProgress.EXPECT().SetMessage(mock.Anything, fmt.Sprintf("Creating marker commit on branch %s", customRef)).Return()
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, fmt.Sprintf("Writing folder metadata files on branch %s", customRef)).Return()
++		mockProgress.EXPECT().SetTotal(mock.Anything, 0).Return()
+ 		mockProgress.EXPECT().SetFinalMessage(mock.Anything, fmt.Sprintf("Folder metadata fixed on branch %s", customRef)).Return()
+ 
+-		// Expect RefURLs to be called with the custom ref and SetRefURLs to be called with the result
+ 		mockRepo.MockRepositoryWithURLs.EXPECT().RefURLs(mock.Anything, customRef).Return(expectedURLs, nil)
+ 		mockProgress.EXPECT().SetRefURLs(mock.Anything, expectedURLs).Return()
+ 
+@@ -185,67 +365,35 @@ func TestWorker_Process(t *testing.T) {
+ 		require.NoError(t, err)
+ 	})
+ 
+-	t.Run("uses repository default when options are nil", func(t *testing.T) {
+-		w := NewWorker()
++	t.Run("blob entries are not processed as directories", func(t *testing.T) {
+ 		ctx := context.Background()
++		w := NewWorker()
+ 
+-		mockRepo := &mockStageableRepo{
+-			MockStageableRepository: repository.NewMockStageableRepository(t),
+-		}
++		mockRepo := &mockStageableRepo{MockStageableRepository: repository.NewMockStageableRepository(t)}
+ 		mockStaged := repository.NewMockStagedRepository(t)
+ 		mockProgress := jobs.NewMockJobProgressRecorder(t)
+ 
+-		job := provisioning.Job{
+-			ObjectMeta: metav1.ObjectMeta{
+-				Name:      "test-job",
+-				Namespace: "default",
+-			},
+-			Spec: provisioning.JobSpec{
+-				Action:            provisioning.JobActionFixFolderMetadata,
+-				Repository:        "test-repo",
+-				FixFolderMetadata: nil, // Nil options should use repository default
+-			},
++		job := makeTestJob("")
++
++		// Only blob entries, no directory entries
++		tree := []repository.FileTreeEntry{
++			treeEntry("dashboard.json", true),
++			treeEntry("other.json", true),
+ 		}
+ 
+-		// Expect staging with empty ref (repository determines default)
+-		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.MatchedBy(func(opts repository.StageOptions) bool {
+-			return opts.Ref == ""
+-		})).Return(mockStaged, nil)
++		mockRepo.MockStageableRepository.EXPECT().Stage(mock.Anything, mock.Anything).Return(mockStaged, nil)
++
++		mockStaged.EXPECT().ReadTree(mock.Anything, "").Return(tree, nil)
++		mockStaged.EXPECT().Config().Return(repoConfig("test-repo"))
++
++		mockProgress.EXPECT().SetMessage(mock.Anything, "Writing folder metadata files on default branch").Return()
++		mockProgress.EXPECT().SetTotal(mock.Anything, 0).Return()
++		mockProgress.EXPECT().SetFinalMessage(mock.Anything, "Folder metadata fixed on default branch").Return()
+ 
+-		mockStaged.EXPECT().Write(mock.Anything, mock.Anything, "", mock.Anything, mock.Anything).Return(nil)
+ 		mockStaged.EXPECT().Push(mock.Anything).Return(nil)
+ 		mockStaged.EXPECT().Remove(mock.Anything).Return(nil)
+-		mockProgress.EXPECT().SetMessage(mock.Anything, "Creating marker commit on default branch").Return()
+-		mockProgress.EXPECT().SetFinalMessage(mock.Anything, "Folder metadata fixed on default branch").Return()
+ 
+ 		err := w.Process(ctx, mockRepo, job, mockProgress)
+ 		require.NoError(t, err)
+ 	})
+ }
+-
+-// mockStageableRepo implements repository.Repository and repository.StageableRepository
+-type mockStageableRepo struct {
+-	*repository.MockStageableRepository
+-}
+-
+-func (m *mockStageableRepo) Config() *provisioning.Repository {
+-	return &provisioning.Repository{}
+-}
+-
+-func (m *mockStageableRepo) Test(ctx context.Context) (*provisioning.TestResults, error) {
+-	return &provisioning.TestResults{}, nil
+-}
+-
+-// mockStageableRepoWithURLs combines StageableRepository and RepositoryWithURLs
+-type mockStageableRepoWithURLs struct {
+-	mockStageableRepo
+-	*repository.MockRepositoryWithURLs
+-}
+-
+-func (m *mockStageableRepoWithURLs) Config() *provisioning.Repository {
+-	return &provisioning.Repository{}
+-}
+-
+-func (m *mockStageableRepoWithURLs) Test(ctx context.Context) (*provisioning.TestResults, error) {
+-	return &provisioning.TestResults{}, nil
+-}
+diff --git a/pkg/registry/apis/provisioning/resources/folders.go b/pkg/registry/apis/provisioning/resources/folders.go
+index 9f69cb37cf38c..f3386def1bb52 100644
+--- a/pkg/registry/apis/provisioning/resources/folders.go
++++ b/pkg/registry/apis/provisioning/resources/folders.go
+@@ -282,7 +282,7 @@ func (fm *FolderManager) RemoveFolder(ctx context.Context, name string) error {
+ 	return fm.client.Delete(ctx, name, metav1.DeleteOptions{})
+ }
+ 
+-// ReplicateTree replicates the folder tree to the repository.
++// EnsureFolderTreeExists replicates the folder tree to the repository.
+ // The function fn is called for each folder.
+ // If the folder already exists, the function is called with created set to false.
+ // If the folder is created, the function is called with created set to true.
+diff --git a/pkg/registry/apis/provisioning/resources/repository_resources_mock.go b/pkg/registry/apis/provisioning/resources/repository_resources_mock.go
+index ac9b61c8c3550..5e2c030294a14 100644
+--- a/pkg/registry/apis/provisioning/resources/repository_resources_mock.go
++++ b/pkg/registry/apis/provisioning/resources/repository_resources_mock.go
+@@ -74,6 +74,64 @@ func (_c *MockRepositoryResources_EnsureFolderExists_Call) RunAndReturn(run func
+ 	return _c
+ }
+ 
++// EnsureFolderMetadata provides a mock function with given fields: ctx, folder, ref
++func (_m *MockRepositoryResources) EnsureFolderMetadata(ctx context.Context, folder Folder, ref string) (bool, error) {
++	ret := _m.Called(ctx, folder, ref)
++
++	if len(ret) == 0 {
++		panic("no return value specified for EnsureFolderMetadata")
++	}
++
++	var r0 bool
++	var r1 error
++	if rf, ok := ret.Get(0).(func(context.Context, Folder, string) (bool, error)); ok {
++		return rf(ctx, folder, ref)
++	}
++	if rf, ok := ret.Get(0).(func(context.Context, Folder, string) bool); ok {
++		r0 = rf(ctx, folder, ref)
++	} else {
++		r0 = ret.Get(0).(bool)
++	}
++
++	if rf, ok := ret.Get(1).(func(context.Context, Folder, string) error); ok {
++		r1 = rf(ctx, folder, ref)
++	} else {
++		r1 = ret.Error(1)
++	}
++
++	return r0, r1
++}
++
++// MockRepositoryResources_EnsureFolderMetadata_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'EnsureFolderMetadata'
++type MockRepositoryResources_EnsureFolderMetadata_Call struct {
++	*mock.Call
++}
++
++// EnsureFolderMetadata is a helper method to define mock.On call
++//   - ctx context.Context
++//   - folder Folder
++//   - ref string
++func (_e *MockRepositoryResources_Expecter) EnsureFolderMetadata(ctx interface{}, folder interface{}, ref interface{}) *MockRepositoryResources_EnsureFolderMetadata_Call {
++	return &MockRepositoryResources_EnsureFolderMetadata_Call{Call: _e.mock.On("EnsureFolderMetadata", ctx, folder, ref)}
++}
++
++func (_c *MockRepositoryResources_EnsureFolderMetadata_Call) Run(run func(ctx context.Context, folder Folder, ref string)) *MockRepositoryResources_EnsureFolderMetadata_Call {
++	_c.Call.Run(func(args mock.Arguments) {
++		run(args[0].(context.Context), args[1].(Folder), args[2].(string))
++	})
++	return _c
++}
++
++func (_c *MockRepositoryResources_EnsureFolderMetadata_Call) Return(_a0 bool, _a1 error) *MockRepositoryResources_EnsureFolderMetadata_Call {
++	_c.Call.Return(_a0, _a1)
++	return _c
++}
++
++func (_c *MockRepositoryResources_EnsureFolderMetadata_Call) RunAndReturn(run func(context.Context, Folder, string) (bool, error)) *MockRepositoryResources_EnsureFolderMetadata_Call {
++	_c.Call.Return(run)
++	return _c
++}
++
+ // EnsureFolderPathExist provides a mock function with given fields: ctx, filePath
+ func (_m *MockRepositoryResources) EnsureFolderPathExist(ctx context.Context, filePath string) (string, error) {
+ 	ret := _m.Called(ctx, filePath)
+diff --git a/pkg/services/featuremgmt/registry.go b/pkg/services/featuremgmt/registry.go
+index efa37dc12485f..3ece6ad08a350 100644
+--- a/pkg/services/featuremgmt/registry.go
++++ b/pkg/services/featuremgmt/registry.go
+@@ -475,8 +475,8 @@ var (
+ 			Expression:      "false",
+ 		},
+ 		{
+-			Name:            "datasourceDisableIdApi",
+-			Description:     "Does not register datasource apis that use the numeric id",
++			Name:            "datasourceLegacyIdApi",
++			Description:     "Register legacy datasource apis that use the numeric id",
+ 			Stage:           FeatureStageExperimental,
+ 			Owner:           grafanaDatasourcesCoreServicesSquad,
+ 			RequiresRestart: true, // affects the routes at startup
+@@ -640,6 +640,13 @@ var (
+ 			Owner:        grafanaDashboardsSquad,
+ 			Expression:   "false",
+ 		},
++		{
++			Name:        "sceneCsvExport",
++			Description: "Enables CSV export using scenes dashboard architecture",
++			Stage:       FeatureStageExperimental,
++			Owner:       grafanaDashboardsSquad,
++			Expression:  "false",
++		},
+ 		{
+ 			Name:         "drilldownRecommendations",
+ 			Description:  "Enables showing recently used drilldowns or recommendations given by the datasource in the AdHocFilters and GroupBy variables",
+diff --git a/pkg/services/featuremgmt/toggles_gen.csv b/pkg/services/featuremgmt/toggles_gen.csv
+index e270580d6e8ad..b60a916b8ad4f 100644
+--- a/pkg/services/featuremgmt/toggles_gen.csv
++++ b/pkg/services/featuremgmt/toggles_gen.csv
+@@ -44,11 +44,11 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2023-09-19,lokiRunQueriesInParallel,privatePreview,@grafana/oss-big-tent,false,false,false
+ 2023-09-28,externalServiceAccounts,preview,@grafana/identity-access-team,false,false,false
+ 2023-12-05,kubernetesSnapshots,experimental,@grafana/grafana-app-platform-squad,false,true,false
+-2025-06-25,kubernetesLibraryPanels,experimental,@grafana/grafana-app-platform-squad,false,true,false
++2025-06-26,kubernetesLibraryPanels,experimental,@grafana/grafana-app-platform-squad,false,true,false
+ 2024-06-05,kubernetesDashboards,GA,@grafana/dashboards-squad,false,false,false
+-2025-07-31,kubernetesShortURLs,experimental,@grafana/grafana-app-platform-squad,false,true,false
++2025-08-01,kubernetesShortURLs,experimental,@grafana/grafana-app-platform-squad,false,true,false
+ 2025-08-29,useKubernetesShortURLsAPI,experimental,@grafana/sharing-squad,false,false,true
+-2025-07-31,kubernetesAlertingRules,experimental,@grafana/alerting-squad,false,true,false
++2025-08-01,kubernetesAlertingRules,experimental,@grafana/alerting-squad,false,true,false
+ 2025-08-29,kubernetesCorrelations,experimental,@grafana/datapro,false,true,false
+ 2025-12-09,kubernetesUnifiedStorageQuotas,experimental,@grafana/search-and-storage,false,true,false
+ 2025-10-16,kubernetesLogsDrilldown,experimental,@grafana/observability-logs,false,true,false
+@@ -58,7 +58,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-04-11,dashboardSchemaValidationLogging,experimental,@grafana/grafana-app-platform-squad,false,false,false
+ 2025-07-30,scanRowInvalidDashboardParseFallbackEnabled,experimental,@grafana/search-and-storage,false,false,false
+ 2024-05-23,datasourceQueryTypes,experimental,@grafana/grafana-app-platform-squad,false,true,false
+-2026-02-18,datasourceDisableIdApi,experimental,@grafana/grafana-datasources-core-services,false,true,false
++2026-03-12,datasourceLegacyIdApi,experimental,@grafana/grafana-datasources-core-services,false,true,false
+ 2024-04-19,queryService,experimental,@grafana/grafana-datasources-core-services,false,true,false
+ 2025-08-28,queryServiceWithConnections,experimental,@grafana/grafana-datasources-core-services,false,true,false
+ 2026-02-18,useNewAPIsForDatasourceCRUD,experimental,@grafana/grafana-datasources-core-services,false,true,true
+@@ -79,6 +79,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2024-10-23,dashboardNewLayouts,preview,@grafana/dashboards-squad,false,false,false
+ 2025-08-29,dashboardUndoRedo,experimental,@grafana/dashboards-squad,false,false,true
+ 2025-10-10,unlimitedLayoutsNesting,experimental,@grafana/dashboards-squad,false,false,true
++2026-02-11,sceneCsvExport,experimental,@grafana/dashboards-squad,false,false,false
+ 2025-12-17,drilldownRecommendations,experimental,@grafana/dashboards-squad,false,false,true
+ 2025-11-21,perPanelNonApplicableDrilldowns,experimental,@grafana/dashboards-squad,false,false,true
+ 2025-11-28,panelGroupBy,experimental,@grafana/dashboards-squad,false,false,true
+@@ -95,7 +96,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2024-01-10,alertingQueryOptimization,GA,@grafana/alerting-squad,false,false,false
+ 2024-01-18,jitterAlertRulesWithinGroups,preview,@grafana/alerting-squad,false,true,false
+ 2025-12-29,auditLoggingAppPlatform,experimental,@grafana/grafana-operator-experience-squad,false,true,false
+-2025-07-31,secretsManagementAppPlatformUI,preview,@grafana/grafana-operator-experience-squad,false,false,false
++2025-08-01,secretsManagementAppPlatformUI,preview,@grafana/grafana-operator-experience-squad,false,false,false
+ 2026-02-18,secretsKeeperUI,experimental,@grafana/grafana-operator-experience-squad,false,false,true
+ 2024-01-23,alertingSaveStatePeriodic,privatePreview,@grafana/alerting-squad,false,false,false
+ 2025-01-27,alertingSaveStateCompressed,preview,@grafana/alerting-squad,false,false,false
+@@ -145,7 +146,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2022-05-30,prometheusAzureOverrideAudience,deprecated,@grafana/partner-datasources,false,false,false
+ 2024-09-11,alertingFilterV2,experimental,@grafana/alerting-squad,false,false,false
+ 2024-08-09,dataplaneAggregator,experimental,@grafana/grafana-app-platform-squad,false,true,false
+-2025-07-31,vizActionsAuth,preview,@grafana/dataviz-squad,false,false,true
++2025-08-01,vizActionsAuth,preview,@grafana/dataviz-squad,false,false,true
+ 2024-09-27,alertingPrometheusRulesPrimary,experimental,@grafana/alerting-squad,false,false,true
+ 2024-08-29,exploreLogsShardSplitting,experimental,@grafana/observability-logs,false,false,true
+ 2024-08-29,exploreLogsAggregatedMetrics,experimental,@grafana/observability-logs,false,false,true
+@@ -174,7 +175,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-07-23,alertingAIFeedback,experimental,@grafana/alerting-squad,false,false,false
+ 2025-07-16,alertingAIImproveAlertRules,experimental,@grafana/alerting-squad,false,false,false
+ 2025-07-16,alertingAIGenTemplates,experimental,@grafana/alerting-squad,false,false,false
+-2025-07-31,alertingEnrichmentPerRule,experimental,@grafana/alerting-squad,false,false,false
++2025-08-01,alertingEnrichmentPerRule,experimental,@grafana/alerting-squad,false,false,false
+ 2025-08-29,alertingEnrichmentAssistantInvestigations,experimental,@grafana/alerting-squad,false,false,false
+ 2025-07-16,alertingAIAnalyzeCentralStateHistory,experimental,@grafana/alerting-squad,false,false,false
+ 2024-11-22,alertingNotificationsStepMode,GA,@grafana/alerting-squad,false,false,true
+@@ -214,7 +215,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-04-09,unifiedNavbars,GA,@grafana/plugins-platform-backend,false,false,true
+ 2025-04-07,logsPanelControls,preview,@grafana/observability-logs,false,false,true
+ 2025-04-09,metricsFromProfiles,experimental,@grafana/observability-traces-and-profiling,false,false,true
+-2025-07-31,grafanaAssistantInProfilesDrilldown,GA,@grafana/observability-traces-and-profiling,false,false,true
++2025-08-01,grafanaAssistantInProfilesDrilldown,GA,@grafana/observability-traces-and-profiling,false,false,true
+ 2025-07-15,tempoAlerting,experimental,@grafana/observability-traces-and-profiling,false,false,false
+ 2025-04-16,pluginsAutoUpdate,experimental,@grafana/plugins-platform-backend,false,false,false
+ 2025-04-22,alertingListViewV2PreviewToggle,privatePreview,@grafana/alerting-squad,false,false,true
+@@ -225,7 +226,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2026-02-18,kubernetesAuthZResourcePermissionsRedirect,experimental,@grafana/identity-access-team,false,false,false
+ 2026-02-18,kubernetesAuthZRolesRedirect,experimental,@grafana/identity-access-team,false,false,false
+ 2026-03-06,kubernetesAuthZRoleBindingsRedirect,experimental,@grafana/identity-access-team,false,false,false
+-2025-07-31,kubernetesAuthzResourcePermissionApis,experimental,@grafana/identity-access-team,false,false,false
++2025-08-01,kubernetesAuthzResourcePermissionApis,experimental,@grafana/identity-access-team,false,false,false
+ 2025-10-13,kubernetesAuthzZanzanaSync,experimental,@grafana/identity-access-team,false,false,false
+ 2026-01-15,kubernetesAuthzGlobalRolesApi,experimental,@grafana/identity-access-team,false,false,false
+ 2026-01-12,kubernetesAuthzRolesApi,experimental,@grafana/identity-access-team,false,false,false
+@@ -237,10 +238,10 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2026-01-13,experimentRecentlyViewedDashboards,experimental,@grafana/grafana-frontend-navigation,false,false,true
+ 2026-02-24,createdByMeSearchFilter,experimental,@grafana/grafana-frontend-navigation,false,false,true
+ 2025-06-06,alertEnrichment,experimental,@grafana/alerting-squad,false,false,false
+-2025-07-31,alertEnrichmentMultiStep,experimental,@grafana/alerting-squad,false,false,false
+-2025-07-31,alertEnrichmentConditional,experimental,@grafana/alerting-squad,false,false,false
++2025-08-01,alertEnrichmentMultiStep,experimental,@grafana/alerting-squad,false,false,false
++2025-08-01,alertEnrichmentConditional,experimental,@grafana/alerting-squad,false,false,false
+ 2025-06-10,alertingImportAlertmanagerAPI,experimental,@grafana/alerting-squad,false,false,false
+-2025-07-31,alertingImportAlertmanagerUI,experimental,@grafana/alerting-squad,false,false,false
++2025-08-01,alertingImportAlertmanagerUI,experimental,@grafana/alerting-squad,false,false,false
+ 2026-02-18,alertingDisableDMAinUI,experimental,@grafana/alerting-squad,false,false,false
+ 2025-07-15,sharingDashboardImage,GA,@grafana/sharing-squad,false,false,true
+ 2025-06-17,preferLibraryPanelTitle,privatePreview,@grafana/dashboards-squad,false,false,false
+@@ -253,18 +254,18 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-07-18,unifiedStorageSearchDualReaderEnabled,experimental,@grafana/search-and-storage,false,false,false
+ 2025-07-31,dashboardLevelTimeMacros,experimental,@grafana/dashboards-squad,false,false,true
+ 2025-07-25,alertmanagerRemoteSecondaryWithRemoteState,experimental,@grafana/alerting-squad,false,false,false
+-2025-07-31,restrictedPluginApis,GA,@grafana/plugins-platform-backend,false,false,true
+-2025-07-31,favoriteDatasources,experimental,@grafana/plugins-platform-backend,false,false,true
+-2025-07-31,newLogContext,experimental,@grafana/observability-logs,false,false,true
+-2025-07-31,newClickhouseConfigPageDesign,privatePreview,@grafana/partner-datasources,false,false,false
+-2025-07-31,teamFolders,experimental,@grafana/grafana-frontend-navigation,false,false,false
++2025-08-01,restrictedPluginApis,GA,@grafana/plugins-platform-backend,false,false,true
++2025-08-01,favoriteDatasources,experimental,@grafana/plugins-platform-backend,false,false,true
++2025-08-01,newLogContext,experimental,@grafana/observability-logs,false,false,true
++2025-08-01,newClickhouseConfigPageDesign,privatePreview,@grafana/partner-datasources,false,false,false
++2025-08-01,teamFolders,experimental,@grafana/grafana-frontend-navigation,false,false,false
+ 2025-10-22,interactiveLearning,preview,@grafana/pathfinder,false,false,false
+-2025-07-31,alertingTriage,experimental,@grafana/alerting-squad,false,false,false
++2025-08-01,alertingTriage,experimental,@grafana/alerting-squad,false,false,false
+ 2026-02-18,alertingAlertsActivityBanner,experimental,@grafana/alerting-squad,false,false,true
+-2025-07-31,graphiteBackendMode,privatePreview,@grafana/partner-datasources,false,false,false
+-2025-07-31,azureResourcePickerUpdates,GA,@grafana/partner-datasources,false,false,true
+-2025-07-31,prometheusTypeMigration,experimental,@grafana/partner-datasources,false,true,false
+-2025-07-31,pluginContainers,privatePreview,@grafana/plugins-platform-backend,false,true,false
++2025-08-01,graphiteBackendMode,privatePreview,@grafana/partner-datasources,false,false,false
++2025-08-01,azureResourcePickerUpdates,GA,@grafana/partner-datasources,false,false,true
++2025-08-01,prometheusTypeMigration,experimental,@grafana/partner-datasources,false,true,false
++2025-08-01,pluginContainers,privatePreview,@grafana/plugins-platform-backend,false,true,false
+ 2025-08-29,cdnPluginsLoadFirst,experimental,@grafana/plugins-platform-backend,false,false,false
+ 2025-08-29,cdnPluginsUrls,experimental,@grafana/plugins-platform-backend,false,false,false
+ 2025-10-24,pluginInstallAPISync,experimental,@grafana/plugins-platform-backend,false,false,false
+@@ -272,9 +273,9 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-11-12,newVizSuggestions,preview,@grafana/dataviz-squad,false,false,true
+ 2026-02-18,panelStyleActions,experimental,@grafana/dataviz-squad,false,false,true
+ 2026-02-18,vizPresets,preview,@grafana/dataviz-squad,false,false,true
+-2025-12-01,externalVizSuggestions,experimental,@grafana/dataviz-squad,false,false,true
++2025-12-02,externalVizSuggestions,experimental,@grafana/dataviz-squad,false,false,true
+ 2026-03-03,vizLegendSeriesLimit,experimental,@grafana/dataviz-squad,false,false,true
+-2026-03-06,nestedFramesFieldOverrides,preview,@grafana/dataviz-squad,false,false,true
++2026-03-07,nestedFramesFieldOverrides,preview,@grafana/dataviz-squad,false,false,true
+ 2025-12-18,heatmapRowsAxisOptions,experimental,@grafana/dataviz-squad,false,false,true
+ 2025-10-17,preventPanelChromeOverflow,preview,@grafana/grafana-frontend-platform,false,false,true
+ 2025-10-31,jaegerEnableGrpcEndpoint,experimental,@grafana/oss-big-tent,false,false,false
+diff --git a/pkg/services/featuremgmt/toggles_gen.go b/pkg/services/featuremgmt/toggles_gen.go
+index 0b922f258e172..bc272876d86a9 100644
+--- a/pkg/services/featuremgmt/toggles_gen.go
++++ b/pkg/services/featuremgmt/toggles_gen.go
+@@ -195,9 +195,9 @@ const (
+ 	// Show query type endpoints in datasource API servers (currently hardcoded for testdata, expressions, and prometheus)
+ 	FlagDatasourceQueryTypes = "datasourceQueryTypes"
+ 
+-	// FlagDatasourceDisableIdApi
+-	// Does not register datasource apis that use the numeric id
+-	FlagDatasourceDisableIdApi = "datasourceDisableIdApi"
++	// FlagDatasourceLegacyIdApi
++	// Register legacy datasource apis that use the numeric id
++	FlagDatasourceLegacyIdApi = "datasourceLegacyIdApi"
+ 
+ 	// FlagQueryService
+ 	// Register /apis/query.grafana.app/ -- will eventually replace /api/ds/query
+@@ -259,6 +259,10 @@ const (
+ 	// Enables new dashboard layouts
+ 	FlagDashboardNewLayouts = "dashboardNewLayouts"
+ 
++	// FlagSceneCsvExport
++	// Enables CSV export using scenes dashboard architecture
++	FlagSceneCsvExport = "sceneCsvExport"
++
+ 	// FlagPdfTables
+ 	// Enables generating table data as PDF in reporting
+ 	FlagPdfTables = "pdfTables"
+diff --git a/pkg/services/featuremgmt/toggles_gen.json b/pkg/services/featuremgmt/toggles_gen.json
+index cafcf3c8ee3a7..70888096ae8e1 100644
+--- a/pkg/services/featuremgmt/toggles_gen.json
++++ b/pkg/services/featuremgmt/toggles_gen.json
+@@ -1517,7 +1517,8 @@
+       "metadata": {
+         "name": "datasourceDisableIdApi",
+         "resourceVersion": "1771434338561",
+-        "creationTimestamp": "2026-02-18T17:05:38Z"
++        "creationTimestamp": "2026-02-18T17:05:38Z",
++        "deletionTimestamp": "2026-03-12T10:43:25Z"
+       },
+       "spec": {
+         "description": "Does not register datasource apis that use the numeric id",
+@@ -1527,6 +1528,20 @@
+         "expression": "false"
+       }
+     },
++    {
++      "metadata": {
++        "name": "datasourceLegacyIdApi",
++        "resourceVersion": "1773312205880",
++        "creationTimestamp": "2026-03-12T10:43:25Z"
++      },
++      "spec": {
++        "description": "Register legacy datasource apis that use the numeric id",
++        "stage": "experimental",
++        "codeowner": "@grafana/grafana-datasources-core-services",
++        "requiresRestart": true,
++        "expression": "false"
++      }
++    },
+     {
+       "metadata": {
+         "name": "datasourceQueryTypes",
+@@ -4148,6 +4163,19 @@
+         "expression": "false"
+       }
+     },
++    {
++      "metadata": {
++        "name": "sceneCsvExport",
++        "resourceVersion": "1770806976610",
++        "creationTimestamp": "2026-02-11T10:49:36Z"
++      },
++      "spec": {
++        "description": "Enables CSV export using scenes dashboard architecture",
++        "stage": "experimental",
++        "codeowner": "@grafana/dashboards-squad",
++        "expression": "false"
++      }
++    },
+     {
+       "metadata": {
+         "name": "scopeApi",
+diff --git a/pkg/storage/unified/migrations/migrator_test.go b/pkg/storage/unified/migrations/migrator_test.go
+index c43b3c7d9a375..d9b086e96a61f 100644
+--- a/pkg/storage/unified/migrations/migrator_test.go
++++ b/pkg/storage/unified/migrations/migrator_test.go
+@@ -75,8 +75,12 @@ func runMigrationTestSuite(t *testing.T, testCases []testcases.ResourceMigratorT
+ 	}
+ 
+ 	// Clean up leftover state from previous test runs (e.g., renamed _legacy tables).
++	// Also register cleanup to run after this test, so other packages sharing the same
++	// MySQL/Postgres test DB don't see the renamed tables (e.g. short_url_legacy).
++	// Failing to do so may cause subsequent tests to fail in environments where the database is shared between tests.
+ 	if !db.IsTestDbSQLite() {
+ 		cleanupLegacyTables(t, testCases)
++		t.Cleanup(func() { cleanupLegacyTables(t, testCases) })
+ 	}
+ 
+ 	// Collect feature toggles required by all test cases
+diff --git a/pkg/storage/unified/resource/broadcaster.go b/pkg/storage/unified/resource/broadcaster.go
+index 5736cf5cb4988..aba91281858c9 100644
+--- a/pkg/storage/unified/resource/broadcaster.go
++++ b/pkg/storage/unified/resource/broadcaster.go
+@@ -101,20 +101,34 @@ func (b *broadcaster[T]) stream(input <-chan T) {
+ 		}
+ 	}
+ 
++	addSubscriber := func(sub subscription[T]) {
++		// send initial batch of cached items
++		if !b.cache.readInto(sub.ch) {
++			close(sub.ch)
++			return
++		}
++		b.subs[sub.ch] = sub
++	}
++
+ 	for {
+ 		select {
+ 		case <-b.shouldTerminate: // service context cancelled
+ 			return
+ 
+ 		case sub := <-b.subscribe: // subscribe
+-			// send initial batch of cached items
+-			if !b.cache.readInto(sub.ch) {
+-				close(sub.ch)
+-				continue
+-			}
+-			b.subs[sub.ch] = sub
++			addSubscriber(sub)
+ 
+ 		case recv := <-b.unsubscribe: // unsubscribe
++			// Drain pending subscribes so we don't miss one that was
++			// buffered before this unsubscribe.
++			for drained := false; !drained; {
++				select {
++				case sub := <-b.subscribe:
++					addSubscriber(sub)
++				default:
++					drained = true
++				}
++			}
+ 			unsubscribe(recv)
+ 
+ 		case item, ok := <-input: // data arrived, send to subscribers
+diff --git a/pkg/tests/api/correlations/correlations_delete_test.go b/pkg/tests/api/correlations/correlations_delete_test.go
+index 42732d360f986..c8c52b6752611 100644
+--- a/pkg/tests/api/correlations/correlations_delete_test.go
++++ b/pkg/tests/api/correlations/correlations_delete_test.go
+@@ -50,7 +50,6 @@ func TestIntegrationDeleteCorrelation(t *testing.T) {
+ 	}
+ 	dataSource = ctx.createDs(createDsCommand)
+ 	writableDs := dataSource.UID
+-	writableDsId := dataSource.ID
+ 	writableDsOrgId := dataSource.OrgID
+ 
+ 	t.Run("Unauthenticated users shouldn't be able to delete correlations", func(t *testing.T) {
+@@ -240,7 +239,7 @@ func TestIntegrationDeleteCorrelation(t *testing.T) {
+ 		})
+ 
+ 		res := ctx.Delete(DeleteParams{
+-			url:  fmt.Sprintf("/api/datasources/%d", writableDsId),
++			url:  fmt.Sprintf("/api/datasources/uid/%s", writableDs),
+ 			user: adminUser,
+ 		})
+ 		require.Equal(t, http.StatusOK, res.StatusCode)
+diff --git a/pkg/tests/apis/provisioning/common/testing.go b/pkg/tests/apis/provisioning/common/testing.go
+index 0cfbc13fbe2fb..3a755ab27799b 100644
+--- a/pkg/tests/apis/provisioning/common/testing.go
++++ b/pkg/tests/apis/provisioning/common/testing.go
+@@ -793,6 +793,11 @@ func WithLogs(opts *testinfra.GrafanaOpts) {
+ 	opts.EnableLog = true
+ }
+ 
++// WithProvisioningFolderMetadata enables the FlagProvisioningFolderMetadata feature toggle.
++func WithProvisioningFolderMetadata(opts *testinfra.GrafanaOpts) {
++	opts.EnableFeatureToggles = append(opts.EnableFeatureToggles, featuremgmt.FlagProvisioningFolderMetadata)
++}
++
+ func WithRepositoryTypes(types []string) GrafanaOption {
+ 	return func(opts *testinfra.GrafanaOpts) {
+ 		opts.ProvisioningRepositoryTypes = types
+diff --git a/pkg/tests/apis/provisioning/files_test.go b/pkg/tests/apis/provisioning/files_test.go
+index ee449b8a9c85e..79efbc8fc0ea7 100644
+--- a/pkg/tests/apis/provisioning/files_test.go
++++ b/pkg/tests/apis/provisioning/files_test.go
+@@ -1102,7 +1102,7 @@ func TestIntegrationProvisioning_FilesAuthorization(t *testing.T) {
+ func TestIntegrationProvisioning_CreateFolder_FolderMetadataFlag(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+-	helper := common.RunGrafana(t, withProvisioningFolderMetadata)
++	helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
+ 	ctx := context.Background()
+ 
+ 	const repo = "folder-metadata-test-repo"
+@@ -1223,7 +1223,7 @@ func TestIntegrationProvisioning_CreateFolder_FolderMetadataFlag(t *testing.T) {
+ func TestIntegrationProvisioning_FolderMetadataFileProtection(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+-	helper := common.RunGrafana(t, withProvisioningFolderMetadata)
++	helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
+ 	ctx := context.Background()
+ 
+ 	const repo = "folder-protection-test-repo"
+@@ -1342,7 +1342,7 @@ func TestIntegrationProvisioning_FolderAuthorizationWithMetadata(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			var helper *common.ProvisioningTestHelper
+ 			if tt.folderMetadataEnabled {
+-				helper = common.RunGrafana(t, withProvisioningFolderMetadata)
++				helper = common.RunGrafana(t, common.WithProvisioningFolderMetadata)
+ 			} else {
+ 				helper = common.RunGrafana(t)
+ 			}
+diff --git a/pkg/tests/apis/provisioning/foldermetadata/fixfoldermetadata_test.go b/pkg/tests/apis/provisioning/foldermetadata/fixfoldermetadata_test.go
+new file mode 100644
+index 0000000000000..2062f723da8b5
+--- /dev/null
++++ b/pkg/tests/apis/provisioning/foldermetadata/fixfoldermetadata_test.go
+@@ -0,0 +1,264 @@
++package foldermetadata
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++
++	folders "github.com/grafana/grafana/apps/folder/pkg/apis/folder/v1beta1"
++	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
++	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
++	"github.com/grafana/grafana/pkg/tests/testsuite"
++	"github.com/grafana/grafana/pkg/util/testutil"
++)
++
++const folderMetadataFileName = "_folder.json"
++
++func TestMain(m *testing.M) {
++	testsuite.Run(m)
++}
++
++// TestIntegrationProvisioning_FixFolderMetadata_MissingFile verifies that the
++// fix-folder-metadata job creates _folder.json files for folders that don't
++// have them yet.
++func TestIntegrationProvisioning_FixFolderMetadata_MissingFile(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
++	ctx := context.Background()
++
++	const repoName = "fix-meta-no-metadata"
++	repoPath := filepath.Join(helper.ProvisioningPath, repoName)
++
++	helper.CreateRepo(t, common.TestRepo{
++		Name:   repoName,
++		Path:   repoPath,
++		Target: "folder",
++		Copies: map[string]string{
++			// A dashboard inside parent/child/ causes both folders to be
++			// created in Grafana during sync.
++			"../testdata/all-panels.json": "parent/child/dashboard.json",
++		},
++		ExpectedDashboards: 1,
++		// root folder + parent + parent/child
++		ExpectedFolders: 3,
++	})
++
++	// Confirm the metadata files do not exist before the job runs.
++	requireFileAbsent(t, filepath.Join(repoPath, "parent", folderMetadataFileName))
++	requireFileAbsent(t, filepath.Join(repoPath, "parent", "child", folderMetadataFileName))
++
++	runFixFolderMetadataJob(t, helper, repoName)
++
++	// After the job both folders must have a well-formed metadata file.
++	parentUID, _ := requireValidFolderMetadata(t, ctx, helper, repoName, "parent")
++	childUID, _ := requireValidFolderMetadata(t, ctx, helper, repoName, "parent/child")
++
++	// The two folders should carry distinct UIDs.
++	require.NotEqual(t, parentUID, childUID,
++		"parent and child folders should have different UIDs")
++}
++
++// TestIntegrationProvisioning_FixFolderMetadata_ValidFile verifies that the
++// fix-folder-metadata job leaves already-correct _folder.json files unchanged.
++func TestIntegrationProvisioning_FixFolderMetadata_ValidFile(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
++	ctx := context.Background()
++
++	const repoName = "fix-meta-valid-metadata"
++	repoPath := filepath.Join(helper.ProvisioningPath, repoName)
++
++	helper.CreateRepo(t, common.TestRepo{
++		Name:   repoName,
++		Path:   repoPath,
++		Target: "folder",
++		Copies: map[string]string{
++			"../testdata/all-panels.json": "parent/child/dashboard.json",
++		},
++		ExpectedDashboards: 1,
++		ExpectedFolders:    3,
++	})
++
++	// First run: let the job create the metadata files.
++	runFixFolderMetadataJob(t, helper, repoName)
++
++	firstParentUID, firstParentTitle := requireValidFolderMetadata(t, ctx, helper, repoName, "parent")
++	firstChildUID, firstChildTitle := requireValidFolderMetadata(t, ctx, helper, repoName, "parent/child")
++
++	// Second run: the metadata files are already correct, nothing should change.
++	runFixFolderMetadataJob(t, helper, repoName)
++
++	afterParentUID, afterParentTitle := requireValidFolderMetadata(t, ctx, helper, repoName, "parent")
++	require.Equal(t, firstParentUID, afterParentUID, "parent folder UID must not change when the metadata file is already valid")
++	require.Equal(t, firstParentTitle, afterParentTitle, "parent folder title must not change when the metadata file is already valid")
++	afterChildUID, afterChildTitle := requireValidFolderMetadata(t, ctx, helper, repoName, "parent/child")
++	require.Equal(t, firstChildUID, afterChildUID, "child folder UID must not change when the metadata file is already valid")
++	require.Equal(t, firstChildTitle, afterChildTitle, "child folder title must not change when the metadata file is already valid")
++}
++
++// TestIntegrationProvisioning_FixFolderMetadata_SkipsExistingMetadata verifies
++// that the fix-folder-metadata job does not overwrite a _folder.json that is
++// already present.
++func TestIntegrationProvisioning_FixFolderMetadata_SkipsExistingMetadata(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
++
++	const repoName = "fix-meta-skip-existing"
++	repoPath := filepath.Join(helper.ProvisioningPath, repoName)
++
++	helper.CreateRepo(t, common.TestRepo{
++		Name:   repoName,
++		Path:   repoPath,
++		Target: "folder",
++		Copies: map[string]string{
++			"../testdata/all-panels.json": "parent/child/dashboard.json",
++		},
++		ExpectedDashboards: 1,
++		ExpectedFolders:    3,
++	})
++
++	// Plant _folder.json files with arbitrary UIDs so we can verify the job
++	// leaves them untouched.
++	const existingParentUID = "existing-uid-parent-9999"
++	const existingChildUID = "existing-uid-child-9999"
++	writeFolderMetadata(t, filepath.Join(repoPath, "parent"), existingParentUID, "parent")
++	writeFolderMetadata(t, filepath.Join(repoPath, "parent", "child"), existingChildUID, "child")
++
++	// The job must leave existing _folder.json files untouched — it only creates
++	// metadata for directories that have none at all.
++	runFixFolderMetadataJob(t, helper, repoName)
++
++	requireFolderMetadataUID(t, filepath.Join(repoPath, "parent", folderMetadataFileName), existingParentUID)
++	requireFolderMetadataUID(t, filepath.Join(repoPath, "parent", "child", folderMetadataFileName), existingChildUID)
++}
++
++// TestIntegrationProvisioning_FixFolderMetadata_SkipsMalformedMetadata verifies
++// that the fix-folder-metadata job does not overwrite a _folder.json that is
++// already present, even when its content is not a valid Folder resource.
++func TestIntegrationProvisioning_FixFolderMetadata_SkipsMalformedMetadata(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
++
++	const repoName = "fix-meta-skip-malformed"
++	repoPath := filepath.Join(helper.ProvisioningPath, repoName)
++
++	helper.CreateRepo(t, common.TestRepo{
++		Name:   repoName,
++		Path:   repoPath,
++		Target: "folder",
++		Copies: map[string]string{
++			"../testdata/all-panels.json": "parent/child/dashboard.json",
++		},
++		ExpectedDashboards: 1,
++		ExpectedFolders:    3,
++	})
++
++	// Write _folder.json files that are valid JSON but not Folder resources.
++	writeMalformedMetadata(t, filepath.Join(repoPath, "parent"))
++	writeMalformedMetadata(t, filepath.Join(repoPath, "parent", "child"))
++
++	// The job must not overwrite existing _folder.json files, even malformed ones.
++	runFixFolderMetadataJob(t, helper, repoName)
++
++	// Files should retain their original malformed content.
++	requireFileContains(t, filepath.Join(repoPath, "parent", folderMetadataFileName), `"type":"not-a-folder"`)
++	requireFileContains(t, filepath.Join(repoPath, "parent", "child", folderMetadataFileName), `"type":"not-a-folder"`)
++}
++
++// ── helpers ────────────────────────────────────────────────────────────────
++
++// runFixFolderMetadataJob triggers the fix-folder-metadata job for the given
++// repository and waits until it completes successfully.
++func runFixFolderMetadataJob(t *testing.T, h *common.ProvisioningTestHelper, repoName string) {
++	t.Helper()
++	h.TriggerJobAndWaitForSuccess(t, repoName, provisioning.JobSpec{
++		Action: provisioning.JobActionFixFolderMetadata,
++	})
++}
++
++// requireFileAbsent asserts that path does not exist on the filesystem.
++func requireFileAbsent(t *testing.T, path string) {
++	t.Helper()
++	_, err := os.Stat(path)
++	require.True(t, os.IsNotExist(err), "expected %s to be absent before the job runs", path)
++}
++
++// requireValidFolderMetadata reads a _folder.json via the repository files API
++// and asserts it is a valid Folder resource (correct apiVersion/kind, non-empty
++// UID and title).
++func requireValidFolderMetadata(t *testing.T, ctx context.Context, h *common.ProvisioningTestHelper, repoName, folderPath string) (string, string) {
++	t.Helper()
++
++	filePath := filepath.Join(folderPath, folderMetadataFileName)
++	wrapObj, err := h.Repositories.Resource.Get(ctx, repoName, metav1.GetOptions{}, "files", filePath)
++	require.NoError(t, err, "%s: _folder.json should be readable via the files endpoint", filePath)
++
++	apiVersion, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "apiVersion")
++	require.Equal(t, "folder.grafana.app/v1beta1", apiVersion, "%s: unexpected apiVersion", filePath)
++	kind, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "kind")
++	require.Equal(t, "Folder", kind, "%s: unexpected kind", filePath)
++
++	uid, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "metadata", "name")
++	require.NotEmpty(t, uid, "%s: should have a non-empty UID", filePath)
++	title, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "spec", "title")
++	require.NotEmpty(t, title, "%s: should have a non-empty title", filePath)
++
++	return uid, title
++}
++
++// writeFolderMetadata writes a syntactically valid _folder.json that
++// references uid as the folder's name.
++func writeFolderMetadata(t *testing.T, folderPath, uid, title string) {
++	t.Helper()
++	f := folders.NewFolder()
++	f.SetGroupVersionKind(folders.FolderResourceInfo.GroupVersionKind())
++	f.Name = uid
++	f.Spec.Title = title
++
++	data, err := json.Marshal(f)
++	require.NoError(t, err)
++
++	metadataPath := filepath.Join(folderPath, folderMetadataFileName)
++	require.NoError(t, os.WriteFile(metadataPath, data, 0o600)) //nolint:gosec
++}
++
++// writeMalformedMetadata writes a _folder.json whose content is valid JSON
++// but not a valid Folder resource (wrong schema, absent UID and title).
++func writeMalformedMetadata(t *testing.T, folderPath string) {
++	t.Helper()
++	data := []byte(`{"type":"not-a-folder","description":"wrong format"}`)
++	metadataPath := filepath.Join(folderPath, folderMetadataFileName)
++	require.NoError(t, os.WriteFile(metadataPath, data, 0o600)) //nolint:gosec
++}
++
++// requireFolderMetadataUID reads a _folder.json from the filesystem and asserts
++// that its metadata.name equals expectedUID.
++func requireFolderMetadataUID(t *testing.T, path, expectedUID string) {
++	t.Helper()
++	data, err := os.ReadFile(path) //nolint:gosec
++	require.NoError(t, err, "reading %s", path)
++	var obj map[string]interface{}
++	require.NoError(t, json.Unmarshal(data, &obj), "parsing %s", path)
++	meta, _ := obj["metadata"].(map[string]interface{})
++	name, _ := meta["name"].(string)
++	require.Equal(t, expectedUID, name, "unexpected UID in %s — job must not overwrite existing _folder.json", path)
++}
++
++// requireFileContains reads a file from the filesystem and asserts it contains
++// the given substring.
++func requireFileContains(t *testing.T, path, substr string) {
++	t.Helper()
++	data, err := os.ReadFile(path) //nolint:gosec
++	require.NoError(t, err, "reading %s", path)
++	require.Contains(t, string(data), substr, "unexpected content in %s — job must not overwrite existing _folder.json", path)
++}
+diff --git a/pkg/tests/apis/provisioning/folderpermissions_test.go b/pkg/tests/apis/provisioning/folderpermissions_test.go
+index 540142429d106..62eec09d3a364 100644
+--- a/pkg/tests/apis/provisioning/folderpermissions_test.go
++++ b/pkg/tests/apis/provisioning/folderpermissions_test.go
+@@ -8,9 +8,7 @@ import (
+ 
+ 	foldersV1 "github.com/grafana/grafana/apps/folder/pkg/apis/folder/v1beta1"
+ 	"github.com/grafana/grafana/pkg/apimachinery/utils"
+-	"github.com/grafana/grafana/pkg/services/featuremgmt"
+ 	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
+-	"github.com/grafana/grafana/pkg/tests/testinfra"
+ 	"github.com/grafana/grafana/pkg/util/testutil"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -20,10 +18,6 @@ import (
+ 	"k8s.io/apimachinery/pkg/types"
+ )
+ 
+-func withProvisioningFolderMetadata(opts *testinfra.GrafanaOpts) {
+-	opts.EnableFeatureToggles = append(opts.EnableFeatureToggles, featuremgmt.FlagProvisioningFolderMetadata)
+-}
+-
+ // We currently block permission updates for folders managed by provisioning.
+ func TestIntegrationFolderPermissions_ProvisionedFolders(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+@@ -84,7 +78,7 @@ func TestIntegrationFolderPermissions_ProvisionedFolders_WithFlag(t *testing.T)
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+ 	repoName := "nested-folder-repo-flag"
+-	helper := common.RunGrafana(t, withProvisioningFolderMetadata)
++	helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
+ 	helper.CreateRepo(t, common.TestRepo{
+ 		Name:            repoName,
+ 		Target:          "folder",
+diff --git a/pkg/tests/apis/provisioning/git/fixfoldermetadata_test.go b/pkg/tests/apis/provisioning/git/fixfoldermetadata_test.go
+new file mode 100644
+index 0000000000000..4bca41e438c1c
+--- /dev/null
++++ b/pkg/tests/apis/provisioning/git/fixfoldermetadata_test.go
+@@ -0,0 +1,166 @@
++package git
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
++	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
++	"github.com/grafana/grafana/pkg/util/testutil"
++	"github.com/stretchr/testify/require"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++)
++
++// TestIntegrationGit_FixFolderMetadata_Branch verifies that the fix-folder-metadata
++// job creates _folder.json files on a feature branch when a Ref is specified, and
++// leaves the default branch untouched.
++func TestIntegrationGit_FixFolderMetadata_Branch(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	// FlagProvisioningFolderMetadata is required so the files API allows reading
++	// _folder.json files back for verification.
++	helper := runGrafanaWithGitServer(t, common.WithProvisioningFolderMetadata)
++	ctx := context.Background()
++
++	const repoName = "fix-meta-git-branch"
++	const featureBranch = "add-folder-metadata"
++
++	// Seed the repo with a dashboard nested under parent/child/ so the worker
++	// sees two directories without _folder.json files. The "branch" workflow is
++	// included so the repository accepts commits to new branches.
++	helper.createGitRepo(t, repoName, map[string][]byte{
++		"parent/child/dashboard.json": dashboardJSON("git-meta-dash", "Git Meta Dashboard", 1),
++	}, "write", "branch")
++
++	// Run the fix-folder-metadata job targeting a new feature branch.
++	// The job creates the branch from main and commits _folder.json files there.
++	job := helper.triggerJobAndWaitForComplete(t, repoName, provisioning.JobSpec{
++		Action: provisioning.JobActionFixFolderMetadata,
++		FixFolderMetadata: &provisioning.FixFolderMetadataJobOptions{
++			Ref: featureBranch,
++		},
++	})
++
++	state, _, _ := unstructured.NestedString(job.Object, "status", "state")
++	require.Equal(t, string(provisioning.JobStateSuccess), state,
++		"fix-folder-metadata job on branch %q should succeed", featureBranch)
++
++	// Both _folder.json files must appear on the feature branch with valid content.
++	parentUID := requireFolderMetadataOnRef(t, helper, ctx, repoName, "parent/_folder.json", featureBranch)
++	childUID := requireFolderMetadataOnRef(t, helper, ctx, repoName, "parent/child/_folder.json", featureBranch)
++
++	require.NotEqual(t, parentUID, childUID,
++		"parent and child folders should have different UIDs")
++
++	// Neither file should exist on the default branch — the job only touched the
++	// feature branch.
++	requireFileAbsentOnDefaultBranch(t, helper, ctx, repoName, "parent/_folder.json")
++	requireFileAbsentOnDefaultBranch(t, helper, ctx, repoName, "parent/child/_folder.json")
++}
++
++// TestIntegrationGit_FixFolderMetadata_ExistingBranch verifies that the
++// fix-folder-metadata job works correctly when the target branch already exists
++// in the remote repository. The job should reuse the existing branch rather
++// than trying to create it, write the missing _folder.json files there, and
++// leave the default branch untouched.
++func TestIntegrationGit_FixFolderMetadata_ExistingBranch(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	helper := runGrafanaWithGitServer(t, common.WithProvisioningFolderMetadata)
++	ctx := context.Background()
++
++	const repoName = "fix-meta-git-existing-branch"
++	const featureBranch = "pre-existing-branch"
++
++	// Seed the repo and capture the local git clone so we can push the branch
++	// to the remote before triggering the job.
++	_, local := helper.createGitRepo(t, repoName, map[string][]byte{
++		"parent/child/dashboard.json": dashboardJSON("git-meta-existing", "Git Meta Existing", 1),
++	}, "write", "branch")
++
++	// Pre-create the branch on the remote so that ensureBranchExists takes the
++	// "branch already exists" path instead of creating a new one.
++	_, err := local.Git("checkout", "-b", featureBranch)
++	require.NoError(t, err, "failed to create feature branch locally")
++	_, err = local.Git("push", "origin", featureBranch)
++	require.NoError(t, err, "failed to push feature branch to remote")
++
++	// Run the fix-folder-metadata job targeting the already-existing branch.
++	job := helper.triggerJobAndWaitForComplete(t, repoName, provisioning.JobSpec{
++		Action: provisioning.JobActionFixFolderMetadata,
++		FixFolderMetadata: &provisioning.FixFolderMetadataJobOptions{
++			Ref: featureBranch,
++		},
++	})
++
++	state, _, _ := unstructured.NestedString(job.Object, "status", "state")
++	require.Equal(t, string(provisioning.JobStateSuccess), state,
++		"fix-folder-metadata job on pre-existing branch %q should succeed", featureBranch)
++
++	// Both _folder.json files must appear on the feature branch with valid content.
++	parentUID := requireFolderMetadataOnRef(t, helper, ctx, repoName, "parent/_folder.json", featureBranch)
++	childUID := requireFolderMetadataOnRef(t, helper, ctx, repoName, "parent/child/_folder.json", featureBranch)
++
++	require.NotEqual(t, parentUID, childUID,
++		"parent and child folders should have different UIDs")
++
++	// Neither file should exist on the default branch.
++	requireFileAbsentOnDefaultBranch(t, helper, ctx, repoName, "parent/_folder.json")
++	requireFileAbsentOnDefaultBranch(t, helper, ctx, repoName, "parent/child/_folder.json")
++}
++
++// requireFolderMetadataOnRef reads the _folder.json at filePath from the given
++// branch via the repository files API and asserts it is a valid Folder resource.
++// It returns the folder UID so callers can compare across files.
++func requireFolderMetadataOnRef(t *testing.T, h *gitTestHelper, ctx context.Context, repoName, filePath, ref string) string {
++	t.Helper()
++
++	subresourceParts := append([]string{"files"}, strings.Split(filePath, "/")...)
++	result := h.AdminREST.Get().
++		Namespace("default").
++		Resource("repositories").
++		Name(repoName).
++		SubResource(subresourceParts...).
++		Param("ref", ref).
++		Do(ctx)
++
++	require.NoError(t, result.Error(),
++		"%s: _folder.json should be readable on branch %q", filePath, ref)
++
++	wrapObj := &unstructured.Unstructured{}
++	require.NoError(t, result.Into(wrapObj),
++		"%s: failed to decode files API response for branch %q", filePath, ref)
++
++	apiVersion, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "apiVersion")
++	require.Equal(t, "folder.grafana.app/v1beta1", apiVersion,
++		"%s: unexpected apiVersion", filePath)
++	kind, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "kind")
++	require.Equal(t, "Folder", kind,
++		"%s: unexpected kind", filePath)
++
++	uid, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "metadata", "name")
++	require.NotEmpty(t, uid, "%s: should have a non-empty UID", filePath)
++	title, _, _ := unstructured.NestedString(wrapObj.Object, "resource", "file", "spec", "title")
++	require.NotEmpty(t, title, "%s: should have a non-empty title", filePath)
++
++	return uid
++}
++
++// requireFileAbsentOnDefaultBranch asserts that filePath does not exist on the
++// repository's default branch (no ref param → default branch is used).
++func requireFileAbsentOnDefaultBranch(t *testing.T, h *gitTestHelper, ctx context.Context, repoName, filePath string) {
++	t.Helper()
++
++	subresourceParts := append([]string{"files"}, strings.Split(filePath, "/")...)
++	result := h.AdminREST.Get().
++		Namespace("default").
++		Resource("repositories").
++		Name(repoName).
++		SubResource(subresourceParts...).
++		Do(ctx)
++
++	require.True(t, apierrors.IsNotFound(result.Error()),
++		"%s should not exist on the default branch; got: %v", filePath, result.Error())
++}
+diff --git a/pkg/tests/apis/provisioning/git/incremental_folder_metadata_test.go b/pkg/tests/apis/provisioning/git/incremental_folder_metadata_test.go
+index 5e4c7fb8496dc..804fdf6e10ea4 100644
+--- a/pkg/tests/apis/provisioning/git/incremental_folder_metadata_test.go
++++ b/pkg/tests/apis/provisioning/git/incremental_folder_metadata_test.go
+@@ -5,23 +5,17 @@ import (
+ 	"testing"
+ 
+ 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
+-	"github.com/grafana/grafana/pkg/services/featuremgmt"
+-	"github.com/grafana/grafana/pkg/tests/testinfra"
++	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
+ 	"github.com/grafana/grafana/pkg/util/testutil"
+ 	"github.com/stretchr/testify/require"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ )
+ 
+-// TODO(ferruvich): use the one in `common` once https://github.com/grafana/grafana/pull/119801 is merged
+-func withProvisioningFolderMetadata(opts *testinfra.GrafanaOpts) {
+-	opts.EnableFeatureToggles = append(opts.EnableFeatureToggles, featuremgmt.FlagProvisioningFolderMetadata)
+-}
+-
+ func TestIntegrationProvisioning_IncrementalSync_MissingFolderMetadata_FlagEnabled(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+ 	t.Run("detects missing folder metadata after adding file to folder", func(t *testing.T) {
+-		helper := runGrafanaWithGitServer(t, withProvisioningFolderMetadata)
++		helper := runGrafanaWithGitServer(t, common.WithProvisioningFolderMetadata)
+ 
+ 		const repoName = "incr-missing-meta-add"
+ 
+@@ -59,7 +53,7 @@ func TestIntegrationProvisioning_IncrementalSync_MissingFolderMetadata_FlagEnabl
+ 	})
+ 
+ 	t.Run("noop incremental sync still detects missing metadata", func(t *testing.T) {
+-		helper := runGrafanaWithGitServer(t, withProvisioningFolderMetadata)
++		helper := runGrafanaWithGitServer(t, common.WithProvisioningFolderMetadata)
+ 
+ 		const repoName = "incr-missing-meta-noop"
+ 
+diff --git a/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go b/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go
+index f580dcbe9302d..a9f4cc069dc0b 100644
+--- a/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go
++++ b/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go
+@@ -1,11 +1,9 @@
+ package jobs
+ 
+ import (
+-	"context"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
+ 	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
+@@ -16,7 +14,6 @@ func TestIntegrationProvisioning_FixFolderMetadataJob(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+ 	helper := common.RunGrafana(t)
+-	ctx := context.Background()
+ 
+ 	const repo = "fix-folder-metadata-test-repo"
+ 	testRepo := common.TestRepo{
+@@ -49,49 +46,6 @@ func TestIntegrationProvisioning_FixFolderMetadataJob(t *testing.T) {
+ 		require.Equal(t, "success", state, "fix-folder-metadata job should complete with success")
+ 	})
+ 
+-	t.Run("job creates marker file even for local repos", func(t *testing.T) {
+-		spec := provisioning.JobSpec{
+-			Action: provisioning.JobActionFixFolderMetadata,
+-		}
+-		helper.TriggerJobAndWaitForSuccess(t, repo, spec)
+-
+-		// Verify original file still exists unchanged
+-		_, err := helper.Repositories.Resource.Get(ctx, repo, metav1.GetOptions{}, "files", "dashboard1.json")
+-		require.NoError(t, err, "original file should still exist after job")
+-
+-		// Verify dashboards are untouched
+-		dashboards, err := helper.DashboardsV1.Resource.List(ctx, metav1.ListOptions{})
+-		require.NoError(t, err)
+-		require.Len(t, dashboards.Items, 1, "dashboard count should be unchanged after job")
+-
+-		// Verify marker file was created in .grafana directory
+-		fileList, err := helper.Repositories.Resource.Get(ctx, repo, metav1.GetOptions{}, "files")
+-		require.NoError(t, err)
+-
+-		// Extract items from the file list
+-		items, ok := fileList.Object["items"].([]interface{})
+-		require.True(t, ok, "files should have items array")
+-
+-		// Check that a .grafana/folder-metadata-fixed-* file was created
+-		foundMarker := false
+-		for _, item := range items {
+-			itemMap, ok := item.(map[string]interface{})
+-			if !ok {
+-				continue
+-			}
+-			path, ok := itemMap["path"].(string)
+-			if !ok {
+-				continue
+-			}
+-			// Match the prefix (29 chars: ".grafana/folder-metadata-fixe")
+-			if len(path) > 29 && path[:29] == ".grafana/folder-metadata-fixe" {
+-				foundMarker = true
+-				break
+-			}
+-		}
+-		require.True(t, foundMarker, "marker file should be created in .grafana directory")
+-	})
+-
+ 	t.Run("job with explicit empty ref completes successfully", func(t *testing.T) {
+ 		// Note: Local repos don't support custom refs/branches
+ 		// This test verifies that explicit empty ref works
+diff --git a/pkg/tests/apis/provisioning/sync_folder_metadata_test.go b/pkg/tests/apis/provisioning/sync_folder_metadata_test.go
+index fbfc9dbc7ccbb..a601fb1f7290e 100644
+--- a/pkg/tests/apis/provisioning/sync_folder_metadata_test.go
++++ b/pkg/tests/apis/provisioning/sync_folder_metadata_test.go
+@@ -19,7 +19,7 @@ func TestIntegrationProvisioning_FullSync_MissingFolderMetadata_FlagEnabled(t *t
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+ 	t.Run("single folder", func(t *testing.T) {
+-		helper := common.RunGrafana(t, withProvisioningFolderMetadata)
++		helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
+ 		const repo = "missing-folder-meta-single"
+ 		helper.CreateRepo(t, common.TestRepo{
+ 			Name:   repo,
+@@ -59,7 +59,7 @@ func TestIntegrationProvisioning_FullSync_MissingFolderMetadata_FlagEnabled(t *t
+ 	})
+ 
+ 	t.Run("multiple folders", func(t *testing.T) {
+-		helper := common.RunGrafana(t, withProvisioningFolderMetadata)
++		helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
+ 		const repo = "missing-folder-meta-multi"
+ 		helper.CreateRepo(t, common.TestRepo{
+ 			Name:   repo,
+@@ -105,7 +105,7 @@ func TestIntegrationProvisioning_FullSync_MissingFolderMetadata_FlagEnabled(t *t
+ 	})
+ 
+ 	t.Run("completed with warnings", func(t *testing.T) {
+-		helper := common.RunGrafana(t, withProvisioningFolderMetadata)
++		helper := common.RunGrafana(t, common.WithProvisioningFolderMetadata)
+ 		const repo = "folder-meta-with-warnings"
+ 		helper.CreateRepo(t, common.TestRepo{
+ 			Name:   repo,
+diff --git a/public/api-merged.json b/public/api-merged.json
+index e5b589e9c9d2f..e0a7b2add2055 100644
+--- a/public/api-merged.json
++++ b/public/api-merged.json
+@@ -4378,146 +4378,6 @@
+         }
+       }
+     },
+-    "/datasources/proxy/{id}/{datasource_proxy_route}": {
+-      "get": {
+-        "description": "Proxies all calls to the actual data source.\n\nPlease refer to [updated API](#/datasources/datasourceProxyGETByUIDcalls) instead",
+-        "tags": [
+-          "datasources"
+-        ],
+-        "summary": "Data source proxy GET calls.",
+-        "operationId": "datasourceProxyGETcalls",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "type": "string",
+-            "name": "datasource_proxy_route",
+-            "in": "path",
+-            "required": true
+-          },
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      },
+-      "post": {
+-        "description": "Proxies all calls to the actual data source. The data source should support POST methods for the specific path and role as defined\n\nPlease refer to [updated API](#/datasources/datasourceProxyPOSTByUIDcalls) instead",
+-        "tags": [
+-          "datasources"
+-        ],
+-        "summary": "Data source proxy POST calls.",
+-        "operationId": "datasourceProxyPOSTcalls",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "name": "DatasourceProxyParam",
+-            "in": "body",
+-            "required": true,
+-            "schema": {}
+-          },
+-          {
+-            "type": "string",
+-            "name": "datasource_proxy_route",
+-            "in": "path",
+-            "required": true
+-          },
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "201": {
+-            "description": "(empty)"
+-          },
+-          "202": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      },
+-      "delete": {
+-        "description": "Proxies all calls to the actual data source.\n\nPlease refer to [updated API](#/datasources/datasourceProxyDELETEByUIDcalls) instead",
+-        "tags": [
+-          "datasources"
+-        ],
+-        "summary": "Data source proxy DELETE calls.",
+-        "operationId": "datasourceProxyDELETEcalls",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          },
+-          {
+-            "type": "string",
+-            "name": "datasource_proxy_route",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "202": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      }
+-    },
+     "/datasources/uid/{sourceUID}/correlations": {
+       "get": {
+         "tags": [
+@@ -5160,200 +5020,6 @@
+         }
+       }
+     },
+-    "/datasources/{id}": {
+-      "get": {
+-        "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:read` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/getDataSourceByUID) instead",
+-        "tags": [
+-          "datasources"
+-        ],
+-        "summary": "Get a single data source by Id.",
+-        "operationId": "getDataSourceByID",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/responses/getDataSourceResponse"
+-          },
+-          "400": {
+-            "$ref": "#/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      },
+-      "put": {
+-        "description": "Similar to creating a data source, `password` and `basicAuthPassword` should be defined under\nsecureJsonData in order to be stored securely as an encrypted blob in the database. Then, the\nencrypted fields are listed under secureJsonFields section in the response.\n\nIf you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:write` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/updateDataSourceByUID) instead",
+-        "tags": [
+-          "datasources"
+-        ],
+-        "summary": "Update an existing data source by its sequential ID.",
+-        "operationId": "updateDataSourceByID",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "name": "Body",
+-            "in": "body",
+-            "required": true,
+-            "schema": {
+-              "$ref": "#/definitions/UpdateDataSourceCommand"
+-            }
+-          },
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/responses/createOrUpdateDatasourceResponse"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      },
+-      "delete": {
+-        "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:delete` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/deleteDataSourceByUID) instead",
+-        "tags": [
+-          "datasources"
+-        ],
+-        "summary": "Delete an existing data source by id.",
+-        "operationId": "deleteDataSourceByID",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/responses/okResponse"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      }
+-    },
+-    "/datasources/{id}/health": {
+-      "get": {
+-        "description": "Please refer to [updated API](#/datasources/checkDatasourceHealthWithUID) instead",
+-        "tags": [
+-          "datasources",
+-          "health"
+-        ],
+-        "summary": "Sends a health check request to the plugin datasource identified by the ID.",
+-        "operationId": "checkDatasourceHealthByID",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/responses/okResponse"
+-          },
+-          "400": {
+-            "$ref": "#/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      }
+-    },
+-    "/datasources/{id}/resources/{datasource_proxy_route}": {
+-      "get": {
+-        "description": "Please refer to [updated API](#/datasources/callDatasourceResourceWithUID) instead",
+-        "tags": [
+-          "datasources"
+-        ],
+-        "summary": "Fetch data source resources by Id.",
+-        "operationId": "callDatasourceResourceByID",
+-        "deprecated": true,
+-        "parameters": [
+-          {
+-            "type": "string",
+-            "name": "datasource_proxy_route",
+-            "in": "path",
+-            "required": true
+-          },
+-          {
+-            "type": "string",
+-            "name": "id",
+-            "in": "path",
+-            "required": true
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/responses/okResponse"
+-          },
+-          "400": {
+-            "$ref": "#/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/responses/internalServerError"
+-          }
+-        }
+-      }
+-    },
+     "/ds/query": {
+       "post": {
+         "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:query`.",
+diff --git a/public/app/core/components/OwnerReferences/OwnerReferenceSelector.test.tsx b/public/app/core/components/OwnerReferences/OwnerReferenceSelector.test.tsx
+index bafaecd87c375..bea61b1f1ef40 100644
+--- a/public/app/core/components/OwnerReferences/OwnerReferenceSelector.test.tsx
++++ b/public/app/core/components/OwnerReferences/OwnerReferenceSelector.test.tsx
+@@ -1,7 +1,8 @@
+ import { HttpResponse, http } from 'msw';
+ import { comboboxTestSetup } from 'test/helpers/comboboxTestSetup';
+-import { render, screen, waitFor, within } from 'test/test-utils';
++import { render, screen, testWithFeatureToggles, waitFor, within } from 'test/test-utils';
+ 
++import { FeatureToggles } from '@grafana/data';
+ import { setBackendSrv } from '@grafana/runtime';
+ import { setupMockServer } from '@grafana/test-utils/server';
+ 
+@@ -13,7 +14,14 @@ setBackendSrv(backendSrv);
+ const server = setupMockServer();
+ comboboxTestSetup();
+ 
+-describe('OwnerReferenceSelector', () => {
++const toggle: Array<keyof FeatureToggles> = ['kubernetesTeamsApi'];
++
++describe.each([
++  { name: 'IAM path', toggles: { enable: toggle } },
++  { name: 'legacy path', toggles: { disable: toggle } },
++])('OwnerReferenceSelector ($name)', ({ toggles }) => {
++  testWithFeatureToggles(toggles);
++
+   it('shows load error but keeps selector interactive', async () => {
+     const { getByRole, findByText } = render(
+       <OwnerReferenceSelector onChange={jest.fn()} defaultTeamUid="team-non-existent" />
+@@ -37,7 +45,6 @@ describe('OwnerReferenceSelector', () => {
+       expect.objectContaining({
+         apiVersion: 'iam.grafana.app/v0alpha1',
+         kind: 'Team',
+-        // Name == uid, we don't send label here
+         name: expect.any(String),
+         uid: expect.any(String),
+       })
+@@ -62,6 +69,9 @@ describe('OwnerReferenceSelector', () => {
+     server.use(
+       http.get('/apis/iam.grafana.app/v0alpha1/namespaces/:namespace/searchTeams', () => {
+         return HttpResponse.json({ totalHits: 0, hits: [] });
++      }),
++      http.get('/api/teams/search', () => {
++        return HttpResponse.json({ totalCount: 0, teams: [], page: 1, perPage: 1000 });
+       })
+     );
+ 
+@@ -79,12 +89,14 @@ describe('OwnerReferenceSelector', () => {
+   it('searches teams by typed query string', async () => {
+     const queries: string[] = [];
+ 
+-    // This just checks if we call the api with the right param and then passes it to the regular handler
++    const captureQuery = ({ request }: { request: Request }) => {
++      const query = new URL(request.url).searchParams.get('query') ?? '';
++      queries.push(query);
++    };
++
+     server.use(
+-      http.get('/apis/iam.grafana.app/v0alpha1/namespaces/:namespace/searchTeams', ({ request }) => {
+-        const query = new URL(request.url).searchParams.get('query') ?? '';
+-        queries.push(query);
+-      })
++      http.get('/apis/iam.grafana.app/v0alpha1/namespaces/:namespace/searchTeams', captureQuery),
++      http.get('/api/teams/search', captureQuery)
+     );
+ 
+     const { user } = render(<OwnerReferenceSelector onChange={jest.fn()} />);
+diff --git a/public/app/core/components/OwnerReferences/OwnerReferenceSelector.tsx b/public/app/core/components/OwnerReferences/OwnerReferenceSelector.tsx
+index 643821981fe6c..5059d2c772c68 100644
+--- a/public/app/core/components/OwnerReferences/OwnerReferenceSelector.tsx
++++ b/public/app/core/components/OwnerReferences/OwnerReferenceSelector.tsx
+@@ -5,13 +5,9 @@ import { t, Trans } from '@grafana/i18n';
+ import { isFetchError } from '@grafana/runtime';
+ import { Alert, Box, Combobox, ComboboxOption, Label } from '@grafana/ui';
+ import { OwnerReference } from 'app/api/clients/folder/v1beta1';
+-import {
+-  API_GROUP as IAM_API_GROUP,
+-  API_VERSION as IAM_API_VERSION,
+-  useLazyGetTeamQuery,
+-  useLazyGetSearchTeamsQuery,
+-} from 'app/api/clients/iam/v0alpha1';
++import { API_GROUP as IAM_API_GROUP, API_VERSION as IAM_API_VERSION } from 'app/api/clients/iam/v0alpha1';
+ import { extractErrorMessage } from 'app/api/utils';
++import { useLazyGetTeamByUidQuery, useLazySearchTeamsQuery } from 'app/features/teams/hooks';
+ 
+ const OWNER_REFERENCE_API_VERSION = `${IAM_API_GROUP}/${IAM_API_VERSION}` as const;
+ const OWNER_REFERENCE_KIND = 'Team' as const;
+@@ -29,13 +25,13 @@ export const OwnerReferenceSelector = ({
+   defaultTeamUid?: string;
+ }) => {
+   const [selectedTeam, setSelectedTeam] = useState<ComboboxOption<string> | string | null>(defaultTeamUid || null);
+-  const [searchTeams, { isLoading }] = useLazyGetSearchTeamsQuery();
+-  const [getTeam, { isLoading: isSelectedTeamLoading, error: selectedTeamError }] = useLazyGetTeamQuery();
++  const [searchTeams, { isLoading }] = useLazySearchTeamsQuery();
++  const [getTeam, { isLoading: isSelectedTeamLoading, error: selectedTeamError }] = useLazyGetTeamByUidQuery();
+ 
+   useEffect(() => {
+     if (defaultTeamUid) {
+       getTeam({ name: defaultTeamUid }, true).then(({ data, status }) => {
+-        if (status === QueryStatus.fulfilled) {
++        if (status === QueryStatus.fulfilled && data) {
+           setSelectedTeam({
+             label: data.spec.title,
+             value: data.metadata.name!,
+@@ -53,14 +49,12 @@ export const OwnerReferenceSelector = ({
+   }, [defaultTeamUid, getTeam]);
+ 
+   const loadOptions = async (inputValue: string): Promise<Array<ComboboxOption<string>>> => {
+-    const result = await searchTeams({ query: inputValue }, true).unwrap();
++    const { data } = await searchTeams({ query: inputValue }, true);
+ 
+-    const mappedResults = result.hits.map((team: { title: string; name: string }) => ({
++    return (data?.hits ?? []).map((team: { title: string; name: string }) => ({
+       label: team.title,
+       value: team.name,
+     }));
+-
+-    return mappedResults;
+   };
+ 
+   const teamIsMissingOrForbidden = isFetchError(selectedTeamError) && [404, 403].includes(selectedTeamError.status);
+diff --git a/public/app/features/alerting/unified/NotificationPoliciesPage.test.tsx b/public/app/features/alerting/unified/NotificationPoliciesPage.test.tsx
+index 0cc324cff7a58..441b669bf7b95 100644
+--- a/public/app/features/alerting/unified/NotificationPoliciesPage.test.tsx
++++ b/public/app/features/alerting/unified/NotificationPoliciesPage.test.tsx
+@@ -712,7 +712,7 @@ describe('alertingNavigationV2 respects alertingMultiplePolicies', () => {
+       );
+       await screen.findByTestId('search-query-input');
+ 
+-      expect(screen.getAllByTestId('am-root-route-container').length).toBeGreaterThan(0);
++      expect((await screen.findAllByTestId('am-root-route-container')).length).toBeGreaterThan(0);
+     });
+   });
+ });
+diff --git a/public/app/features/alerting/unified/state/AlertmanagerContext.test.tsx b/public/app/features/alerting/unified/state/AlertmanagerContext.test.tsx
+index aa3bea49a7a37..3ba07e1f32d58 100644
+--- a/public/app/features/alerting/unified/state/AlertmanagerContext.test.tsx
++++ b/public/app/features/alerting/unified/state/AlertmanagerContext.test.tsx
+@@ -3,15 +3,19 @@ import * as React from 'react';
+ import { Provider } from 'react-redux';
+ 
+ import { store } from '@grafana/data';
+-import { locationService } from '@grafana/runtime';
++import { config, locationService } from '@grafana/runtime';
+ import { AlertManagerImplementation } from 'app/plugins/datasource/alertmanager/types';
+ import { configureStore } from 'app/store/configureStore';
+ 
+ import * as useAlertManagerSources from '../hooks/useAlertManagerSources';
+-import { ALERTMANAGER_NAME_LOCAL_STORAGE_KEY } from '../utils/constants';
+ import { AlertManagerDataSource, GRAFANA_RULES_SOURCE_NAME } from '../utils/datasource';
+ 
+-import { AlertmanagerProvider, isAlertManagerWithConfigAPI, useAlertmanager } from './AlertmanagerContext';
++import {
++  AlertmanagerProvider,
++  getOrgAlertmanagerLocalStorageKey,
++  isAlertManagerWithConfigAPI,
++  useAlertmanager,
++} from './AlertmanagerContext';
+ 
+ const externalAmProm: AlertManagerDataSource = {
+   name: 'PrometheusAm',
+@@ -88,7 +92,7 @@ describe('useAlertmanager', () => {
+ 
+     const wrapper = getProviderWrapper();
+ 
+-    store.set(ALERTMANAGER_NAME_LOCAL_STORAGE_KEY, externalAmProm.name);
++    store.set(getOrgAlertmanagerLocalStorageKey(config.bootData.user.orgId), externalAmProm.name);
+     locationService.push({ search: '' });
+     const { result } = renderHook(() => useAlertmanager(), { wrapper });
+     expect(result.current.selectedAlertmanager).toBe(externalAmProm.name);
+@@ -104,11 +108,59 @@ describe('useAlertmanager', () => {
+ 
+     const wrapper = getProviderWrapper();
+ 
+-    store.set(ALERTMANAGER_NAME_LOCAL_STORAGE_KEY, externalAmMimir.name);
++    store.set(getOrgAlertmanagerLocalStorageKey(config.bootData.user.orgId), externalAmMimir.name);
+ 
+     const { result } = renderHook(() => useAlertmanager(), { wrapper });
+     expect(result.current.selectedAlertmanager).toBe(externalAmProm.name);
+   });
++
++  it('Should fall back to Grafana AM when stored AM is not available', () => {
++    jest.spyOn(useAlertManagerSources, 'useAlertManagersByPermission').mockReturnValueOnce({
++      availableExternalDataSources: [],
++      availableInternalDataSources: [{ name: GRAFANA_RULES_SOURCE_NAME, imgUrl: '', hasConfigurationAPI: true }],
++    });
++
++    const orgKey = getOrgAlertmanagerLocalStorageKey(config.bootData.user.orgId);
++    store.set(orgKey, 'NonExistentAM');
++    locationService.push({ search: '' });
++
++    const wrapper = getProviderWrapper();
++    const { result } = renderHook(() => useAlertmanager(), { wrapper });
++
++    expect(result.current.selectedAlertmanager).toBe(GRAFANA_RULES_SOURCE_NAME);
++  });
++
++  it('Should clean up stale localStorage entry when stored AM is not available', () => {
++    jest.spyOn(useAlertManagerSources, 'useAlertManagersByPermission').mockReturnValueOnce({
++      availableExternalDataSources: [],
++      availableInternalDataSources: [{ name: GRAFANA_RULES_SOURCE_NAME, imgUrl: '', hasConfigurationAPI: true }],
++    });
++
++    const orgKey = getOrgAlertmanagerLocalStorageKey(config.bootData.user.orgId);
++    store.set(orgKey, 'NonExistentAM');
++    locationService.push({ search: '' });
++
++    const wrapper = getProviderWrapper();
++    renderHook(() => useAlertmanager(), { wrapper });
++
++    expect(store.get(orgKey)).toBeUndefined();
++  });
++
++  it('Should not read localStorage from a different org', () => {
++    jest.spyOn(useAlertManagerSources, 'useAlertManagersByPermission').mockReturnValueOnce({
++      availableExternalDataSources: [externalAmProm],
++      availableInternalDataSources: [{ name: GRAFANA_RULES_SOURCE_NAME, imgUrl: '', hasConfigurationAPI: true }],
++    });
++
++    const otherOrgKey = getOrgAlertmanagerLocalStorageKey(999);
++    store.set(otherOrgKey, externalAmProm.name);
++    locationService.push({ search: '' });
++
++    const wrapper = getProviderWrapper();
++    const { result } = renderHook(() => useAlertmanager(), { wrapper });
++
++    expect(result.current.selectedAlertmanager).toBe(GRAFANA_RULES_SOURCE_NAME);
++  });
+ });
+ 
+ test('isAlertManagerWithConfigAPI', () => {
+diff --git a/public/app/features/alerting/unified/state/AlertmanagerContext.tsx b/public/app/features/alerting/unified/state/AlertmanagerContext.tsx
+index 5f2168f7d6c45..635db3543c8c1 100644
+--- a/public/app/features/alerting/unified/state/AlertmanagerContext.tsx
++++ b/public/app/features/alerting/unified/state/AlertmanagerContext.tsx
+@@ -1,7 +1,7 @@
+ import * as React from 'react';
+ 
+ import { store } from '@grafana/data';
+-import { locationService } from '@grafana/runtime';
++import { config, locationService } from '@grafana/runtime';
+ import { AlertManagerDataSourceJsonData, AlertManagerImplementation } from 'app/plugins/datasource/alertmanager/types';
+ 
+ import { useAlertManagersByPermission } from '../hooks/useAlertManagerSources';
+@@ -23,6 +23,10 @@ interface Context {
+ 
+ const AlertmanagerContext = React.createContext<Context | undefined>(undefined);
+ 
++export function getOrgAlertmanagerLocalStorageKey(orgId: number): string {
++  return `${ALERTMANAGER_NAME_LOCAL_STORAGE_KEY}-org-${orgId}`;
++}
++
+ interface Props extends React.PropsWithChildren {
+   accessType: 'instance' | 'notification';
+   // manually setting the alertmanagersource name will override all of the other sources
+@@ -33,6 +37,7 @@ const AlertmanagerProvider = ({ children, accessType, alertmanagerSourceName }:
+   const queryParams = locationService.getSearch();
+   const updateQueryParams = locationService.partial;
+   const allAvailableAlertManagers = useAlertManagersByPermission(accessType);
++  const localStorageKey = getOrgAlertmanagerLocalStorageKey(config.bootData.user.orgId);
+ 
+   const availableAlertManagers = React.useMemo(() => {
+     const regularAlertManagers = allAvailableAlertManagers.availableInternalDataSources.concat(
+@@ -59,18 +64,18 @@ const AlertmanagerProvider = ({ children, accessType, alertmanagerSourceName }:
+       }
+ 
+       if (selectedAlertManager === GRAFANA_RULES_SOURCE_NAME) {
+-        store.delete(ALERTMANAGER_NAME_LOCAL_STORAGE_KEY);
++        store.delete(localStorageKey);
+         updateQueryParams({ [ALERTMANAGER_NAME_QUERY_KEY]: undefined });
+       } else {
+-        store.set(ALERTMANAGER_NAME_LOCAL_STORAGE_KEY, selectedAlertManager);
++        store.set(localStorageKey, selectedAlertManager);
+         updateQueryParams({ [ALERTMANAGER_NAME_QUERY_KEY]: selectedAlertManager });
+       }
+     },
+-    [availableAlertManagers, updateQueryParams]
++    [availableAlertManagers, localStorageKey, updateQueryParams]
+   );
+ 
+   const sourceFromQuery = queryParams.get(ALERTMANAGER_NAME_QUERY_KEY);
+-  const sourceFromStore = store.get(ALERTMANAGER_NAME_LOCAL_STORAGE_KEY);
++  const sourceFromStore = store.get(localStorageKey);
+   const defaultSource = GRAFANA_RULES_SOURCE_NAME;
+ 
+   // This overrides AM in the store to be in sync with the one in the URL
+@@ -78,18 +83,30 @@ const AlertmanagerProvider = ({ children, accessType, alertmanagerSourceName }:
+   // It's safest to always use URLs with alertmanager query param
+   React.useEffect(() => {
+     if (sourceFromQuery && sourceFromQuery !== sourceFromStore) {
+-      store.set(ALERTMANAGER_NAME_LOCAL_STORAGE_KEY, sourceFromQuery);
++      store.set(localStorageKey, sourceFromQuery);
+     }
+-  }, [sourceFromQuery, sourceFromStore]);
++  }, [localStorageKey, sourceFromQuery, sourceFromStore]);
+ 
+   // queryParam > localStorage > default
+   const desiredAlertmanager = alertmanagerSourceName ?? sourceFromQuery ?? sourceFromStore ?? defaultSource;
+-  const selectedAlertmanager = isAlertManagerAvailable(availableAlertManagers, desiredAlertmanager)
+-    ? desiredAlertmanager
+-    : undefined;
++  const isDesiredAvailable = isAlertManagerAvailable(availableAlertManagers, desiredAlertmanager);
++
++  let selectedAlertmanager: string | undefined;
++  if (isDesiredAvailable) {
++    selectedAlertmanager = desiredAlertmanager;
++  } else if (isAlertManagerAvailable(availableAlertManagers, defaultSource)) {
++    selectedAlertmanager = defaultSource;
++  }
++
++  // Clean up stale org-scoped key if the stored value no longer resolves to an available AM
++  React.useEffect(() => {
++    if (sourceFromStore && !isAlertManagerAvailable(availableAlertManagers, sourceFromStore)) {
++      store.delete(localStorageKey);
++    }
++  }, [availableAlertManagers, localStorageKey, sourceFromStore]);
+ 
+   const selectedAlertmanagerConfig = React.useMemo(() => {
+-    return getAlertmanagerDataSourceByName(selectedAlertmanager)?.jsonData;
++    return selectedAlertmanager ? getAlertmanagerDataSourceByName(selectedAlertmanager)?.jsonData : undefined;
+   }, [selectedAlertmanager]);
+ 
+   // determine if we're dealing with an Alertmanager data source that supports the ruler API
+diff --git a/public/app/features/browse-dashboards/components/FolderDetailsActions/FolderDetailsActions.tsx b/public/app/features/browse-dashboards/components/FolderDetailsActions/FolderDetailsActions.tsx
+index e5c3d3a2e68fb..f5e7261db5d88 100644
+--- a/public/app/features/browse-dashboards/components/FolderDetailsActions/FolderDetailsActions.tsx
++++ b/public/app/features/browse-dashboards/components/FolderDetailsActions/FolderDetailsActions.tsx
+@@ -2,7 +2,6 @@ import { css } from '@emotion/css';
+ import { skipToken } from '@reduxjs/toolkit/query';
+ 
+ import { OwnerReference as OwnerReferenceType } from '@grafana/api-clients/rtkq/folder/v1beta1';
+-import { useGetTeamQuery } from '@grafana/api-clients/rtkq/iam/v0alpha1';
+ import { GrafanaTheme2 } from '@grafana/data';
+ import { Trans } from '@grafana/i18n';
+ import { config, reportInteraction } from '@grafana/runtime';
+@@ -11,6 +10,7 @@ import { CombinedFolder, useGetFolderQueryFacade } from 'app/api/clients/folder/
+ import { OwnerReference } from 'app/core/components/OwnerReferences/OwnerReference';
+ import { contextSrv } from 'app/core/services/context_srv';
+ import { useGetResourceRepositoryView } from 'app/features/provisioning/hooks/useGetResourceRepositoryView';
++import { useGetTeamByUidQuery } from 'app/features/teams/hooks';
+ import { AccessControlAction } from 'app/types/accessControl';
+ 
+ import { getFolderPermissions } from '../../permissions';
+@@ -63,7 +63,7 @@ const FolderOwners = ({ ownerReferences }: { ownerReferences?: OwnerReferenceTyp
+   const styles = useStyles2(getStyles);
+   const teamOwnerReferences = ownerReferences?.filter((ref) => ref.kind === 'Team');
+   const teamUid = teamOwnerReferences?.at(0)?.uid;
+-  const { data: team, isLoading: isLoadingTeam } = useGetTeamQuery(teamUid ? { name: teamUid } : skipToken);
++  const { data: team, isLoading: isLoadingTeam } = useGetTeamByUidQuery(teamUid ? { name: teamUid } : skipToken);
+ 
+   if (!teamOwnerReferences || teamOwnerReferences.length === 0 || isLoadingTeam || !team) {
+     return null;
+diff --git a/public/app/features/dashboard-scene/scene/SoloPanelContext.tsx b/public/app/features/dashboard-scene/scene/SoloPanelContext.tsx
+index b1eca307731d2..417d82380b4c0 100644
+--- a/public/app/features/dashboard-scene/scene/SoloPanelContext.tsx
++++ b/public/app/features/dashboard-scene/scene/SoloPanelContext.tsx
+@@ -9,10 +9,12 @@ import { DashboardScene } from './DashboardScene';
+ export interface SoloPanelContextValue {
+   matches: (VizPanel: VizPanel) => boolean;
+   matchFound: boolean;
++  matchedPanels?: VizPanel[];
+ }
+ 
+ export class SoloPanelContextWithPathIdFilter implements SoloPanelContextValue {
+   public matchFound = false;
++  public matchedPanels: VizPanel[] = [];
+ 
+   public constructor(public keyPath: string) {}
+ 
+@@ -21,6 +23,9 @@ export class SoloPanelContextWithPathIdFilter implements SoloPanelContextValue {
+     if (/^\d+$/.test(this.keyPath)) {
+       if (`panel-${this.keyPath}` === panel.state.key!) {
+         this.matchFound = true;
++        if (!this.matchedPanels.includes(panel)) {
++          this.matchedPanels.push(panel);
++        }
+         return true;
+       }
+ 
+@@ -29,6 +34,9 @@ export class SoloPanelContextWithPathIdFilter implements SoloPanelContextValue {
+ 
+     if (this.keyPath === panel.getPathId()) {
+       this.matchFound = true;
++      if (!this.matchedPanels.includes(panel)) {
++        this.matchedPanels.push(panel);
++      }
+       return true;
+     }
+ 
+diff --git a/public/app/features/dashboard-scene/solo/SoloPanelPage.tsx b/public/app/features/dashboard-scene/solo/SoloPanelPage.tsx
+index f2e67034ffccc..6329a8b7758e8 100644
+--- a/public/app/features/dashboard-scene/solo/SoloPanelPage.tsx
++++ b/public/app/features/dashboard-scene/solo/SoloPanelPage.tsx
+@@ -1,6 +1,6 @@
+ // Libraries
+ import { css } from '@emotion/css';
+-import { useEffect, useRef, useState } from 'react';
++import { ReactNode, useEffect, useRef, useState } from 'react';
+ import { useParams } from 'react-router-dom-v5-compat';
+ 
+ import { GrafanaTheme2, UrlQueryValue } from '@grafana/data';
+@@ -66,10 +66,12 @@ export function SoloPanelRenderer({
+   dashboard,
+   panelId,
+   hideLogo,
++  children,
+ }: {
+   dashboard: DashboardScene;
+   panelId: string;
+   hideLogo?: UrlQueryValue;
++  children?: ReactNode;
+ }) {
+   const { controls, body } = dashboard.useState();
+   const refreshPicker = controls?.useState()?.refreshPicker;
+@@ -100,6 +102,7 @@ export function SoloPanelRenderer({
+       <div className={styles.panelWrapper}>
+         <SoloPanelContextProvider value={soloPanelContext} dashboard={dashboard} singleMatch={true}>
+           <body.Component model={body} />
++          {children}
+         </SoloPanelContextProvider>
+       </div>
+     </div>
+diff --git a/public/app/features/query/components/QueryActionAssistantButton.test.tsx b/public/app/features/query/components/QueryActionAssistantButton.test.tsx
+index e8d7723424e55..b941d0fee590b 100644
+--- a/public/app/features/query/components/QueryActionAssistantButton.test.tsx
++++ b/public/app/features/query/components/QueryActionAssistantButton.test.tsx
+@@ -1,8 +1,8 @@
+ import { render, screen } from '@testing-library/react';
+ 
+ import { AssistantHook, useAssistant } from '@grafana/assistant';
+-import { CoreApp, DataSourceInstanceSettings } from '@grafana/data';
+-import { DataQuery } from '@grafana/schema';
++import { CoreApp, DataSourceApi, DataSourceInstanceSettings } from '@grafana/data';
++import { DataQuery, DataSourceJsonData } from '@grafana/schema';
+ 
+ import { QueryActionAssistantButton } from './QueryActionAssistantButton';
+ // Mock the assistant hook
+@@ -113,4 +113,35 @@ describe('QueryActionAssistantButton', () => {
+     const button = screen.getByRole('button', { name: /query with assistant/i });
+     expect(button).toBeInTheDocument();
+   });
++
++  it('should handle getQueryDisplayText throwing an error gracefully', () => {
++    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++    const mockOpenAssistant = jest.fn();
++    useAssistantMock.mockReturnValue({
++      isAvailable: true,
++      openAssistant: mockOpenAssistant,
++    } as unknown as AssistantHook);
++
++    const queryWithContent = { refId: 'A', expr: 'up' } as DataQuery;
++    const mockDatasourceApi = {
++      getQueryDisplayText: jest.fn().mockImplementation(() => {
++        throw new Error('display text error');
++      }),
++    } as unknown as DataSourceApi<DataQuery, DataSourceJsonData, {}>;
++
++    render(
++      <QueryActionAssistantButton
++        {...defaultProps}
++        query={queryWithContent}
++        queries={[queryWithContent]}
++        datasourceApi={mockDatasourceApi}
++      />
++    );
++
++    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.any(Error));
++    const button = screen.getByRole('button', { name: /query with assistant/i });
++    expect(button).toBeInTheDocument();
++
++    consoleErrorSpy.mockRestore();
++  });
+ });
+diff --git a/public/app/features/query/components/QueryActionAssistantButton.tsx b/public/app/features/query/components/QueryActionAssistantButton.tsx
+index a4f2d3d22816c..ca7acf671ec94 100644
+--- a/public/app/features/query/components/QueryActionAssistantButton.tsx
++++ b/public/app/features/query/components/QueryActionAssistantButton.tsx
+@@ -77,9 +77,14 @@ export function QueryActionAssistantButton<TQuery extends DataQuery = DataQuery>
+     );
+   }
+ 
+-  // Get query display text to determine if we're creating or updating
+-  const queryDisplayText =
+-    hasCurrentQuery && datasourceApi?.getQueryDisplayText ? datasourceApi.getQueryDisplayText(query) : null;
++  let queryDisplayText: string | undefined = undefined;
++  if (hasCurrentQuery && datasourceApi?.getQueryDisplayText) {
++    try {
++      queryDisplayText = datasourceApi.getQueryDisplayText(query)?.trim();
++    } catch (error) {
++      console.error(error);
++    }
++  }
+ 
+   // Determine if we're creating or updating based on queryDisplayText
+   const isUpdating = !!queryDisplayText;
+diff --git a/public/app/features/teams/hooks.ts b/public/app/features/teams/hooks.ts
+index ea661c4a5f8cb..84c777f689dc6 100644
+--- a/public/app/features/teams/hooks.ts
++++ b/public/app/features/teams/hooks.ts
+@@ -1,13 +1,26 @@
+ import { skipToken } from '@reduxjs/toolkit/query';
+-import { useEffect, useMemo } from 'react';
++import { useCallback, useEffect, useMemo } from 'react';
+ 
++import { config } from '@grafana/runtime';
+ import { useCreateFolder } from 'app/api/clients/folder/v1beta1/hooks';
++import {
++  API_GROUP,
++  API_VERSION,
++  GetTeamApiArg,
++  Team,
++  useLazyGetSearchTeamsQuery as useLazyGetSearchTeamsQueryIam,
++  useLazyGetTeamQuery as useLazyGetTeamQueryIam,
++  useGetTeamQuery as useGetTeamQueryIam,
++} from 'app/api/clients/iam/v0alpha1';
+ import {
+   CreateTeamCommand,
++  TeamDto,
+   UpdateTeamCommand,
+   useCreateTeamMutation,
+   useDeleteTeamByIdMutation,
+   useGetTeamByIdQuery,
++  useLazyGetTeamByIdQuery as useLazyGetTeamByIdQueryLegacy,
++  useLazySearchTeamsQuery as useLazySearchTeamsQueryLegacy,
+   useSearchTeamsQuery as useLegacySearchTeamsQuery,
+   useListTeamsRolesQuery,
+   useSetTeamRolesMutation,
+@@ -162,3 +175,109 @@ export const useCreateTeam = () => {
+ 
+   return [trigger, response] as const;
+ };
++
++/**
++ * Transform a legacy TeamDto to the IAM Team (k8s) shape.
++ */
++export function teamDtoToTeam(dto: TeamDto): Team {
++  return {
++    apiVersion: `${API_GROUP}/${API_VERSION}`,
++    kind: 'Team',
++    metadata: {
++      name: dto.uid,
++      creationTimestamp: '',
++    },
++    spec: {
++      title: dto.name,
++      email: dto.email ?? '',
++      externalUID: dto.externalUID ?? '',
++      provisioned: dto.isProvisioned,
++    },
++  };
++}
++
++/**
++ * Transform legacy TeamDto[] to IAM search hit shape.
++ */
++export function legacySearchToIamSearchHits(teams: TeamDto[]): Array<{ title: string; name: string }> {
++  return teams.map((t) => ({ title: t.name, name: t.uid }));
++}
++
++const appPlatformIamEnabled = () => Boolean(config.featureToggles.kubernetesTeamsApi);
++
++/**
++ * Facade hook: get a team by UID, using IAM or legacy endpoint based on feature toggle.
++ */
++export function useGetTeamByUidQuery(args: GetTeamApiArg | typeof skipToken) {
++  const enabled = appPlatformIamEnabled();
++
++  const iamResult = useGetTeamQueryIam(enabled ? args : skipToken);
++  const legacyResult = useGetTeamByIdQuery(!enabled && args !== skipToken ? { teamId: args.name } : skipToken);
++
++  if (enabled) {
++    return iamResult;
++  }
++
++  return {
++    ...legacyResult,
++    data: legacyResult.data ? teamDtoToTeam(legacyResult.data) : undefined,
++  };
++}
++
++/**
++ * Calls either the IAM or legacy get team by UID endpoint based on the feature toggle.
++ */
++export function useLazyGetTeamByUidQuery() {
++  const enabled = appPlatformIamEnabled();
++  const [iamTrigger, iamResult] = useLazyGetTeamQueryIam();
++  const [legacyTrigger, legacyResult] = useLazyGetTeamByIdQueryLegacy();
++
++  const iamTriggerer = useCallback(
++    (args: GetTeamApiArg, preferCacheValue?: boolean) => iamTrigger(args, preferCacheValue),
++    [iamTrigger]
++  );
++
++  const legacyTriggerer = useCallback(
++    (args: GetTeamApiArg, preferCacheValue?: boolean) =>
++      legacyTrigger({ teamId: args.name }, preferCacheValue).then((result) => ({
++        ...result,
++        data: result.data ? teamDtoToTeam(result.data) : undefined,
++      })),
++    [legacyTrigger]
++  );
++
++  if (enabled) {
++    return [iamTriggerer, iamResult] as const;
++  }
++
++  return [
++    legacyTriggerer,
++    {
++      ...legacyResult,
++      data: legacyResult.data ? teamDtoToTeam(legacyResult.data) : undefined,
++    },
++  ] as const;
++}
++
++/**
++ * Calls either the IAM or legacy search teams endpoint based on the feature toggle.
++ */
++export function useLazySearchTeamsQuery() {
++  const enabled = appPlatformIamEnabled();
++  const [iamTrigger, iamResult] = useLazyGetSearchTeamsQueryIam();
++  const [legacyTrigger, legacyResult] = useLazySearchTeamsQueryLegacy();
++
++  const legacyTriggerWrapped = (args: { query?: string }, preferCacheValue?: boolean) =>
++    legacyTrigger({ query: args.query }, preferCacheValue).then((result) => ({
++      ...result,
++      data: result.data
++        ? { hits: legacySearchToIamSearchHits(result.data.teams ?? []), totalHits: result.data.totalCount ?? 0 }
++        : undefined,
++    }));
++
++  if (enabled) {
++    return [iamTrigger, iamResult] as const;
++  }
++
++  return [legacyTriggerWrapped, legacyResult] as const;
++}
+diff --git a/public/app/plugins/datasource/loki/package.json b/public/app/plugins/datasource/loki/package.json
+index 3e3f3983813bf..5fa91926e9adf 100644
+--- a/public/app/plugins/datasource/loki/package.json
++++ b/public/app/plugins/datasource/loki/package.json
+@@ -7,7 +7,7 @@
+     "@emotion/css": "11.13.5",
+     "@grafana/data": "13.0.0-pre",
+     "@grafana/lezer-logql": "0.2.9",
+-    "@grafana/llm": "1.0.2",
++    "@grafana/llm": "1.0.3",
+     "@grafana/monaco-logql": "^0.0.8",
+     "@grafana/runtime": "13.0.0-pre",
+     "@grafana/schema": "13.0.0-pre",
+diff --git a/public/openapi3.json b/public/openapi3.json
+index d684648c380ca..17b55a0add8b2 100644
+--- a/public/openapi3.json
++++ b/public/openapi3.json
+@@ -18723,161 +18723,6 @@
+         ]
+       }
+     },
+-    "/datasources/proxy/{id}/{datasource_proxy_route}": {
+-      "delete": {
+-        "deprecated": true,
+-        "description": "Proxies all calls to the actual data source.\n\nPlease refer to [updated API](#/datasources/datasourceProxyDELETEByUIDcalls) instead",
+-        "operationId": "datasourceProxyDELETEcalls",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "202": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Data source proxy DELETE calls.",
+-        "tags": [
+-          "datasources"
+-        ]
+-      },
+-      "get": {
+-        "deprecated": true,
+-        "description": "Proxies all calls to the actual data source.\n\nPlease refer to [updated API](#/datasources/datasourceProxyGETByUIDcalls) instead",
+-        "operationId": "datasourceProxyGETcalls",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Data source proxy GET calls.",
+-        "tags": [
+-          "datasources"
+-        ]
+-      },
+-      "post": {
+-        "deprecated": true,
+-        "description": "Proxies all calls to the actual data source. The data source should support POST methods for the specific path and role as defined\n\nPlease refer to [updated API](#/datasources/datasourceProxyPOSTByUIDcalls) instead",
+-        "operationId": "datasourceProxyPOSTcalls",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "requestBody": {
+-          "content": {
+-            "application/json": {
+-              "schema": {}
+-            }
+-          },
+-          "required": true,
+-          "x-originalParamName": "DatasourceProxyParam"
+-        },
+-        "responses": {
+-          "201": {
+-            "description": "(empty)"
+-          },
+-          "202": {
+-            "description": "(empty)"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Data source proxy POST calls.",
+-        "tags": [
+-          "datasources"
+-        ]
+-      }
+-    },
+     "/datasources/uid/{sourceUID}/correlations": {
+       "get": {
+         "operationId": "getCorrelationsBySourceUID",
+@@ -19605,215 +19450,6 @@
+         ]
+       }
+     },
+-    "/datasources/{id}": {
+-      "delete": {
+-        "deprecated": true,
+-        "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:delete` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/deleteDataSourceByUID) instead",
+-        "operationId": "deleteDataSourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/okResponse"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Delete an existing data source by id.",
+-        "tags": [
+-          "datasources"
+-        ]
+-      },
+-      "get": {
+-        "deprecated": true,
+-        "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:read` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/getDataSourceByUID) instead",
+-        "operationId": "getDataSourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/getDataSourceResponse"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Get a single data source by Id.",
+-        "tags": [
+-          "datasources"
+-        ]
+-      },
+-      "put": {
+-        "deprecated": true,
+-        "description": "Similar to creating a data source, `password` and `basicAuthPassword` should be defined under\nsecureJsonData in order to be stored securely as an encrypted blob in the database. Then, the\nencrypted fields are listed under secureJsonFields section in the response.\n\nIf you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:write` and scopes: `datasources:*`, `datasources:id:*` and `datasources:id:1` (single data source).\n\nPlease refer to [updated API](#/datasources/updateDataSourceByUID) instead",
+-        "operationId": "updateDataSourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "requestBody": {
+-          "content": {
+-            "application/json": {
+-              "schema": {
+-                "$ref": "#/components/schemas/UpdateDataSourceCommand"
+-              }
+-            }
+-          },
+-          "required": true,
+-          "x-originalParamName": "Body"
+-        },
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/createOrUpdateDatasourceResponse"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Update an existing data source by its sequential ID.",
+-        "tags": [
+-          "datasources"
+-        ]
+-      }
+-    },
+-    "/datasources/{id}/health": {
+-      "get": {
+-        "deprecated": true,
+-        "description": "Please refer to [updated API](#/datasources/checkDatasourceHealthWithUID) instead",
+-        "operationId": "checkDatasourceHealthByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/okResponse"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Sends a health check request to the plugin datasource identified by the ID.",
+-        "tags": [
+-          "datasources",
+-          "health"
+-        ]
+-      }
+-    },
+-    "/datasources/{id}/resources/{datasource_proxy_route}": {
+-      "get": {
+-        "deprecated": true,
+-        "description": "Please refer to [updated API](#/datasources/callDatasourceResourceWithUID) instead",
+-        "operationId": "callDatasourceResourceByID",
+-        "parameters": [
+-          {
+-            "in": "path",
+-            "name": "datasource_proxy_route",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          },
+-          {
+-            "in": "path",
+-            "name": "id",
+-            "required": true,
+-            "schema": {
+-              "type": "string"
+-            }
+-          }
+-        ],
+-        "responses": {
+-          "200": {
+-            "$ref": "#/components/responses/okResponse"
+-          },
+-          "400": {
+-            "$ref": "#/components/responses/badRequestError"
+-          },
+-          "401": {
+-            "$ref": "#/components/responses/unauthorisedError"
+-          },
+-          "403": {
+-            "$ref": "#/components/responses/forbiddenError"
+-          },
+-          "404": {
+-            "$ref": "#/components/responses/notFoundError"
+-          },
+-          "500": {
+-            "$ref": "#/components/responses/internalServerError"
+-          }
+-        },
+-        "summary": "Fetch data source resources by Id.",
+-        "tags": [
+-          "datasources"
+-        ]
+-      }
+-    },
+     "/ds/query": {
+       "post": {
+         "description": "If you are running Grafana Enterprise and have Fine-grained access control enabled\nyou need to have a permission with action: `datasources:query`.",
+diff --git a/yarn.lock b/yarn.lock
+index c14010eb673b5..af2aefc8ef508 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -3006,7 +3006,7 @@ __metadata:
+     "@grafana/data": "npm:13.0.0-pre"
+     "@grafana/e2e-selectors": "npm:13.0.0-pre"
+     "@grafana/lezer-logql": "npm:0.2.9"
+-    "@grafana/llm": "npm:1.0.2"
++    "@grafana/llm": "npm:1.0.3"
+     "@grafana/monaco-logql": "npm:^0.0.8"
+     "@grafana/plugin-configs": "npm:13.0.0-pre"
+     "@grafana/runtime": "npm:13.0.0-pre"
+@@ -3693,11 +3693,11 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@grafana/llm@npm:1.0.2":
+-  version: 1.0.2
+-  resolution: "@grafana/llm@npm:1.0.2"
++"@grafana/llm@npm:1.0.3":
++  version: 1.0.3
++  resolution: "@grafana/llm@npm:1.0.3"
+   dependencies:
+-    "@modelcontextprotocol/sdk": "npm:^1.25.1"
++    "@modelcontextprotocol/sdk": "npm:^1.26.0"
+     publint: "npm:^0.3.12"
+     react-use: "npm:^17.6.0"
+     semver: "npm:^7.6.3"
+@@ -3707,7 +3707,7 @@ __metadata:
+     "@grafana/runtime": ^10.4.0 || ^11 || ^12
+     react: ^18
+     rxjs: ^7.8.2
+-  checksum: 10/867a0845dd57c63b9d833549d12f36b112d3b0577bcb87ca7b829210917ea11dce39a6cbd59f5fbc2613daaf4d6b83bab98cd81273c04f3f9aa9478c81f1c7db
++  checksum: 10/4d78ddd4a3de4ac2abbe2b2c2c819153540caa37bffe6528fcfebdc26b4621d84ec17663f2866bc5d60af9145b0bc298a23f598e784a3e46b1a0d66b0b08bbf5
+   languageName: node
+   linkType: hard
+ 
+@@ -6004,9 +6004,9 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@modelcontextprotocol/sdk@npm:^1.25.1":
+-  version: 1.25.3
+-  resolution: "@modelcontextprotocol/sdk@npm:1.25.3"
++"@modelcontextprotocol/sdk@npm:^1.26.0":
++  version: 1.27.1
++  resolution: "@modelcontextprotocol/sdk@npm:1.27.1"
+   dependencies:
+     "@hono/node-server": "npm:^1.19.9"
+     ajv: "npm:^8.17.1"
+@@ -6016,14 +6016,15 @@ __metadata:
+     cross-spawn: "npm:^7.0.5"
+     eventsource: "npm:^3.0.2"
+     eventsource-parser: "npm:^3.0.0"
+-    express: "npm:^5.0.1"
+-    express-rate-limit: "npm:^7.5.0"
+-    jose: "npm:^6.1.1"
++    express: "npm:^5.2.1"
++    express-rate-limit: "npm:^8.2.1"
++    hono: "npm:^4.11.4"
++    jose: "npm:^6.1.3"
+     json-schema-typed: "npm:^8.0.2"
+     pkce-challenge: "npm:^5.0.0"
+     raw-body: "npm:^3.0.0"
+     zod: "npm:^3.25 || ^4.0"
+-    zod-to-json-schema: "npm:^3.25.0"
++    zod-to-json-schema: "npm:^3.25.1"
+   peerDependencies:
+     "@cfworker/json-schema": ^4.1.1
+     zod: ^3.25 || ^4.0
+@@ -6032,7 +6033,7 @@ __metadata:
+       optional: true
+     zod:
+       optional: false
+-  checksum: 10/e4e38845ecfeaee124860ac2dfe378d2a4e8a09bd085b77124c9047b944826cff1776f97c11eaa56b0d83e164518a064f19c0be3046fa4307ba05dbe2ec325a1
++  checksum: 10/3cb0d61cfb916e555c85b4a527e772f88fcf9c6abacbe5eb5e965aac7c898190c416341ab3b3cba8c2d5f5ce4d513279fba3ad7784a0903d7ccd335decc55395
+   languageName: node
+   linkType: hard
+ 
+@@ -18841,16 +18842,18 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"express-rate-limit@npm:^7.5.0":
+-  version: 7.5.0
+-  resolution: "express-rate-limit@npm:7.5.0"
++"express-rate-limit@npm:^8.2.1":
++  version: 8.3.1
++  resolution: "express-rate-limit@npm:8.3.1"
++  dependencies:
++    ip-address: "npm:10.1.0"
+   peerDependencies:
+-    express: ^4.11 || 5 || ^5.0.0-beta.1
+-  checksum: 10/eff34c83bf586789933a332a339b66649e2cca95c8e977d193aa8bead577d3182ac9f0e9c26f39389287539b8038890ff023f910b54ebb506a26a2ce135b92ca
++    express: ">= 4.11"
++  checksum: 10/dd97bfc48c01a6d4c5433203232b5e7a1e55e21322bde49033e5f8c4339584fe671a94096144a0810f4ea21dcec8aaaf15823109627e609f8ed1bc5912a345cf
+   languageName: node
+   linkType: hard
+ 
+-"express@npm:^5.0.1":
++"express@npm:^5.2.1":
+   version: 5.2.1
+   resolution: "express@npm:5.2.1"
+   dependencies:
+@@ -20449,7 +20452,7 @@ __metadata:
+     "@grafana/google-sdk": "npm:0.3.5"
+     "@grafana/i18n": "workspace:*"
+     "@grafana/lezer-logql": "npm:0.2.9"
+-    "@grafana/llm": "npm:1.0.2"
++    "@grafana/llm": "npm:1.0.3"
+     "@grafana/monaco-logql": "npm:^0.0.8"
+     "@grafana/o11y-ds-frontend": "workspace:*"
+     "@grafana/plugin-e2e": "npm:3.4.0"
+@@ -21075,6 +21078,13 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
++"hono@npm:^4.11.4":
++  version: 4.12.7
++  resolution: "hono@npm:4.12.7"
++  checksum: 10/fed37e612730491ba9456f8f68f1b8727a5298cd839fff9641a0b7a95b1e8567a05abb819d32621b40988f166b01140cf7d573c9218dee2741004f48e09564d5
++  languageName: node
++  linkType: hard
++
+ "hookified@npm:^1.10.0":
+   version: 1.11.0
+   resolution: "hookified@npm:1.11.0"
+@@ -21973,6 +21983,13 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
++"ip-address@npm:10.1.0":
++  version: 10.1.0
++  resolution: "ip-address@npm:10.1.0"
++  checksum: 10/a6979629d1ad9c1fb424bc25182203fad739b40225aebc55ec6243bbff5035faf7b9ed6efab3a097de6e713acbbfde944baacfa73e11852bb43989c45a68d79e
++  languageName: node
++  linkType: hard
++
+ "ip-address@npm:^9.0.5":
+   version: 9.0.5
+   resolution: "ip-address@npm:9.0.5"
+@@ -23592,10 +23609,10 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"jose@npm:^6.1.1":
+-  version: 6.1.3
+-  resolution: "jose@npm:6.1.3"
+-  checksum: 10/9626c51e8c3792b505e954f3094698c182208617b62dfb27269230f31e57560b083985ed8128b8a9753aa92daf18d3a2341cc826d149503f14569abe87d42389
++"jose@npm:^6.1.3":
++  version: 6.2.1
++  resolution: "jose@npm:6.2.1"
++  checksum: 10/12f06a76ac743eb48314e662e02b141f6e4644dbcbdb1cd083c3867b1f72f1e148a67ebf4978d0d5adeb62f4be1572feee76f1849cbc32f8af1457ec9f788299
+   languageName: node
+   linkType: hard
+ 
+@@ -35805,12 +35822,12 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"zod-to-json-schema@npm:^3.25.0":
+-  version: 3.25.0
+-  resolution: "zod-to-json-schema@npm:3.25.0"
++"zod-to-json-schema@npm:^3.25.1":
++  version: 3.25.1
++  resolution: "zod-to-json-schema@npm:3.25.1"
+   peerDependencies:
+     zod: ^3.25 || ^4
+-  checksum: 10/cb932e20b5b5e64c75b2c34a7e6dae74b727292eab9e014b93c2607378b8cb1b227f80b429053ceb77c8e0dddc338837f9e534b2a658540ff60c9e4ffdc7cc19
++  checksum: 10/744dd370f4452c8db120de1475ea4d484a11df884c4636111d630e5e1351b8a7590d99cf14a2b9f21e7906f8b78721d958663a7973a40994e7d28770876674cc
+   languageName: node
+   linkType: hard
+ 

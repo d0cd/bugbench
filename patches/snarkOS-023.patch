@@ -1,41 +1,78 @@
-diff --git a/cli/src/commands/start.rs b/cli/src/commands/start.rs
-index 53eae507f..8f295faa2 100644
---- a/cli/src/commands/start.rs
-+++ b/cli/src/commands/start.rs
-@@ -110,7 +110,9 @@ pub struct Start {
-     /// Specify the IP address and port of the validator(s) to connect to
-     #[clap(default_value = "", long = "validators")]
-     pub validators: String,
--    /// If the flag is set, a validator will allow untrusted peers to connect
-+    /// If the flag is set, a validator will allow untrusted peers to connect.
-+    /// Client and Prover nodes ignore the flag and always allow untrusted peers
-+    /// to connect.
-     #[clap(long = "allow-external-peers")]
-     pub allow_external_peers: bool,
-     /// If the flag is set, a client will periodically evict more external peers
-diff --git a/node/bft/src/gateway.rs b/node/bft/src/gateway.rs
-index 8e5128c28..840b42985 100644
---- a/node/bft/src/gateway.rs
-+++ b/node/bft/src/gateway.rs
-@@ -904,7 +904,7 @@ impl<N: Network> Gateway<N> {
-             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-             info!("Starting the heartbeat of the gateway...");
-             loop {
--                // Process a heartbeat in the router.
-+                // Process a heartbeat in the gateway.
-                 self_clone.heartbeat();
-                 // Sleep for the heartbeat interval.
-                 tokio::time::sleep(Duration::from_secs(15)).await;
-diff --git a/node/router/src/handshake.rs b/node/router/src/handshake.rs
-index 8bed9c5e6..bdcb54271 100644
---- a/node/router/src/handshake.rs
-+++ b/node/router/src/handshake.rs
-@@ -318,7 +318,7 @@ impl<N: Network> Router<N> {
-         if self.is_connected(&peer_ip) {
-             bail!("Dropping connection request from '{peer_ip}' (already connected)")
-         }
--        // Only allow trusted peers to connect if allow_external_peers is set
-+        // Ensure either the peer is trusted or `allow_external_peers` is true.
-         if !self.allow_external_peers() && !self.is_trusted(&peer_ip) {
-             bail!("Dropping connection request from '{peer_ip}' (untrusted)")
-         }
+diff --git a/Cargo.lock b/Cargo.lock
+index 3f896de5d..70b7cdbfc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3246,9 +3246,9 @@ checksum = "6bdef32e8150c2a081110b42772ffe7d7c9032b606bc226c8260fd97e0976601"
+ 
+ [[package]]
+ name = "syn"
+-version = "1.0.78"
++version = "1.0.80"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a4eac2e6c19f5c3abc0c229bea31ff0b9b091c7b14990e8924b92902a303a0c0"
++checksum = "d010a1623fbd906d51d650a9916aaefc05ffa0e4053ff7fe601167f3e715d194"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -3440,9 +3440,9 @@ checksum = "360dfd1d6d30e05fda32ace2c8c70e9c0a9da713275777f5a4dbb8a1893930c6"
+ 
+ [[package]]
+ name = "tracing"
+-version = "0.1.28"
++version = "0.1.29"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "84f96e095c0c82419687c20ddf5cb3eadb61f4e1405923c9dc8e53a1adacbda8"
++checksum = "375a639232caf30edfc78e8d89b2d4c375515393e7af7e16f01cd96917fb2105"
+ dependencies = [
+  "cfg-if 1.0.0",
+  "log",
+@@ -3492,9 +3492,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "tracing-subscriber"
+-version = "0.2.24"
++version = "0.2.25"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fdd0568dbfe3baf7048b7908d2b32bca0d81cd56bec6d2a8f894b01d74f86be3"
++checksum = "0e0d2eaa99c3c2e41547cfa109e910a68ea03823cccad4a0525dcbc9b01e8c71"
+ dependencies = [
+  "ansi_term 0.12.1",
+  "chrono",
+diff --git a/consensus/src/consensus/inner/commit.rs b/consensus/src/consensus/inner/commit.rs
+index e60028137..3dccdbec5 100644
+--- a/consensus/src/consensus/inner/commit.rs
++++ b/consensus/src/consensus/inner/commit.rs
+@@ -56,10 +56,7 @@ impl ConsensusInner {
+                 return Ok(());
+             }
+             _ => {
+-                let fork_path = self
+-                    .storage
+-                    .get_fork_path(&block.header.previous_block_hash, crate::OLDEST_FORK_THRESHOLD)
+-                    .await?;
++                let fork_path = self.storage.get_fork_path(hash, crate::OLDEST_FORK_THRESHOLD).await?;
+                 match fork_path {
+                     ForkDescription::Path(fork_path) => {
+                         let new_block_number = fork_path.base_index + fork_path.path.len() as u32;
+diff --git a/consensus/tests/consensus_sidechain.rs b/consensus/tests/consensus_sidechain.rs
+index 65415c8c8..b7faa0d35 100644
+--- a/consensus/tests/consensus_sidechain.rs
++++ b/consensus/tests/consensus_sidechain.rs
+@@ -149,7 +149,7 @@ mod consensus_sidechain {
+ 
+         new_block_height = consensus.storage.canon().await.unwrap().block_height;
+ 
+-        assert_eq!(old_block_height, new_block_height);
++        assert_eq!(old_block_height + 1, new_block_height);
+ 
+         // 4. Receive valid canon block 1 and accept the previous irrelevant block 2
+ 
+@@ -159,7 +159,7 @@ mod consensus_sidechain {
+ 
+         new_block_height = consensus.storage.canon().await.unwrap().block_height;
+ 
+-        assert_eq!(old_block_height + 1, new_block_height);
++        assert_eq!(old_block_height, new_block_height);
+     }
+ 
+     #[tokio::test]

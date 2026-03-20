@@ -1,0 +1,1882 @@
+diff --git a/packages/grafana-ui/src/components/Alert/Alert.tsx b/packages/grafana-ui/src/components/Alert/Alert.tsx
+index 0f70f0ee5e5e3..4420bd712b3a5 100644
+--- a/packages/grafana-ui/src/components/Alert/Alert.tsx
++++ b/packages/grafana-ui/src/components/Alert/Alert.tsx
+@@ -11,6 +11,7 @@ import { IconName } from '../../types/icon';
+ import { Button } from '../Button/Button';
+ import { Icon } from '../Icon/Icon';
+ import { Box } from '../Layout/Box/Box';
++import { Stack } from '../Layout/Stack/Stack';
+ import { Text } from '../Text/Text';
+ export type AlertVariant = 'success' | 'warning' | 'error' | 'info';
+ 
+@@ -84,17 +85,22 @@ export const Alert = React.forwardRef<HTMLDivElement, Props>(
+             </div>
+           </Box>
+ 
+-          <Box paddingY={1} grow={1}>
+-            <Text color="primary" weight="medium">
+-              {title}
+-            </Text>
+-            {children && <div className={styles.content}>{children}</div>}
+-          </Box>
+-          {action && (
+-            <Box marginLeft={1} display="flex" alignItems="center">
+-              {action}
++          <Stack alignItems="center" flex={1} wrap="wrap" columnGap={1} rowGap={0}>
++            <Box paddingY={1} flex={1} minWidth="50%">
++              <Text color="primary" weight="medium">
++                {title}
++              </Text>
++              {children && <div className={styles.content}>{children}</div>}
+             </Box>
+-          )}
++            <Stack alignItems="center" wrap="wrap">
++              {action}
++              {onRemove && buttonContent && (
++                <Button aria-label={closeLabel} variant="secondary" onClick={onRemove} type="button">
++                  {buttonContent}
++                </Button>
++              )}
++            </Stack>
++          </Stack>
+           {/* If onRemove is specified, giving preference to onRemove */}
+           {onRemove && !buttonContent && (
+             <div className={styles.close}>
+@@ -108,14 +114,6 @@ export const Alert = React.forwardRef<HTMLDivElement, Props>(
+               />
+             </div>
+           )}
+-
+-          {onRemove && buttonContent && (
+-            <Box marginLeft={1} display="flex" alignItems="center">
+-              <Button aria-label={closeLabel} variant="secondary" onClick={onRemove} type="button">
+-                {buttonContent}
+-              </Button>
+-            </Box>
+-          )}
+         </Box>
+       </div>
+     );
+diff --git a/pkg/server/wire_gen.go b/pkg/server/wire_gen.go
+index ad232c40736ff..8a4ee16741dd2 100644
+--- a/pkg/server/wire_gen.go
++++ b/pkg/server/wire_gen.go
+@@ -593,7 +593,7 @@ func Initialize(ctx context.Context, cfg *setting.Cfg, opts Options, apiOpts api
+ 	unifiedMigrator := migrations2.ProvideUnifiedMigrator(resourceClient, migrationRegistry)
+ 	unifiedStorageMigrationService := migrations2.ProvideUnifiedStorageMigrationService(unifiedMigrator, legacyDatabaseProvider, cfg, sqlStore, kvStore, resourceClient, migrationRegistry)
+ 	migrationStatusReader := migrations2.ProvideMigrationStatusReader(sqlStore, cfg, migrationRegistry)
+-	dualwriteService, err := dualwrite.ProvideService(featureToggles, kvStore, cfg, unifiedStorageMigrationService, migrationStatusReader)
++	dualwriteService, err := dualwrite.ProvideService(featureToggles, kvStore, cfg, unifiedStorageMigrationService, migrationStatusReader, registerer)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -1286,7 +1286,7 @@ func InitializeForTest(ctx context.Context, t sqlutil.ITestDB, testingT interfac
+ 	unifiedMigrator := migrations2.ProvideUnifiedMigrator(resourceClient, migrationRegistry)
+ 	unifiedStorageMigrationService := migrations2.ProvideUnifiedStorageMigrationService(unifiedMigrator, legacyDatabaseProvider, cfg, sqlStore, kvStore, resourceClient, migrationRegistry)
+ 	migrationStatusReader := migrations2.ProvideMigrationStatusReader(sqlStore, cfg, migrationRegistry)
+-	dualwriteService, err := dualwrite.ProvideService(featureToggles, kvStore, cfg, unifiedStorageMigrationService, migrationStatusReader)
++	dualwriteService, err := dualwrite.ProvideService(featureToggles, kvStore, cfg, unifiedStorageMigrationService, migrationStatusReader, registerer)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/services/ngalert/state/compat.go b/pkg/services/ngalert/state/compat.go
+index bff2746eb3cd9..1967971547fb7 100644
+--- a/pkg/services/ngalert/state/compat.go
++++ b/pkg/services/ngalert/state/compat.go
+@@ -64,6 +64,12 @@ func StateToPostableAlert(transition StateTransition, appURL *url.URL, featureTo
+ 		nA[alertingModels.OrgIDAnnotation] = strconv.FormatInt(alertState.OrgID, 10)
+ 	}
+ 
++	// Propagate the namespace/folder UID as an annotation because the label is stripped before sending.
++	// This is required by notification history.
++	if namespaceUID, ok := nL[alertingModels.NamespaceUIDLabel]; ok && namespaceUID != "" {
++		nA[alertingModels.NamespaceUIDLabel] = namespaceUID
++	}
++
+ 	var urlStr string
+ 	if uid := nL[alertingModels.RuleUIDLabel]; len(uid) > 0 && appURL != nil {
+ 		u := *appURL
+diff --git a/pkg/services/ngalert/state/compat_test.go b/pkg/services/ngalert/state/compat_test.go
+index 4d3141b399235..ff174eb524620 100644
+--- a/pkg/services/ngalert/state/compat_test.go
++++ b/pkg/services/ngalert/state/compat_test.go
+@@ -183,6 +183,29 @@ func Test_StateToPostableAlert(t *testing.T) {
+ 				require.Equal(t, alertState.StateReason, result.Annotations[ngModels.StateReasonAnnotation])
+ 			})
+ 
++			t.Run("should propagate namespace UID label as annotation", func(t *testing.T) {
++				t.Run("when label is present and non-empty", func(t *testing.T) {
++					alertState := randomTransition(eval.Normal, tc.state)
++					alertState.Labels[alertingModels.NamespaceUIDLabel] = "test-namespace-uid"
++					result := StateToPostableAlert(alertState, appURL, featuremgmt.WithFeatures())
++					require.Equal(t, "test-namespace-uid", result.Annotations[alertingModels.NamespaceUIDLabel])
++				})
++
++				t.Run("when label is empty", func(t *testing.T) {
++					alertState := randomTransition(eval.Normal, tc.state)
++					alertState.Labels[alertingModels.NamespaceUIDLabel] = ""
++					result := StateToPostableAlert(alertState, appURL, featuremgmt.WithFeatures())
++					require.NotContains(t, result.Annotations, alertingModels.NamespaceUIDLabel)
++				})
++
++				t.Run("when label is missing", func(t *testing.T) {
++					alertState := randomTransition(eval.Normal, tc.state)
++					delete(alertState.Labels, alertingModels.NamespaceUIDLabel)
++					result := StateToPostableAlert(alertState, appURL, featuremgmt.WithFeatures())
++					require.NotContains(t, result.Annotations, alertingModels.NamespaceUIDLabel)
++				})
++			})
++
+ 			switch tc.state {
+ 			case eval.NoData:
+ 				t.Run("should keep existing labels and change name", func(t *testing.T) {
+diff --git a/pkg/storage/legacysql/dualwrite/dualwriter.go b/pkg/storage/legacysql/dualwrite/dualwriter.go
+index bd28321825349..b9a0c9e808170 100644
+--- a/pkg/storage/legacysql/dualwrite/dualwriter.go
++++ b/pkg/storage/legacysql/dualwrite/dualwriter.go
+@@ -13,6 +13,7 @@ import (
+ 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"k8s.io/apiserver/pkg/registry/rest"
+ 	"k8s.io/apiserver/pkg/util/dryrun"
+ 
+@@ -42,6 +43,8 @@ type dualWriter struct {
+ 	unified     grafanarest.Storage
+ 	readUnified bool
+ 	errorIsOK   bool // in "mode1" we try writing both -- but don't block on unified write errors
++	gr          schema.GroupResource
++	metrics     *dualWriterMetrics
+ }
+ 
+ func (d *dualWriter) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+@@ -51,7 +54,7 @@ func (d *dualWriter) Get(ctx context.Context, name string, options *metav1.GetOp
+ 			attribute.Bool("readUnified", d.readUnified)))
+ 	defer span.End()
+ 
+-	log := logging.FromContext(ctx).With("method", "Get", "name", name)
++	log := logging.FromContext(ctx).With("method", "Get", "name", name, "resource", d.gr.String())
+ 	// If we read from unified, we can just do that and return.
+ 	if d.readUnified {
+ 		return d.unified.Get(ctx, name, options)
+@@ -69,6 +72,7 @@ func (d *dualWriter) Get(ctx context.Context, name string, options *metav1.GetOp
+ 			defer cancel()
+ 			if _, err := d.unified.Get(ctxBg, name, options); err != nil {
+ 				log.Error("failed background GET to unified", "err", err)
++				d.metrics.backgroundErrors.WithLabelValues(d.gr.String(), "GET").Inc()
+ 			}
+ 		}(context.WithTimeout(context.WithoutCancel(ctx), backgroundReqTimeout))
+ 		return legacyGet, nil
+@@ -93,7 +97,7 @@ func (d *dualWriter) List(ctx context.Context, options *metainternalversion.List
+ 	var (
+ 		legacyOptions  = options.DeepCopy()
+ 		unifiedOptions = options.DeepCopy()
+-		log            = logging.FromContext(ctx).With("method", "List", "options", options)
++		log            = logging.FromContext(ctx).With("method", "List", "options", options, "resource", d.gr.String())
+ 	)
+ 
+ 	legacyToken, unifiedToken, err := parseContinueTokens(options.Continue)
+@@ -160,12 +164,14 @@ func (d *dualWriter) List(ctx context.Context, options *metainternalversion.List
+ 			unifiedList, err := d.unified.List(ctxBg, unifiedOptions)
+ 			if err != nil {
+ 				log.Error("failed background LIST to unified", "err", err)
++				d.metrics.backgroundErrors.WithLabelValues(d.gr.String(), "LIST").Inc()
+ 				return
+ 			}
+ 			unifiedMeta, err := meta.ListAccessor(unifiedList)
+ 			if err != nil {
+ 				log.Error("failed background LIST to unified", "err",
+ 					fmt.Errorf("failed to access unified List MetaData: %w", err))
++				d.metrics.backgroundErrors.WithLabelValues(d.gr.String(), "LIST").Inc()
+ 			}
+ 			out <- unifiedMeta.GetContinue()
+ 		}(context.WithTimeout(context.WithoutCancel(ctx), backgroundReqTimeout))
+@@ -209,7 +215,7 @@ func (d *dualWriter) Create(ctx context.Context, in runtime.Object, createValida
+ 		return d.unified.Create(ctx, in, createValidation, options)
+ 	}
+ 
+-	log := logging.FromContext(ctx).With("method", "Create")
++	log := logging.FromContext(ctx).With("method", "Create", "resource", d.gr.String())
+ 
+ 	accIn, err := utils.MetaAccessor(in)
+ 	if err != nil {
+@@ -302,6 +308,7 @@ func (d *dualWriter) Create(ctx context.Context, in runtime.Object, createValida
+ 			defer cancel()
+ 			if _, err := d.unified.Create(ctxBg, createdCopy, createValidation, options); err != nil {
+ 				log.With("objectInfo", objectInfo(createdCopy)).Error("failed to CREATE object in unified storage", "err", err)
++				d.metrics.backgroundErrors.WithLabelValues(d.gr.String(), "CREATE").Inc()
+ 			}
+ 		}(context.WithTimeout(context.WithoutCancel(ctx), backgroundReqTimeout))
+ 	} else {
+@@ -347,7 +354,7 @@ func (d *dualWriter) Delete(ctx context.Context, name string, deleteValidation r
+ 		return d.unified.Delete(ctx, name, deleteValidation, options)
+ 	}
+ 
+-	log := logging.FromContext(ctx).With("method", "Delete", "name", name)
++	log := logging.FromContext(ctx).With("method", "Delete", "name", name, "resource", d.gr.String())
+ 	ctx = utils.SetFolderRemovePermissions(ctx, false)
+ 
+ 	objFromLegacy, asyncLegacy, err := d.legacy.Delete(ctx, name, deleteValidation, options)
+@@ -373,6 +380,7 @@ func (d *dualWriter) Delete(ctx context.Context, name string, deleteValidation r
+ 			defer cancel()
+ 			if _, _, err := d.unified.Delete(ctxBg, name, deleteValidation, options); err != nil && !apierrors.IsNotFound(err) {
+ 				log.Error("failed background DELETE in unified storage", "err", err)
++				d.metrics.backgroundErrors.WithLabelValues(d.gr.String(), "DELETE").Inc()
+ 			}
+ 		}(context.WithTimeout(context.WithoutCancel(ctx), backgroundReqTimeout))
+ 		return objFromLegacy, asyncLegacy, nil
+@@ -406,7 +414,7 @@ func (d *dualWriter) Update(ctx context.Context, name string, objInfo rest.Updat
+ 		return d.unified.Update(ctx, name, dryRunInfo, createValidation, updateValidation, dryRunForceCreate, options)
+ 	}
+ 
+-	log := logging.FromContext(ctx).With("method", "Update", "name", name)
++	log := logging.FromContext(ctx).With("method", "Update", "name", name, "resource", d.gr.String())
+ 	// update in legacy first, and then unistore. Will return a failure if either fails.
+ 	//
+ 	// we want to update in legacy first, otherwise if the update from unistore was successful,
+@@ -463,6 +471,7 @@ func (d *dualWriter) Update(ctx context.Context, name string, objInfo rest.Updat
+ 			defer cancel()
+ 			if _, _, err := d.unified.Update(ctxBg, name, unifiedInfo, createValidation, updateValidation, unifiedForceCreate, options); err != nil {
+ 				log.With("objectInfo", objectInfo(objFromLegacy)).Error("failed background UPDATE to unified storage", "err", err)
++				d.metrics.backgroundErrors.WithLabelValues(d.gr.String(), "UPDATE").Inc()
+ 			}
+ 		}(context.WithTimeout(context.WithoutCancel(ctx), backgroundReqTimeout))
+ 		return objFromLegacy, createdLegacy, nil
+@@ -498,7 +507,7 @@ func (d *dualWriter) DeleteCollection(ctx context.Context, deleteValidation rest
+ 		return d.unified.DeleteCollection(ctx, deleteValidation, options, listOptions)
+ 	}
+ 
+-	log := logging.FromContext(ctx).With("method", "DeleteCollection", "resourceVersion", listOptions.ResourceVersion)
++	log := logging.FromContext(ctx).With("method", "DeleteCollection", "resourceVersion", listOptions.ResourceVersion, "resource", d.gr.String())
+ 
+ 	// delete from legacy first, and anything that is successful can be deleted in unistore too.
+ 	//
+@@ -521,6 +530,7 @@ func (d *dualWriter) DeleteCollection(ctx context.Context, deleteValidation rest
+ 			defer cancel()
+ 			if _, err := d.unified.DeleteCollection(ctxBg, deleteValidation, options, listOptions); err != nil {
+ 				log.With("objectInfo", objectInfo(deletedLegacy)).Error("failed background DELETE collection to unified storage", "err", err)
++				d.metrics.backgroundErrors.WithLabelValues(d.gr.String(), "DELETE_COLLECTION").Inc()
+ 			}
+ 		}(context.WithTimeout(context.WithoutCancel(ctx), backgroundReqTimeout))
+ 		return deletedLegacy, nil
+diff --git a/pkg/storage/legacysql/dualwrite/metrics.go b/pkg/storage/legacysql/dualwrite/metrics.go
+new file mode 100644
+index 0000000000000..dc0e9e54c4172
+--- /dev/null
++++ b/pkg/storage/legacysql/dualwrite/metrics.go
+@@ -0,0 +1,43 @@
++package dualwrite
++
++import (
++	"sync"
++
++	"github.com/grafana/grafana/pkg/infra/log"
++	"github.com/prometheus/client_golang/prometheus"
++)
++
++var (
++	registerMetricsOnce    sync.Once
++	backgroundErrorsMetric = prometheus.NewCounterVec(prometheus.CounterOpts{
++		Name: "dualwriter_background_errors_total",
++		Help: "Total number of failed background operations in unified storage",
++	}, []string{"resource", "method"})
++
++	backgroundErrorMethods = []string{"GET", "LIST", "CREATE", "DELETE", "UPDATE", "DELETE_COLLECTION"}
++)
++
++type dualWriterMetrics struct {
++	backgroundErrors *prometheus.CounterVec
++}
++
++func provideDualWriterMetrics(reg prometheus.Registerer) *dualWriterMetrics {
++	registerMetricsOnce.Do(func() {
++		if reg != nil {
++			if err := reg.Register(backgroundErrorsMetric); err != nil {
++				log.New("dualwrite").Warn("failed to register dualwriter metrics", "error", err)
++			}
++		}
++	})
++	return &dualWriterMetrics{
++		backgroundErrors: backgroundErrorsMetric,
++	}
++}
++
++// initResource initializes all method counter combinations to zero for the given resource,
++// so that the metric is distinguishable from "not scraped" (absent) vs "no errors" (zero).
++func (m *dualWriterMetrics) initResource(resource string) {
++	for _, method := range backgroundErrorMethods {
++		m.backgroundErrors.WithLabelValues(resource, method).Add(0)
++	}
++}
+diff --git a/pkg/storage/legacysql/dualwrite/runtime_test.go b/pkg/storage/legacysql/dualwrite/runtime_test.go
+index 590f2b9935592..4ec9dbce94ad7 100644
+--- a/pkg/storage/legacysql/dualwrite/runtime_test.go
++++ b/pkg/storage/legacysql/dualwrite/runtime_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"testing"
+ 
++	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/stretchr/testify/mock"
+ 	"github.com/stretchr/testify/require"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -77,7 +78,7 @@ func TestRuntime_Create(t *testing.T) {
+ 				tt.setupStorageFn(us.Mock, tt.input)
+ 			}
+ 
+-			m, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagManagedDualWriter), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader())
++			m, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagManagedDualWriter), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader(), prometheus.NewRegistry())
+ 			require.NoError(t, err)
+ 			dw, err := m.NewStorage(kind, ls, us)
+ 			require.NoError(t, err)
+@@ -150,7 +151,7 @@ func TestRuntime_Get(t *testing.T) {
+ 				tt.setupStorageFn(us.Mock, name)
+ 			}
+ 
+-			m, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagManagedDualWriter), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader())
++			m, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagManagedDualWriter), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader(), prometheus.NewRegistry())
+ 			require.NoError(t, err)
+ 			dw, err := m.NewStorage(kind, ls, us)
+ 			require.NoError(t, err)
+@@ -235,7 +236,7 @@ func TestRuntime_CreateWhileMigrating(t *testing.T) {
+ 		}
+ 
+ 	// Shared provider across all tests
+-	dual, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagManagedDualWriter), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader())
++	dual, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagManagedDualWriter), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader(), prometheus.NewRegistry())
+ 	require.NoError(t, err)
+ 
+ 	for _, tt := range tests {
+diff --git a/pkg/storage/legacysql/dualwrite/service.go b/pkg/storage/legacysql/dualwrite/service.go
+index 6886057835aa2..53dea8f6a56bd 100644
+--- a/pkg/storage/legacysql/dualwrite/service.go
++++ b/pkg/storage/legacysql/dualwrite/service.go
+@@ -6,6 +6,7 @@ import (
+ 	"time"
+ 
+ 	gocache "github.com/patrickmn/go-cache"
++	"github.com/prometheus/client_golang/prometheus"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 
+ 	"github.com/grafana/grafana-app-sdk/logging"
+@@ -67,7 +68,7 @@ func ProvideStaticServiceForTests(cfg *setting.Cfg) Service {
+ 	if cfg == nil {
+ 		cfg = &setting.Cfg{}
+ 	}
+-	return &staticService{cfg: cfg}
++	return &staticService{cfg: cfg, metrics: provideDualWriterMetrics(prometheus.NewRegistry())}
+ }
+ 
+ func ProvideService(
+@@ -76,6 +77,7 @@ func ProvideService(
+ 	cfg *setting.Cfg,
+ 	migrator unifiedmigrations.UnifiedStorageMigrationService,
+ 	statusReader unifiedmigrations.MigrationStatusReader,
++	reg prometheus.Registerer,
+ ) (Service, error) {
+ 	// Ensure migrations have run before starting dualwrite
+ 	err := migrator.Run(context.Background())
+@@ -87,9 +89,11 @@ func ProvideService(
+ 	enabled := features.IsEnabledGlobally(featuremgmt.FlagManagedDualWriter) ||
+ 		features.IsEnabledGlobally(featuremgmt.FlagProvisioning) // required for git provisioning
+ 
++	metrics := provideDualWriterMetrics(reg)
++
+ 	if cfg != nil {
+ 		if !enabled {
+-			return &staticService{cfg: cfg, statusReader: statusReader}, nil
++			return &staticService{cfg: cfg, statusReader: statusReader, metrics: metrics}, nil
+ 		}
+ 
+ 		foldersMode := cfg.UnifiedStorage["folders.folder.grafana.app"].DualWriterMode
+@@ -97,7 +101,7 @@ func ProvideService(
+ 
+ 		// If both are fully on unified (Mode5), the dynamic service is not needed.
+ 		if foldersMode == rest.Mode5 && dashboardsMode == rest.Mode5 {
+-			return &staticService{cfg: cfg, statusReader: statusReader}, nil
++			return &staticService{cfg: cfg, statusReader: statusReader, metrics: metrics}, nil
+ 		}
+ 
+ 		if (foldersMode >= rest.Mode4 || dashboardsMode >= rest.Mode4) && foldersMode != dashboardsMode {
+@@ -120,6 +124,7 @@ func ProvideService(
+ 		enabled:            enabled,
+ 		statusReader:       statusReader,
+ 		resourceModesCache: gocache.New(cacheTTL, cacheCleanup),
++		metrics:            metrics,
+ 	}, nil
+ }
+ 
+@@ -128,6 +133,7 @@ type service struct {
+ 	enabled            bool
+ 	statusReader       unifiedmigrations.MigrationStatusReader
+ 	resourceModesCache *gocache.Cache
++	metrics            *dualWriterMetrics
+ }
+ 
+ // getStorageMode returns the cached StorageMode for a non-managed resource.
+@@ -154,12 +160,13 @@ func (m *service) NewStorage(gr schema.GroupResource, legacy rest.Storage, unifi
+ 		}
+ 
+ 		if m.enabled && status.Runtime {
++			m.metrics.initResource(gr.String())
+ 			// Dynamic storage behavior
+ 			return &runtimeDualWriter{
+ 				service:   m,
+ 				legacy:    legacy,
+ 				unified:   unified,
+-				dualwrite: &dualWriter{legacy: legacy, unified: unified}, // not used for read
++				dualwrite: &dualWriter{legacy: legacy, unified: unified, gr: gr, metrics: m.metrics}, // not used for read
+ 				gr:        gr,
+ 			}, nil
+ 		}
+@@ -170,7 +177,8 @@ func (m *service) NewStorage(gr schema.GroupResource, legacy rest.Storage, unifi
+ 	case unifiedmigrations.StorageModeUnified:
+ 		return unified, nil
+ 	case unifiedmigrations.StorageModeDualWrite:
+-		return &dualWriter{legacy: legacy, unified: unified, errorIsOK: true}, nil
++		m.metrics.initResource(gr.String())
++		return &dualWriter{legacy: legacy, unified: unified, errorIsOK: true, gr: gr, metrics: m.metrics}, nil
+ 	default:
+ 		return legacy, nil
+ 	}
+diff --git a/pkg/storage/legacysql/dualwrite/service_test.go b/pkg/storage/legacysql/dualwrite/service_test.go
+index 513dcbabe6080..39ceae9dff543 100644
+--- a/pkg/storage/legacysql/dualwrite/service_test.go
++++ b/pkg/storage/legacysql/dualwrite/service_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/stretchr/testify/require"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 
+@@ -18,7 +19,7 @@ import (
+ func TestService(t *testing.T) {
+ 	t.Run("dynamic", func(t *testing.T) {
+ 		ctx := context.Background()
+-		mode, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagProvisioning), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader())
++		mode, err := ProvideService(featuremgmt.WithFeatures(featuremgmt.FlagProvisioning), kvstore.NewFakeKVStore(), NewFakeConfig(), NewFakeMigrator(), NewFakeMigrationStatusReader(), prometheus.NewRegistry())
+ 		require.NoError(t, err)
+ 
+ 		// Use a managed resource so KV-based Status path is exercised.
+@@ -140,6 +141,7 @@ func TestService(t *testing.T) {
+ 					NewFakeConfig(),
+ 					NewFakeMigrator(),
+ 					statusReader,
++					prometheus.NewRegistry(),
+ 				)
+ 				require.NoError(t, err)
+ 
+@@ -180,6 +182,7 @@ func TestService(t *testing.T) {
+ 					NewFakeConfig(),
+ 					NewFakeMigrator(),
+ 					statusReader,
++					prometheus.NewRegistry(),
+ 				)
+ 				require.NoError(t, err)
+ 
+@@ -217,6 +220,7 @@ func TestService(t *testing.T) {
+ 					NewFakeConfig(),
+ 					NewFakeMigrator(),
+ 					statusReader,
++					prometheus.NewRegistry(),
+ 				)
+ 				require.NoError(t, err)
+ 
+@@ -241,6 +245,7 @@ func TestService(t *testing.T) {
+ 			NewFakeConfig(),
+ 			NewFakeMigrator(),
+ 			reader,
++			prometheus.NewRegistry(),
+ 		)
+ 		require.NoError(t, err)
+ 
+@@ -339,7 +344,7 @@ func TestService(t *testing.T) {
+ 					"dashboards.dashboard.grafana.app", storageModeFromConfigMode(tc.cfg.UnifiedStorage["dashboards.dashboard.grafana.app"].DualWriterMode),
+ 					"folders.folder.grafana.app", storageModeFromConfigMode(tc.cfg.UnifiedStorage["folders.folder.grafana.app"].DualWriterMode),
+ 				)
+-				svc, err := ProvideService(tc.flags, kvstore.NewFakeKVStore(), &tc.cfg, NewFakeMigrator(), statusReader)
++				svc, err := ProvideService(tc.flags, kvstore.NewFakeKVStore(), &tc.cfg, NewFakeMigrator(), statusReader, prometheus.NewRegistry())
+ 				if tc.error != "" {
+ 					require.ErrorContains(t, err, tc.error)
+ 					require.Nil(t, svc, "expect a nil service when an error exts")
+diff --git a/pkg/storage/legacysql/dualwrite/static.go b/pkg/storage/legacysql/dualwrite/static.go
+index 0d17074af377c..bc55ff80903f9 100644
+--- a/pkg/storage/legacysql/dualwrite/static.go
++++ b/pkg/storage/legacysql/dualwrite/static.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"sync"
+ 
++	"github.com/prometheus/client_golang/prometheus"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 
+ 	"github.com/grafana/grafana-app-sdk/logging"
+@@ -20,7 +21,7 @@ func NewStaticStorage(
+ 	legacy rest.Storage,
+ 	unified rest.Storage,
+ ) (rest.Storage, error) {
+-	m := &staticService{}
++	m := &staticService{metrics: provideDualWriterMetrics(prometheus.NewRegistry())}
+ 	m.SetMode(gr, mode)
+ 	return m.NewStorage(gr, legacy, unified)
+ }
+@@ -28,6 +29,7 @@ func NewStaticStorage(
+ type staticService struct {
+ 	cfg          *setting.Cfg
+ 	statusReader unifiedmigrations.MigrationStatusReader
++	metrics      *dualWriterMetrics
+ 
+ 	// resourceModesCache holds the resolved StorageMode per resource
+ 	resourceModesCache sync.Map // map[string]unifiedmigrations.StorageMode
+@@ -79,7 +81,8 @@ func (m *staticService) NewStorage(gr schema.GroupResource, legacy rest.Storage,
+ 	case unifiedmigrations.StorageModeUnified:
+ 		return unified, nil
+ 	case unifiedmigrations.StorageModeDualWrite:
+-		return &dualWriter{legacy: legacy, unified: unified, errorIsOK: true}, nil
++		m.metrics.initResource(gr.String())
++		return &dualWriter{legacy: legacy, unified: unified, errorIsOK: true, gr: gr, metrics: m.metrics}, nil
+ 	default:
+ 		return legacy, nil
+ 	}
+diff --git a/pkg/tests/api/alerting/api_notification_channel_test.go b/pkg/tests/api/alerting/api_notification_channel_test.go
+index 4bec8472400ab..4485859ab901a 100644
+--- a/pkg/tests/api/alerting/api_notification_channel_test.go
++++ b/pkg/tests/api/alerting/api_notification_channel_test.go
+@@ -2772,6 +2772,7 @@ var expNonEmailNotifications = map[string][]string{
+ 			  "grafana_folder": "default"
+ 			},
+ 		"annotations": {
++		  "__alert_rule_namespace_uid__":"default",
+ 		  "__orgId__":"1",
+               "__values__": "{\"A\":1}",
+               "__value_string__": "[ var='A' labels={} type='math' value=1 ]"
+diff --git a/public/app/features/dashboard/dashgrid/DashboardLibrary/CommunityDashboardSection.tsx b/public/app/features/dashboard/dashgrid/DashboardLibrary/CommunityDashboardSection.tsx
+index 589522003315f..8b352bb662b3d 100644
+--- a/public/app/features/dashboard/dashgrid/DashboardLibrary/CommunityDashboardSection.tsx
++++ b/public/app/features/dashboard/dashgrid/DashboardLibrary/CommunityDashboardSection.tsx
+@@ -14,7 +14,7 @@ import { MappingContext } from './SuggestedDashboardsModal';
+ import { checkDashboardCompatibility } from './api/compatibilityApi';
+ import { fetchCommunityDashboards } from './api/dashboardLibraryApi';
+ import { CONTENT_KINDS, DISCOVERY_METHODS, EVENT_LOCATIONS, SOURCE_ENTRY_POINTS } from './constants';
+-import { DashboardLibraryInteractions } from './interactions';
++import { DashboardLibraryInteractions, SuggestedDashboardInteractions } from './interactions';
+ import { GnetDashboard, isGnetDashboard } from './types';
+ import {
+   getThumbnailUrl,
+@@ -116,7 +116,7 @@ export const CommunityDashboardSection = ({ onShowMapping, datasourceType }: Pro
+   // Track analytics only once on first successful load
+   useEffect(() => {
+     if (!loading && !hasTrackedLoaded.current && response?.dashboards && response.dashboards.length > 0) {
+-      DashboardLibraryInteractions.loaded({
++      SuggestedDashboardInteractions.loaded({
+         numberOfItems: response.dashboards.length,
+         contentKinds: [CONTENT_KINDS.COMMUNITY_DASHBOARD],
+         datasourceTypes: [response.datasourceType],
+@@ -141,7 +141,7 @@ export const CommunityDashboardSection = ({ onShowMapping, datasourceType }: Pro
+       }
+ 
+       // Track item click
+-      DashboardLibraryInteractions.itemClicked({
++      SuggestedDashboardInteractions.itemClicked({
+         contentKind: CONTENT_KINDS.COMMUNITY_DASHBOARD,
+         datasourceTypes: [response.datasourceType],
+         libraryItemId: String(dashboard.id),
+diff --git a/public/app/features/provisioning/GettingStarted/FeaturesList.tsx b/public/app/features/provisioning/GettingStarted/FeaturesList.tsx
+index 95b381c5238a6..4b9cd357dfae8 100644
+--- a/public/app/features/provisioning/GettingStarted/FeaturesList.tsx
++++ b/public/app/features/provisioning/GettingStarted/FeaturesList.tsx
+@@ -5,18 +5,19 @@ import { Trans } from '@grafana/i18n';
+ import { Box, FeatureBadge, LinkButton, Stack, Text, TextLink, useStyles2 } from '@grafana/ui';
+ 
+ import { RepositoryTypeCards } from '../Shared/RepositoryTypeCards';
+-import { isFreeTierLicense } from '../utils/isFreeTierLicense';
+ import { isOnPrem } from '../utils/isOnPrem';
+ 
+ interface FeaturesListProps {
+   hasRequiredFeatures: boolean;
+   isConnectionLimitExceeded?: boolean;
++  maxRepositories?: number;
+   onSetupFeatures: () => void;
+ }
+ 
+ export const FeaturesList = ({
+   hasRequiredFeatures,
+   isConnectionLimitExceeded,
++  maxRepositories = 0,
+   onSetupFeatures,
+ }: FeaturesListProps) => {
+   const styles = useStyles2(getStyles);
+@@ -40,10 +41,10 @@ export const FeaturesList = ({
+             Store dashboards in version-controlled storage for better organization and history tracking
+           </Trans>
+         </li>
+-        {isFreeTierLicense() && (
++        {!!maxRepositories && (
+           <li>
+-            <Trans i18nKey="provisioning.free-tier-limit.message">
+-              Free-tier accounts are capped to 1 connection, and 20 resources per folder
++            <Trans i18nKey="provisioning.quota-limit.message-repositories-info" count={maxRepositories}>
++              Your account is limited to {{ count: maxRepositories }} connected repositories
+             </Trans>
+           </li>
+         )}
+diff --git a/public/app/features/provisioning/GettingStarted/GettingStarted.tsx b/public/app/features/provisioning/GettingStarted/GettingStarted.tsx
+index c91078ad34458..c131c184b0557 100644
+--- a/public/app/features/provisioning/GettingStarted/GettingStarted.tsx
++++ b/public/app/features/provisioning/GettingStarted/GettingStarted.tsx
+@@ -8,9 +8,7 @@ import { config } from '@grafana/runtime';
+ import { Stack, useStyles2 } from '@grafana/ui';
+ import { Repository, useGetFrontendSettingsQuery } from 'app/api/clients/provisioning/v0alpha1';
+ 
+-import { FREE_TIER_CONNECTION_LIMIT } from '../constants';
+ import provisioningSvg from '../img/provisioning.svg';
+-import { isFreeTierLicense } from '../utils/isFreeTierLicense';
+ 
+ import { EnhancedFeatures } from './EnhancedFeatures';
+ import { FeaturesList } from './FeaturesList';
+@@ -131,7 +129,8 @@ export default function GettingStarted({ items }: Props) {
+   });
+   const connectionCount = settingsQuery.data?.items?.length ?? 0;
+   const hasItems = connectionCount > 0;
+-  const isConnectionLimitExceeded = isFreeTierLicense() && connectionCount >= FREE_TIER_CONNECTION_LIMIT;
++  const maxRepositories = settingsQuery.data?.maxRepositories;
++  const isConnectionLimitExceeded = !!maxRepositories && connectionCount >= maxRepositories;
+   const { hasPublicAccess, hasImageRenderer, hasRequiredFeatures } = getConfigurationStatus();
+   const [showInstructionsModal, setShowModal] = useState(false);
+   const [setupType, setSetupType] = useState<SetupType>(null);
+@@ -147,6 +146,7 @@ export default function GettingStarted({ items }: Props) {
+           <FeaturesList
+             hasRequiredFeatures={hasRequiredFeatures}
+             isConnectionLimitExceeded={isConnectionLimitExceeded}
++            maxRepositories={maxRepositories}
+             onSetupFeatures={() => {
+               setSetupType('required-features');
+               setShowModal(true);
+diff --git a/public/app/features/provisioning/Repository/RepositoryOverview.tsx b/public/app/features/provisioning/Repository/RepositoryOverview.tsx
+index 4d4a3ed2beae9..d8adf3de7ed0f 100644
+--- a/public/app/features/provisioning/Repository/RepositoryOverview.tsx
++++ b/public/app/features/provisioning/Repository/RepositoryOverview.tsx
+@@ -8,9 +8,10 @@ import { Box, Card, CellProps, Grid, InteractiveTable, LinkButton, Stack, Text,
+ import { Repository, ResourceCount } from 'app/api/clients/provisioning/v0alpha1';
+ 
+ import { RecentJobs } from '../Job/RecentJobs';
+-import { FreeTierLimitNote } from '../Shared/FreeTierLimitNote';
++import { QuotaLimitNote } from '../Shared/QuotaLimitNote';
+ import { MissingFolderMetadataBanner } from '../components/Folders/MissingFolderMetadataBanner';
+ import { useRepoMetadataStatus } from '../hooks/useRepoMetadataStatus';
++import { isQuotaReachedOrExceeded } from '../utils/quota';
+ import { formatTimestamp } from '../utils/time';
+ 
+ import { RepositoryHealthCard } from './RepositoryHealthCard';
+@@ -32,8 +33,9 @@ export function RepositoryOverview({ repo }: { repo: Repository }) {
+   const { status: folderMetadataStatus } = useRepoMetadataStatus(showFolderMetadataCheck ? repoName : '');
+ 
+   const status = repo.status;
++  const { conditions, quota } = status ?? {};
+   const webhookURL = getWebhookURL(repo);
+-  const { lgColumn, xxlColumn } = getColumnCount(Boolean(repo.status?.webhook));
++  const { lgColumn, xxlColumn } = getColumnCount(Boolean(status?.webhook));
+ 
+   const resourceColumns = useMemo(
+     () => [
+@@ -69,16 +71,18 @@ export function RepositoryOverview({ repo }: { repo: Repository }) {
+                 <Trans i18nKey="provisioning.repository-overview.resources">Resources</Trans>
+               </Card.Heading>
+               <Card.Description>
+-                {repo.status?.stats ? (
++                {status?.stats ? (
+                   <InteractiveTable
+                     columns={resourceColumns}
+-                    data={repo.status.stats}
++                    data={status.stats}
+                     getRowId={(r: ResourceCount) => `${r.group}-${r.resource}`}
+                   />
+                 ) : null}
+-                <Box paddingTop={2}>
+-                  <FreeTierLimitNote limitType="resource" />
+-                </Box>
++                {isQuotaReachedOrExceeded(conditions, 'ResourceQuota') && (
++                  <Box paddingTop={2}>
++                    <QuotaLimitNote maxResourcesPerRepository={quota?.maxResourcesPerRepository} />
++                  </Box>
++                )}
+               </Card.Description>
+               <Card.Actions className={styles.actions}>
+                 <LinkButton size="md" href={getFolderURL(repo)} icon="folder-open" variant="secondary">
+@@ -88,14 +92,14 @@ export function RepositoryOverview({ repo }: { repo: Repository }) {
+             </Card>
+           </div>
+ 
+-          {repo.status?.health && (
++          {status?.health && (
+             <div className={styles.cardContainer}>
+               <RepositoryHealthCard repo={repo} />
+             </div>
+           )}
+ 
+           {/* Webhook */}
+-          {repo.status?.webhook && (
++          {status?.webhook && (
+             <div className={styles.cardContainer}>
+               <Card noMargin className={styles.card}>
+                 <Card.Heading>
+@@ -144,7 +148,7 @@ export function RepositoryOverview({ repo }: { repo: Repository }) {
+           <div
+             className={cx(
+               styles.pullStatusCard,
+-              repo.status?.webhook ? styles.pullStatusCardLgSpan3 : styles.pullStatusCardLgSpan2
++              status?.webhook ? styles.pullStatusCardLgSpan3 : styles.pullStatusCardLgSpan2
+             )}
+           >
+             <RepositoryPullStatusCard repo={repo} />
+diff --git a/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx b/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx
+index 43af31beff86d..b3c06b6e1ade5 100644
+--- a/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx
++++ b/public/app/features/provisioning/Shared/ConnectRepositoryButton.tsx
+@@ -13,9 +13,9 @@ interface Props {
+ }
+ 
+ export function ConnectRepositoryButton({ items }: Props) {
+-  const state = checkSyncSettings(items);
+   const navigate = useNavigate();
+   const { data: frontendSettings } = useGetFrontendSettingsQuery();
++  const state = checkSyncSettings(items, frontendSettings?.maxRepositories);
+ 
+   const isButtonDisabled = state.instanceConnected || state.maxReposReached;
+ 
+@@ -77,8 +77,8 @@ export function getConfigureRepoTooltip({
+ 
+   if (maxReposReached) {
+     return t(
+-      'provisioning.connect-repository-button.free-tier-limit-tooltip',
+-      'Free-tier accounts are restricted to one connection'
++      'provisioning.connect-repository-button.max-repos-reached-tooltip',
++      'Your account has reached the maximum number of connected repositories'
+     );
+   }
+ 
+diff --git a/public/app/features/provisioning/Shared/FreeTierLimitNote.tsx b/public/app/features/provisioning/Shared/FreeTierLimitNote.tsx
+deleted file mode 100644
+index 06e332654a10f..0000000000000
+--- a/public/app/features/provisioning/Shared/FreeTierLimitNote.tsx
++++ /dev/null
+@@ -1,66 +0,0 @@
+-import { css } from '@emotion/css';
+-
+-import { GrafanaTheme2 } from '@grafana/data';
+-import { Trans } from '@grafana/i18n';
+-import { Icon, Stack, Text, useStyles2 } from '@grafana/ui';
+-
+-import { UPGRADE_URL } from '../constants';
+-import { isFreeTierLicense } from '../utils/isFreeTierLicense';
+-
+-export interface FreeTierLimitNoteProps {
+-  /** The type of limit to display: connection limit or resource limit */
+-  limitType?: 'connection' | 'resource';
+-}
+-
+-/**
+- * Displays a free tier limit notification with an icon and "Note:" prefix
+- * Only visible for free tier users
+- */
+-export function FreeTierLimitNote({ limitType = 'resource' }: FreeTierLimitNoteProps) {
+-  const styles = useStyles2(getStyles);
+-
+-  if (!isFreeTierLicense()) {
+-    return null;
+-  }
+-
+-  return (
+-    <Stack direction="row" alignItems="flex-start">
+-      <Icon name="exclamation-triangle" className={styles.warningIcon} size="sm" />
+-      <Text variant="bodySmall">
+-        <Trans i18nKey="provisioning.free-tier-limit.note">Note:</Trans>{' '}
+-        {limitType === 'connection' ? (
+-          <Trans i18nKey="provisioning.free-tier-limit.message-connection">
+-            Free-tier accounts are limited to 1 connection. To add more connections,
+-          </Trans>
+-        ) : (
+-          <Trans i18nKey="provisioning.free-tier-limit.message-resource">
+-            Free-tier accounts are limited to 20 resources per folder. To add more resources,
+-          </Trans>
+-        )}{' '}
+-        {/* We are using a custom "a" tag here instead of the TextLink component because we need the link text to wrap*/}
+-        <a href={UPGRADE_URL} target="_blank" rel="noopener noreferrer" className={styles.link}>
+-          <Trans i18nKey="provisioning.free-tier-limit.upgrade-link">upgrade your account</Trans>{' '}
+-          <Icon name="external-link-alt" size="xs" />
+-        </a>
+-        .
+-      </Text>
+-    </Stack>
+-  );
+-}
+-
+-const getStyles = (theme: GrafanaTheme2) => {
+-  return {
+-    warningIcon: css({
+-      color: theme.colors.warning.text,
+-      marginTop: theme.spacing(0.25),
+-    }),
+-    link: css({
+-      color: theme.colors.text.link,
+-      textDecoration: 'underline',
+-      '&:hover': {
+-        color: theme.colors.text.link,
+-        textDecoration: 'none',
+-      },
+-    }),
+-  };
+-};
+diff --git a/public/app/features/provisioning/Shared/QuotaLimitNote.tsx b/public/app/features/provisioning/Shared/QuotaLimitNote.tsx
+new file mode 100644
+index 0000000000000..8f27d6e8387fd
+--- /dev/null
++++ b/public/app/features/provisioning/Shared/QuotaLimitNote.tsx
+@@ -0,0 +1,73 @@
++import { css } from '@emotion/css';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { Trans } from '@grafana/i18n';
++import { Icon, Stack, Text, useStyles2 } from '@grafana/ui';
++
++import { UPGRADE_URL } from '../constants';
++
++export interface QuotaLimitNoteProps {
++  maxRepositories?: number;
++  maxResourcesPerRepository?: number;
++}
++
++export function QuotaLimitNote({ maxRepositories = 0, maxResourcesPerRepository = 0 }: QuotaLimitNoteProps) {
++  const styles = useStyles2(getStyles);
++
++  const hasRepoLimit = maxRepositories > 0;
++  const hasResourceLimit = maxResourcesPerRepository > 0;
++
++  if (!hasRepoLimit && !hasResourceLimit) {
++    return null;
++  }
++
++  return (
++    <Stack direction="row" alignItems="flex-start">
++      <Icon name="exclamation-triangle" className={styles.warningIcon} size="sm" />
++      <Text variant="bodySmall">
++        <Trans i18nKey="provisioning.quota-limit.note">Note:</Trans> {/* Generic message about resource quota */}
++        {hasRepoLimit && hasResourceLimit ? (
++          <>
++            <Trans i18nKey="provisioning.quota-limit.note-message-both-repositories" count={maxRepositories}>
++              Your account is limited to {{ count: maxRepositories }} connected repositories
++            </Trans>{' '}
++            <Trans i18nKey="provisioning.quota-limit.note-message-both-resources" count={maxResourcesPerRepository}>
++              and {{ count: maxResourcesPerRepository }} synced resources per repository. To increase limits,
++            </Trans>
++          </>
++        ) : hasResourceLimit ? (
++          <Trans i18nKey="provisioning.quota-limit.note-message-resource" count={maxResourcesPerRepository}>
++            Your account is limited to {{ count: maxResourcesPerRepository }} synced resources per repository. To add
++            more resources,
++          </Trans>
++        ) : (
++          <Trans i18nKey="provisioning.quota-limit.note-message-repository" count={maxRepositories}>
++            Your account is limited to {{ count: maxRepositories }} connected repositories. To add more repositories,
++          </Trans>
++        )}
++        {/* Upgrade Link */}
++        <a href={UPGRADE_URL} target="_blank" rel="noopener noreferrer" className={styles.link}>
++          <Trans i18nKey="provisioning.quota-limit.upgrade-link">upgrade your account</Trans>{' '}
++          <Icon name="external-link-alt" size="xs" />
++        </a>
++      </Text>
++    </Stack>
++  );
++}
++
++const getStyles = (theme: GrafanaTheme2) => {
++  return {
++    warningIcon: css({
++      color: theme.colors.warning.text,
++      marginTop: theme.spacing(0.25),
++    }),
++    link: css({
++      color: theme.colors.text.link,
++      textDecoration: 'underline',
++      '&:hover': {
++        color: theme.colors.text.link,
++        textDecoration: 'none',
++      },
++    }),
++  };
++};
+diff --git a/public/app/features/provisioning/Shared/RepositoryList.tsx b/public/app/features/provisioning/Shared/RepositoryList.tsx
+index 6d6dd2ec24109..7a4a12e162c28 100644
+--- a/public/app/features/provisioning/Shared/RepositoryList.tsx
++++ b/public/app/features/provisioning/Shared/RepositoryList.tsx
+@@ -2,14 +2,13 @@ import { useState } from 'react';
+ 
+ import { t, Trans } from '@grafana/i18n';
+ import { Alert, Box, EmptyState, FilterInput, Icon, Stack, TextLink } from '@grafana/ui';
+-import { Repository } from 'app/api/clients/provisioning/v0alpha1';
++import { Repository, useGetFrontendSettingsQuery } from 'app/api/clients/provisioning/v0alpha1';
+ 
+ import { RepositoryListItem } from '../Repository/RepositoryListItem';
+ import { useResourceStats } from '../Wizard/hooks/useResourceStats';
+ import { UPGRADE_URL } from '../constants';
+ import { useIsProvisionedInstance } from '../hooks/useIsProvisionedInstance';
+ import { checkSyncSettings } from '../utils/checkSyncSettings';
+-import { isFreeTierLicense } from '../utils/isFreeTierLicense';
+ 
+ interface Props {
+   items: Repository[];
+@@ -19,10 +18,12 @@ export function RepositoryList({ items }: Props) {
+   const [query, setQuery] = useState('');
+   const isProvisionedInstance = useIsProvisionedInstance();
+   const { resourceCount, managedCount, unmanagedCount } = useResourceStats(items[0]?.metadata?.name);
+-
++  const { data: frontendSettings } = useGetFrontendSettingsQuery();
++  const maxRepositories = frontendSettings?.maxRepositories;
++  const maxResourcesPerRepository = items[0]?.status?.quota?.maxResourcesPerRepository;
++  const isRepoLimitHit = !!maxRepositories && items.length >= maxRepositories;
+   const filteredItems = items.filter((item) => item.metadata?.name?.includes(query));
+   const isEmpty = items.length === 0;
+-
+   if (isEmpty) {
+     return (
+       <EmptyState
+@@ -66,16 +67,27 @@ export function RepositoryList({ items }: Props) {
+                 </Trans>
+               </>
+             )}
+-            {isFreeTierLicense() && (
++            {isRepoLimitHit && (
+               <>
+-                <br />
+-                <Trans i18nKey="provisioning.folder-repository-list.free-tier-limit.message-connection">
+-                  Free-tier accounts are limited to 20 resources per folder. To add more resources per folder,
+-                </Trans>{' '}
++                {' '}
++                {!!maxResourcesPerRepository ? (
++                  <>
++                    <Trans i18nKey="provisioning.quota-limit.message-both-repositories" count={maxRepositories}>
++                      Your account is limited to {{ count: maxRepositories }} connected repositories
++                    </Trans>{' '}
++                    <Trans i18nKey="provisioning.quota-limit.message-both-resources" count={maxResourcesPerRepository}>
++                      and {{ count: maxResourcesPerRepository }} synced resources per repository.
++                    </Trans>
++                  </>
++                ) : (
++                  <Trans i18nKey="provisioning.quota-limit.message-repository" count={maxRepositories}>
++                    Your account is limited to {{ count: maxRepositories }} connected repositories. To add more
++                    repositories,
++                  </Trans>
++                )}{' '}
+                 <TextLink href={UPGRADE_URL} external>
+-                  <Trans i18nKey="provisioning.free-tier-limit.upgrade-link">upgrade your account</Trans>{' '}
++                  <Trans i18nKey="provisioning.quota-limit.upgrade-link">upgrade your account</Trans>
+                 </TextLink>
+-                .
+               </>
+             )}
+           </Alert>
+diff --git a/public/app/features/provisioning/Shared/RepositoryTypeCards.tsx b/public/app/features/provisioning/Shared/RepositoryTypeCards.tsx
+index baaa55b2e1d01..9f7af79ac4420 100644
+--- a/public/app/features/provisioning/Shared/RepositoryTypeCards.tsx
++++ b/public/app/features/provisioning/Shared/RepositoryTypeCards.tsx
+@@ -8,7 +8,7 @@ import { useGetFrontendSettingsQuery } from 'app/api/clients/provisioning/v0alph
+ import { CONNECT_URL } from '../constants';
+ import { getOrderedRepositoryConfigs } from '../utils/repositoryTypes';
+ 
+-import { FreeTierLimitNote } from './FreeTierLimitNote';
++import { QuotaLimitNote } from './QuotaLimitNote';
+ import { RepoIcon } from './RepoIcon';
+ 
+ interface RepositoryTypeCardsProps {
+@@ -96,7 +96,7 @@ export function RepositoryTypeCards({ disabled }: RepositoryTypeCardsProps) {
+         </Stack>
+       )}
+ 
+-      {disabled && <FreeTierLimitNote limitType="connection" />}
++      {disabled && <QuotaLimitNote maxRepositories={frontendSettings?.maxRepositories} />}
+     </Stack>
+   );
+ }
+diff --git a/public/app/features/provisioning/Wizard/BootstrapStep.test.tsx b/public/app/features/provisioning/Wizard/BootstrapStep.test.tsx
+index af3e3056a82dc..7df17e2743b1c 100644
+--- a/public/app/features/provisioning/Wizard/BootstrapStep.test.tsx
++++ b/public/app/features/provisioning/Wizard/BootstrapStep.test.tsx
+@@ -5,8 +5,6 @@ import { FormProvider, useForm } from 'react-hook-form';
+ 
+ import { useGetRepositoryFilesQuery, useGetResourceStatsQuery } from 'app/api/clients/provisioning/v0alpha1';
+ 
+-import { isFreeTierLicense } from '../utils/isFreeTierLicense';
+-
+ import { BootstrapStep, Props } from './BootstrapStep';
+ import { StepStatusProvider, useStepStatus } from './StepStatusContext';
+ import { useModeOptions } from './hooks/useModeOptions';
+@@ -31,10 +29,6 @@ jest.mock('./hooks/useRepositoryStatus', () => ({
+   useRepositoryStatus: jest.fn(),
+ }));
+ 
+-jest.mock('../utils/isFreeTierLicense', () => ({
+-  isFreeTierLicense: jest.fn(),
+-}));
+-
+ const mockUseGetRepositoryFilesQuery = useGetRepositoryFilesQuery as jest.MockedFunction<
+   typeof useGetRepositoryFilesQuery
+ >;
+@@ -42,7 +36,6 @@ const mockUseGetResourceStatsQuery = useGetResourceStatsQuery as jest.MockedFunc
+ const mockUseRepositoryStatus = useRepositoryStatus as jest.MockedFunction<typeof useRepositoryStatus>;
+ const mockUseResourceStats = useResourceStats as jest.MockedFunction<typeof useResourceStats>;
+ const mockUseModeOptions = useModeOptions as jest.MockedFunction<typeof useModeOptions>;
+-const mockIsFreeTierLicense = isFreeTierLicense as jest.MockedFunction<typeof isFreeTierLicense>;
+ 
+ type WizardFormDefaults = Omit<Partial<WizardFormData>, 'repository'> & {
+   repository?: Partial<WizardFormData['repository']>;
+@@ -149,6 +142,8 @@ describe('BootstrapStep', () => {
+       healthMessage: undefined,
+       healthStatusNotReady: false,
+       fieldErrors: undefined,
++      quota: undefined,
++      conditions: undefined,
+       refetch: jest.fn(),
+     });
+ 
+@@ -176,9 +171,6 @@ describe('BootstrapStep', () => {
+       ],
+       disabledOptions: [],
+     });
+-
+-    // Default to non-free tier (quota not enforced)
+-    mockIsFreeTierLicense.mockReturnValue(false);
+   });
+ 
+   describe('rendering', () => {
+@@ -390,14 +382,28 @@ describe('BootstrapStep', () => {
+   });
+ 
+   describe('quota exceeded', () => {
+-    it('should not render content when resource count exceeds free-tier limit on folder sync', () => {
+-      mockIsFreeTierLicense.mockReturnValue(true);
++    it('should not render content when resource count exceeds quota limit', () => {
++      mockUseRepositoryStatus.mockReturnValue({
++        isReady: true,
++        isLoading: false,
++        isFetching: false,
++        hasError: false,
++        isHealthy: true,
++        isUnhealthy: false,
++        isReconciled: true,
++        healthMessage: undefined,
++        healthStatusNotReady: false,
++        fieldErrors: undefined,
++        quota: { maxResourcesPerRepository: 20 },
++        conditions: undefined,
++        refetch: jest.fn(),
++      });
+ 
+       mockUseResourceStats.mockReturnValue({
+         managedCount: 25,
+         unmanagedCount: 0,
+         fileCount: 25,
+-        resourceCount: 25, // Exceeds free-tier limit of 20
++        resourceCount: 25,
+         resourceCountString: '25 resources',
+         fileCountString: '25 files',
+         isLoading: false,
+@@ -407,19 +413,32 @@ describe('BootstrapStep', () => {
+ 
+       setup();
+ 
+-      // Content should not be rendered when quota is exceeded on free tier
+       expect(screen.queryByText('Sync external storage to a new Grafana folder')).not.toBeInTheDocument();
+       expect(screen.queryByRole('textbox', { name: /display name/i })).not.toBeInTheDocument();
+     });
+ 
+-    it('should render content when resource count exceeds free-tier limit but not on free tier', async () => {
+-      mockIsFreeTierLicense.mockReturnValue(false);
++    it('should render content when no quota is configured even with high resource count', async () => {
++      mockUseRepositoryStatus.mockReturnValue({
++        isReady: true,
++        isLoading: false,
++        isFetching: false,
++        hasError: false,
++        isHealthy: true,
++        isUnhealthy: false,
++        isReconciled: true,
++        healthMessage: undefined,
++        healthStatusNotReady: false,
++        fieldErrors: undefined,
++        quota: undefined,
++        conditions: undefined,
++        refetch: jest.fn(),
++      });
+ 
+       mockUseResourceStats.mockReturnValue({
+         managedCount: 25,
+         unmanagedCount: 0,
+         fileCount: 25,
+-        resourceCount: 25, // Exceeds limit but not on free tier
++        resourceCount: 25,
+         resourceCountString: '25 resources',
+         fileCountString: '25 files',
+         isLoading: false,
+@@ -429,18 +448,31 @@ describe('BootstrapStep', () => {
+ 
+       setup();
+ 
+-      // Quota is not enforced when not on free tier
+       expect(await screen.findByText('Sync external storage to a new Grafana folder')).toBeInTheDocument();
+     });
+ 
+-    it('should render content when resource count is within quota on free tier', async () => {
+-      mockIsFreeTierLicense.mockReturnValue(true);
++    it('should render content when resource count is within quota', async () => {
++      mockUseRepositoryStatus.mockReturnValue({
++        isReady: true,
++        isLoading: false,
++        isFetching: false,
++        hasError: false,
++        isHealthy: true,
++        isUnhealthy: false,
++        isReconciled: true,
++        healthMessage: undefined,
++        healthStatusNotReady: false,
++        fieldErrors: undefined,
++        quota: { maxResourcesPerRepository: 20 },
++        conditions: undefined,
++        refetch: jest.fn(),
++      });
+ 
+       mockUseResourceStats.mockReturnValue({
+         managedCount: 15,
+         unmanagedCount: 0,
+         fileCount: 15,
+-        resourceCount: 15, // Within free-tier limit of 20
++        resourceCount: 15,
+         resourceCountString: '15 resources',
+         fileCountString: '15 files',
+         isLoading: false,
+@@ -453,14 +485,28 @@ describe('BootstrapStep', () => {
+       expect(await screen.findByText('Sync external storage to a new Grafana folder')).toBeInTheDocument();
+     });
+ 
+-    it('should render content when resource count equals quota limit on free tier', async () => {
+-      mockIsFreeTierLicense.mockReturnValue(true);
++    it('should render content when resource count equals quota limit', async () => {
++      mockUseRepositoryStatus.mockReturnValue({
++        isReady: true,
++        isLoading: false,
++        isFetching: false,
++        hasError: false,
++        isHealthy: true,
++        isUnhealthy: false,
++        isReconciled: true,
++        healthMessage: undefined,
++        healthStatusNotReady: false,
++        fieldErrors: undefined,
++        quota: { maxResourcesPerRepository: 20 },
++        conditions: undefined,
++        refetch: jest.fn(),
++      });
+ 
+       mockUseResourceStats.mockReturnValue({
+         managedCount: 20,
+         unmanagedCount: 0,
+         fileCount: 20,
+-        resourceCount: 20, // Exactly at free-tier limit of 20
++        resourceCount: 20,
+         resourceCountString: '20 resources',
+         fileCountString: '20 files',
+         isLoading: false,
+@@ -470,51 +516,41 @@ describe('BootstrapStep', () => {
+ 
+       setup();
+ 
+-      // Exactly at limit is allowed (only > limit triggers exceeded)
+       expect(await screen.findByText('Sync external storage to a new Grafana folder')).toBeInTheDocument();
+     });
+ 
+-    it('should render content when resource count exceeds limit on free tier for instance sync', async () => {
+-      mockIsFreeTierLicense.mockReturnValue(true);
+-
+-      mockUseModeOptions.mockReturnValue({
+-        enabledOptions: [
+-          {
+-            target: 'instance',
+-            label: 'Sync all resources with external storage',
+-            description: 'Resources will be synced with external storage',
+-            subtitle: 'Use this option if you want to sync your entire instance',
+-            disabled: false,
+-          },
+-        ],
+-        disabledOptions: [],
++    it('should render content when quota is unlimited (maxResourcesPerRepository = 0)', async () => {
++      mockUseRepositoryStatus.mockReturnValue({
++        isReady: true,
++        isLoading: false,
++        isFetching: false,
++        hasError: false,
++        isHealthy: true,
++        isUnhealthy: false,
++        isReconciled: true,
++        healthMessage: undefined,
++        healthStatusNotReady: false,
++        fieldErrors: undefined,
++        quota: { maxResourcesPerRepository: 0 },
++        conditions: undefined,
++        refetch: jest.fn(),
+       });
+ 
+       mockUseResourceStats.mockReturnValue({
+-        managedCount: 25,
++        managedCount: 100,
+         unmanagedCount: 0,
+-        fileCount: 25,
+-        resourceCount: 25, // Exceeds limit but instance sync is not restricted
+-        resourceCountString: '25 resources',
+-        fileCountString: '25 files',
++        fileCount: 100,
++        resourceCount: 100,
++        resourceCountString: '100 resources',
++        fileCountString: '100 files',
+         isLoading: false,
+         requiresMigration: false,
+         shouldSkipSync: false,
+       });
+ 
+-      setup(
+-        {},
+-        {
+-          repository: {
+-            sync: {
+-              target: 'instance',
+-              enabled: true,
+-            },
+-          },
+-        }
+-      );
++      setup();
+ 
+-      expect(await screen.findByText('Sync all resources with external storage')).toBeInTheDocument();
++      expect(await screen.findByText('Sync external storage to a new Grafana folder')).toBeInTheDocument();
+     });
+   });
+ 
+@@ -532,6 +568,8 @@ describe('BootstrapStep', () => {
+         healthMessage: ['Some temporary error'],
+         healthStatusNotReady: true,
+         fieldErrors: undefined,
++        quota: undefined,
++        conditions: undefined,
+         refetch: jest.fn(),
+       });
+ 
+@@ -567,6 +605,8 @@ describe('BootstrapStep', () => {
+         healthMessage: ['Connection failed'],
+         healthStatusNotReady: false,
+         fieldErrors: undefined,
++        quota: undefined,
++        conditions: undefined,
+         refetch: jest.fn(),
+       });
+ 
+@@ -601,6 +641,8 @@ describe('BootstrapStep', () => {
+         healthMessage: undefined,
+         healthStatusNotReady: false,
+         fieldErrors: undefined,
++        quota: undefined,
++        conditions: undefined,
+         refetch: jest.fn(),
+       });
+ 
+diff --git a/public/app/features/provisioning/Wizard/BootstrapStep.tsx b/public/app/features/provisioning/Wizard/BootstrapStep.tsx
+index 900fe7b69f724..c6e31a6b177a8 100644
+--- a/public/app/features/provisioning/Wizard/BootstrapStep.tsx
++++ b/public/app/features/provisioning/Wizard/BootstrapStep.tsx
+@@ -8,9 +8,8 @@ import { Box, Card, Field, Input, LoadingPlaceholder, Stack, Text, useStyles2 }
+ import { RepositoryViewList } from 'app/api/clients/provisioning/v0alpha1';
+ import { generateRepositoryTitle } from 'app/features/provisioning/utils/data';
+ 
+-import { FreeTierLimitNote } from '../Shared/FreeTierLimitNote';
++import { QuotaLimitNote } from '../Shared/QuotaLimitNote';
+ import { UPGRADE_URL } from '../constants';
+-import { isFreeTierLicense } from '../utils/isFreeTierLicense';
+ 
+ import { BootstrapStepCardIcons } from './BootstrapStepCardIcons';
+ import { BootstrapStepResourceCounting } from './BootstrapStepResourceCounting';
+@@ -20,9 +19,6 @@ import { useRepositoryStatus } from './hooks/useRepositoryStatus';
+ import { useResourceStats } from './hooks/useResourceStats';
+ import { WizardFormData } from './types';
+ 
+-// TODO use the limits from the API when they are available
+-const FREE_TIER_FOLDER_RESOURCE_LIMIT = 20;
+-
+ export interface Props {
+   settingsData?: RepositoryViewList;
+   repoName: string;
+@@ -52,6 +48,7 @@ export const BootstrapStep = memo(function BootstrapStep({ settingsData, repoNam
+     isHealthy,
+     isUnhealthy,
+     healthStatusNotReady,
++    quota,
+   } = useRepositoryStatus(repoName);
+ 
+   const {
+@@ -61,9 +58,8 @@ export const BootstrapStep = memo(function BootstrapStep({ settingsData, repoNam
+     isLoading: isResourceStatsLoading,
+   } = useResourceStats(repoName, selectedTarget, undefined, { isHealthy, healthStatusNotReady });
+ 
+-  const isQuotaExceeded = Boolean(
+-    isFreeTierLicense() && selectedTarget === 'folder' && resourceCount > FREE_TIER_FOLDER_RESOURCE_LIMIT
+-  );
++  const maxResourcesPerRepository = quota?.maxResourcesPerRepository ?? 0;
++  const isQuotaExceeded = maxResourcesPerRepository > 0 && resourceCount > maxResourcesPerRepository;
+   const styles = useStyles2(getStyles);
+ 
+   const isLoading = isRepositoryStatusLoading || isResourceStatsLoading || !isRepositoryReady;
+@@ -105,8 +101,8 @@ export const BootstrapStep = memo(function BootstrapStep({ settingsData, repoNam
+           title: t('provisioning.bootstrap-step.error-quota-exceeded-title', 'Resource quota exceeded'),
+           message: t(
+             'provisioning.bootstrap-step.error-quota-exceeded-message',
+-            'The repository contains {{resourceCount}} resources, which exceeds the free-tier limit of {{limit}} resources per folder. To sync this repository, upgrade your account or reduce the number of resources.',
+-            { resourceCount, limit: FREE_TIER_FOLDER_RESOURCE_LIMIT }
++            'This repository contains {{resourceCount}} resources, which exceeds your account limit of {{limit}}. To sync this repository, upgrade your account or reduce the number of resources to sync.',
++            { resourceCount, limit: maxResourcesPerRepository }
+           ),
+         },
+         action: {
+@@ -123,6 +119,7 @@ export const BootstrapStep = memo(function BootstrapStep({ settingsData, repoNam
+     setStepStatusInfo,
+     repositoryStatusError,
+     retryRepositoryStatus,
++    maxResourcesPerRepository,
+     isQuotaExceeded,
+     resourceCount,
+     isUnhealthy,
+@@ -181,7 +178,7 @@ export const BootstrapStep = memo(function BootstrapStep({ settingsData, repoNam
+                     <Stack direction="column" gap={3}>
+                       {action.description}
+                       <Text color="primary">{action.subtitle}</Text>
+-                      <FreeTierLimitNote limitType="resource" />
++                      <QuotaLimitNote maxResourcesPerRepository={maxResourcesPerRepository} />
+                     </Stack>
+                     <div className={styles.divider} />
+ 
+diff --git a/public/app/features/provisioning/Wizard/ConnectStep.tsx b/public/app/features/provisioning/Wizard/ConnectStep.tsx
+index 7e1577d06b4f0..a3df0ef703bee 100644
+--- a/public/app/features/provisioning/Wizard/ConnectStep.tsx
++++ b/public/app/features/provisioning/Wizard/ConnectStep.tsx
+@@ -2,8 +2,9 @@ import { memo, useEffect, useRef } from 'react';
+ import { Controller, useFormContext } from 'react-hook-form';
+ 
+ import { Combobox, Field, Input, Stack } from '@grafana/ui';
++import { useGetFrontendSettingsQuery } from 'app/api/clients/provisioning/v0alpha1';
+ 
+-import { FreeTierLimitNote } from '../Shared/FreeTierLimitNote';
++import { QuotaLimitNote } from '../Shared/QuotaLimitNote';
+ import { useGetRepositoryFolders } from '../hooks/useGetRepositoryFolders';
+ import { useGetRepositoryRefs } from '../hooks/useGetRepositoryRefs';
+ import { isGitProvider } from '../utils/repositoryTypes';
+@@ -21,6 +22,7 @@ export const ConnectStep = memo(function ConnectStep() {
+     setValue,
+   } = useFormContext<WizardFormData>();
+ 
++  const { data: frontendSettings } = useGetFrontendSettingsQuery();
+   // We don't need to dynamically react on repo type changes, so we use getValues for it
+   const type = getValues('repository.type');
+   const [repositoryName = '', branch = ''] = watch(['repositoryName', 'repository.branch']);
+@@ -135,7 +137,7 @@ export const ConnectStep = memo(function ConnectStep() {
+         </Field>
+       )}
+ 
+-      <FreeTierLimitNote limitType="connection" />
++      <QuotaLimitNote maxRepositories={frontendSettings?.maxRepositories} />
+     </Stack>
+   );
+ });
+diff --git a/public/app/features/provisioning/Wizard/hooks/useRepositoryStatus.ts b/public/app/features/provisioning/Wizard/hooks/useRepositoryStatus.ts
+index ecd3b1f4e7de7..e57715532826b 100644
+--- a/public/app/features/provisioning/Wizard/hooks/useRepositoryStatus.ts
++++ b/public/app/features/provisioning/Wizard/hooks/useRepositoryStatus.ts
+@@ -17,6 +17,8 @@ export function useRepositoryStatus(repoName?: string) {
+   const repository = query.data?.items?.[0];
+   const { healthy: rawIsHealthy, message: healthMessage } = repository?.status?.health || {};
+   const fieldErrors = repository?.status?.fieldErrors;
++  const quota = repository?.status?.quota;
++  const conditions = repository?.status?.conditions;
+ 
+   const isReconciled = isResourceReconciled(repository);
+   const isReady = Boolean(repoName) && query.isSuccess;
+@@ -35,6 +37,8 @@ export function useRepositoryStatus(repoName?: string) {
+     healthMessage,
+     healthStatusNotReady, // true when waiting for reconciliation
+     fieldErrors,
++    quota,
++    conditions,
+     isLoading: query.isLoading,
+     isFetching: query.isFetching,
+     hasError: query.isError,
+diff --git a/public/app/features/provisioning/components/Dashboards/DashboardPreviewBanner.test.tsx b/public/app/features/provisioning/components/Dashboards/DashboardPreviewBanner.test.tsx
+index 1eea2d38d4f6d..80296932dc105 100644
+--- a/public/app/features/provisioning/components/Dashboards/DashboardPreviewBanner.test.tsx
++++ b/public/app/features/provisioning/components/Dashboards/DashboardPreviewBanner.test.tsx
+@@ -107,6 +107,7 @@ function setup(props: Partial<DashboardPreviewBannerProps> = {}, overrides: Setu
+     repoType: 'github',
+     ...overrides.pullRequestParam,
+     resourcePushedTo: 'abc',
++    action: 'create',
+   });
+ 
+   mockUseGetResourceRepositoryView.mockReturnValue({
+diff --git a/public/app/features/provisioning/components/Dashboards/DeleteProvisionedDashboardForm.tsx b/public/app/features/provisioning/components/Dashboards/DeleteProvisionedDashboardForm.tsx
+index ab19fc09a0a46..d71c95831cf45 100644
+--- a/public/app/features/provisioning/components/Dashboards/DeleteProvisionedDashboardForm.tsx
++++ b/public/app/features/provisioning/components/Dashboards/DeleteProvisionedDashboardForm.tsx
+@@ -10,7 +10,6 @@ import { Job, RepositoryView, useDeleteRepositoryFilesWithPathMutation } from 'a
+ import { DashboardScene } from 'app/features/dashboard-scene/scene/DashboardScene';
+ import { JobStatus } from 'app/features/provisioning/Job/JobStatus';
+ import { StepStatusInfo } from 'app/features/provisioning/Wizard/types';
+-import { PROVISIONING_URL } from 'app/features/provisioning/constants';
+ 
+ import { ProvisioningAlert } from '../../Shared/ProvisioningAlert';
+ import { useProvisionedRequestHandler } from '../../hooks/useProvisionedRequestHandler';
+@@ -136,14 +135,14 @@ export function DeleteProvisionedDashboardForm({
+     }
+   };
+ 
+-  // Branch success handler for /files API
+-  const onBranchSuccess = (path: string, info: { repoType: string }, urls?: Record<string, string>) => {
++  // Branch success handler for /files API — redirects to /dashboards (not the deleted dashboard's preview URL)
++  const onBranchSuccess = (_path: string, info: { repoType: string }, urls?: Record<string, string>) => {
+     panelEditor?.onDiscard();
+     const url = buildResourceBranchRedirectUrl({
+-      baseUrl: `${PROVISIONING_URL}/${defaultValues.repo}/dashboard/preview/${path}`,
+-      paramName: 'pull_request_url',
++      paramName: 'new_pull_request_url',
+       paramValue: urls?.newPullRequestURL,
+       repoType: info.repoType,
++      action: 'delete',
+     });
+     navigate(url);
+   };
+diff --git a/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.test.tsx b/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.test.tsx
+index 84ae1e4e4e15a..8cd0c73a7519c 100644
+--- a/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.test.tsx
++++ b/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.test.tsx
+@@ -341,6 +341,7 @@ describe('DeleteProvisionedFolderForm', () => {
+         const expectedParams = new URLSearchParams();
+         expectedParams.set('new_pull_request_url', 'https://github.com/test/repo/pull/new');
+         expectedParams.set('repo_type', 'git');
++        expectedParams.set('action', 'delete');
+         const expectedUrl = `/dashboards?${expectedParams.toString()}`;
+ 
+         expect(mockNavigate).toHaveBeenCalledWith(expectedUrl);
+diff --git a/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.tsx b/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.tsx
+index 6286adba53697..7f151784cbe37 100644
+--- a/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.tsx
++++ b/public/app/features/provisioning/components/Folders/DeleteProvisionedFolderForm.tsx
+@@ -121,6 +121,7 @@ function FormContent({ initialValues, parentFolder, repository, canPushToConfigu
+         paramName: 'new_pull_request_url',
+         paramValue: prUrl,
+         repoType: info.repoType,
++        action: 'delete',
+       });
+       navigate(url);
+     }
+diff --git a/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.test.tsx b/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.test.tsx
+index 2a8b30f19460c..19ed4077eab83 100644
+--- a/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.test.tsx
++++ b/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.test.tsx
+@@ -25,20 +25,23 @@ const mockTextUtil = jest.mocked(textUtil);
+ const mockUsePullRequestParam = jest.mocked(usePullRequestParam);
+ 
+ function setup(
+-  options: { prURL: string; isNewPr?: boolean; repoType?: RepoType } = { prURL: 'test-url', repoType: 'github' }
++  options: { prURL: string; isNewPr?: boolean; repoType?: RepoType; action?: string } = {
++    prURL: 'test-url',
++    repoType: 'github',
++  }
+ ) {
+   const componentProps = {
+     prURL: options.prURL,
+     isNewPr: options.isNewPr || false,
+   };
+ 
+-  // Mock the hook BEFORE rendering the component
+   mockUsePullRequestParam.mockReturnValue({
+     prURL: undefined,
+     newPrURL: undefined,
+     repoURL: undefined,
+     repoType: options.repoType || 'github',
+     resourcePushedTo: 'abc',
++    action: options.action,
+   });
+ 
+   const renderResult = render(<PreviewBannerViewPR {...componentProps} />);
+@@ -169,6 +172,30 @@ describe('PreviewBannerViewPR', () => {
+       ).toBeInTheDocument();
+     });
+   });
++
++  describe('Delete action', () => {
++    it('should render delete-specific title for new PR', () => {
++      setup({ prURL: 'test-url', isNewPr: true, action: 'delete' });
++
++      expect(screen.getByText('A resource has been deleted in a branch in GitHub.')).toBeInTheDocument();
++    });
++
++    it('should render delete-specific body text', () => {
++      setup({ prURL: 'test-url', isNewPr: true, action: 'delete' });
++
++      expect(
++        screen.getByText(
++          'The rest of Grafana users in your organization will still see this resource until this branch is merged'
++        )
++      ).toBeInTheDocument();
++    });
++
++    it('should still render PR button for delete action', () => {
++      setup({ prURL: 'test-url', isNewPr: true, action: 'delete' });
++
++      expect(screen.getByText('Open pull request in GitHub')).toBeInTheDocument();
++    });
++  });
+ });
+ 
+ describe('isValidRepoType', () => {
+diff --git a/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.tsx b/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.tsx
+index 903a76d92176e..d6f8adc76bbf1 100644
+--- a/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.tsx
++++ b/public/app/features/provisioning/components/Shared/PreviewBannerViewPR.tsx
+@@ -43,29 +43,16 @@ function BranchDisplay({ baseUrl, branch, repoType }: { baseUrl: string; branch:
+ }
+ 
+ /**
+- * @description This component is used to display a banner when a provisioned dashboard/folder is created or loaded from a new branch in repo.
++ * @description This component is used to display a banner when a provisioned dashboard/folder is created, deleted, or loaded from a new branch in repo.
+  */
+ export function PreviewBannerViewPR({ prURL, isNewPr, behindBranch, repoUrl, branchInfo }: Props) {
+-  const { repoType } = usePullRequestParam();
++  const { repoType, action } = usePullRequestParam();
+ 
+   const capitalizedRepoType = isValidRepoType(repoType) ? RepoTypeDisplay[repoType] : 'repository';
+   const linkUrl = prURL || branchInfo?.repoBaseUrl || repoUrl;
+ 
+-  const titleText = isNewPr
+-    ? t(
+-        'provisioned-resource-preview-banner.title-created-branch-in-repo',
+-        'A new resource has been created in a branch in {{repoType}}.',
+-        {
+-          repoType: capitalizedRepoType,
+-        }
+-      )
+-    : t(
+-        'provisioned-resource-preview-banner.title-loaded-pull-request-in-repo',
+-        'This resource is loaded from the branch you just created in {{repoType}} and it is only visible to you',
+-        {
+-          repoType: capitalizedRepoType,
+-        }
+-      );
++  const actionText =
++    action === 'delete' ? getDeleteBannerText(capitalizedRepoType) : getCreateBannerText(isNewPr, capitalizedRepoType);
+ 
+   if (behindBranch) {
+     return (
+@@ -101,29 +88,16 @@ export function PreviewBannerViewPR({ prURL, isNewPr, behindBranch, repoUrl, bra
+   return (
+     <Alert
+       {...commonAlertProps}
+-      title={titleText}
++      title={actionText.title}
+       buttonContent={
+         <Stack alignItems="center">
+-          {isNewPr
+-            ? t(
+-                'provisioned-resource-preview-banner.preview-banner.open-pull-request-in-repo',
+-                'Open pull request in {{repoType}}',
+-                { repoType: capitalizedRepoType }
+-              )
+-            : t(
+-                'provisioned-resource-preview-banner.preview-banner.view-pull-request-in-repo',
+-                'View pull request in {{repoType}}',
+-                { repoType: capitalizedRepoType }
+-              )}
++          {actionText.button}
+           <Icon name="external-link-alt" />
+         </Stack>
+       }
+       onRemove={linkUrl ? () => window.open(textUtil.sanitizeUrl(linkUrl), '_blank') : undefined}
+     >
+-      <Trans i18nKey="provisioned-resource-preview-banner.preview-banner.not-saved">
+-        The rest of Grafana users in your organization will still see the current version saved to configured default
+-        branch until this branch is merged
+-      </Trans>
++      {actionText.body}
+ 
+       {/* when the repo type is a valid provider, we show branch information */}
+       {showBranchInfo(repoType, branchInfo) && (
+@@ -139,6 +113,62 @@ export function PreviewBannerViewPR({ prURL, isNewPr, behindBranch, repoUrl, bra
+   );
+ }
+ 
++interface BannerText {
++  title: string;
++  body: string;
++  button: string;
++}
++
++function getCreateBannerText(isNewPr: boolean | undefined, repoType: string): BannerText {
++  return {
++    title: isNewPr
++      ? t(
++          'provisioned-resource-preview-banner.title-created-branch-in-repo',
++          'A new resource has been created in a branch in {{repoType}}.',
++          { repoType }
++        )
++      : t(
++          'provisioned-resource-preview-banner.title-loaded-pull-request-in-repo',
++          'This resource is loaded from the branch you just created in {{repoType}} and it is only visible to you',
++          { repoType }
++        ),
++    body: t(
++      'provisioned-resource-preview-banner.preview-banner.not-saved',
++      'The rest of Grafana users in your organization will still see the current version saved to configured default branch until this branch is merged'
++    ),
++    button: isNewPr
++      ? t(
++          'provisioned-resource-preview-banner.preview-banner.open-pull-request-in-repo',
++          'Open pull request in {{repoType}}',
++          { repoType }
++        )
++      : t(
++          'provisioned-resource-preview-banner.preview-banner.view-pull-request-in-repo',
++          'View pull request in {{repoType}}',
++          { repoType }
++        ),
++  };
++}
++
++function getDeleteBannerText(repoType: string): BannerText {
++  return {
++    title: t(
++      'provisioned-resource-preview-banner.title-deleted-resource-in-branch',
++      'A resource has been deleted in a branch in {{repoType}}.',
++      { repoType }
++    ),
++    body: t(
++      'provisioned-resource-preview-banner.preview-banner.delete-from-branch',
++      'The rest of Grafana users in your organization will still see this resource until this branch is merged'
++    ),
++    button: t(
++      'provisioned-resource-preview-banner.preview-banner.open-pull-request-in-repo',
++      'Open pull request in {{repoType}}',
++      { repoType }
++    ),
++  };
++}
++
+ function showBranchInfo(
+   repoType: string | undefined,
+   branchInfo?: PreviewBranchInfo
+diff --git a/public/app/features/provisioning/constants.ts b/public/app/features/provisioning/constants.ts
+index c815203c19127..05777279ae165 100644
+--- a/public/app/features/provisioning/constants.ts
++++ b/public/app/features/provisioning/constants.ts
+@@ -7,9 +7,6 @@ export const UPGRADE_URL = 'https://grafana.com/profile/org/subscription';
+ 
+ export const DEFAULT_REPOSITORY_TYPES: Array<'github' | 'local'> = ['github', 'local'];
+ 
+-// TODO: use the limits from the API when they are available
+-export const FREE_TIER_CONNECTION_LIMIT = 1;
+-
+ export const DEFAULT_BRANCH_NAMES = ['main', 'master'] as const;
+ 
+ export const FOLDER_METADATA_FILE = '_folder.json';
+diff --git a/public/app/features/provisioning/hooks/usePullRequestParam.ts b/public/app/features/provisioning/hooks/usePullRequestParam.ts
+index 6675b371ea19c..8ee0d0b326a07 100644
+--- a/public/app/features/provisioning/hooks/usePullRequestParam.ts
++++ b/public/app/features/provisioning/hooks/usePullRequestParam.ts
+@@ -8,6 +8,7 @@ export const usePullRequestParam = () => {
+   const repoUrl = params.get('repo_url');
+   const repoType = params.get('repo_type');
+   const resourcePushedTo = params.get('resource_pushed_to');
++  const actionParam = params.get('action');
+ 
+   return {
+     prURL: prParam ? textUtil.sanitizeUrl(decodeURIComponent(prParam)) : undefined,
+@@ -16,5 +17,6 @@ export const usePullRequestParam = () => {
+     repoType: repoType ? textUtil.sanitizeUrl(decodeURIComponent(repoType)) : undefined,
+     // Repository name the resource was pushed to, used to link to its status overview page
+     resourcePushedTo: resourcePushedTo ? textUtil.sanitizeUrl(decodeURIComponent(resourcePushedTo)) : undefined,
++    action: actionParam === 'create' || actionParam === 'delete' ? actionParam : undefined,
+   };
+ };
+diff --git a/public/app/features/provisioning/utils/checkSyncSettings.ts b/public/app/features/provisioning/utils/checkSyncSettings.ts
+index d59c91fcbe5a6..11344a9599ece 100644
+--- a/public/app/features/provisioning/utils/checkSyncSettings.ts
++++ b/public/app/features/provisioning/utils/checkSyncSettings.ts
+@@ -1,7 +1,5 @@
+ import { Repository } from 'app/api/clients/provisioning/v0alpha1';
+ 
+-import { isFreeTierLicense } from './isFreeTierLicense';
+-
+ type syncState = {
+   instanceConnected: boolean;
+   folderConnected: boolean;
+@@ -9,7 +7,7 @@ type syncState = {
+   maxReposReached: boolean;
+ };
+ 
+-export function checkSyncSettings(repos?: Repository[]): syncState {
++export function checkSyncSettings(repos?: Repository[], maxRepositories = 0): syncState {
+   if (!repos?.length) {
+     return {
+       instanceConnected: false,
+@@ -20,7 +18,7 @@ export function checkSyncSettings(repos?: Repository[]): syncState {
+   }
+ 
+   const repoCount = repos.length;
+-  const maxReposReached = isFreeTierLicense() ? repoCount >= 1 : false;
++  const maxReposReached = maxRepositories > 0 && repoCount >= maxRepositories;
+ 
+   return {
+     instanceConnected: repos.some((item) => item.spec?.sync.target === 'instance'),
+diff --git a/public/app/features/provisioning/utils/quota.ts b/public/app/features/provisioning/utils/quota.ts
+new file mode 100644
+index 0000000000000..3f9ca172a8fe4
+--- /dev/null
++++ b/public/app/features/provisioning/utils/quota.ts
+@@ -0,0 +1,6 @@
++import { Condition } from 'app/api/clients/provisioning/v0alpha1';
++
++export function isQuotaReachedOrExceeded(conditions: Condition[] | undefined, conditionType: string): boolean {
++  const condition = conditions?.find((c) => c.type === conditionType);
++  return condition?.reason === 'QuotaReached' || condition?.reason === 'QuotaExceeded';
++}
+diff --git a/public/app/features/provisioning/utils/redirect.ts b/public/app/features/provisioning/utils/redirect.ts
+index 59783ec37b909..ebd1a4d339fdb 100644
+--- a/public/app/features/provisioning/utils/redirect.ts
++++ b/public/app/features/provisioning/utils/redirect.ts
+@@ -1,8 +1,11 @@
++export type ResourceAction = 'create' | 'delete';
++
+ type ResourceBranchUrlOptions = {
+   baseUrl?: string;
+   paramName?: string;
+   paramValue?: string;
+   repoType?: string;
++  action?: ResourceAction;
+ };
+ 
+ export function buildResourceBranchRedirectUrl({
+@@ -10,6 +13,7 @@ export function buildResourceBranchRedirectUrl({
+   paramName,
+   paramValue,
+   repoType,
++  action,
+ }: ResourceBranchUrlOptions): string {
+   const params = new URLSearchParams();
+ 
+@@ -21,6 +25,10 @@ export function buildResourceBranchRedirectUrl({
+     params.set('repo_type', repoType);
+   }
+ 
++  if (action) {
++    params.set('action', action);
++  }
++
+   const queryString = params.toString();
+   return queryString ? `${baseUrl}?${queryString}` : baseUrl;
+ }
+diff --git a/public/locales/en-US/grafana.json b/public/locales/en-US/grafana.json
+index e610612f2ce38..3840a151cba37 100644
+--- a/public/locales/en-US/grafana.json
++++ b/public/locales/en-US/grafana.json
+@@ -12707,6 +12707,7 @@
+     "preview-banner": {
+       "behind-branch-text": "This resource is behind the branch in {{repoType}}.",
+       "branch-text": "branch:",
++      "delete-from-branch": "The rest of Grafana users in your organization will still see this resource until this branch is merged",
+       "not-saved": "The rest of Grafana users in your organization will still see the current version saved to configured default branch until this branch is merged",
+       "open-in-repo-button": "Open in {{repoType}}",
+       "open-pull-request-in-repo": "Open pull request in {{repoType}}",
+@@ -12714,6 +12715,7 @@
+       "view-pull-request-in-repo": "View pull request in {{repoType}}"
+     },
+     "title-created-branch-in-repo": "A new resource has been created in a branch in {{repoType}}.",
++    "title-deleted-resource-in-branch": "A resource has been deleted in a branch in {{repoType}}.",
+     "title-loaded-pull-request-in-repo": "This resource is loaded from the branch you just created in {{repoType}} and it is only visible to you"
+   },
+   "provisioning": {
+@@ -12746,7 +12748,7 @@
+       "description-clear-repository-connection": "This name will be used for the repository connection and the folder displayed in the UI",
+       "empty": "Empty",
+       "error-field-required": "This field is required.",
+-      "error-quota-exceeded-message": "The repository contains {{resourceCount}} resources, which exceeds the free-tier limit of {{limit}} resources per folder. To sync this repository, upgrade your account or reduce the number of resources.",
++      "error-quota-exceeded-message": "This repository contains {{resourceCount}} resources, which exceeds your account limit of {{limit}}. To sync this repository, upgrade your account or reduce the number of resources to sync.",
+       "error-quota-exceeded-title": "Resource quota exceeded",
+       "error-repository-status-unhealthy-message": "There was an issue connecting to the repository. Please check the repository settings and try again.",
+       "error-repository-status-unhealthy-title": "Repository status unhealthy",
+@@ -12805,8 +12807,8 @@
+     },
+     "connect-repository-button": {
+       "configure": "Configure",
+-      "free-tier-limit-tooltip": "Free-tier accounts are restricted to one connection",
+-      "instance-fully-managed-tooltip": "Configuration is disabled because this instance is fully managed"
++      "instance-fully-managed-tooltip": "Configuration is disabled because this instance is fully managed",
++      "max-repos-reached-tooltip": "Your account has reached the maximum number of connected repositories"
+     },
+     "connect-step": {
+       "text-folders-not-available": "Folder suggestions will be available after the repository is connected.",
+@@ -12974,22 +12976,12 @@
+     "folder-repository-list": {
+       "all-resources-managed_one": "All {{count}} resources are managed",
+       "all-resources-managed_other": "All {{count}} resources are managed",
+-      "free-tier-limit": {
+-        "message-connection": "Free-tier accounts are limited to 20 resources per folder. To add more resources per folder,"
+-      },
+       "no-results-matching-your-query": "No results matching your query",
+       "partial-managed": "{{managedCount}}/{{resourceCount}} resources managed by Git sync.",
+       "placeholder-search": "Search",
+       "unmanaged-resources_one": "{{count}} resources aren't managed by Git sync.",
+       "unmanaged-resources_other": "{{count}} resources aren't managed by Git sync."
+     },
+-    "free-tier-limit": {
+-      "message": "Free-tier accounts are capped to 1 connection, and 20 resources per folder",
+-      "message-connection": "Free-tier accounts are limited to 1 connection. To add more connections,",
+-      "message-resource": "Free-tier accounts are limited to 20 resources per folder. To add more resources,",
+-      "note": "Note:",
+-      "upgrade-link": "upgrade your account"
+-    },
+     "get-default-values": {
+       "title": {
+         "repository": "Repository"
+@@ -13144,6 +13136,26 @@
+         }
+       }
+     },
++    "quota-limit": {
++      "message-both-repositories_one": "Your account is limited to {{count}} connected repository",
++      "message-both-repositories_other": "Your account is limited to {{count}} connected repositories",
++      "message-both-resources_one": "and {{count}} synced resource per repository.",
++      "message-both-resources_other": "and {{count}} synced resources per repository.",
++      "message-repositories-info_one": "Your account is limited to {{count}} connected repository",
++      "message-repositories-info_other": "Your account is limited to {{count}} connected repositories",
++      "message-repository_one": "Your account is limited to {{count}} connected repository. To add more repositories,",
++      "message-repository_other": "Your account is limited to {{count}} connected repositories. To add more repositories,",
++      "note": "Note:",
++      "note-message-both-repositories_one": "Your account is limited to {{count}} connected repository",
++      "note-message-both-repositories_other": "Your account is limited to {{count}} connected repositories",
++      "note-message-both-resources_one": "and {{count}} synced resource per repository. To increase limits,",
++      "note-message-both-resources_other": "and {{count}} synced resources per repository. To increase limits,",
++      "note-message-repository_one": "Your account is limited to {{count}} connected repository. To add more repositories,",
++      "note-message-repository_other": "Your account is limited to {{count}} connected repositories. To add more repositories,",
++      "note-message-resource_one": "Your account is limited to {{count}} synced resource per repository. To add more resources,",
++      "note-message-resource_other": "Your account is limited to {{count}} synced resources per repository. To add more resources,",
++      "upgrade-link": "upgrade your account"
++    },
+     "read-only-local-tooltip": "This resource is read-only and provisioned through file provisioning. To make any changes, update the connected repository. To modify the settings go to Administration > Provisioning > Repositories.",
+     "read-only-remote-tooltip": "This resource is read-only and provisioned through Git. To make any changes, update the connected repository. To modify the settings go to Administration > Provisioning > Repositories.",
+     "recent-jobs": {

@@ -1,0 +1,3260 @@
+diff --git a/app/assets/stylesheets/common/toolbar-popup-menu-options.scss b/app/assets/stylesheets/common/toolbar-popup-menu-options.scss
+index 0ea31c18b2e23..e0f1cba36efb1 100644
+--- a/app/assets/stylesheets/common/toolbar-popup-menu-options.scss
++++ b/app/assets/stylesheets/common/toolbar-popup-menu-options.scss
+@@ -30,7 +30,9 @@
+   }
+ }
+ 
+-.toolbar-menu__options-content {
++.toolbar-menu__options-content,
++.toolbar-menu__list-content,
++.toolbar-menu__heading-content {
+   .dropdown-menu {
+     .btn {
+       &.--active {
+@@ -58,16 +60,10 @@
+   }
+ }
+ 
+-.toolbar-menu__heading-content {
++.toolbar-menu__heading-content,
++.toolbar-menu__list-content {
+   .dropdown-menu {
+     .btn {
+-      &.--active {
+-        .d-button-label__active-icon {
+-          visibility: visible;
+-          margin-left: auto;
+-        }
+-      }
+-
+       &:hover,
+       &:focus,
+       &:focus-visible {
+@@ -106,7 +102,11 @@
+         font-size: var(--font-down-1-rem);
+       }
+     }
++  }
++}
+ 
++.toolbar-menu__heading-content {
++  .dropdown-menu {
+     .btn[data-name="heading-1"] {
+       .d-button-label__text,
+       .d-icon[class*="d-icon-discourse"] {
+diff --git a/app/controllers/groups_controller.rb b/app/controllers/groups_controller.rb
+index 257332b84106e..918d8cbcbe3d0 100644
+--- a/app/controllers/groups_controller.rb
++++ b/app/controllers/groups_controller.rb
+@@ -610,6 +610,9 @@ def request_membership
+ 
+     group = find_group(:name)
+ 
++    raise Discourse::InvalidAccess unless group.allow_membership_requests?
++    raise Discourse::InvalidAccess if group.users.exists?(id: current_user.id)
++
+     begin
+       GroupRequest.create!(group: group, user: current_user, reason: params[:reason])
+     rescue ActiveRecord::RecordNotUnique
+diff --git a/app/controllers/post_actions_controller.rb b/app/controllers/post_actions_controller.rb
+index 966af4d4baec1..333f8258ea455 100644
+--- a/app/controllers/post_actions_controller.rb
++++ b/app/controllers/post_actions_controller.rb
+@@ -48,7 +48,11 @@ def destroy
+     if result.failed?
+       render_json_error(result)
+     else
+-      render_post_json(result.post, add_raw: false)
++      if !guardian.can_see_post?(result.post)
++        head :no_content
++      else
++        render_post_json(result.post, add_raw: false)
++      end
+     end
+   end
+ 
+diff --git a/app/models/topic.rb b/app/models/topic.rb
+index a723c64d4ce12..7995d3ca58de2 100644
+--- a/app/models/topic.rb
++++ b/app/models/topic.rb
+@@ -520,6 +520,7 @@ def limit_topics_per_day
+ 
+   def limit_private_messages_per_day
+     return unless private_message?
++    return if subtype == TopicSubtype.notify_moderators
+     apply_per_day_rate_limit_for("pms", :max_personal_messages_per_day)
+   end
+ 
+diff --git a/app/services/post_action_notifier.rb b/app/services/post_action_notifier.rb
+index 698d2362935fb..e35f8b10d43cd 100644
+--- a/app/services/post_action_notifier.rb
++++ b/app/services/post_action_notifier.rb
+@@ -161,14 +161,21 @@ def self.add_post_revision_notifier_recipients(&block)
+   private
+ 
+   def self.notification_is_disabled?(post_revision)
++    if SiteSetting.disable_system_edit_notifications &&
++         post_revision.user_id == Discourse::SYSTEM_USER_ID
++      return true
++    end
++
+     modifications = post_revision.modifications
+-    (
+-      SiteSetting.disable_system_edit_notifications &&
+-        post_revision.user_id == Discourse::SYSTEM_USER_ID
+-    ) ||
+-      (
+-        SiteSetting.disable_category_edit_notifications &&
+-          modifications&.dig("category_id").present?
+-      ) || (SiteSetting.disable_tags_edit_notifications && modifications&.dig("tags").present?)
++
++    if SiteSetting.disable_category_edit_notifications && modifications&.dig("category_id").present?
++      return true
++    end
++
++    if SiteSetting.disable_tags_edit_notifications && modifications&.dig("tags").present?
++      return true
++    end
++
++    false
+   end
+ end
+diff --git a/app/services/tags/bulk_create.rb b/app/services/tags/bulk_create.rb
+index d600c79be6add..2de71e367ce91 100644
+--- a/app/services/tags/bulk_create.rb
++++ b/app/services/tags/bulk_create.rb
+@@ -67,27 +67,18 @@ def normalize_tags(raw_tag_names:)
+     raw_tag_names.each do |raw_name|
+       next if raw_name.blank?
+ 
+-      normalized_input = raw_name.strip
+-      normalized_input = normalized_input.downcase if SiteSetting.force_lowercase_tags
+-      normalized_input = normalized_input.gsub(/[[:space:]]+/, "-")
+-
+-      if normalized_input.length > SiteSetting.max_tag_length
+-        results[:failed][raw_name] = I18n.t(
+-          "tags.bulk_create.tag_too_long",
+-          count: SiteSetting.max_tag_length,
+-        )
+-        next
+-      end
+-
+-      tag_name = DiscourseTagging.clean_tag(raw_name)
++      tag_name = DiscourseTagging.clean_tag(raw_name, truncate: false)
+ 
+       if tag_name.blank?
+         results[:failed][raw_name] = I18n.t("tags.bulk_create.invalid_name")
+         next
+       end
+ 
+-      if tag_name != normalized_input
+-        results[:failed][raw_name] = I18n.t("tags.bulk_create.invalid_name")
++      if tag_name.length > SiteSetting.max_tag_length
++        results[:failed][raw_name] = I18n.t(
++          "tags.bulk_create.tag_too_long",
++          count: SiteSetting.max_tag_length,
++        )
+         next
+       end
+ 
+diff --git a/config/locales/client.en.yml b/config/locales/client.en.yml
+index 94e83205b5304..968dccf86fcc5 100644
+--- a/config/locales/client.en.yml
++++ b/config/locales/client.en.yml
+@@ -3153,6 +3153,7 @@ en:
+       upload_description: "enter upload description here"
+       olist_title: "Numbered list"
+       ulist_title: "Bulleted list"
++      list_title: "Lists"
+       list_item: "List item"
+       toggle_direction: "Toggle direction"
+       apply_wrap_title: "Apply wrap"
+diff --git a/frontend/discourse/app/components/d-editor.gjs b/frontend/discourse/app/components/d-editor.gjs
+index cc59f83a96ba8..2d5caba62010c 100644
+--- a/frontend/discourse/app/components/d-editor.gjs
++++ b/frontend/discourse/app/components/d-editor.gjs
+@@ -196,13 +196,13 @@ export default class DEditor extends Component {
+       keymap[sc] = () => {
+         const customAction = shortcuts[sc].shortcutAction;
+ 
++        const toolbarEvent = this.newToolbarEvent();
+         if (customAction) {
+-          const toolbarEvent = this.newToolbarEvent();
+           if (!button.condition || button.condition(toolbarEvent)) {
+             customAction(toolbarEvent);
+           }
+         } else {
+-          button.action(button);
++          button.action(toolbarEvent);
+         }
+         return false;
+       };
+diff --git a/frontend/discourse/app/components/form-template-field/tag-chooser.gjs b/frontend/discourse/app/components/form-template-field/tag-chooser.gjs
+index 79f6e68350e52..8b9dcf82cf5d7 100644
+--- a/frontend/discourse/app/components/form-template-field/tag-chooser.gjs
++++ b/frontend/discourse/app/components/form-template-field/tag-chooser.gjs
+@@ -89,23 +89,23 @@ export default class TagChooserField extends Component {
+   }
+ 
+   @action
+-  handleSelectedTagIds(event) {
++  handleSelectedTagNames(event) {
+     return Array.from(event.target.selectedOptions)
+-      .map((option) => parseInt(option.value, 10))
+-      .filter((id) => !isNaN(id));
++      .map((option) => option.value)
++      .filter((name) => name !== "");
+   }
+ 
+   @action
+   handleInput(event) {
+-    const selectedTagIds = this.handleSelectedTagIds(event);
+-    const validTagIds = this.formattedChoices.map((choice) => choice.id);
+-    const filteredTagIds = selectedTagIds.filter((tagId) =>
+-      validTagIds.includes(tagId)
++    const selectedTagNames = this.handleSelectedTagNames(event);
++    const validTagNames = this.formattedChoices.map((choice) => choice.name);
++    const filteredTagNames = selectedTagNames.filter((name) =>
++      validTagNames.includes(name)
+     );
+     const existingSelectedTagIds = this.selectedTags.map((t) => this._tagId(t));
+ 
+-    const selectedTags = filteredTagIds.map((tagId) =>
+-      this.formattedChoices.find((choice) => choice.id === tagId)
++    const selectedTags = filteredTagNames.map((name) =>
++      this.formattedChoices.find((choice) => choice.name === name)
+     );
+ 
+     set(
+@@ -167,7 +167,7 @@ export default class TagChooserField extends Component {
+         {{/if}}
+         {{#each this.formattedChoices as |choice|}}
+           <option
+-            value={{choice.id}}
++            value={{choice.name}}
+             selected={{this.isSelected choice.id}}
+           >{{choice.display}}</option>
+         {{/each}}
+diff --git a/frontend/discourse/app/components/toolbar-popup-menu-options.gjs b/frontend/discourse/app/components/toolbar-popup-menu-options.gjs
+index 2256c3901da71..94679072d6b09 100644
+--- a/frontend/discourse/app/components/toolbar-popup-menu-options.gjs
++++ b/frontend/discourse/app/components/toolbar-popup-menu-options.gjs
+@@ -33,7 +33,7 @@ export default class ToolbarPopupmenuOptions extends Component {
+   }
+ 
+   #convertMenuOption(content) {
+-    if (content.condition) {
++    if (content.condition !== false) {
+       const label = this.#calculateLabel(content);
+       const title = this.#calculateTitle(content);
+ 
+diff --git a/frontend/discourse/app/lib/composer/rich-editor-extensions.js b/frontend/discourse/app/lib/composer/rich-editor-extensions.js
+index 04150df20c9cd..dd471a9254653 100644
+--- a/frontend/discourse/app/lib/composer/rich-editor-extensions.js
++++ b/frontend/discourse/app/lib/composer/rich-editor-extensions.js
+@@ -32,6 +32,7 @@
+  * @property {typeof import('prosemirror-history')} pmHistory
+  * @property {typeof import('prosemirror-transform')} pmTransform
+  * @property {typeof import('prosemirror-commands')} pmCommands
++ * @property {typeof import('prosemirror-schema-list')} pmSchemaList
+  * @property {import('prosemirror-model').Schema} schema
+  * @property {() => PluginContext} getContext
+  */
+diff --git a/frontend/discourse/app/lib/composer/toolbar.js b/frontend/discourse/app/lib/composer/toolbar.js
+index 872ff25cf9419..3853ffb96fd3e 100644
+--- a/frontend/discourse/app/lib/composer/toolbar.js
++++ b/frontend/discourse/app/lib/composer/toolbar.js
+@@ -1,5 +1,5 @@
+ // @ts-check
+-import { action } from "@ember/object";
++import { customPopupMenuOptions } from "discourse/lib/composer/custom-popup-menu-options";
+ import { translateModKey } from "discourse/lib/utilities";
+ import { waitForClosedKeyboard } from "discourse/lib/wait-for-keyboard";
+ import { PLATFORM_KEY_MODIFIER } from "discourse/services/keyboard-shortcuts";
+@@ -134,6 +134,10 @@ export class ToolbarBase {
+ 
+     // Popup menu option item shortcut bindings and title text.
+     if (buttonAttrs.popupMenu) {
++      // Default action passes toolbarEvent to option.action
++      buttonAttrs.popupMenu.action ??= (option) =>
++        option.action(this.context.newToolbarEvent());
++
+       buttonAttrs.popupMenu.options()?.forEach((option) => {
+         if (option.shortcut) {
+           const shortcutKeyTranslated = translateModKey(
+@@ -181,6 +185,8 @@ export class ToolbarBase {
+  * Standard editor toolbar with default buttons
+  */
+ export default class Toolbar extends ToolbarBase {
++  #listOptions;
++
+   constructor(opts) {
+     super(opts);
+ 
+@@ -269,7 +275,8 @@ export default class Toolbar extends ToolbarBase {
+ 
+                 return false;
+               },
+-              action: this.onHeadingMenuAction.bind(this),
++              action: (toolbarEvent) =>
++                toolbarEvent.applyHeading(headingLevel, "heading"),
+             });
+           }
+           headingOptions.push({
+@@ -281,11 +288,10 @@ export default class Toolbar extends ToolbarBase {
+             showActiveIcon: true,
+             shortcut: "Alt+0",
+             active: ({ state }) => state?.inParagraph,
+-            action: this.onHeadingMenuAction.bind(this),
++            action: (toolbarEvent) => toolbarEvent.applyHeading(0, "heading"),
+           });
+           return headingOptions;
+         },
+-        action: this.onHeadingMenuAction.bind(this),
+       },
+     });
+ 
+@@ -325,28 +331,25 @@ export default class Toolbar extends ToolbarBase {
+         active: ({ state }) => state.inCode || state.inCodeBlock,
+       });
+ 
+-      this.addButton({
+-        id: "bullet",
+-        group: "extras",
+-        icon: "list-ul",
+-        shortcut: "Shift+8",
+-        title: "composer.ulist_title",
+-        perform: (e) => e.applyList("* ", "list_item"),
+-        active: ({ state }) => state.inBulletList,
+-      });
+-
+       this.addButton({
+         id: "list",
+         group: "extras",
+-        icon: "list-ol",
+-        shortcut: "Shift+7",
+-        title: "composer.olist_title",
+-        perform: (e) =>
+-          e.applyList(
+-            (i) => (!i ? "1. " : `${parseInt(i, 10) + 1}. `),
+-            "list_item"
+-          ),
+-        active: ({ state }) => state.inOrderedList,
++        active: ({ state }) => {
++          return this.getListPopupMenuOptions().some((option) =>
++            option.active({ state })
++          );
++        },
++        icon: ({ state }) => {
++          return (
++            this.getListPopupMenuOptions().find((option) =>
++              option.active({ state })
++            )?.icon || "list-ul"
++          );
++        },
++        title: "composer.list_title",
++        popupMenu: {
++          options: () => this.getListPopupMenuOptions(),
++        },
+       });
+     }
+ 
+@@ -362,16 +365,46 @@ export default class Toolbar extends ToolbarBase {
+     }
+   }
+ 
+-  @action
+-  onHeadingMenuAction(menuItem) {
+-    let level;
+-
+-    if (menuItem.name === "heading-paragraph") {
+-      level = 0;
+-    } else {
+-      level = parseInt(menuItem.name.split("-")[1], 10);
+-    }
++  getListPopupMenuOptions() {
++    this.#listOptions ??= [
++      {
++        name: "list-bullet",
++        icon: "list-ul",
++        label: "composer.ulist_title",
++        shortcut: "Shift+8",
++        showActiveIcon: true,
++        active: ({ state }) => state?.inBulletList,
++        action: (toolbarEvent) => {
++          if (
++            !toolbarEvent.commands?.toggleBulletList ||
++            !toolbarEvent.commands.toggleBulletList()
++          ) {
++            toolbarEvent.applyList("* ", "list_item");
++          }
++        },
++      },
++      {
++        name: "list-ordered",
++        icon: "list-ol",
++        label: "composer.olist_title",
++        shortcut: "Shift+7",
++        showActiveIcon: true,
++        active: ({ state }) => state?.inOrderedList,
++        action: (toolbarEvent) => {
++          if (
++            !toolbarEvent.commands?.toggleOrderedList ||
++            !toolbarEvent.commands.toggleOrderedList()
++          ) {
++            toolbarEvent.applyList(
++              (i) => (!i ? "1. " : `${parseInt(i, 10) + 1}. `),
++              "list_item"
++            );
++          }
++        },
++      },
++      ...customPopupMenuOptions.filter((option) => option.menu === "list"),
++    ];
+ 
+-    this.context.newToolbarEvent().applyHeading(level, "heading");
++    return this.#listOptions;
+   }
+ }
+diff --git a/frontend/discourse/app/lib/plugin-api.gjs b/frontend/discourse/app/lib/plugin-api.gjs
+index 188055f9ae03b..9e4506cc78ab9 100644
+--- a/frontend/discourse/app/lib/plugin-api.gjs
++++ b/frontend/discourse/app/lib/plugin-api.gjs
+@@ -848,6 +848,8 @@ class _PluginApi {
+    * @returns {boolean} - Whether the button should be displayed.
+    *
+    * @param {Object} opts - An Object.
++   * @param {string} [opts.menu] - Target menu: 'list' for list dropdown, omit for options popup (default).
++   * @param {string} [opts.name] - Unique identifier for the option.
+    * @param {string} opts.icon - The name of the FontAwesome icon to display for the button.
+    * @param {string} opts.label - The I18n translation key for the button's label.
+    * @param {string} opts.shortcut - The keyboard shortcut to apply, NOTE: this will unconditionally add CTRL/META key (eg: m means CTRL+m).
+@@ -866,6 +868,18 @@ class _PluginApi {
+    *     return composer.editingPost;
+    *   }
+    * });
++   *
++   * @example
++   * // Add option to list dropdown
++   * api.addComposerToolbarPopupMenuOption({
++   *   menu: 'list',
++   *   name: 'my-custom-list',
++   *   icon: 'list-check',
++   *   label: 'my_plugin.custom_list',
++   *   action: (toolbarEvent) => {
++   *     toolbarEvent.applyList("- [x] ", "list_item");
++   *   }
++   * });
+    **/
+   addComposerToolbarPopupMenuOption(opts) {
+     addPopupMenuOption(opts);
+diff --git a/frontend/discourse/app/services/composer.js b/frontend/discourse/app/services/composer.js
+index bd563c676c24e..65823de552155 100644
+--- a/frontend/discourse/app/services/composer.js
++++ b/frontend/discourse/app/services/composer.js
+@@ -487,13 +487,14 @@ export default class ComposerService extends Service {
+         }),
+       ];
+ 
+-      return options
+-        .concat(
+-          customPopupMenuOptions
+-            .map((option) => this._setupPopupMenuOption({ ...option }))
+-            .filter((o) => o)
+-        )
+-        .concat(secondaryOptions);
++      return [
++        ...options,
++        ...customPopupMenuOptions
++          .filter((option) => !option.menu)
++          .map((option) => this._setupPopupMenuOption({ ...option }))
++          .filter(Boolean),
++        ...secondaryOptions,
++      ];
+     }
+   }
+ 
+@@ -725,12 +726,9 @@ export default class ComposerService extends Service {
+       menuItem
+     );
+     if (typeof menuItem.action === "function") {
+-      // note: due to the way args are passed to actions we need
+-      // to create the explicity toolbarEvent as a fallback for no
+-      // event
+-      // Long term we want to avoid needing this awkwardness and pass
+-      // the event explicitly
+-      return menuItem.action(this.toolbarEvent || toolbarEvent);
++      // toolbarEvent is passed when triggered via keyboard shortcut,
++      // otherwise fall back to stored toolbarEvent from menu open
++      return menuItem.action(toolbarEvent ?? this.toolbarEvent);
+     } else {
+       return (
+         this.actions?.[menuItem.action]?.bind(this) || // Legacy-style contributions from themes/plugins
+diff --git a/frontend/discourse/app/static/prosemirror/components/prosemirror-editor.gjs b/frontend/discourse/app/static/prosemirror/components/prosemirror-editor.gjs
+index c938cb0d77fa6..a5424d09785bc 100644
+--- a/frontend/discourse/app/static/prosemirror/components/prosemirror-editor.gjs
++++ b/frontend/discourse/app/static/prosemirror/components/prosemirror-editor.gjs
+@@ -17,6 +17,7 @@ import * as ProsemirrorHistory from "prosemirror-history";
+ import { history } from "prosemirror-history";
+ import { keymap } from "prosemirror-keymap";
+ import * as ProsemirrorModel from "prosemirror-model";
++import * as ProsemirrorSchemaList from "prosemirror-schema-list";
+ import * as ProsemirrorState from "prosemirror-state";
+ import { EditorState } from "prosemirror-state";
+ import * as ProsemirrorTransform from "prosemirror-transform";
+@@ -106,6 +107,7 @@ export default class ProsemirrorEditor extends Component {
+       pmView: ProsemirrorView,
+       pmHistory: ProsemirrorHistory,
+       pmTransform: ProsemirrorTransform,
++      pmSchemaList: ProsemirrorSchemaList,
+       pmCommands: ProsemirrorCommands,
+       getContext: () => ({
+         placeholder: this.args.placeholder,
+diff --git a/frontend/discourse/app/static/prosemirror/lib/text-manipulation.js b/frontend/discourse/app/static/prosemirror/lib/text-manipulation.js
+index 4b94070275c26..afed1b07813ee 100644
+--- a/frontend/discourse/app/static/prosemirror/lib/text-manipulation.js
++++ b/frontend/discourse/app/static/prosemirror/lib/text-manipulation.js
+@@ -5,7 +5,11 @@ import { isEmpty } from "@ember/utils";
+ import { TrackedObject } from "@ember-compat/tracked-built-ins";
+ import { lift, setBlockType, toggleMark, wrapIn } from "prosemirror-commands";
+ import { Slice } from "prosemirror-model";
+-import { liftListItem, sinkListItem } from "prosemirror-schema-list";
++import {
++  liftListItem,
++  sinkListItem,
++  wrapInList,
++} from "prosemirror-schema-list";
+ import { Selection, TextSelection } from "prosemirror-state";
+ import { bind } from "discourse/lib/decorators";
+ import escapeRegExp from "discourse/lib/escape-regexp";
+@@ -186,26 +190,63 @@ export default class ProsemirrorTextManipulation {
+   applyList(_selection, head, exampleKey) {
+     let command;
+ 
+-    const isInside = (type) => {
++    const findParentList = () => {
+       const $from = this.view.state.selection.$from;
+       for (let depth = $from.depth; depth > 0; depth--) {
+-        const parent = $from.node(depth);
+-        if (parent.type === type) {
+-          return true;
++        const node = $from.node(depth);
++        if (
++          node.type === this.schema.nodes.bullet_list ||
++          node.type === this.schema.nodes.ordered_list
++        ) {
++          return {
++            node,
++            pos: $from.before(depth),
++            type: node.type,
++          };
+         }
+       }
+-      return false;
++      return null;
+     };
+ 
+     if (exampleKey === "list_item") {
+-      const nodeType =
++      const targetType =
+         head === "* "
+           ? this.schema.nodes.bullet_list
+           : this.schema.nodes.ordered_list;
+ 
+-      command = isInside(this.schema.nodes.list_item) ? lift : wrapIn(nodeType);
++      const parentList = findParentList();
++
++      if (parentList) {
++        if (parentList.type === targetType) {
++          // Same list type - toggle off (lift)
++          command = liftListItem(this.schema.nodes.list_item);
++        } else {
++          // Different list type - convert selection
++          // We achieve this by lifting out of the current list, then wrapping in the new type
++          command = (state, dispatch) => {
++            if (dispatch) {
++              const liftCmd = liftListItem(this.schema.nodes.list_item);
++              let lifted = false;
++              liftCmd(state, (tr) => {
++                dispatch(tr);
++                lifted = true;
++              });
++
++              if (lifted) {
++                // If lift succeeded, now wrap in the new list type
++                // We need to re-fetch state from view since dispatch updated it
++                wrapInList(targetType)(this.view.state, dispatch);
++              }
++            }
++            return true;
++          };
++        }
++      } else {
++        // Not in a list - wrap in the target type
++        command = wrapInList(targetType);
++      }
+     } else if (exampleKey === "blockquote_text") {
+-      command = isInside(this.schema.nodes.blockquote)
++      command = inNode(this.view.state, this.schema.nodes.blockquote)
+         ? lift
+         : wrapIn(this.schema.nodes.blockquote);
+     } else {
+@@ -213,6 +254,7 @@ export default class ProsemirrorTextManipulation {
+     }
+ 
+     command?.(this.view.state, this.view.dispatch);
++    this.focus();
+   }
+ 
+   applyHeading(_selection, level) {
+diff --git a/frontend/discourse/select-kit/services/tag-utils.js b/frontend/discourse/select-kit/services/tag-utils.js
+index d132d9ff2fc86..8ce746709b817 100644
+--- a/frontend/discourse/select-kit/services/tag-utils.js
++++ b/frontend/discourse/select-kit/services/tag-utils.js
+@@ -74,6 +74,7 @@ export default class TagUtils extends Service {
+       .trim()
+       .replace(/\s+/g, "-")
+       .replace(/[\/\?#\[\]@!\$&'\(\)\*\+,;=\.%\\`^\s|\{\}"<>]+/g, "")
++      .replace(/-{2,}/g, "-")
+       .substring(0, this.siteSettings.max_tag_length);
+ 
+     if (this.siteSettings.force_lowercase_tags) {
+diff --git a/frontend/discourse/tests/integration/components/d-editor-test.gjs b/frontend/discourse/tests/integration/components/d-editor-test.gjs
+index 03f8cabe239c6..f5280e7927630 100644
+--- a/frontend/discourse/tests/integration/components/d-editor-test.gjs
++++ b/frontend/discourse/tests/integration/components/d-editor-test.gjs
+@@ -567,12 +567,14 @@ third line`
+     async function (assert, textarea) {
+       const example = i18n("composer.list_item");
+ 
+-      await click(`button.bullet`);
++      await click(`button.list`);
++      await click('.btn[data-name="list-bullet"]');
+       assert.strictEqual(this.value, `hello world.\n\n* ${example}`);
+       assert.strictEqual(textarea.selectionStart, 14);
+       assert.strictEqual(textarea.selectionEnd, 16 + example.length);
+ 
+-      await click(`button.bullet`);
++      await click(`button.list`);
++      await click('.btn[data-name="list-bullet"]');
+       assert.strictEqual(this.value, `hello world.\n\n${example}`);
+     }
+   );
+@@ -583,12 +585,14 @@ third line`
+       textarea.selectionStart = 6;
+       textarea.selectionEnd = 11;
+ 
+-      await click(`button.bullet`);
++      await click(`button.list`);
++      await click('.btn[data-name="list-bullet"]');
+       assert.strictEqual(this.value, `hello\n\n* world\n\n.`);
+       assert.strictEqual(textarea.selectionStart, 7);
+       assert.strictEqual(textarea.selectionEnd, 14);
+ 
+-      await click(`button.bullet`);
++      await click(`button.list`);
++      await click('.btn[data-name="list-bullet"]');
+       assert.strictEqual(this.value, `hello\n\nworld\n\n.`);
+       assert.strictEqual(textarea.selectionStart, 7);
+       assert.strictEqual(textarea.selectionEnd, 12);
+@@ -603,12 +607,14 @@ third line`
+       textarea.selectionStart = 0;
+       textarea.selectionEnd = 20;
+ 
+-      await click(`button.bullet`);
++      await click(`button.list`);
++      await click('.btn[data-name="list-bullet"]');
+       assert.strictEqual(this.value, "Hello\n\nWorld\n\nEvil");
+       assert.strictEqual(textarea.selectionStart, 0);
+       assert.strictEqual(textarea.selectionEnd, 18);
+ 
+-      await click(`button.bullet`);
++      await click(`button.list`);
++      await click('.btn[data-name="list-bullet"]');
+       assert.strictEqual(this.value, "* Hello\n\n* World\n\n* Evil");
+       assert.strictEqual(textarea.selectionStart, 0);
+       assert.strictEqual(textarea.selectionEnd, 24);
+@@ -621,11 +627,13 @@ third line`
+       const example = i18n("composer.list_item");
+ 
+       await click(`button.list`);
++      await click('.btn[data-name="list-ordered"]');
+       assert.strictEqual(this.value, `hello world.\n\n1. ${example}`);
+       assert.strictEqual(textarea.selectionStart, 14);
+       assert.strictEqual(textarea.selectionEnd, 17 + example.length);
+ 
+       await click(`button.list`);
++      await click('.btn[data-name="list-ordered"]');
+       assert.strictEqual(this.value, `hello world.\n\n${example}`);
+       assert.strictEqual(textarea.selectionStart, 14);
+       assert.strictEqual(textarea.selectionEnd, 14 + example.length);
+@@ -639,11 +647,13 @@ third line`
+       textarea.selectionEnd = 11;
+ 
+       await click(`button.list`);
++      await click('.btn[data-name="list-ordered"]');
+       assert.strictEqual(this.value, `hello\n\n1. world\n\n.`);
+       assert.strictEqual(textarea.selectionStart, 7);
+       assert.strictEqual(textarea.selectionEnd, 15);
+ 
+       await click(`button.list`);
++      await click('.btn[data-name="list-ordered"]');
+       assert.strictEqual(this.value, `hello\n\nworld\n\n.`);
+       assert.strictEqual(textarea.selectionStart, 7);
+       assert.strictEqual(textarea.selectionEnd, 12);
+@@ -659,11 +669,13 @@ third line`
+       textarea.selectionEnd = 18;
+ 
+       await click(`button.list`);
++      await click('.btn[data-name="list-ordered"]');
+       assert.strictEqual(this.value, "1. Hello\n\n2. World\n\n3. Evil");
+       assert.strictEqual(textarea.selectionStart, 0);
+       assert.strictEqual(textarea.selectionEnd, 27);
+ 
+       await click(`button.list`);
++      await click('.btn[data-name="list-ordered"]');
+       assert.strictEqual(this.value, "Hello\n\nWorld\n\nEvil");
+       assert.strictEqual(textarea.selectionStart, 0);
+       assert.strictEqual(textarea.selectionEnd, 18);
+@@ -678,6 +690,7 @@ third line`
+       textarea.selectionEnd = 8;
+ 
+       await click("button.list");
++      await click('.btn[data-name="list-ordered"]');
+       assert.strictEqual(this.value, "1. existing");
+ 
+       document.execCommand("undo");
+diff --git a/frontend/discourse/tests/unit/services/tag-utils-test.js b/frontend/discourse/tests/unit/services/tag-utils-test.js
+new file mode 100644
+index 0000000000000..8eeca77ca03c2
+--- /dev/null
++++ b/frontend/discourse/tests/unit/services/tag-utils-test.js
+@@ -0,0 +1,41 @@
++import { getOwner } from "@ember/owner";
++import { setupTest } from "ember-qunit";
++import { module, test } from "qunit";
++
++module("Unit | Service | tag-utils", function (hooks) {
++  setupTest(hooks);
++
++  hooks.beforeEach(function () {
++    this.tagUtils = getOwner(this).lookup("service:tag-utils");
++  });
++
++  test("createContentFromInput squeezes consecutive dashes", function (assert) {
++    assert.strictEqual(
++      this.tagUtils.createContentFromInput("test--tag"),
++      "test-tag"
++    );
++    assert.strictEqual(
++      this.tagUtils.createContentFromInput("multi---dash"),
++      "multi-dash"
++    );
++    assert.strictEqual(
++      this.tagUtils.createContentFromInput("a--b--c"),
++      "a-b-c"
++    );
++  });
++
++  test("createContentFromInput handles basic normalization", function (assert) {
++    assert.strictEqual(
++      this.tagUtils.createContentFromInput("  spaced  "),
++      "spaced"
++    );
++    assert.strictEqual(
++      this.tagUtils.createContentFromInput("has spaces"),
++      "has-spaces"
++    );
++    assert.strictEqual(
++      this.tagUtils.createContentFromInput("special!@#chars"),
++      "specialchars"
++    );
++  });
++});
+diff --git a/lib/discourse_tagging.rb b/lib/discourse_tagging.rb
+index 21a24d40fb5a8..3f9b1ba1de396 100644
+--- a/lib/discourse_tagging.rb
++++ b/lib/discourse_tagging.rb
+@@ -804,7 +804,7 @@ def self.clear_cache!
+     Discourse.cache.delete(TAGS_STAFF_CACHE_KEY)
+   end
+ 
+-  def self.clean_tag(tag)
++  def self.clean_tag(tag, truncate: true)
+     tag = tag.dup
+     tag.downcase! if SiteSetting.force_lowercase_tags
+     tag.strip!
+@@ -812,7 +812,7 @@ def self.clean_tag(tag)
+     tag.gsub!(/[^[:word:][:punct:]]+/, "")
+     tag.gsub!(TAGS_FILTER_REGEXP, "")
+     tag.squeeze!("-")
+-    tag[0...SiteSetting.max_tag_length]
++    truncate ? tag[0...SiteSetting.max_tag_length] : tag
+   end
+ 
+   def self.tags_for_saving(tags_arg, guardian, opts = {})
+diff --git a/lib/post_revisor.rb b/lib/post_revisor.rb
+index b65bf9119624a..c94d162014a7c 100644
+--- a/lib/post_revisor.rb
++++ b/lib/post_revisor.rb
+@@ -68,7 +68,7 @@ def apply_tag_changes(tag_value)
+         removed_tags = prev_tags - persisted_tag_names
+         diff_tags = added_tags | removed_tags
+ 
+-        if diff_tags.present?
++        if diff_tags.present? && !self.silent
+           Jobs.enqueue(:notify_tag_change, post_id: post.id, notified_user_ids:, diff_tags:)
+ 
+           PostRevisor.create_small_action_for_tag_changes(
+diff --git a/lib/service/base/lock_step.rb b/lib/service/base/lock_step.rb
+index 61aa200650eeb..80b3640d0517e 100644
+--- a/lib/service/base/lock_step.rb
++++ b/lib/service/base/lock_step.rb
+@@ -38,7 +38,7 @@ def lock_name
+         [
+           context.__service_class__.to_s.underscore,
+           *keys.flat_map do |key|
+-            value = context[:params].public_send(key) || context[key]
++            value = context[:params].try(key) || context[key]
+             [key, value.try(:id) || value]
+           end,
+         ].join(":")
+diff --git a/lib/topics_bulk_action.rb b/lib/topics_bulk_action.rb
+index fdc050a6dbf9c..3264283495e67 100644
+--- a/lib/topics_bulk_action.rb
++++ b/lib/topics_bulk_action.rb
+@@ -251,75 +251,72 @@ def delete
+   end
+ 
+   def change_tags
+-    tag_ids, tag_names = extract_tag_params
++    tags = resolve_tag_names || []
+ 
+-    topics.each do |t|
+-      if guardian.can_edit?(t)
+-        success =
+-          if tag_ids.present?
+-            DiscourseTagging.tag_topic_by_ids(t, guardian, tag_ids)
+-          elsif tag_names.present?
+-            DiscourseTagging.tag_topic_by_names(t, guardian, tag_names)
+-          else
+-            t.tags = []
+-            true
+-          end
+-
+-        if success
+-          @changed_ids << t.id
+-        else
+-          t.errors.full_messages.each { |msg| @errors[msg] += 1 }
+-        end
++    topics_with_tags.each do |t|
++      next unless guardian.can_edit?(t)
++      next unless t.first_post
++
++      if t.first_post.revise(@user, { tags: tags }, bulk_tag_opts)
++        @changed_ids << t.id
++      else
++        t.errors.full_messages.each { |msg| @errors[msg] += 1 }
+       end
+     end
+   end
+ 
+   def append_tags
+-    tag_ids, tag_names = extract_tag_params
++    tags = resolve_tag_names || []
+ 
+-    topics.each do |t|
+-      if guardian.can_edit?(t)
+-        success =
+-          if tag_ids.present?
+-            DiscourseTagging.tag_topic_by_ids(t, guardian, tag_ids, append: true)
+-          elsif tag_names.present?
+-            DiscourseTagging.tag_topic_by_names(t, guardian, tag_names, append: true)
+-          else
+-            true
+-          end
+-
+-        if success
+-          @changed_ids << t.id
+-        else
+-          t.errors.full_messages.each { |msg| @errors[msg] += 1 }
+-        end
++    return if tags.blank?
++
++    topics_with_tags.each do |t|
++      next unless guardian.can_edit?(t)
++      next unless t.first_post
++
++      merged = t.tags.map(&:name) | tags
++      if t.first_post.revise(@user, { tags: merged }, bulk_tag_opts)
++        @changed_ids << t.id
++      else
++        t.errors.full_messages.each { |msg| @errors[msg] += 1 }
+       end
+     end
+   end
+ 
+-  def extract_tag_params
++  def remove_tags
++    topics_with_tags.each do |t|
++      next unless guardian.can_edit?(t)
++      next unless t.first_post
++
++      if t.first_post.revise(@user, { tags: [] }, bulk_tag_opts)
++        @changed_ids << t.id
++      else
++        t.errors.full_messages.each { |msg| @errors[msg] += 1 }
++      end
++    end
++  end
++
++  def resolve_tag_names
+     if @operation[:tag_ids].present?
+-      [@operation[:tag_ids], nil]
++      Tag.where(id: @operation[:tag_ids]).pluck(:name)
+     elsif @operation[:tags].present?
+       Discourse.deprecate(
+         "the tags param for bulk actions is deprecated, use tag_ids instead",
+         since: "2026.01",
+         drop_from: "2026.07",
+       )
+-      tag_names = @operation[:tags]
+-      [nil, tag_names]
+-    else
+-      [nil, nil]
++      @operation[:tags]
+     end
+   end
+ 
+-  def remove_tags
+-    topics.each do |t|
+-      if guardian.can_edit?(t)
+-        TopicTag.where(topic_id: t.id).in_batches.destroy_all
+-        @changed_ids << t.id
+-      end
+-    end
++  def bulk_tag_opts
++    {
++      bypass_bump: true,
++      validate_post: false,
++      bypass_rate_limiter: true,
++      skip_revision: true,
++      silent: true,
++    }
+   end
+ 
+   def guardian
+@@ -330,6 +327,10 @@ def topics
+     @topics ||= Topic.where(id: @topic_ids)
+   end
+ 
++  def topics_with_tags
++    @topics_with_tags ||= topics.includes(:first_post, :tags)
++  end
++
+   def dismiss_topics_since_date
+     new_topic_duration_minutes =
+       @user.user_option&.new_topic_duration_minutes ||
+diff --git a/plugins/chat/app/controllers/chat/api/channels_invites_controller.rb b/plugins/chat/app/controllers/chat/api/channels_invites_controller.rb
+index 9c295d1727bbb..879f389fbff5c 100644
+--- a/plugins/chat/app/controllers/chat/api/channels_invites_controller.rb
++++ b/plugins/chat/app/controllers/chat/api/channels_invites_controller.rb
+@@ -2,10 +2,12 @@
+ 
+ class Chat::Api::ChannelsInvitesController < Chat::ApiController
+   def create
++    RateLimiter.new(current_user, "invite_to_chat_channel", 5, 1.minute).performed!
++
+     Chat::InviteUsersToChannel.call(service_params) do
+       on_success { render(json: success_json) }
+       on_failure { render(json: failed_json, status: :unprocessable_entity) }
+-      on_failed_policy(:can_view_channel) { raise Discourse::InvalidAccess }
++      on_failed_policy(:can_join_channel) { raise Discourse::InvalidAccess }
+       on_model_not_found(:channel) { raise Discourse::NotFound }
+       on_failed_contract do |contract|
+         render(json: failed_json.merge(errors: contract.errors.full_messages), status: :bad_request)
+diff --git a/plugins/chat/app/controllers/chat/api/channels_messages_interactions_controller.rb b/plugins/chat/app/controllers/chat/api/channels_messages_interactions_controller.rb
+index db6123c1c987c..f4d1a94651238 100644
+--- a/plugins/chat/app/controllers/chat/api/channels_messages_interactions_controller.rb
++++ b/plugins/chat/app/controllers/chat/api/channels_messages_interactions_controller.rb
+@@ -8,6 +8,7 @@ def create
+       end
+       on_failure { render(json: failed_json, status: :unprocessable_entity) }
+       on_model_not_found(:message) { raise Discourse::NotFound }
++      on_failed_policy(:can_interact_with_message) { raise Discourse::NotFound }
+       on_model_not_found(:action) { raise Discourse::NotFound }
+       on_failed_contract do |contract|
+         render(json: failed_json.merge(errors: contract.errors.full_messages), status: :bad_request)
+diff --git a/plugins/chat/app/controllers/chat/api/search_controller.rb b/plugins/chat/app/controllers/chat/api/search_controller.rb
+index 9fd36fac4053e..a5179ac3693f7 100644
+--- a/plugins/chat/app/controllers/chat/api/search_controller.rb
++++ b/plugins/chat/app/controllers/chat/api/search_controller.rb
+@@ -18,7 +18,7 @@ def index
+       end
+       on_failure { render(json: failed_json, status: :unprocessable_entity) }
+       on_model_not_found(:channel) { raise Discourse::NotFound }
+-      on_failed_policy(:can_view_channel) { raise Discourse::InvalidAccess }
++      on_failed_policy(:can_view_channel) { raise Discourse::NotFound }
+       on_failed_contract do |contract|
+         render(json: failed_json.merge(errors: contract.errors.full_messages), status: :bad_request)
+       end
+diff --git a/plugins/chat/app/controllers/chat/chat_controller.rb b/plugins/chat/app/controllers/chat/chat_controller.rb
+index 1af55e9d3c636..90fa502460438 100644
+--- a/plugins/chat/app/controllers/chat/chat_controller.rb
++++ b/plugins/chat/app/controllers/chat/chat_controller.rb
+@@ -2,12 +2,8 @@
+ 
+ module Chat
+   class ChatController < ::Chat::BaseController
+-    # Other endpoints use set_channel_and_chatable_with_access_check, but
+-    # these endpoints require a standalone find because they need to be
+-    # able to get deleted channels and recover them.
+-    before_action :find_chat_message, only: %i[rebake]
+     before_action :set_channel_and_chatable_with_access_check,
+-                  except: %i[respond set_user_chat_status dismiss_retention_reminder]
++                  except: %i[respond set_user_chat_status dismiss_retention_reminder rebake]
+ 
+     def respond
+       render
+@@ -27,9 +23,20 @@ def react
+     end
+ 
+     def rebake
+-      guardian.ensure_can_rebake_chat_message!(@message)
+-      @message.rebake!(invalidate_oneboxes: true)
+-      render json: success_json
++      Chat::RebakeMessage.call(service_params) do
++        on_success { render(json: success_json) }
++        on_failure { render(json: failed_json, status: :unprocessable_entity) }
++        on_model_not_found(:channel) { raise Discourse::NotFound }
++        on_failed_policy(:can_access_channel) { raise Discourse::InvalidAccess }
++        on_model_not_found(:message) { raise Discourse::NotFound }
++        on_failed_policy(:can_rebake) { raise Discourse::InvalidAccess }
++        on_failed_contract do |contract|
++          render(
++            json: failed_json.merge(errors: contract.errors.full_messages),
++            status: :bad_request,
++          )
++        end
++      end
+     end
+ 
+     def set_user_chat_status
+@@ -70,35 +77,5 @@ def quote_messages
+         ).generate_markdown
+       render json: success_json.merge(markdown: markdown)
+     end
+-
+-    private
+-
+-    def preloaded_chat_message_query
+-      query =
+-        Chat::Message
+-          .includes(in_reply_to: [:user, chat_webhook_event: [:incoming_chat_webhook]])
+-          .includes(:revisions)
+-          .includes(user: :primary_group)
+-          .includes(chat_webhook_event: :incoming_chat_webhook)
+-          .includes(reactions: :user)
+-          .includes(:bookmarks)
+-          .includes(uploads: { optimized_videos: :optimized_upload })
+-          .includes(chat_channel: :chatable)
+-          .includes(:thread)
+-          .includes(:chat_mentions)
+-
+-      query = query.includes(user: :user_status) if SiteSetting.enable_user_status
+-
+-      query
+-    end
+-
+-    def find_chat_message
+-      @message = preloaded_chat_message_query.with_deleted
+-      @message = @message.where(chat_channel_id: params[:chat_channel_id]) if params[
+-        :chat_channel_id
+-      ]
+-      @message = @message.find_by(id: params[:message_id])
+-      raise Discourse::NotFound unless @message
+-    end
+   end
+ end
+diff --git a/plugins/chat/app/services/chat/create_message_interaction.rb b/plugins/chat/app/services/chat/create_message_interaction.rb
+index 983c67ebd10c3..42483c3b58d2b 100644
+--- a/plugins/chat/app/services/chat/create_message_interaction.rb
++++ b/plugins/chat/app/services/chat/create_message_interaction.rb
+@@ -18,9 +18,11 @@ class CreateMessageInteraction
+     params do
+       attribute :message_id, :integer
+       attribute :action_id, :string
++      attribute :channel_id, :integer
+ 
+       validates :action_id, presence: true
+       validates :message_id, presence: true
++      validates :channel_id, presence: true
+     end
+ 
+     model :message
+@@ -35,7 +37,7 @@ class CreateMessageInteraction
+     private
+ 
+     def fetch_message(params:)
+-      Chat::Message.find_by(id: params.message_id)
++      Chat::Message.find_by(id: params.message_id, chat_channel_id: params.channel_id)
+     end
+ 
+     def fetch_action(params:, message:)
+diff --git a/plugins/chat/app/services/chat/invite_users_to_channel.rb b/plugins/chat/app/services/chat/invite_users_to_channel.rb
+index 61f6178e9a0d3..5edcc1db798cc 100644
+--- a/plugins/chat/app/services/chat/invite_users_to_channel.rb
++++ b/plugins/chat/app/services/chat/invite_users_to_channel.rb
+@@ -27,7 +27,7 @@ class InviteUsersToChannel
+     end
+ 
+     model :channel
+-    policy :can_view_channel
++    policy :can_join_channel
+     model :users, optional: true
+     step :send_invite_notifications
+ 
+@@ -37,8 +37,8 @@ def fetch_channel(params:)
+       ::Chat::Channel.find_by(id: params.channel_id)
+     end
+ 
+-    def can_view_channel(guardian:, channel:)
+-      guardian.can_preview_chat_channel?(channel)
++    def can_join_channel(guardian:, channel:)
++      guardian.can_join_chat_channel?(channel)
+     end
+ 
+     def fetch_users(params:)
+diff --git a/plugins/chat/app/services/chat/rebake_message.rb b/plugins/chat/app/services/chat/rebake_message.rb
+new file mode 100644
+index 0000000000000..afde79d3b0fd4
+--- /dev/null
++++ b/plugins/chat/app/services/chat/rebake_message.rb
+@@ -0,0 +1,59 @@
++# frozen_string_literal: true
++
++module Chat
++  # Service responsible for rebaking a chat message.
++  #
++  # @example
++  #  Chat::RebakeMessage.call(params: { message_id: 2, chat_channel_id: 1 }, guardian: guardian)
++  #
++  class RebakeMessage
++    include Service::Base
++
++    # @!method self.call(guardian:, params:)
++    #   @param [Guardian] guardian
++    #   @param [Hash] params
++    #   @option params [Integer] :message_id
++    #   @option params [Integer] :chat_channel_id
++    #   @return [Service::Base::Context]
++
++    params do
++      attribute :message_id, :integer
++      attribute :chat_channel_id, :integer
++
++      validates :message_id, presence: true
++      validates :chat_channel_id, presence: true
++    end
++
++    model :channel
++    policy :can_access_channel
++    model :message
++    policy :can_rebake
++
++    step :rebake_message
++
++    private
++
++    def fetch_channel(params:)
++      Chat::Channel.includes(:chatable).find_by(id: params.chat_channel_id)
++    end
++
++    def can_access_channel(guardian:, channel:)
++      guardian.can_join_chat_channel?(channel)
++    end
++
++    def fetch_message(params:, channel:)
++      Chat::Message
++        .includes(chat_channel: :chatable)
++        .with_deleted
++        .find_by(id: params.message_id, chat_channel_id: channel.id)
++    end
++
++    def can_rebake(guardian:, message:)
++      guardian.can_rebake_chat_message?(message)
++    end
++
++    def rebake_message(message:)
++      message.rebake!(invalidate_oneboxes: true)
++    end
++  end
++end
+diff --git a/plugins/chat/spec/requests/chat/api/channels_invites_controller_spec.rb b/plugins/chat/spec/requests/chat/api/channels_invites_controller_spec.rb
+index fb74c80f227b8..d4ca0c36f7d50 100644
+--- a/plugins/chat/spec/requests/chat/api/channels_invites_controller_spec.rb
++++ b/plugins/chat/spec/requests/chat/api/channels_invites_controller_spec.rb
+@@ -50,7 +50,7 @@
+       end
+     end
+ 
+-    describe "current user can't view channel" do
++    describe "current user can't join channel" do
+       fab!(:channel_1, :private_category_channel)
+ 
+       it "returns a 403" do
+@@ -60,6 +60,32 @@
+       end
+     end
+ 
++    describe "current user can view but not join channel" do
++      fab!(:group)
++
++      before do
++        channel_1.chatable.set_permissions(group => :readonly)
++        channel_1.chatable.save!
++        group.add(current_user)
++      end
++
++      it "returns a 403" do
++        post "/chat/api/channels/#{channel_1.id}/invites?user_ids=#{user_1.id},#{user_2.id}"
++
++        expect(response.status).to eq(403)
++      end
++    end
++
++    describe "rate limiting" do
++      it "rate limits invites" do
++        RateLimiter.enable
++
++        6.times { post "/chat/api/channels/#{channel_1.id}/invites?user_ids=#{user_1.id}" }
++
++        expect(response.status).to eq(429)
++      end
++    end
++
+     describe "channel doesn’t exist" do
+       it "returns a 404" do
+         post "/chat/api/channels/-1/invites?user_ids=#{user_1.id},#{user_2.id}"
+diff --git a/plugins/chat/spec/requests/chat/api/channels_messages_interactions_controller_spec.rb b/plugins/chat/spec/requests/chat/api/channels_messages_interactions_controller_spec.rb
+new file mode 100644
+index 0000000000000..b3fb1433ce55b
+--- /dev/null
++++ b/plugins/chat/spec/requests/chat/api/channels_messages_interactions_controller_spec.rb
+@@ -0,0 +1,161 @@
++# frozen_string_literal: true
++
++RSpec.describe Chat::Api::ChannelsMessagesInteractionsController do
++  fab!(:current_user, :user)
++  fab!(:channel, :private_category_channel)
++  fab!(:message) do
++    Fabricate(
++      :chat_message,
++      chat_channel: channel,
++      user: Discourse.system_user,
++      blocks: [
++        {
++          type: "actions",
++          elements: [
++            {
++              action_id: "xxx",
++              value: "foo",
++              type: "button",
++              text: {
++                type: "plain_text",
++                text: "Click Me",
++              },
++            },
++          ],
++        },
++      ],
++    )
++  end
++
++  before do
++    SiteSetting.chat_enabled = true
++    SiteSetting.chat_allowed_groups = Group::AUTO_GROUPS[:everyone]
++    sign_in(current_user)
++  end
++
++  describe "#create" do
++    context "when user has access to the channel" do
++      fab!(:accessible_channel, :category_channel)
++      fab!(:accessible_message) do
++        Fabricate(
++          :chat_message,
++          chat_channel: accessible_channel,
++          user: Discourse.system_user,
++          blocks: [
++            {
++              type: "actions",
++              elements: [
++                {
++                  action_id: "xxx",
++                  value: "foo",
++                  type: "button",
++                  text: {
++                    type: "plain_text",
++                    text: "Click Me",
++                  },
++                },
++              ],
++            },
++          ],
++        )
++      end
++
++      before { accessible_channel.add(current_user) }
++
++      it "creates an interaction and returns serialized data" do
++        post "/chat/api/channels/#{accessible_channel.id}/messages/#{accessible_message.id}/interactions",
++             params: {
++               action_id: "xxx",
++             }
++
++        expect(response.status).to eq(200)
++        expect(response.parsed_body["interaction"]).to include(
++          "user" => hash_including("id" => current_user.id),
++          "message" => hash_including("id" => accessible_message.id),
++          "channel" => hash_including("id" => accessible_channel.id),
++          "action" => hash_including("action_id" => "xxx"),
++        )
++      end
++
++      it "returns 404 when action_id does not match any block element" do
++        post "/chat/api/channels/#{accessible_channel.id}/messages/#{accessible_message.id}/interactions",
++             params: {
++               action_id: "nonexistent",
++             }
++
++        expect(response.status).to eq(404)
++      end
++
++      it "returns 400 when action_id is missing" do
++        post "/chat/api/channels/#{accessible_channel.id}/messages/#{accessible_message.id}/interactions",
++             params: {
++             }
++
++        expect(response.status).to eq(400)
++      end
++    end
++
++    context "when user is not logged in" do
++      before { sign_out }
++
++      it "returns 404" do
++        post "/chat/api/channels/#{channel.id}/messages/#{message.id}/interactions",
++             params: {
++               action_id: "xxx",
++             }
++
++        expect(response.status).to eq(404)
++      end
++    end
++
++    context "when chat is disabled" do
++      before { SiteSetting.chat_enabled = false }
++
++      it "returns 404" do
++        post "/chat/api/channels/#{channel.id}/messages/#{message.id}/interactions",
++             params: {
++               action_id: "xxx",
++             }
++
++        expect(response.status).to eq(404)
++      end
++    end
++
++    context "when message exists in a channel the user cannot access" do
++      it "returns 404 to avoid leaking message existence" do
++        post "/chat/api/channels/#{channel.id}/messages/#{message.id}/interactions",
++             params: {
++               action_id: "xxx",
++             }
++
++        expect(response.status).to eq(404)
++      end
++    end
++
++    context "when message does not exist" do
++      it "returns 404" do
++        post "/chat/api/channels/#{channel.id}/messages/-999/interactions",
++             params: {
++               action_id: "xxx",
++             }
++
++        expect(response.status).to eq(404)
++      end
++    end
++
++    context "when message exists but in a different channel than the URL" do
++      fab!(:other_channel, :category_channel)
++
++      before { other_channel.add(current_user) }
++
++      it "returns 404 to avoid cross-channel message lookup" do
++        post "/chat/api/channels/#{other_channel.id}/messages/#{message.id}/interactions",
++             params: {
++               action_id: "xxx",
++             }
++
++        expect(response.status).to eq(404)
++      end
++    end
++  end
++end
+diff --git a/plugins/chat/spec/requests/chat/api/search_controller_spec.rb b/plugins/chat/spec/requests/chat/api/search_controller_spec.rb
+new file mode 100644
+index 0000000000000..8bfbf3f0d768a
+--- /dev/null
++++ b/plugins/chat/spec/requests/chat/api/search_controller_spec.rb
+@@ -0,0 +1,146 @@
++# frozen_string_literal: true
++
++RSpec.describe Chat::Api::SearchController do
++  fab!(:current_user, :user)
++  fab!(:channel, :chat_channel)
++
++  before do
++    SiteSetting.chat_enabled = true
++    SiteSetting.chat_allowed_groups = Group::AUTO_GROUPS[:everyone]
++    channel.add(current_user)
++  end
++
++  describe "#index" do
++    context "when not logged in" do
++      it "returns a 403" do
++        get "/chat/api/search.json", params: { query: "test" }
++
++        expect(response.status).to eq(403)
++      end
++    end
++
++    context "when logged in" do
++      before { sign_in(current_user) }
++
++      context "when chat is disabled" do
++        it "returns a 404" do
++          SiteSetting.chat_enabled = false
++
++          get "/chat/api/search.json", params: { query: "test" }
++
++          expect(response.status).to eq(404)
++        end
++      end
++
++      context "when query is missing" do
++        it "returns a 400" do
++          get "/chat/api/search.json", params: {}
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when limit is invalid" do
++        it "returns a 400 when limit is 0" do
++          get "/chat/api/search.json", params: { query: "test", limit: 0 }
++
++          expect(response.status).to eq(400)
++        end
++
++        it "returns a 400 when limit exceeds maximum" do
++          get "/chat/api/search.json", params: { query: "test", limit: 41 }
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when offset is negative" do
++        it "returns a 400" do
++          get "/chat/api/search.json", params: { query: "test", offset: -1 }
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when sort is invalid" do
++        it "returns a 400" do
++          get "/chat/api/search.json", params: { query: "test", sort: "invalid" }
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when channel_id refers to a non-existent channel" do
++        it "returns a 404" do
++          get "/chat/api/search.json", params: { query: "test", channel_id: -999 }
++
++          expect(response.status).to eq(404)
++        end
++      end
++
++      context "when channel_id refers to an existing channel the user cannot access" do
++        fab!(:private_channel, :private_category_channel)
++
++        it "returns a 404" do
++          get "/chat/api/search.json", params: { query: "test", channel_id: private_channel.id }
++
++          expect(response.status).to eq(404)
++        end
++      end
++
++      context "when searching with valid params" do
++        fab!(:message_1) do
++          Fabricate(:chat_message, chat_channel: channel, message: "hello world foo bar")
++        end
++
++        before { SearchIndexer.enable }
++        after { SearchIndexer.disable }
++
++        it "returns matching messages" do
++          SearchIndexer.index(message_1)
++
++          get "/chat/api/search.json", params: { query: "hello world" }
++
++          expect(response.status).to eq(200)
++          expect(response.parsed_body["messages"].map { |m| m["id"] }).to include(message_1.id)
++        end
++
++        it "returns metadata with pagination info" do
++          SearchIndexer.index(message_1)
++
++          get "/chat/api/search.json", params: { query: "hello world", limit: 5, offset: 0 }
++
++          expect(response.status).to eq(200)
++          meta = response.parsed_body["meta"]
++          expect(meta).to have_key("has_more")
++          expect(meta["limit"]).to eq(5)
++          expect(meta["offset"]).to eq(0)
++        end
++
++        it "scopes results to a specific channel" do
++          other_channel = Fabricate(:chat_channel)
++          other_channel.add(current_user)
++          other_message =
++            Fabricate(:chat_message, chat_channel: other_channel, message: "hello world baz")
++          SearchIndexer.index(message_1)
++          SearchIndexer.index(other_message)
++
++          get "/chat/api/search.json", params: { query: "hello world", channel_id: channel.id }
++
++          expect(response.status).to eq(200)
++          ids = response.parsed_body["messages"].map { |m| m["id"] }
++          expect(ids).to include(message_1.id)
++          expect(ids).not_to include(other_message.id)
++        end
++
++        it "accepts sort parameter" do
++          SearchIndexer.index(message_1)
++
++          get "/chat/api/search.json", params: { query: "hello world", sort: "latest" }
++
++          expect(response.status).to eq(200)
++        end
++      end
++    end
++  end
++end
+diff --git a/plugins/chat/spec/requests/chat_controller_spec.rb b/plugins/chat/spec/requests/chat_controller_spec.rb
+index aca6fe419cfa3..58c67622df36c 100644
+--- a/plugins/chat/spec/requests/chat_controller_spec.rb
++++ b/plugins/chat/spec/requests/chat_controller_spec.rb
+@@ -33,88 +33,44 @@ def flag_message(message, flagger, flag_type: ReviewableScore.types[:off_topic])
+   describe "#rebake" do
+     fab!(:chat_message) { Fabricate(:chat_message, chat_channel: chat_channel, user: user) }
+ 
+-    context "as staff" do
+-      it "rebakes the post" do
+-        sign_in(Fabricate(:admin))
+-
+-        expect_enqueued_with(
+-          job: Jobs::Chat::ProcessMessage,
+-          args: {
+-            chat_message_id: chat_message.id,
+-          },
+-        ) do
+-          put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
+-
+-          expect(response.status).to eq(200)
+-        end
++    it "works" do
++      sign_in(admin)
++      put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
++      expect(response.status).to eq(200)
++    end
++
++    context "when message does not exist" do
++      it "returns a 404" do
++        sign_in(admin)
++        put "/chat/#{chat_channel.id}/-999/rebake.json"
++        expect(response.status).to eq(404)
+       end
++    end
+ 
+-      it "does not interfere with core's guardian can_rebake? for posts" do
+-        sign_in(Fabricate(:admin))
+-        put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
+-        expect(response.status).to eq(200)
+-        post = Fabricate(:post)
+-        put "/posts/#{post.id}/rebake.json"
+-        expect(response.status).to eq(200)
++    context "when channel does not exist" do
++      it "returns a 404" do
++        sign_in(admin)
++        put "/chat/-999/#{chat_message.id}/rebake.json"
++        expect(response.status).to eq(404)
+       end
++    end
+ 
+-      it "does not rebake the post when channel is read_only" do
+-        chat_message.chat_channel.update!(status: :read_only)
+-        sign_in(Fabricate(:admin))
++    context "when user cannot access the channel" do
++      fab!(:inaccessible_channel, :private_category_channel)
+ 
+-        put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
++      it "returns a 403" do
++        sign_in(Fabricate(:user))
++        put "/chat/#{inaccessible_channel.id}/-999/rebake.json"
+         expect(response.status).to eq(403)
+       end
+-
+-      context "when cooked has changed" do
+-        it "marks the message as dirty" do
+-          sign_in(Fabricate(:admin))
+-          chat_message.update!(message: "new content")
+-
+-          expect_enqueued_with(
+-            job: Jobs::Chat::ProcessMessage,
+-            args: {
+-              chat_message_id: chat_message.id,
+-            },
+-          ) do
+-            put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
+-
+-            expect(response.status).to eq(200)
+-          end
+-        end
+-      end
+     end
+ 
+-    context "when not staff" do
+-      it "forbids non staff to rebake" do
++    context "when user cannot rebake" do
++      it "returns a 403" do
+         sign_in(Fabricate(:user))
+         put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
+         expect(response.status).to eq(403)
+       end
+-
+-      context "as TL3 user" do
+-        it "forbids less then TL4 user tries to rebake" do
+-          sign_in(Fabricate(:user, trust_level: TrustLevel[3]))
+-          put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
+-          expect(response.status).to eq(403)
+-        end
+-      end
+-
+-      context "as TL4 user" do
+-        it "allows TL4 users to rebake" do
+-          sign_in(Fabricate(:user, trust_level: TrustLevel[4]))
+-          put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
+-          expect(response.status).to eq(200)
+-        end
+-
+-        it "does not rebake the post when channel is read_only" do
+-          chat_message.chat_channel.update!(status: :read_only)
+-          sign_in(Fabricate(:user, trust_level: TrustLevel[4]))
+-
+-          put "/chat/#{chat_channel.id}/#{chat_message.id}/rebake.json"
+-          expect(response.status).to eq(403)
+-        end
+-      end
+     end
+   end
+ 
+diff --git a/plugins/chat/spec/services/chat/create_message_interaction_spec.rb b/plugins/chat/spec/services/chat/create_message_interaction_spec.rb
+index 9ca0cbc0de233..a99b72af2f09c 100644
+--- a/plugins/chat/spec/services/chat/create_message_interaction_spec.rb
++++ b/plugins/chat/spec/services/chat/create_message_interaction_spec.rb
+@@ -4,6 +4,7 @@
+   describe described_class::Contract, type: :model do
+     it { is_expected.to validate_presence_of :message_id }
+     it { is_expected.to validate_presence_of :action_id }
++    it { is_expected.to validate_presence_of :channel_id }
+   end
+ 
+   describe ".call" do
+@@ -34,7 +35,9 @@
+     end
+ 
+     let(:guardian) { Guardian.new(current_user) }
+-    let(:params) { { message_id: message.id, action_id: "xxx" } }
++    let(:params) do
++      { message_id: message.id, action_id: "xxx", channel_id: message.chat_channel_id }
++    end
+     let(:dependencies) { { guardian: } }
+ 
+     context "when all steps pass" do
+diff --git a/plugins/chat/spec/services/chat/invite_users_to_channel_spec.rb b/plugins/chat/spec/services/chat/invite_users_to_channel_spec.rb
+index 3d2b120a78c23..80a9cb52ef4fc 100644
+--- a/plugins/chat/spec/services/chat/invite_users_to_channel_spec.rb
++++ b/plugins/chat/spec/services/chat/invite_users_to_channel_spec.rb
+@@ -83,11 +83,24 @@
+       it { is_expected.to fail_to_find_a_model(:channel) }
+     end
+ 
+-    context "when current user can't view channel" do
++    context "when current user can't join channel" do
+       fab!(:current_user, :user)
+       fab!(:channel_1, :private_category_channel)
+ 
+-      it { is_expected.to fail_a_policy(:can_view_channel) }
++      it { is_expected.to fail_a_policy(:can_join_channel) }
++    end
++
++    context "when current user can view but not join channel" do
++      fab!(:current_user, :user)
++      fab!(:channel_1, :category_channel)
++
++      before do
++        channel_1.chatable.set_permissions(group_1 => :readonly)
++        channel_1.chatable.save!
++        group_1.add(current_user)
++      end
++
++      it { is_expected.to fail_a_policy(:can_join_channel) }
+     end
+   end
+ end
+diff --git a/plugins/chat/spec/services/chat/rebake_message_spec.rb b/plugins/chat/spec/services/chat/rebake_message_spec.rb
+new file mode 100644
+index 0000000000000..bf681ef005993
+--- /dev/null
++++ b/plugins/chat/spec/services/chat/rebake_message_spec.rb
+@@ -0,0 +1,85 @@
++# frozen_string_literal: true
++
++RSpec.describe Chat::RebakeMessage do
++  describe described_class::Contract, type: :model do
++    it { is_expected.to validate_presence_of(:message_id) }
++    it { is_expected.to validate_presence_of(:chat_channel_id) }
++  end
++
++  describe ".call" do
++    subject(:result) { described_class.call(params:, **dependencies) }
++
++    fab!(:admin)
++    fab!(:message, :chat_message)
++
++    let(:guardian) { Guardian.new(admin) }
++    let(:params) { { message_id: message.id, chat_channel_id: message.chat_channel_id } }
++    let(:dependencies) { { guardian: } }
++
++    before do
++      SiteSetting.chat_enabled = true
++      SiteSetting.chat_allowed_groups = Group::AUTO_GROUPS[:everyone]
++    end
++
++    context "when params are not valid" do
++      let(:params) { {} }
++
++      it { is_expected.to fail_a_contract }
++    end
++
++    context "when the channel does not exist" do
++      let(:params) { { message_id: message.id, chat_channel_id: -1 } }
++
++      it { is_expected.to fail_to_find_a_model(:channel) }
++    end
++
++    context "when the user cannot access the channel" do
++      fab!(:private_channel) do
++        Fabricate(
++          :private_category_channel,
++          group: Fabricate(:group),
++          chatable: Fabricate(:private_category, group: Fabricate(:group)),
++        )
++      end
++
++      let(:current_user) { Fabricate(:user) }
++      let(:guardian) { Guardian.new(current_user) }
++      let(:params) { { message_id: -999, chat_channel_id: private_channel.id } }
++
++      it { is_expected.to fail_a_policy(:can_access_channel) }
++    end
++
++    context "when the message does not exist" do
++      let(:params) { { message_id: -1, chat_channel_id: message.chat_channel_id } }
++
++      it { is_expected.to fail_to_find_a_model(:message) }
++    end
++
++    context "when the message does not belong to the channel" do
++      let(:other_channel) { Fabricate(:category_channel) }
++      let(:params) { { message_id: message.id, chat_channel_id: other_channel.id } }
++
++      it { is_expected.to fail_to_find_a_model(:message) }
++    end
++
++    context "when the user does not have permission to rebake" do
++      let(:current_user) { Fabricate(:user) }
++      let(:guardian) { Guardian.new(current_user) }
++
++      it { is_expected.to fail_a_policy(:can_rebake) }
++    end
++
++    context "when the user has permission to rebake" do
++      it { is_expected.to run_successfully }
++
++      it "enqueues a process message job" do
++        expect_enqueued_with(
++          job: Jobs::Chat::ProcessMessage,
++          args: {
++            chat_message_id: message.id,
++          },
++        ) { result }
++      end
++    end
++  end
++end
+diff --git a/plugins/checklist/assets/javascripts/discourse/initializers/checklist.js b/plugins/checklist/assets/javascripts/discourse/initializers/checklist.js
+index d65ee040d1e30..a187c8b183f9e 100644
+--- a/plugins/checklist/assets/javascripts/discourse/initializers/checklist.js
++++ b/plugins/checklist/assets/javascripts/discourse/initializers/checklist.js
+@@ -10,6 +10,22 @@ function initializePlugin(api) {
+   if (siteSettings.checklist_enabled) {
+     api.decorateCookedElement(checklistSyntax);
+     api.registerRichEditorExtension(richEditorExtension);
++
++    api.addComposerToolbarPopupMenuOption({
++      menu: "list",
++      name: "list-checklist",
++      icon: "list-check",
++      label: "checklist.composer.checklist",
++      showActiveIcon: true,
++      active: ({ state }) => state?.inCheckList,
++      action: (toolbarEvent) => {
++        if (toolbarEvent.commands?.toggleChecklist) {
++          toolbarEvent.commands.toggleChecklist();
++        } else {
++          toolbarEvent.applyList("- [ ] ", "list_item");
++        }
++      },
++    });
+   }
+ }
+ 
+diff --git a/plugins/checklist/assets/javascripts/lib/rich-editor-extension.js b/plugins/checklist/assets/javascripts/lib/rich-editor-extension.js
+index adb8a2320078f..f9366eedf5d20 100644
+--- a/plugins/checklist/assets/javascripts/lib/rich-editor-extension.js
++++ b/plugins/checklist/assets/javascripts/lib/rich-editor-extension.js
+@@ -1,8 +1,5 @@
+ /** @type {RichEditorExtension} */
+ const extension = {
+-  // TODO(renato): make the checkbox clickable
+-  // TODO(renato): auto-continue checkbox list on ENTER
+-  // TODO(renato): apply .has-checkbox style to the <li> to avoid :has
+   nodeSpec: {
+     check: {
+       attrs: { checked: { default: false } },
+@@ -23,9 +20,7 @@ const extension = {
+       parseDOM: [
+         {
+           tag: "span.chcklst-box",
+-          getAttrs: (dom) => {
+-            return { checked: hasCheckedClass(dom.className) };
+-          },
++          getAttrs: (dom) => ({ checked: hasCheckedClass(dom.className) }),
+         },
+       ],
+     },
+@@ -34,12 +29,16 @@ const extension = {
+   inputRules: [
+     {
+       match: /(^|\s)\[(x? ?)]$/,
+-      handler: (state, match, start, end) =>
+-        state.tr.replaceWith(
+-          start + match[1].length,
+-          end,
+-          state.schema.nodes.check.create({ checked: match[2] === "x" })
+-        ),
++      handler: (state, match, start, end) => {
++        const checkNode = state.schema.nodes.check.create({
++          checked: match[2] === "x",
++        });
++        const spaceNode = state.schema.text(" ");
++        return state.tr.replaceWith(start + match[1].length, end, [
++          checkNode,
++          spaceNode,
++        ]);
++      },
+     },
+   ],
+ 
+@@ -58,6 +57,515 @@ const extension = {
+       state.write(node.attrs.checked ? "[x]" : "[ ]");
+     },
+   },
++
++  plugins({
++    pmState: { Plugin },
++    pmView: { Decoration, DecorationSet },
++    schema,
++    utils: { changedDescendants },
++  }) {
++    const checkType = schema.nodes.check;
++    const listItemType = schema.nodes.list_item;
++    const bulletListType = schema.nodes.bullet_list;
++
++    const startsWithCheck = (node) =>
++      node?.isTextblock && node.firstChild?.type === checkType;
++
++    const findBulletListContext = ($from) => {
++      for (let depth = $from.depth; depth > 0; depth--) {
++        if ($from.node(depth).type === listItemType) {
++          if ($from.node(depth - 1)?.type === bulletListType) {
++            return { bulletListDepth: depth - 1, listItemDepth: depth };
++          }
++          return null;
++        }
++      }
++      return null;
++    };
++
++    const inBulletListItem = (doc, pos) =>
++      findBulletListContext(doc.resolve(pos)) !== null;
++
++    const ensureSpaceAfterChecks = (tr, oldState, newState) => {
++      const positionsToInsert = [];
++
++      changedDescendants(oldState.doc, newState.doc, (node, pos) => {
++        if (!startsWithCheck(node) || !inBulletListItem(newState.doc, pos)) {
++          return;
++        }
++
++        const secondChild = node.childCount > 1 ? node.child(1) : null;
++        const hasSpaceAfter =
++          secondChild?.isText && secondChild.text?.[0] === " ";
++
++        if (!hasSpaceAfter) {
++          positionsToInsert.push(pos + 1 + node.firstChild.nodeSize);
++        }
++      });
++
++      for (let i = positionsToInsert.length - 1; i >= 0; i--) {
++        tr.insert(positionsToInsert[i], schema.text(" "));
++      }
++    };
++
++    const exitChecklist = (tr, ctx) => {
++      const { bulletListDepth, listItemDepth } = ctx;
++      const { selection } = tr;
++      const { $from } = selection;
++      const bulletList = $from.node(bulletListDepth);
++      const listItemIndex = $from.index(bulletListDepth);
++      const prevListItem = bulletList.child(listItemIndex - 1);
++      const bulletListStart = $from.before(bulletListDepth);
++
++      tr.delete($from.before(listItemDepth), $from.after(listItemDepth));
++
++      let prevOffset = 1;
++      for (let i = 0; i < listItemIndex - 1; i++) {
++        prevOffset += bulletList.child(i).nodeSize;
++      }
++      const prevItemStart = tr.mapping.map(bulletListStart + prevOffset);
++      tr.delete(prevItemStart, prevItemStart + prevListItem.nodeSize);
++
++      const mappedListStart = tr.mapping.map(bulletListStart);
++      const listAfter = tr.doc.nodeAt(mappedListStart);
++
++      if (listAfter && listAfter.childCount > 0) {
++        const listEnd = mappedListStart + listAfter.nodeSize;
++        tr.insert(listEnd, schema.nodes.paragraph.create());
++        tr.setSelection(
++          selection.constructor.near(tr.doc.resolve(listEnd + 1))
++        );
++      } else {
++        tr.replaceWith(
++          mappedListStart,
++          mappedListStart + (listAfter?.nodeSize || 0),
++          schema.nodes.paragraph.create()
++        );
++        tr.setSelection(
++          selection.constructor.near(tr.doc.resolve(mappedListStart + 1))
++        );
++      }
++      return tr;
++    };
++
++    const handleChecklistContinuation = (tr, transactions) => {
++      if (!transactions.some((t) => t.docChanged)) {
++        return null;
++      }
++
++      const { selection } = tr;
++      const { $from } = selection;
++
++      if (!selection.empty) {
++        return null;
++      }
++
++      const parent = $from.parent;
++      if (!parent.isTextblock || parent.content.size !== 0) {
++        return null;
++      }
++
++      const ctx = findBulletListContext($from);
++      if (!ctx) {
++        return null;
++      }
++
++      const bulletList = $from.node(ctx.bulletListDepth);
++      const listItemIndex = $from.index(ctx.bulletListDepth);
++      if (listItemIndex === 0) {
++        return null;
++      }
++
++      const prevParagraph = bulletList.child(listItemIndex - 1).firstChild;
++      if (!startsWithCheck(prevParagraph)) {
++        return null;
++      }
++
++      if (prevParagraph.content.size > 2) {
++        const checkNode = checkType.create({ checked: false });
++        tr.insert($from.pos, [checkNode, schema.text(" ")]);
++        tr.setSelection(
++          selection.constructor.near(tr.doc.resolve($from.pos + 2))
++        );
++        return tr;
++      }
++
++      return exitChecklist(tr, ctx);
++    };
++
++    const adjustCursorPosition = (tr) => {
++      const { doc, selection } = tr;
++      const { $from } = selection;
++
++      if (!selection.empty) {
++        return null;
++      }
++
++      const parent = $from.parent;
++      if (!startsWithCheck(parent) || !inBulletListItem(doc, $from.pos)) {
++        return null;
++      }
++
++      const checkSize = parent.firstChild.nodeSize;
++      const secondChild = parent.childCount > 1 ? parent.child(1) : null;
++      const hasSpaceAfter =
++        secondChild?.isText && secondChild.text?.[0] === " ";
++      const minPos = hasSpaceAfter ? checkSize + 1 : checkSize;
++
++      if ($from.parentOffset < minPos) {
++        tr.setSelection(
++          selection.constructor.near(doc.resolve($from.start() + minPos))
++        );
++        return tr;
++      }
++
++      return null;
++    };
++
++    return [
++      new Plugin({
++        props: {
++          handleClickOn(view, pos, node, nodePos) {
++            if (node.type.name === "check") {
++              view.dispatch(
++                view.state.tr.setNodeMarkup(nodePos, null, {
++                  checked: !node.attrs.checked,
++                })
++              );
++              return true;
++            }
++            return false;
++          },
++
++          handleKeyDown(view, event) {
++            if (event.key !== "Backspace" && event.key !== "ArrowLeft") {
++              return false;
++            }
++
++            const { state, dispatch } = view;
++            const { selection } = state;
++            const { $from } = selection;
++
++            // Only handle at position 2 (right after check+space) in a checklist
++            if (
++              !selection.empty ||
++              $from.parentOffset !== 2 ||
++              !startsWithCheck($from.parent) ||
++              !inBulletListItem(state.doc, $from.pos)
++            ) {
++              return false;
++            }
++
++            if (event.key === "Backspace") {
++              const ctx = findBulletListContext($from);
++
++              const checkStart = $from.start();
++              let tr = state.tr.delete(checkStart, checkStart + 2);
++
++              if (ctx) {
++                const listItemPos = tr.mapping.map(
++                  $from.before(ctx.listItemDepth)
++                );
++                const $listItem = tr.doc.resolve(listItemPos);
++
++                if ($listItem.nodeBefore?.type === listItemType) {
++                  tr = tr.join(listItemPos, 2);
++                }
++              }
++
++              dispatch(tr);
++              return true;
++            }
++
++            const beforeTextblock = $from.before();
++            if (beforeTextblock > 0) {
++              dispatch(
++                state.tr.setSelection(
++                  selection.constructor.near(
++                    state.doc.resolve(beforeTextblock),
++                    -1
++                  )
++                )
++              );
++              return true;
++            }
++
++            return false;
++          },
++        },
++
++        appendTransaction(transactions, oldState, newState) {
++          const isFullReplace = transactions.some(
++            (t) =>
++              t.steps.length === 1 &&
++              t.steps[0].from === 0 &&
++              t.steps[0].to === oldState.doc.content.size
++          );
++          if (isFullReplace) {
++            return null;
++          }
++
++          const tr = newState.tr;
++          ensureSpaceAfterChecks(tr, oldState, newState);
++
++          return (
++            handleChecklistContinuation(tr, transactions) ??
++            adjustCursorPosition(tr) ??
++            (tr.docChanged ? tr : null)
++          );
++        },
++      }),
++
++      // Decoration plugin to add has-checkbox class to checklist items
++      new Plugin({
++        props: {
++          decorations(state) {
++            const decorations = [];
++
++            state.doc.descendants((node, pos, parent) => {
++              if (
++                node.type === listItemType &&
++                parent?.type === bulletListType &&
++                startsWithCheck(node.firstChild)
++              ) {
++                decorations.push(
++                  Decoration.node(pos, pos + node.nodeSize, {
++                    class: "has-checkbox",
++                  })
++                );
++              }
++            });
++
++            return DecorationSet.create(state.doc, decorations);
++          },
++        },
++      }),
++    ];
++  },
++
++  commands: ({ schema, pmSchemaList }) => {
++    const checkType = schema.nodes.check;
++    const bulletListType = schema.nodes.bullet_list;
++    const orderedListType = schema.nodes.ordered_list;
++    const listItemType = schema.nodes.list_item;
++
++    const listItemHasCheck = (listItem) => {
++      const p = listItem.firstChild;
++      return p?.isTextblock && p.firstChild?.type === checkType;
++    };
++
++    const findListContext = (state) => {
++      const { $from, $to } = state.selection;
++      for (let depth = $from.depth; depth > 0; depth--) {
++        if ($from.node(depth).type === listItemType) {
++          const list = $from.node(depth - 1);
++          if (list?.type === bulletListType || list?.type === orderedListType) {
++            return {
++              listDepth: depth - 1,
++              listItemDepth: depth,
++              listType: list.type,
++              list,
++              listStart: $from.before(depth - 1),
++              $from,
++              $to,
++            };
++          }
++        }
++      }
++      return null;
++    };
++
++    const forEachSelectedItem = (ctx, callback) => {
++      const { list, listStart, $from, $to } = ctx;
++      const collapsed = $from.pos === $to.pos;
++
++      list.forEach((item, offset) => {
++        const itemStart = listStart + 1 + offset;
++        const itemEnd = itemStart + item.nodeSize;
++        const inSelection = collapsed
++          ? $from.pos >= itemStart && $from.pos <= itemEnd
++          : !(itemEnd <= $from.pos || itemStart >= $to.pos);
++
++        if (inSelection) {
++          callback(item, itemStart);
++        }
++      });
++    };
++
++    const hasCheckInSelection = (ctx) => {
++      if (!ctx || ctx.listType !== bulletListType) {
++        return false;
++      }
++      let found = false;
++      forEachSelectedItem(ctx, (item) => {
++        if (listItemHasCheck(item)) {
++          found = true;
++        }
++      });
++      return found;
++    };
++
++    const removeChecksFromSelection = (state, ctx) => {
++      const toDelete = [];
++      forEachSelectedItem(ctx, (item, itemStart) => {
++        if (listItemHasCheck(item)) {
++          const textblock = item.firstChild;
++          const checkSize = textblock.firstChild.nodeSize;
++          const second = textblock.childCount > 1 ? textblock.child(1) : null;
++          const hasSpace = second?.isText && second.text?.[0] === " ";
++          toDelete.push({
++            from: itemStart + 2,
++            to: itemStart + 2 + checkSize + (hasSpace ? 1 : 0),
++          });
++        }
++      });
++
++      let tr = state.tr;
++      for (let i = toDelete.length - 1; i >= 0; i--) {
++        tr = tr.delete(toDelete[i].from, toDelete[i].to);
++      }
++      return tr;
++    };
++
++    const addChecksToSelection = (state, ctx) => {
++      const toInsert = [];
++      forEachSelectedItem(ctx, (item, itemStart) => {
++        if (!listItemHasCheck(item) && item.firstChild?.isTextblock) {
++          toInsert.push(itemStart + 2);
++        }
++      });
++
++      let tr = state.tr;
++      let offset = 0;
++      for (const pos of toInsert) {
++        const check = checkType.create({ checked: false });
++        const space = schema.text(" ");
++        tr = tr.insert(pos + offset, [check, space]);
++        offset += check.nodeSize + space.nodeSize;
++      }
++      return tr;
++    };
++
++    return {
++      toggleBulletList() {
++        return (state, dispatch) => {
++          const ctx = findListContext(state);
++          if (hasCheckInSelection(ctx)) {
++            if (dispatch) {
++              dispatch(removeChecksFromSelection(state, ctx));
++            }
++            return true;
++          }
++          return false;
++        };
++      },
++
++      toggleOrderedList() {
++        return (state, dispatch, view) => {
++          const ctx = findListContext(state);
++          if (!hasCheckInSelection(ctx)) {
++            return false;
++          }
++
++          if (!dispatch) {
++            return true;
++          }
++
++          const liftListItem = pmSchemaList?.liftListItem;
++          const wrapInList = pmSchemaList?.wrapInList;
++          if (!liftListItem || !wrapInList) {
++            return false;
++          }
++
++          dispatch(removeChecksFromSelection(state, ctx));
++          if (view) {
++            liftListItem(listItemType)(view.state, dispatch);
++            wrapInList(orderedListType)(view.state, dispatch);
++          }
++          return true;
++        };
++      },
++
++      toggleChecklist() {
++        return (state, dispatch, view) => {
++          const ctx = findListContext(state);
++          const wrapInList = pmSchemaList?.wrapInList;
++          const liftListItem = pmSchemaList?.liftListItem;
++
++          if (hasCheckInSelection(ctx)) {
++            if (!dispatch || !liftListItem) {
++              return !!liftListItem;
++            }
++            dispatch(removeChecksFromSelection(state, ctx));
++            if (view) {
++              liftListItem(listItemType)(view.state, dispatch);
++            }
++            return true;
++          }
++
++          if (ctx?.listType === bulletListType) {
++            if (dispatch) {
++              dispatch(addChecksToSelection(state, ctx));
++            }
++            return true;
++          }
++
++          if (ctx?.listType === orderedListType) {
++            if (!dispatch || !liftListItem || !wrapInList) {
++              return !!(liftListItem && wrapInList);
++            }
++            liftListItem(listItemType)(state, dispatch);
++            if (view) {
++              wrapInList(bulletListType)(view.state, dispatch);
++              const newCtx = findListContext(view.state);
++              if (newCtx) {
++                dispatch(addChecksToSelection(view.state, newCtx));
++              }
++            }
++            return true;
++          }
++
++          if (!wrapInList) {
++            return false;
++          }
++          if (!dispatch) {
++            return wrapInList(bulletListType)(state, undefined);
++          }
++
++          wrapInList(bulletListType)(state, dispatch);
++          if (view) {
++            const newCtx = findListContext(view.state);
++            if (newCtx) {
++              dispatch(addChecksToSelection(view.state, newCtx));
++            }
++          }
++          return true;
++        };
++      },
++    };
++  },
++
++  state: ({ schema, utils: { inNode } }, viewState) => {
++    const { $from } = viewState.selection;
++    let inCheckList = false;
++
++    for (let depth = $from.depth; depth > 0; depth--) {
++      const node = $from.node(depth);
++      if (node.type === schema.nodes.list_item) {
++        if ($from.node(depth - 1)?.type === schema.nodes.bullet_list) {
++          const p = node.firstChild;
++          inCheckList =
++            p?.isTextblock && p.firstChild?.type === schema.nodes.check;
++        }
++        break;
++      }
++    }
++
++    return {
++      inCheckList,
++      inBulletList: !inCheckList && inNode(viewState, schema.nodes.bullet_list),
++    };
++  },
+ };
+ 
+ const CHECKED_REGEX = /\bchecked\b/;
+diff --git a/plugins/checklist/assets/stylesheets/checklist.scss b/plugins/checklist/assets/stylesheets/checklist.scss
+index 238a9e0e66ab2..a1519e93416af 100644
+--- a/plugins/checklist/assets/stylesheets/checklist.scss
++++ b/plugins/checklist/assets/stylesheets/checklist.scss
+@@ -83,8 +83,7 @@ ul li.has-checkbox {
+ }
+ 
+ .ProseMirror {
+-  // TODO(renato): this is temporary, we should use `has-checkbox` instead
+-  li:has(p:first-of-type > span.chcklst-box) {
++  ul > li.has-checkbox {
+     list-style-type: none;
+ 
+     .chcklst-box:first-of-type {
+diff --git a/plugins/checklist/config/locales/client.en.yml b/plugins/checklist/config/locales/client.en.yml
+new file mode 100644
+index 0000000000000..4c5f683d2d1ec
+--- /dev/null
++++ b/plugins/checklist/config/locales/client.en.yml
+@@ -0,0 +1,5 @@
++en:
++  js:
++    checklist:
++      composer:
++        checklist: "Check list"
+diff --git a/plugins/checklist/spec/system/page_objects/components/rich_checklist.rb b/plugins/checklist/spec/system/page_objects/components/rich_checklist.rb
+new file mode 100644
+index 0000000000000..88c0f82e2aac2
+--- /dev/null
++++ b/plugins/checklist/spec/system/page_objects/components/rich_checklist.rb
+@@ -0,0 +1,40 @@
++# frozen_string_literal: true
++
++module PageObjects
++  module Components
++    class RichChecklist < PageObjects::Components::Base
++      CHECKBOX_SELECTOR = ".chcklst-box"
++      UNCHECKED_SELECTOR = "#{CHECKBOX_SELECTOR}.fa.fa-square-o"
++      CHECKED_SELECTOR = "#{CHECKBOX_SELECTOR}.checked.fa.fa-square-check-o"
++
++      def initialize(rich_editor)
++        @rich_editor = rich_editor
++      end
++
++      def click_checkbox(index = 0)
++        @rich_editor.find_all(CHECKBOX_SELECTOR)[index].click
++        self
++      end
++
++      def has_checkboxes?(count:)
++        @rich_editor.has_css?(CHECKBOX_SELECTOR, count: count)
++      end
++
++      def has_no_checkboxes?
++        @rich_editor.has_no_css?(CHECKBOX_SELECTOR)
++      end
++
++      def has_checked?(count: 1)
++        @rich_editor.has_css?(CHECKED_SELECTOR, count: count)
++      end
++
++      def has_unchecked?(count: 1)
++        @rich_editor.has_css?(UNCHECKED_SELECTOR, count: count)
++      end
++
++      def has_items?(count:)
++        @rich_editor.has_css?("ul li", count: count)
++      end
++    end
++  end
++end
+diff --git a/plugins/checklist/spec/system/rich_editor_extension_spec.rb b/plugins/checklist/spec/system/rich_editor_extension_spec.rb
+new file mode 100644
+index 0000000000000..2b5f4171e246b
+--- /dev/null
++++ b/plugins/checklist/spec/system/rich_editor_extension_spec.rb
+@@ -0,0 +1,141 @@
++# frozen_string_literal: true
++
++describe "Composer - ProseMirror editor - Checklist extension", type: :system do
++  fab!(:user) { Fabricate(:user, refresh_auto_groups: true) }
++  let(:composer) { PageObjects::Components::Composer.new }
++  let(:rich) { composer.rich_editor }
++  let(:checklist) { PageObjects::Components::RichChecklist.new(rich) }
++
++  before do
++    sign_in(user)
++    SiteSetting.rich_editor = true
++  end
++
++  def open_composer_and_toggle_rich_editor
++    page.visit "/new-topic"
++    expect(composer).to be_opened
++    composer.toggle_rich_editor
++  end
++
++  def click_checklist_toolbar_option
++    find(".toolbar__button.list").click
++    find("button[data-name='list-checklist']").click
++  end
++
++  describe "checklist functionality" do
++    it "toggles checked state when clicking checkbox" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      rich.send_keys("[ ] Item 1")
++      expect(checklist).to have_unchecked(count: 1)
++
++      checklist.click_checkbox
++      expect(checklist).to have_checked(count: 1)
++    end
++
++    it "shows checklist option in toolbar" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      find(".toolbar__button.list").click
++
++      expect(page).to have_css("button[data-name='list-checklist']")
++    end
++  end
++
++  describe "checklist structure" do
++    it "creates proper list structure with toolbar" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      click_checklist_toolbar_option
++      rich.send_keys("First item")
++
++      expect(checklist).to have_items(count: 1)
++      expect(checklist).to have_checkboxes(count: 1)
++    end
++
++    it "continues checklist on Enter" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      click_checklist_toolbar_option
++      rich.send_keys("First item")
++      rich.send_keys(:enter)
++
++      expect(checklist).to have_items(count: 2)
++      expect(checklist).to have_checkboxes(count: 2)
++    end
++
++    it "allows double-Enter to escape checklist" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      click_checklist_toolbar_option
++      rich.send_keys("First item")
++      rich.send_keys(:enter)
++
++      expect(checklist).to have_checkboxes(count: 2)
++
++      rich.send_keys(:enter)
++
++      expect(checklist).to have_checkboxes(count: 1)
++      expect(checklist).to have_items(count: 1)
++    end
++  end
++
++  describe "backspace behavior" do
++    it "joins with previous item when backspacing at start of checklist item with content" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      click_checklist_toolbar_option
++      rich.send_keys("First item")
++      rich.send_keys(:enter)
++      rich.send_keys("Second item")
++
++      expect(checklist).to have_checkboxes(count: 2)
++      expect(checklist).to have_items(count: 2)
++
++      rich.send_keys(:home)
++      rich.send_keys(:backspace)
++
++      expect(checklist).to have_checkboxes(count: 1)
++      expect(rich).to have_text("First itemSecond item")
++    end
++
++    it "joins with previous item when backspacing on empty checklist item" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      click_checklist_toolbar_option
++      rich.send_keys("First item")
++      rich.send_keys(:enter)
++
++      expect(checklist).to have_checkboxes(count: 2)
++
++      rich.send_keys(:backspace)
++
++      expect(checklist).to have_checkboxes(count: 1)
++      expect(rich).to have_text("First item")
++    end
++
++    it "removes checkbox when backspacing on first/only checklist item" do
++      open_composer_and_toggle_rich_editor
++      rich.click
++
++      click_checklist_toolbar_option
++      rich.send_keys("Only item")
++
++      expect(checklist).to have_checkboxes(count: 1)
++      expect(checklist).to have_items(count: 1)
++
++      rich.send_keys(:home)
++      rich.send_keys(:backspace)
++
++      expect(checklist).to have_no_checkboxes
++      expect(rich).to have_text("Only item")
++    end
++  end
++end
+diff --git a/plugins/checklist/test/javascripts/integration/rich-editor-extension-test.js b/plugins/checklist/test/javascripts/integration/rich-editor-extension-test.js
+index 505316932fd02..d2c95174f6c33 100644
+--- a/plugins/checklist/test/javascripts/integration/rich-editor-extension-test.js
++++ b/plugins/checklist/test/javascripts/integration/rich-editor-extension-test.js
+@@ -43,7 +43,7 @@ module(
+       ],
+       "handles checkboxes in lists": [
+         "* [ ] unchecked list item\n* [x] checked list item",
+-        `<ul data-tight="true"><li><p>${unchecked} unchecked list item</p></li><li><p>${checked} checked list item</p></li></ul>`,
++        `<ul data-tight="true"><li class="has-checkbox"><p>${unchecked} unchecked list item</p></li><li class="has-checkbox"><p>${checked} checked list item</p></li></ul>`,
+         "* [ ] unchecked list item\n* [x] checked list item",
+       ],
+       "handles checkboxes with formatting": [
+@@ -51,21 +51,26 @@ module(
+         `<p>${unchecked} <em>italics</em> and ${checked} <strong>bold</strong></p>`,
+         "[ ] *italics* and [x] **bold**",
+       ],
+-      "does not render escaped opening bracket as checkbox": [
++      "does not render escaped checkbox": [
+         "\\[x] not a checkbox",
+         "<p>[x] not a checkbox</p>",
+         "\\[x\\] not a checkbox",
+       ],
+-      "does not render escaped closing bracket as checkbox": [
+-        "[x\\] not a checkbox",
+-        "<p>[x] not a checkbox</p>",
+-        "\\[x\\] not a checkbox",
+-      ],
+       "handles escaped checkbox followed by real checkbox": [
+         "\\[x] escaped [x] real",
+         `<p>[x] escaped ${checked} real</p>`,
+         "\\[x\\] escaped [x] real",
+       ],
++      "preserves checkbox state in ordered lists": [
++        "1. [ ] unchecked\n2. [x] checked",
++        `<ol data-tight="true"><li><p>${unchecked} unchecked</p></li><li><p>${checked} checked</p></li></ol>`,
++        "1. [ ] unchecked\n2. [x] checked",
++      ],
++      "handles nested list with checkboxes": [
++        "* [ ] parent\n  * [x] child",
++        `<ul data-tight="true"><li class="has-checkbox"><p>${unchecked} parent</p><ul data-tight="true"><li class="has-checkbox"><p>${checked} child</p></li></ul></li></ul>`,
++        "* [ ] parent\n  * [x] child",
++      ],
+     }).forEach(([name, [markdown, html, expectedMarkdown]]) => {
+       test(name, async function (assert) {
+         await testMarkdown(assert, markdown, html, expectedMarkdown);
+diff --git a/plugins/discourse-data-explorer/assets/javascripts/discourse/templates/admin-plugins/show/explorer/details.gjs b/plugins/discourse-data-explorer/assets/javascripts/admin/templates/admin-plugins/show/explorer/details.gjs
+similarity index 95%
+rename from plugins/discourse-data-explorer/assets/javascripts/discourse/templates/admin-plugins/show/explorer/details.gjs
+rename to plugins/discourse-data-explorer/assets/javascripts/admin/templates/admin-plugins/show/explorer/details.gjs
+index f1e325de7ccf1..231004485aa1c 100644
+--- a/plugins/discourse-data-explorer/assets/javascripts/discourse/templates/admin-plugins/show/explorer/details.gjs
++++ b/plugins/discourse-data-explorer/assets/javascripts/admin/templates/admin-plugins/show/explorer/details.gjs
+@@ -12,10 +12,10 @@ import icon from "discourse/helpers/d-icon";
+ import draggable from "discourse/modifiers/draggable";
+ import MultiSelect from "discourse/select-kit/components/multi-select";
+ import { i18n } from "discourse-i18n";
+-import CodeView from "../../../../components/code-view";
+-import ExplorerSchema from "../../../../components/explorer-schema";
+-import ParamInputForm from "../../../../components/param-input-form";
+-import QueryResultsWrapper from "../../../../components/query-results-wrapper";
++import CodeView from "discourse/plugins/discourse-data-explorer/discourse/components/code-view";
++import ExplorerSchema from "discourse/plugins/discourse-data-explorer/discourse/components/explorer-schema";
++import ParamInputForm from "discourse/plugins/discourse-data-explorer/discourse/components/param-input-form";
++import QueryResultsWrapper from "discourse/plugins/discourse-data-explorer/discourse/components/query-results-wrapper";
+ 
+ export default class QueriesDetails extends Component {
+   get showDestroyQuery() {
+diff --git a/plugins/discourse-data-explorer/assets/javascripts/discourse/templates/admin-plugins/show/explorer/index.gjs b/plugins/discourse-data-explorer/assets/javascripts/admin/templates/admin-plugins/show/explorer/index.gjs
+similarity index 98%
+rename from plugins/discourse-data-explorer/assets/javascripts/discourse/templates/admin-plugins/show/explorer/index.gjs
+rename to plugins/discourse-data-explorer/assets/javascripts/admin/templates/admin-plugins/show/explorer/index.gjs
+index f8536b8c52a5f..be9ffb29918a2 100644
+--- a/plugins/discourse-data-explorer/assets/javascripts/discourse/templates/admin-plugins/show/explorer/index.gjs
++++ b/plugins/discourse-data-explorer/assets/javascripts/admin/templates/admin-plugins/show/explorer/index.gjs
+@@ -11,7 +11,7 @@ import ageWithTooltip from "discourse/helpers/age-with-tooltip";
+ import icon from "discourse/helpers/d-icon";
+ import { not } from "discourse/truth-helpers";
+ import { i18n } from "discourse-i18n";
+-import ShareReport from "../../../../components/share-report";
++import ShareReport from "discourse/plugins/discourse-data-explorer/discourse/components/share-report";
+ 
+ export default <template>
+   <div class="admin-detail">
+diff --git a/spec/lib/post_action_creator_spec.rb b/spec/lib/post_action_creator_spec.rb
+index 44a07de66291d..a3c4be90442d9 100644
+--- a/spec/lib/post_action_creator_spec.rb
++++ b/spec/lib/post_action_creator_spec.rb
+@@ -17,6 +17,27 @@
+ 
+       expect { PostActionCreator.like(user, post) }.to raise_error(RateLimiter::LimitExceeded)
+     end
++
++    it "does not count notify_moderators PM against personal message rate limit" do
++      SiteSetting.max_personal_messages_per_day = 1
++      SiteSetting.max_topics_per_day = 0
++      SiteSetting.max_topics_in_first_day = 0
++      SiteSetting.rate_limit_create_topic = 0
++      SiteSetting.rate_limit_create_post = 0
++      SiteSetting.rate_limit_new_user_create_post = 0
++
++      archetype = Archetype.private_message
++
++      create_post(user:, archetype:, target_usernames: [admin.username])
++
++      expect { create_post(user:, archetype:, target_usernames: [admin.username]) }.to raise_error(
++        RateLimiter::LimitExceeded,
++      )
++
++      reason = "This is a 'something else' flag."
++      result = PostActionCreator.notify_moderators(user, post, reason)
++      expect(result).to be_success
++    end
+   end
+ 
+   describe "messaging" do
+diff --git a/spec/lib/post_revisor_spec.rb b/spec/lib/post_revisor_spec.rb
+index a61e343e5b89a..b619ad5b17975 100644
+--- a/spec/lib/post_revisor_spec.rb
++++ b/spec/lib/post_revisor_spec.rb
+@@ -1066,15 +1066,15 @@
+       expect(post_revisor.raw_changed?).to eq(false)
+ 
+       post_revisor.revise!(admin, tags: %w[new-tag new-tag-2])
+-      expect(post.post_revisions.last.modifications).to eq(
+-        "tags" => [["new-tag"], %w[new-tag new-tag-2]],
+-      )
++      before, after = post.post_revisions.last.modifications["tags"]
++      expect(before).to contain_exactly("new-tag")
++      expect(after).to contain_exactly("new-tag", "new-tag-2")
+       expect(post_revisor.raw_changed?).to eq(false)
+ 
+       post_revisor.revise!(admin, tags: ["new-tag-3"])
+-      expect(post.post_revisions.last.modifications).to eq(
+-        "tags" => [%w[new-tag new-tag-2], ["new-tag-3"]],
+-      )
++      before, after = post.post_revisions.last.modifications["tags"]
++      expect(before).to contain_exactly("new-tag", "new-tag-2")
++      expect(after).to contain_exactly("new-tag-3")
+       expect(post_revisor.raw_changed?).to eq(false)
+     end
+ 
+diff --git a/spec/lib/service/runner_spec.rb b/spec/lib/service/runner_spec.rb
+index 32fcaeb0426ff..4018e60072dc9 100644
+--- a/spec/lib/service/runner_spec.rb
++++ b/spec/lib/service/runner_spec.rb
+@@ -184,13 +184,14 @@ def locked_step
+   class LockWithModelService
+     include Service::Base
+ 
++    params { attribute :topic_id, :integer }
+     model :topic
+     lock(:topic) { step :locked_step }
+ 
+     private
+ 
+-    def fetch_topic
+-      OpenStruct.new(id: 123)
++    def fetch_topic(params:)
++      OpenStruct.new(id: params.topic_id)
+     end
+ 
+     def locked_step
+@@ -533,9 +534,9 @@ def request
+         end
+       end
+ 
+-      context "when the lock key resolves from context" do
++      context "when the lock key resolves from context (not params)" do
+         let(:service) { LockWithModelService }
+-        let(:dependencies) { { params: {} } }
++        let(:dependencies) { { params: { topic_id: 123 } } }
+         let(:actions) { <<-BLOCK }
+             proc do
+               on_success { :success }
+diff --git a/spec/lib/topics_bulk_action_spec.rb b/spec/lib/topics_bulk_action_spec.rb
+index 43d91464372c3..43ea3e418e5c0 100644
+--- a/spec/lib/topics_bulk_action_spec.rb
++++ b/spec/lib/topics_bulk_action_spec.rb
+@@ -504,6 +504,7 @@
+   end
+ 
+   describe "change_tags" do
++    fab!(:first_post) { Fabricate(:post, topic:) }
+     fab!(:tag1, :tag)
+     fab!(:tag2, :tag)
+ 
+@@ -577,9 +578,30 @@
+         expect(topic.reload.tags).to contain_exactly(tag1, tag2)
+       end
+     end
++
++    it "does not send notifications" do
++      fab_tag3 = Fabricate(:tag)
++      topic_watcher = Fabricate(:user)
++      Jobs.run_immediately!
++      TopicUser.change(
++        topic_watcher,
++        topic.id,
++        notification_level: TopicUser.notification_levels[:watching],
++      )
++
++      expect do
++        TopicsBulkAction.new(
++          Fabricate(:admin),
++          [topic.id],
++          type: "change_tags",
++          tag_ids: [fab_tag3.id],
++        ).perform!
++      end.to not_change { Notification.where(user: topic_watcher).count }
++    end
+   end
+ 
+   describe "append_tags" do
++    fab!(:first_post) { Fabricate(:post, topic:) }
+     fab!(:tag1, :tag)
+     fab!(:tag2, :tag)
+     fab!(:tag3, :tag)
+@@ -604,11 +626,11 @@
+         expect(topic.reload.tags).to contain_exactly(tag1, tag2, tag3)
+       end
+ 
+-      it "keeps existing tags when appending empty array" do
++      it "is a no-op when appending empty array" do
+         topic_ids =
+           TopicsBulkAction.new(topic.user, [topic.id], type: "append_tags", tag_ids: []).perform!
+ 
+-        expect(topic_ids).to eq([topic.id])
++        expect(topic_ids).to eq([])
+         expect(topic.reload.tags).to contain_exactly(tag1, tag2)
+       end
+     end
+@@ -651,17 +673,36 @@
+         expect(topic.reload.tags).to contain_exactly(tag1, tag2)
+       end
+     end
++
++    it "does not send notifications" do
++      topic_watcher = Fabricate(:user)
++      Jobs.run_immediately!
++      TopicUser.change(
++        topic_watcher,
++        topic.id,
++        notification_level: TopicUser.notification_levels[:watching],
++      )
++
++      expect do
++        TopicsBulkAction.new(
++          Fabricate(:admin),
++          [topic.id],
++          type: "append_tags",
++          tag_ids: [tag3.id],
++        ).perform!
++      end.to not_change { Notification.where(user: topic_watcher).count }
++    end
+   end
+ 
+   describe "remove_tags" do
++    fab!(:first_post) { Fabricate(:post, topic:) }
+     fab!(:tag1, :tag)
+     fab!(:tag2, :tag)
+ 
+     before do
+       SiteSetting.tagging_enabled = true
+       SiteSetting.tag_topic_allowed_groups = Group::AUTO_GROUPS[:trust_level_0]
+-      TopicTag.create!(topic: topic, tag: tag1)
+-      TopicTag.create!(topic: topic, tag: tag2)
++      topic.tags = [tag1, tag2]
+     end
+ 
+     context "when the user can edit the topic" do
+@@ -683,8 +724,22 @@
+         topic_ids = TopicsBulkAction.new(topic.user, [topic.id], type: "remove_tags").perform!
+ 
+         expect(topic_ids).to eq([])
+-        expect(topic.reload.tags.map(&:name)).to contain_exactly(tag1.name, tag2.name)
++        expect(topic.reload.tags).to contain_exactly(tag1, tag2)
+       end
+     end
++
++    it "does not send notifications" do
++      topic_watcher = Fabricate(:user)
++      Jobs.run_immediately!
++      TopicUser.change(
++        topic_watcher,
++        topic.id,
++        notification_level: TopicUser.notification_levels[:watching],
++      )
++
++      expect do
++        TopicsBulkAction.new(Fabricate(:admin), [topic.id], type: "remove_tags").perform!
++      end.to not_change { Notification.where(user: topic_watcher).count }
++    end
+   end
+ end
+diff --git a/spec/requests/groups_controller_spec.rb b/spec/requests/groups_controller_spec.rb
+index a5be5a6682798..ab19a26536b24 100644
+--- a/spec/requests/groups_controller_spec.rb
++++ b/spec/requests/groups_controller_spec.rb
+@@ -2507,20 +2507,41 @@ def expect_type_to_return_right_groups(type, expected_group_ids)
+   describe "#request_membership" do
+     fab!(:new_user, :user)
+ 
++    before { group.update_column(:allow_membership_requests, true) }
++
+     it "requires the user to log in" do
+       post "/groups/#{group.name}/request_membership.json"
+       expect(response.status).to eq(403)
+     end
+ 
+-    it "requires a reason" do
++    it "rejects the request when allow_membership_requests is false" do
++      group.update!(allow_membership_requests: false)
++      sign_in(new_user)
++
++      post "/groups/#{group.name}/request_membership.json", params: { reason: "Please add me" }
++
++      expect(response.status).to eq(403)
++      expect(GroupRequest.where(group: group, user: new_user).exists?).to eq(false)
++    end
++
++    it "rejects the request when the user is already a group member" do
+       sign_in(user)
+ 
++      post "/groups/#{group.name}/request_membership.json", params: { reason: "Please add me" }
++
++      expect(response.status).to eq(403)
++      expect(GroupRequest.where(group: group, user: user).exists?).to eq(false)
++    end
++
++    it "requires a reason" do
++      sign_in(new_user)
++
+       post "/groups/#{group.name}/request_membership.json"
+       expect(response.status).to eq(400)
+     end
+ 
+     it "checks for duplicates" do
+-      sign_in(user)
++      sign_in(new_user)
+ 
+       post "/groups/#{group.name}/request_membership.json", params: { reason: "Please add me in" }
+ 
+@@ -2532,7 +2553,7 @@ def expect_type_to_return_right_groups(type, expected_group_ids)
+     end
+ 
+     it "limits the character count of the reason" do
+-      sign_in(user)
++      sign_in(new_user)
+ 
+       post "/groups/#{group.name}/request_membership.json",
+            params: {
+@@ -2550,7 +2571,7 @@ def expect_type_to_return_right_groups(type, expected_group_ids)
+       owner2 = Fabricate(:user, last_seen_at: 1.day.ago)
+       [owner1, owner2].each { |owner| group.add_owner(owner) }
+ 
+-      sign_in(user)
++      sign_in(new_user)
+ 
+       post "/groups/#{group.name}/request_membership.json", params: { reason: "Please add me in" }
+ 
+@@ -2562,7 +2583,7 @@ def expect_type_to_return_right_groups(type, expected_group_ids)
+ 
+       expect(body["relative_url"]).to eq(topic.relative_url)
+       expect(post.topic.custom_fields["requested_group_id"].to_i).to eq(group.id)
+-      expect(post.user).to eq(user)
++      expect(post.user).to eq(new_user)
+ 
+       expect(topic.title).to eq(
+         I18n.t("groups.request_membership_pm.title", group_name: group.name),
+@@ -2570,7 +2591,7 @@ def expect_type_to_return_right_groups(type, expected_group_ids)
+ 
+       expect(post.raw).to start_with("Please add me in")
+       expect(topic.archetype).to eq(Archetype.private_message)
+-      expect(topic.allowed_users).to contain_exactly(user, owner1, owner2)
++      expect(topic.allowed_users).to contain_exactly(new_user, owner1, owner2)
+       expect(topic.allowed_groups).to eq([])
+     end
+   end
+diff --git a/spec/requests/post_actions_controller_spec.rb b/spec/requests/post_actions_controller_spec.rb
+index d23cd4a524bdb..92e64b9a1ffa1 100644
+--- a/spec/requests/post_actions_controller_spec.rb
++++ b/spec/requests/post_actions_controller_spec.rb
+@@ -72,6 +72,27 @@
+ 
+           expect(response).to be_forbidden
+         end
++
++        it "does not return post content when the user can no longer see the post" do
++          restricted_category = Fabricate(:category, read_restricted: true)
++          post.topic.update!(category: restricted_category)
++
++          delete "/post_actions/#{post.id}.json",
++                 params: {
++                   post_action_type_id: PostActionType.types[:like],
++                 }
++
++          expect(response.status).to eq(204)
++          expect(response.body).to be_blank
++          expect(
++            PostAction.exists?(
++              user_id: user.id,
++              post_id: post.id,
++              post_action_type_id: PostActionType.types[:like],
++              deleted_at: nil,
++            ),
++          ).to eq(false)
++        end
+       end
+     end
+   end
+diff --git a/spec/requests/topics_controller_spec.rb b/spec/requests/topics_controller_spec.rb
+index 1da6ab3a158b0..350f0e1e0f4e2 100644
+--- a/spec/requests/topics_controller_spec.rb
++++ b/spec/requests/topics_controller_spec.rb
+@@ -4206,6 +4206,7 @@ def extract_post_stream
+         SiteSetting.tag_topic_allowed_groups = Group::AUTO_GROUPS[:trust_level_0]
+         tag1 = Fabricate(:tag)
+         topic.update!(user:)
++        _first_post = Fabricate(:post, topic:, user:)
+ 
+         put "/topics/bulk.json",
+             params: {
+@@ -4225,6 +4226,7 @@ def extract_post_stream
+         SiteSetting.tag_topic_allowed_groups = Group::AUTO_GROUPS[:trust_level_0]
+         tag1 = Fabricate(:tag)
+         topic.update!(user:)
++        _first_post = Fabricate(:post, topic:, user:)
+ 
+         put "/topics/bulk.json",
+             params: {
+diff --git a/spec/services/tags/bulk_create_spec.rb b/spec/services/tags/bulk_create_spec.rb
+index b113cda3a9f3a..2a19bbdf9148d 100644
+--- a/spec/services/tags/bulk_create_spec.rb
++++ b/spec/services/tags/bulk_create_spec.rb
+@@ -155,8 +155,40 @@
+       end
+     end
+ 
+-    context "when some tags are invalid" do
+-      let(:tag_names) { ["", "valid-tag", "   ", "%^&ui^&*", "!!!test"] }
++    context "when tags contain consecutive dashes" do
++      let(:tag_names) { %w[test--tag multi---dash a--b--c] }
++
++      it { is_expected.to run_successfully }
++
++      it "normalizes consecutive dashes and creates tags" do
++        expect { result }.to change { Tag.count }.by(3)
++        expect(Tag.where(name: %w[test-tag multi-dash a-b-c]).count).to eq(3)
++      end
++
++      it "returns normalized names" do
++        expect(result.results[:created]).to contain_exactly("test-tag", "multi-dash", "a-b-c")
++        expect(result.results[:failed]).to be_empty
++      end
++    end
++
++    context "when tags contain characters that get stripped by clean_tag" do
++      let(:tag_names) { %w[valid-tag %^&ui^&* !!!test] }
++
++      it { is_expected.to run_successfully }
++
++      it "cleans and creates tags" do
++        expect { result }.to change { Tag.count }.by(3)
++        expect(Tag.where(name: %w[valid-tag ui test]).count).to eq(3)
++      end
++
++      it "returns cleaned names" do
++        expect(result.results[:created]).to contain_exactly("valid-tag", "ui", "test")
++        expect(result.results[:failed]).to be_empty
++      end
++    end
++
++    context "when tags are entirely invalid" do
++      let(:tag_names) { ["", "valid-tag", "   ", "@!#$%^&*"] }
+ 
+       it { is_expected.to run_successfully }
+ 
+@@ -166,7 +198,7 @@
+ 
+       it "reports failed tags" do
+         expect(result.results[:created]).to contain_exactly("valid-tag")
+-        expect(result.results[:failed].keys).to contain_exactly("%^&ui^&*", "!!!test")
++        expect(result.results[:failed].keys).to contain_exactly("@!#$%^&*")
+       end
+     end
+ 
+@@ -202,7 +234,7 @@
+     context "when mixing valid, existing, and invalid tags" do
+       fab!(:existing_tag) { Fabricate(:tag, name: "existing") }
+ 
+-      let(:tag_names) { ["new-tag", "existing", "", "invalid@@@", "another-new"] }
++      let(:tag_names) { ["new-tag", "existing", "", "@!#$%", "another-new"] }
+ 
+       it { is_expected.to run_successfully }
+ 
+@@ -210,7 +242,7 @@
+         expect { result }.to change { Tag.count }.by(2)
+         expect(result.results[:created]).to contain_exactly("new-tag", "another-new")
+         expect(result.results[:existing]).to contain_exactly("existing")
+-        expect(result.results[:failed].keys).to contain_exactly("invalid@@@")
++        expect(result.results[:failed].keys).to contain_exactly("@!#$%")
+       end
+     end
+   end
+diff --git a/spec/system/composer/form_template_tag_chooser_spec.rb b/spec/system/composer/form_template_tag_chooser_spec.rb
+new file mode 100644
+index 0000000000000..0bd692305670f
+--- /dev/null
++++ b/spec/system/composer/form_template_tag_chooser_spec.rb
+@@ -0,0 +1,49 @@
++# frozen_string_literal: true
++
++describe "Composer Form Template", type: :system do
++  fab!(:user) { Fabricate(:user, refresh_auto_groups: true) }
++  fab!(:tag1) { Fabricate(:tag, name: "persian") }
++  fab!(:tag2) { Fabricate(:tag, name: "siamese") }
++  fab!(:tag_group) { Fabricate(:tag_group, name: "Cat Breeds", tags: [tag1, tag2]) }
++  fab!(:form_template) do
++    Fabricate(
++      :form_template,
++      name: "Cat Template",
++      template:
++        "- type: tag-chooser\n  id: cat-breed\n  tag_group: \"Cat Breeds\"\n  attributes:\n    label: \"Cat Breed\"\n    none_label: \"Select a breed\"\n    multiple: false\n  validations:\n    required: true\n- type: input\n  id: notes\n  attributes:\n    label: \"Notes\"\n",
++    )
++  end
++  fab!(:category) do
++    Fabricate(
++      :category,
++      name: "Cats",
++      slug: "cats",
++      topic_count: 2,
++      form_template_ids: [form_template.id],
++    )
++  end
++
++  let(:composer) { PageObjects::Components::Composer.new }
++
++  before do
++    SiteSetting.enable_form_templates = true
++    SiteSetting.show_preview_for_form_templates = true
++    SiteSetting.tagging_enabled = true
++    sign_in(user)
++  end
++
++  it "uses tag name instead of tag ID in form template preview" do
++    visit("/")
++    find("#create-topic").click
++    find(".category-chooser").click
++    find(".category-row[data-value='#{category.id}']").click
++
++    expect(page).to have_css(".form-template-field__multi-select[name='cat-breed']")
++
++    find(".form-template-field__multi-select[name='cat-breed']").select("PERSIAN")
++
++    preview = find(".d-editor-preview")
++    expect(preview).to have_content("persian")
++    expect(preview).to have_no_content(tag1.id.to_s)
++  end
++end
+diff --git a/spec/system/composer/prosemirror_toolbar_spec.rb b/spec/system/composer/prosemirror_toolbar_spec.rb
+index 28c8c9863d0c9..adc67add78f23 100644
+--- a/spec/system/composer/prosemirror_toolbar_spec.rb
++++ b/spec/system/composer/prosemirror_toolbar_spec.rb
+@@ -11,7 +11,6 @@
+       expect(page).to have_css(".toolbar__button.italic.--active", count: 0)
+       expect(page).to have_css(".toolbar__button.heading.--active", count: 0)
+       expect(page).to have_css(".toolbar__button.link.--active", count: 0)
+-      expect(page).to have_css(".toolbar__button.bullet.--active", count: 0)
+       expect(page).to have_css(".toolbar__button.list.--active", count: 0)
+       expect(page).to have_css(".toolbar__button.code.--active", count: 0)
+       expect(page).to have_css(".toolbar__button.blockquote.--active", count: 0)
+@@ -22,16 +21,9 @@
+       expect(page).to have_css(".toolbar__button.bold.--active", count: 1)
+       expect(page).to have_css(".toolbar__button.italic.--active", count: 1)
+       expect(page).to have_css(".toolbar__button.link.--active", count: 1)
+-      expect(page).to have_css(".toolbar__button.bullet.--active", count: 1)
+-      expect(page).to have_css(".toolbar__button.list.--active", count: 0)
++      expect(page).to have_css(".toolbar__button.list.--active", count: 1)
+       expect(page).to have_css(".toolbar__button.code.--active", count: 1)
+       expect(page).to have_css(".toolbar__button.blockquote.--active", count: 1)
+-
+-      page.find(".toolbar__button.bullet").click
+-      page.find(".toolbar__button.list").click
+-
+-      expect(page).to have_css(".toolbar__button.list.--active", count: 1)
+-      expect(page).to have_css(".toolbar__button.bullet.--active", count: 0)
+     end
+   end
+ 
+diff --git a/spec/system/page_objects/pages/form_template.rb b/spec/system/page_objects/pages/form_template.rb
+index f371bab2a1536..248f2b7eb5cfe 100644
+--- a/spec/system/page_objects/pages/form_template.rb
++++ b/spec/system/page_objects/pages/form_template.rb
+@@ -84,7 +84,7 @@ def has_input_field_with_name?(type, name)
+       end
+ 
+       def has_tag_chooser_tag?(tag)
+-        find("option[value='#{tag.id}']", visible: :all).present?
++        find("option[value='#{tag.name}']", visible: :all).present?
+       end
+ 
+       def has_preview_modal?
+diff --git a/themes/horizon/scss/compatibility.scss b/themes/horizon/scss/compatibility.scss
+index 88182c3b83a5b..105af54d65130 100644
+--- a/themes/horizon/scss/compatibility.scss
++++ b/themes/horizon/scss/compatibility.scss
+@@ -64,3 +64,9 @@
+     grid-template-columns: auto auto;
+   }
+ }
++
++// TC: Blog Style
++body:not(.d-toc-installed).blog-post .container.posts,
++body.d-toc-installed.blog-post .container.posts {
++  grid-template-columns: var(--blog-width) 0;
++}
+diff --git a/themes/horizon/scss/topic.scss b/themes/horizon/scss/topic.scss
+index 1d581e84713d1..42dc9f89d0eb6 100644
+--- a/themes/horizon/scss/topic.scss
++++ b/themes/horizon/scss/topic.scss
+@@ -13,8 +13,6 @@
+ }
+ 
+ .timeline-container .topic-timeline {
+-  min-width: unset;
+-
+   .timeline-scrollarea {
+     border-left: 1px solid var(--accent-color);
+ 

@@ -1,165 +1,275 @@
-diff --git a/tests/snuba/preprod/__init__.py b/tests/snuba/preprod/__init__.py
-new file mode 100644
-index 00000000000..e69de29bb2d
-diff --git a/tests/snuba/preprod/eap/__init__.py b/tests/snuba/preprod/eap/__init__.py
-new file mode 100644
-index 00000000000..e69de29bb2d
-diff --git a/tests/snuba/preprod/eap/test_preprod_eap_integration.py b/tests/snuba/preprod/eap/test_preprod_eap_integration.py
-index 740b9e68edb..e671188d866 100644
---- a/tests/snuba/preprod/eap/test_preprod_eap_integration.py
-+++ b/tests/snuba/preprod/eap/test_preprod_eap_integration.py
-@@ -1,4 +1,3 @@
--import time
- from datetime import datetime, timedelta
- from datetime import timezone as dt_timezone
+diff --git a/static/app/components/modals/widgetViewerModal.tsx b/static/app/components/modals/widgetViewerModal.tsx
+index f6877dba10af53..4f3caee4383128 100644
+--- a/static/app/components/modals/widgetViewerModal.tsx
++++ b/static/app/components/modals/widgetViewerModal.tsx
+@@ -82,6 +82,7 @@ import {
+   getWidgetReleasesUrl,
+   isUsingPerformanceScore,
+   performanceScoreTooltip,
++  usesTimeSeriesData,
+ } from 'sentry/views/dashboards/utils';
+ import {checkUserHasEditAccess} from 'sentry/views/dashboards/utils/checkUserHasEditAccess';
+ import {
+@@ -603,6 +604,12 @@ function WidgetViewerModal(props: Props) {
+     widget.displayType !== DisplayType.TABLE &&
+     widget.displayType !== DisplayType.AGENTS_TRACES_TABLE;
  
-@@ -13,10 +12,12 @@ from sentry.preprod.models import (
-     PreprodArtifactSizeMetrics,
-     PreprodBuildConfiguration,
- )
--from sentry.testutils.cases import SnubaTestCase
-+from sentry.testutils.cases import SnubaTestCase, TestCase
- 
-+PREPROD_PRODUCER_MOCK_PATH = "sentry.preprod.eap.write._eap_producer.produce"
- 
--class PreprodEAPIntegrationTest(SnubaTestCase):
++  const shouldRenderTable =
++    // At the moment, issue tables do not support aggregates, so we should never render the table in full screen for timeseries widgets
++    !(widget.widgetType === WidgetType.ISSUE && usesTimeSeriesData(widget.displayType)) &&
++    widget.displayType !== DisplayType.RAGE_AND_DEAD_CLICKS &&
++    widget.displayType !== DisplayType.SERVER_TREE;
 +
-+class PreprodEAPIntegrationTest(TestCase, SnubaTestCase):
-     def test_write_and_read_size_metric_round_trip(self):
-         commit_comparison = CommitComparison.objects.create(
-             organization_id=self.organization.id,
-@@ -58,41 +59,35 @@ class PreprodEAPIntegrationTest(SnubaTestCase):
-             analysis_file_id=123,
-         )
+   function renderWidgetViewer() {
+     return (
+       <Fragment>
+@@ -736,7 +743,7 @@ function WidgetViewerModal(props: Props) {
+             )}
+           </QueryContainer>
+         )}
+-        {renderWidgetViewerTable()}
++        {shouldRenderTable && renderWidgetViewerTable()}
+       </Fragment>
+     );
+   }
+diff --git a/static/app/views/issueList/overview.actions.spec.tsx b/static/app/views/issueList/overview.actions.spec.tsx
+index f40b4e11c70484..57d874fece22d3 100644
+--- a/static/app/views/issueList/overview.actions.spec.tsx
++++ b/static/app/views/issueList/overview.actions.spec.tsx
+@@ -1,4 +1,5 @@
+ import {Fragment} from 'react';
++import Cookies from 'js-cookie';
+ import {GroupFixture} from 'sentry-fixture/group';
+ import {GroupStatsFixture} from 'sentry-fixture/groupStats';
+ import {OrganizationFixture} from 'sentry-fixture/organization';
+@@ -502,4 +503,134 @@ describe('IssueListOverview (actions)', () => {
+       expect(screen.getByText('Medium priority issue')).toBeInTheDocument();
+     });
+   });
++
++  describe('realtime mode', () => {
++    const group1 = GroupFixture({
++      id: '1',
++      metadata: {title: 'Group 1'},
++      shortId: 'JAVASCRIPT-1',
++    });
++    const group2 = GroupFixture({
++      id: '2',
++      metadata: {title: 'Group 2'},
++      shortId: 'JAVASCRIPT-2',
++    });
++
++    beforeEach(() => {
++      jest.spyOn(Cookies, 'get').mockImplementation((name?: string) => {
++        if (name === 'realtimeActive') {
++          return 'true';
++        }
++        return {};
++      });
++
++      MockApiClient.addMockResponse({
++        url: '/organizations/org-slug/issues/',
++        body: [group1, group2],
++        headers: {Link: DEFAULT_LINKS_HEADER},
++      });
++    });
++
++    afterEach(() => {
++      jest.restoreAllMocks();
++    });
++
++    it('removes a resolved issue from the stream without triggering a refetch', async () => {
++      const updateIssueMock = MockApiClient.addMockResponse({
++        url: '/organizations/org-slug/issues/',
++        method: 'PUT',
++      });
++      // This is the GET for the initial load; we track calls to assert no refetch happens
++      const getIssueMock = MockApiClient.addMockResponse({
++        url: '/organizations/org-slug/issues/',
++        body: [group1, group2],
++        headers: {Link: DEFAULT_LINKS_HEADER},
++      });
++
++      render(<IssueListOverview />, {
++        organization,
++        initialRouterConfig: {
++          route: '/organizations/:orgId/issues/',
++          location: {
++            pathname: '/organizations/org-slug/issues/',
++            query: {query: 'is:unresolved'},
++          },
++        },
++      });
++
++      const groups = await screen.findAllByTestId('group');
++
++      await userEvent.click(
++        within(groups[0]!).getByRole('checkbox', {name: /select issue/i})
++      );
++
++      expect(screen.getByText('Group 1')).toBeInTheDocument();
++      expect(screen.getByText('Group 2')).toBeInTheDocument();
++
++      const initialGetCallCount = getIssueMock.mock.calls.length;
++
++      await userEvent.click(await screen.findByRole('button', {name: 'Resolve'}));
++
++      expect(updateIssueMock).toHaveBeenCalledWith(
++        '/organizations/org-slug/issues/',
++        expect.objectContaining({
++          query: expect.objectContaining({id: ['1']}),
++          data: {status: 'resolved', statusDetails: {}, substatus: null},
++        })
++      );
++
++      // Issue should be removed from the stream
++      expect(screen.queryByText('Group 1')).not.toBeInTheDocument();
++      expect(screen.getByText('Group 2')).toBeInTheDocument();
++
++      // No additional GET request should have been triggered by the action
++      expect(getIssueMock.mock.calls).toHaveLength(initialGetCallCount);
++    });
++
++    it('removes an archived issue from the stream without triggering a refetch', async () => {
++      const updateIssueMock = MockApiClient.addMockResponse({
++        url: '/organizations/org-slug/issues/',
++        method: 'PUT',
++      });
++      const getIssueMock = MockApiClient.addMockResponse({
++        url: '/organizations/org-slug/issues/',
++        body: [group1, group2],
++        headers: {Link: DEFAULT_LINKS_HEADER},
++      });
++
++      render(<IssueListOverview />, {
++        organization,
++        initialRouterConfig: {
++          route: '/organizations/:orgId/issues/',
++          location: {
++            pathname: '/organizations/org-slug/issues/',
++            query: {query: 'is:unresolved'},
++          },
++        },
++      });
++
++      const groups = await screen.findAllByTestId('group');
++
++      await userEvent.click(
++        within(groups[0]!).getByRole('checkbox', {name: /select issue/i})
++      );
++
++      const initialGetCallCount = getIssueMock.mock.calls.length;
++
++      await userEvent.click(await screen.findByRole('button', {name: 'Archive'}));
++
++      expect(updateIssueMock).toHaveBeenCalledWith(
++        '/organizations/org-slug/issues/',
++        expect.objectContaining({
++          query: expect.objectContaining({id: ['1']}),
++        })
++      );
++
++      expect(screen.queryByText('Group 1')).not.toBeInTheDocument();
++      expect(screen.getByText('Group 2')).toBeInTheDocument();
++
++      // No additional GET request should have been triggered by the action
++      expect(getIssueMock.mock.calls).toHaveLength(initialGetCallCount);
++    });
++  });
+ });
+diff --git a/static/app/views/issueList/overview.tsx b/static/app/views/issueList/overview.tsx
+index c708ed31469f14..588df369538e7e 100644
+--- a/static/app/views/issueList/overview.tsx
++++ b/static/app/views/issueList/overview.tsx
+@@ -734,11 +734,13 @@ function IssueListOverview({
+     itemIds,
+     actionType,
+     shouldRemove,
++    skipRefetch,
+     undo,
+   }: {
+     actionType: 'Reviewed' | 'Resolved' | 'Ignored' | 'Archived' | 'Reprioritized';
+     itemIds: string[];
+     shouldRemove: boolean;
++    skipRefetch?: boolean;
+     undo?: () => void;
+   }) => {
+     if (itemIds.length > 1) {
+@@ -766,6 +768,10 @@ function IssueListOverview({
+     actionTakenRef.current = true;
+     setQueryCount(newQueryCount);
  
--        produce_preprod_size_metric_to_eap(
-+        self.produce_and_store_eap_items(
-+            PREPROD_PRODUCER_MOCK_PATH,
-+            produce_preprod_size_metric_to_eap,
-             size_metric=size_metric,
-             organization=self.organization,
-             organization_id=self.organization.id,
-             project_id=self.project.id,
-         )
++    if (skipRefetch) {
++      return;
++    }
++
+     if (GroupStore.getAllItemIds().length === 0) {
+       // If we run out of issues on the last page, navigate back a page to
+       // avoid showing an empty state - if not on the last page, just show a spinner
+@@ -778,10 +784,6 @@ function IssueListOverview({
+   };
  
--        max_attempts = 20
--        found = False
+   const onActionTaken = (itemIds: string[], data: IssueUpdateData) => {
+-    if (realtimeActive) {
+-      return;
+-    }
 -
--        for attempt in range(max_attempts):
--            time.sleep(0.5)
--
--            app_filter = TraceItemFilter(
--                comparison_filter=ComparisonFilter(
--                    key=AttributeKey(name="app_id", type=AttributeKey.Type.TYPE_STRING),
--                    op=ComparisonFilter.OP_EQUALS,
--                    value=AttributeValue(val_str="com.example.integrationtest"),
--                )
--            )
--
--            response = query_preprod_size_metrics(
--                organization_id=self.organization.id,
--                project_ids=[self.project.id],
--                start=datetime.now(dt_timezone.utc) - timedelta(hours=1),
--                end=datetime.now(dt_timezone.utc) + timedelta(hours=1),
--                referrer="test.preprod.integration",
--                filter=app_filter,
-+        app_filter = TraceItemFilter(
-+            comparison_filter=ComparisonFilter(
-+                key=AttributeKey(name="app_id", type=AttributeKey.Type.TYPE_STRING),
-+                op=ComparisonFilter.OP_EQUALS,
-+                value=AttributeValue(val_str="com.example.integrationtest"),
-             )
-+        )
+     const groupItems = itemIds.map(id => GroupStore.get(id)).filter(defined);
  
--            if response.column_values:
--                found = True
--                break
-+        response = query_preprod_size_metrics(
-+            organization_id=self.organization.id,
-+            project_ids=[self.project.id],
-+            start=datetime.now(dt_timezone.utc) - timedelta(hours=1),
-+            end=datetime.now(dt_timezone.utc) + timedelta(hours=1),
-+            referrer="test.preprod.integration",
-+            filter=app_filter,
-+        )
- 
--        assert found, f"Data not found in Snuba after {max_attempts} attempts"
-+        assert response.column_values and response.column_values[0].results, (
-+            "Data not found in Snuba"
-+        )
- 
-         columns = {cv.attribute_name: idx for idx, cv in enumerate(response.column_values)}
- 
-@@ -154,49 +149,44 @@ class PreprodEAPIntegrationTest(SnubaTestCase):
-             max_install_size=1000,
-         )
- 
--        produce_preprod_size_metric_to_eap(
-+        self.produce_and_store_eap_items(
-+            PREPROD_PRODUCER_MOCK_PATH,
-+            produce_preprod_size_metric_to_eap,
-             size_metric=size_metric_main,
-             organization=self.organization,
-             organization_id=self.organization.id,
-             project_id=self.project.id,
-         )
- 
--        produce_preprod_size_metric_to_eap(
-+        self.produce_and_store_eap_items(
-+            PREPROD_PRODUCER_MOCK_PATH,
-+            produce_preprod_size_metric_to_eap,
-             size_metric=size_metric_watch,
-             organization=self.organization,
-             organization_id=self.organization.id,
-             project_id=self.project.id,
-         )
- 
--        max_attempts = 20
--        found_count = 0
--
--        for attempt in range(max_attempts):
--            time.sleep(0.5)
--
--            app_filter = TraceItemFilter(
--                comparison_filter=ComparisonFilter(
--                    key=AttributeKey(name="app_id", type=AttributeKey.Type.TYPE_STRING),
--                    op=ComparisonFilter.OP_EQUALS,
--                    value=AttributeValue(val_str="com.example.multitest"),
--                )
--            )
--
--            response = query_preprod_size_metrics(
--                organization_id=self.organization.id,
--                project_ids=[self.project.id],
--                start=datetime.now(dt_timezone.utc) - timedelta(hours=1),
--                end=datetime.now(dt_timezone.utc) + timedelta(hours=1),
--                referrer="test.preprod.integration",
--                filter=app_filter,
-+        app_filter = TraceItemFilter(
-+            comparison_filter=ComparisonFilter(
-+                key=AttributeKey(name="app_id", type=AttributeKey.Type.TYPE_STRING),
-+                op=ComparisonFilter.OP_EQUALS,
-+                value=AttributeValue(val_str="com.example.multitest"),
-             )
-+        )
- 
--            if response.column_values:
--                found_count = len(response.column_values[0].results)
--            if found_count >= 2:
--                break
-+        response = query_preprod_size_metrics(
-+            organization_id=self.organization.id,
-+            project_ids=[self.project.id],
-+            start=datetime.now(dt_timezone.utc) - timedelta(hours=1),
-+            end=datetime.now(dt_timezone.utc) + timedelta(hours=1),
-+            referrer="test.preprod.integration",
-+            filter=app_filter,
-+        )
- 
--        assert found_count == 2, f"Expected 2 records, found {found_count}"
-+        assert response.column_values and len(response.column_values[0].results) == 2, (
-+            f"Expected 2 records, found {len(response.column_values[0].results) if response.column_values else 0}"
-+        )
- 
-         columns = {cv.attribute_name: idx for idx, cv in enumerate(response.column_values)}
-         num_rows = len(response.column_values[0].results)
+     if ('status' in data) {
+@@ -793,11 +795,14 @@ function IssueListOverview({
+             query.includes('is:unresolved') ||
+             query.includes('is:ignored') ||
+             isForReviewQuery(query),
+-          undo: () =>
+-            undoAction({
+-              data: {status: GroupStatus.UNRESOLVED, statusDetails: {}},
+-              groupItems,
+-            }),
++          skipRefetch: realtimeActive,
++          undo: realtimeActive
++            ? undefined
++            : () =>
++                undoAction({
++                  data: {status: GroupStatus.UNRESOLVED, statusDetails: {}},
++                  groupItems,
++                }),
+         });
+         return;
+       }
+@@ -807,11 +812,14 @@ function IssueListOverview({
+           itemIds,
+           actionType: 'Archived',
+           shouldRemove: query.includes('is:unresolved') || isForReviewQuery(query),
+-          undo: () =>
+-            undoAction({
+-              data: {status: GroupStatus.UNRESOLVED, statusDetails: {}},
+-              groupItems,
+-            }),
++          skipRefetch: realtimeActive,
++          undo: realtimeActive
++            ? undefined
++            : () =>
++                undoAction({
++                  data: {status: GroupStatus.UNRESOLVED, statusDetails: {}},
++                  groupItems,
++                }),
+         });
+         return;
+       }
+@@ -822,6 +830,7 @@ function IssueListOverview({
+         itemIds,
+         actionType: 'Reviewed',
+         shouldRemove: isForReviewQuery(query),
++        skipRefetch: realtimeActive,
+       });
+       return;
+     }
+@@ -834,6 +843,7 @@ function IssueListOverview({
+         itemIds,
+         actionType: 'Reprioritized',
+         shouldRemove: !priorityValues.has(priority),
++        skipRefetch: realtimeActive,
+       });
+       return;
+     }

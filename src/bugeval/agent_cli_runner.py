@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bugeval.agent_models import AgentResult
+from bugeval.pr_eval_models import default_pricing
 
 
 def _parse_cli_token_count(output: str) -> int:
@@ -85,6 +86,125 @@ def _parse_stream_json_output(
     return conversation, result_text, token_count, cost_usd, turns
 
 
+def _parse_gemini_stream_json(
+    stdout: str,
+) -> tuple[list[dict[str, Any]], str, int, int, int, int]:
+    """Parse Gemini CLI --output-format stream-json JSONL into conversation + metadata.
+
+    Returns (conversation, result_text, token_count, input_tokens, output_tokens, turns).
+    Builds a conversation list from message, tool_use, and tool_result events.
+    Counts only assistant messages as turns.
+    """
+    conversation: list[dict[str, Any]] = []
+    result_text = ""
+    token_count = 0
+    input_tokens = 0
+    output_tokens = 0
+    turns = 0
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        event_type = event.get("type")
+        if event_type == "message":
+            role = event.get("role", "")
+            content = event.get("content", "")
+            if role == "assistant":
+                turns += 1
+                result_text = content
+            conversation.append({"role": role, "content": content})
+        elif event_type == "tool_use":
+            conversation.append(
+                {
+                    "role": "assistant",
+                    "tool_use": {
+                        "name": event.get("tool_name", ""),
+                        "id": event.get("tool_id", ""),
+                        "parameters": event.get("parameters", {}),
+                    },
+                }
+            )
+        elif event_type == "tool_result":
+            conversation.append(
+                {
+                    "role": "tool",
+                    "tool_id": event.get("tool_id", ""),
+                    "status": event.get("status", ""),
+                    "output": event.get("output", ""),
+                }
+            )
+        elif event_type == "result":
+            stats = event.get("stats") or {}
+            token_count = int(stats.get("total_tokens", 0))
+            input_tokens = int(stats.get("input_tokens", 0))
+            output_tokens = int(stats.get("output_tokens", 0))
+
+    return conversation, result_text, token_count, input_tokens, output_tokens, turns
+
+
+def _parse_codex_json_output(
+    stdout: str,
+) -> tuple[list[dict[str, Any]], str, int, int, int, int]:
+    """Parse Codex CLI --json JSONL into conversation + metadata.
+
+    Returns (conversation, result_text, token_count, input_tokens, output_tokens, turns).
+    Builds a conversation list from item.completed events (agent_message and
+    command_execution). Extracts usage from turn.completed events.
+    """
+    conversation: list[dict[str, Any]] = []
+    result_text = ""
+    token_count = 0
+    input_tokens = 0
+    output_tokens = 0
+    turns = 0
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        event_type = event.get("type")
+        if event_type == "item.completed":
+            item = event.get("item") or {}
+            item_type = item.get("type", "")
+            if item_type == "agent_message":
+                result_text = item.get("text", "")
+                conversation.append({"role": "assistant", "content": result_text})
+            elif item_type == "command_execution":
+                conversation.append(
+                    {
+                        "role": "tool",
+                        "command": item.get("command", ""),
+                        "output": item.get("aggregated_output", ""),
+                        "exit_code": item.get("exit_code"),
+                    }
+                )
+        elif event_type == "turn.completed":
+            turns += 1
+            usage = event.get("usage") or {}
+            in_t = int(usage.get("input_tokens", 0))
+            out_t = int(usage.get("output_tokens", 0))
+            input_tokens += in_t
+            output_tokens += out_t
+            token_count += in_t + out_t
+
+    return conversation, result_text, token_count, input_tokens, output_tokens, turns
+
+
 def _parse_cli_findings(stdout: str) -> list[dict[str, Any]]:
     """Extract JSON findings array from CLI stdout output.
 
@@ -142,7 +262,7 @@ def run_claude_cli(
         "claude",
         "--print",
         "-p",
-        prompt,
+        "-",
         "--max-turns",
         str(max_turns),
         "--model",
@@ -166,6 +286,7 @@ def run_claude_cli(
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            input=prompt,
         )
     except subprocess.TimeoutExpired:
         wall_time = time.monotonic() - start
@@ -210,12 +331,23 @@ def run_gemini_cli(
     timeout_seconds: int = 300,
     model: str = "gemini-2.5-flash",
 ) -> AgentResult:
-    """Run gemini -p <prompt> -m <model> in repo_dir.
+    """Run gemini -p <prompt> -m <model> -o stream-json -y -s false in repo_dir.
 
     Returns AgentResult with stdout, findings, wall_time.
     On timeout: returns AgentResult with error='timeout'.
     """
-    cmd = ["gemini", "-p", prompt, "-m", model]
+    cmd = [
+        "gemini",
+        "-p",
+        "-",
+        "-m",
+        model,
+        "-o",
+        "stream-json",
+        "-y",
+        "-s",
+        "false",
+    ]
     start = time.monotonic()
 
     try:
@@ -225,6 +357,7 @@ def run_gemini_cli(
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            input=prompt,
         )
     except subprocess.TimeoutExpired:
         wall_time = time.monotonic() - start
@@ -247,13 +380,20 @@ def run_gemini_cli(
             error=f"gemini exited with code {result.returncode}: {stderr[:500]}",
         )
 
-    findings = _parse_cli_findings(stdout)
-    token_count = _parse_cli_token_count(stdout + "\n" + stderr)
+    conversation, response_text, token_count, in_toks, out_toks, turns = _parse_gemini_stream_json(
+        stdout
+    )
+    findings = _parse_cli_findings(response_text)
+    cost_usd = default_pricing().estimate_cost(model, in_toks, out_toks)
     return AgentResult(
         findings=findings,
+        conversation=conversation,
         stdout=stdout,
         stderr=stderr,
         token_count=token_count,
+        cost_usd=cost_usd,
+        turns=turns,
+        response_text=response_text,
         wall_time_seconds=wall_time,
         model=model,
     )
@@ -263,23 +403,33 @@ def run_codex_cli(
     repo_dir: Path,
     prompt: str,
     timeout_seconds: int = 300,
-    model: str = "o4-mini",
+    model: str = "gpt-5.4-mini",
 ) -> AgentResult:
-    """Run codex -q <prompt> --model <model> in repo_dir.
+    """Run codex exec <prompt> --full-auto --json -m <model> -C <dir>.
 
     Returns AgentResult with stdout, findings, wall_time.
     On timeout: returns AgentResult with error='timeout'.
     """
-    cmd = ["codex", "-q", prompt, "--model", model]
+    cmd = [
+        "codex",
+        "exec",
+        "-",
+        "--full-auto",
+        "--json",
+        "-m",
+        model,
+        "-C",
+        str(repo_dir),
+    ]
     start = time.monotonic()
 
     try:
         result = subprocess.run(
             cmd,
-            cwd=repo_dir,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            input=prompt,
         )
     except subprocess.TimeoutExpired:
         wall_time = time.monotonic() - start
@@ -302,13 +452,20 @@ def run_codex_cli(
             error=f"codex exited with code {result.returncode}: {stderr[:500]}",
         )
 
-    findings = _parse_cli_findings(stdout)
-    token_count = _parse_cli_token_count(stdout + "\n" + stderr)
+    conversation, response_text, token_count, in_toks, out_toks, turns = _parse_codex_json_output(
+        stdout
+    )
+    findings = _parse_cli_findings(response_text)
+    cost_usd = default_pricing().estimate_cost(model, in_toks, out_toks)
     return AgentResult(
         findings=findings,
+        conversation=conversation,
         stdout=stdout,
         stderr=stderr,
         token_count=token_count,
+        cost_usd=cost_usd,
+        turns=turns,
+        response_text=response_text,
         wall_time_seconds=wall_time,
         model=model,
     )

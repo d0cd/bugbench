@@ -20,27 +20,58 @@ from bugeval.result_models import NormalizedResult
 from bugeval.run_pr_eval import load_cases
 
 
-def bootstrap_ci(values: list[float], n_boot: int = 2000, ci: float = 0.95) -> tuple[float, float]:
+def bootstrap_ci(
+    values: list[float], n_boot: int = 2000, ci: float = 0.95, seed: int = 42
+) -> tuple[float, float]:
     """Return (lower, upper) bootstrap CI for the mean of values."""
     if not values:
         return 0.0, 0.0
-    means = [sum(random.choices(values, k=len(values))) / len(values) for _ in range(n_boot)]
+    rng = random.Random(seed)
+    means = [sum(rng.choices(values, k=len(values))) / len(values) for _ in range(n_boot)]
     means.sort()
     lo = int((1 - ci) / 2 * n_boot)
     hi = int((1 + ci) / 2 * n_boot)
     return means[lo], means[hi]
 
 
-def permutation_p_value(a: list[float], b: list[float], n_perm: int = 5000) -> float:
+def benjamini_hochberg(p_values: list[float]) -> list[float]:
+    """Apply Benjamini-Hochberg FDR correction to a list of p-values.
+
+    Returns adjusted p-values in the same order as the input.
+    Adjusted values are capped at 1.0 and monotonized (non-decreasing in rank).
+    """
+    m = len(p_values)
+    if m == 0:
+        return []
+    # Sort indices by p-value
+    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
+    adjusted = [0.0] * m
+    # Work backwards to enforce monotonicity
+    prev = 1.0
+    for rank_minus_1 in range(m - 1, -1, -1):
+        orig_idx, raw_p = indexed[rank_minus_1]
+        rank = rank_minus_1 + 1
+        corrected = min(raw_p * m / rank, 1.0)
+        corrected = min(corrected, prev)
+        adjusted[orig_idx] = corrected
+        prev = corrected
+    return adjusted
+
+
+def permutation_p_value(
+    a: list[float], b: list[float], n_perm: int = 5000, seed: int = 42
+) -> float:
     """Two-sided permutation test: P(|mean_a - mean_b| >= observed) under H0."""
     if not a or not b:
         return 1.0
+    rng = random.Random(seed)
     observed = abs(sum(a) / len(a) - sum(b) / len(b))
     combined = a + b
     count = 0
     for _ in range(n_perm):
-        random.shuffle(combined)
-        diff = abs(sum(combined[: len(a)]) / len(a) - sum(combined[len(a) :]) / len(b))
+        shuffled = combined[:]
+        rng.shuffle(shuffled)
+        diff = abs(sum(shuffled[: len(a)]) / len(a) - sum(shuffled[len(a) :]) / len(b))
         if diff >= observed:
             count += 1
     return count / n_perm
@@ -68,6 +99,55 @@ def compute_snr(scores: list[JudgeScore]) -> float:
     return sum(s.noise.snr for s in scores) / len(scores)
 
 
+def compute_snr_conservative(scores: list[JudgeScore]) -> float:
+    """Average conservative SNR: TP-expected only (ignores TP-novel)."""
+    if not scores:
+        return 0.0
+    values = []
+    for s in scores:
+        total = s.noise.total_comments
+        if total > 0:
+            values.append(s.noise.true_positives / total)
+        else:
+            values.append(0.0)
+    return sum(values) / len(values)
+
+
+def compute_snr_inclusive(scores: list[JudgeScore]) -> float:
+    """Average inclusive SNR: (TP-expected + TP-novel) / total. Same as compute_snr."""
+    return compute_snr(scores)
+
+
+def compute_avg_quality_adjusted_precision(scores: list[JudgeScore]) -> float:
+    if not scores:
+        return 0.0
+    return sum(s.noise.quality_adjusted_precision for s in scores) / len(scores)
+
+
+def compute_avg_weighted_signal(scores: list[JudgeScore]) -> float:
+    if not scores:
+        return 0.0
+    return sum(s.noise.weighted_signal for s in scores) / len(scores)
+
+
+def compute_avg_actionability_rate(scores: list[JudgeScore]) -> float:
+    if not scores:
+        return 0.0
+    return sum(s.noise.actionability_rate for s in scores) / len(scores)
+
+
+def compute_avg_noise_ratio(scores: list[JudgeScore]) -> float:
+    if not scores:
+        return 0.0
+    return sum(s.noise.noise_ratio for s in scores) / len(scores)
+
+
+def compute_avg_precision(scores: list[JudgeScore]) -> float:
+    if not scores:
+        return 0.0
+    return sum(s.noise.precision for s in scores) / len(scores)
+
+
 def aggregate_scores(scores: list[JudgeScore]) -> dict[str, dict[str, Any]]:
     """Group scores by tool and compute per-tool metrics."""
     by_tool: dict[str, list[JudgeScore]] = {}
@@ -82,17 +162,30 @@ def aggregate_scores(scores: list[JudgeScore]) -> dict[str, dict[str, Any]]:
         score_values = [float(s.score) for s in tool_scores]
         catch_rate_ci = bootstrap_ci(catch_values)
         avg_score_ci = bootstrap_ci(score_values)
+        qap_values = [s.noise.quality_adjusted_precision for s in tool_scores]
+        qap_ci = bootstrap_ci(qap_values)
         result[tool] = {
             "count": len(tool_scores),
             "catch_rate": compute_catch_rate(tool_scores),
             "catch_rate_lo": catch_rate_ci[0],
             "catch_rate_hi": catch_rate_ci[1],
             "avg_snr": compute_snr(tool_scores),
+            "avg_snr_conservative": compute_snr_conservative(tool_scores),
             "score_dist": dist,
             "avg_score": sum(s.score for s in tool_scores) / len(tool_scores),
             "avg_score_lo": avg_score_ci[0],
             "avg_score_hi": avg_score_ci[1],
             "vote_agreement": compute_vote_agreement(tool_scores),
+            "avg_quality_adjusted_precision": compute_avg_quality_adjusted_precision(tool_scores),
+            "avg_qap_lo": qap_ci[0],
+            "avg_qap_hi": qap_ci[1],
+            "avg_weighted_signal": compute_avg_weighted_signal(tool_scores),
+            "avg_actionability_rate": compute_avg_actionability_rate(tool_scores),
+            "avg_noise_ratio": compute_avg_noise_ratio(tool_scores),
+            "avg_precision": compute_avg_precision(tool_scores),
+            "avg_novel_findings": (
+                sum(s.noise.novel_findings for s in tool_scores) / len(tool_scores)
+            ),
         }
     return result
 
@@ -100,18 +193,28 @@ def aggregate_scores(scores: list[JudgeScore]) -> dict[str, dict[str, Any]]:
 def generate_markdown(agg: dict[str, dict[str, Any]]) -> str:
     """Produce a markdown comparison table from aggregated scores."""
     lines = [
-        "| Tool | Cases | Detection Rate | Avg Score | Avg SNR | Judge Agreement |",
-        "|------|-------|--------------|-----------|---------|----------------|",
+        "| Tool | Cases | Detection Rate | Avg Score "
+        "| QAP | Actionability | Noise Ratio | Precision | SNR (inclusive) | Agreement |",
+        "|------|-------|--------------|-----------|"
+        "-----|---------------|-------------|-----------|----------------|-----------|",
     ]
     for tool, metrics in agg.items():
         catch_lo = metrics.get("catch_rate_lo", metrics["catch_rate"])
         catch_hi = metrics.get("catch_rate_hi", metrics["catch_rate"])
         score_lo = metrics.get("avg_score_lo", metrics["avg_score"])
         score_hi = metrics.get("avg_score_hi", metrics["avg_score"])
+        qap = metrics.get("avg_quality_adjusted_precision", 0.0)
+        act_rate = metrics.get("avg_actionability_rate", 0.0)
+        noise = metrics.get("avg_noise_ratio", 0.0)
+        prec = metrics.get("avg_precision", 0.0)
         lines.append(
             f"| {tool} | {metrics['count']} "
             f"| {metrics['catch_rate']:.1%} [{catch_lo:.1%}–{catch_hi:.1%}] "
             f"| {metrics['avg_score']:.2f} [{score_lo:.2f}–{score_hi:.2f}] "
+            f"| {qap:.2f} "
+            f"| {act_rate:.0%} "
+            f"| {noise:.0%} "
+            f"| {prec:.2f} "
             f"| {metrics['avg_snr']:.2f} "
             f"| {metrics.get('vote_agreement', 0.0):.0%} |"
         )
@@ -134,6 +237,12 @@ def generate_csv(agg: dict[str, dict[str, Any]], path: Path) -> None:
                 "avg_score",
                 "avg_score_lo",
                 "avg_score_hi",
+                "avg_quality_adjusted_precision",
+                "avg_weighted_signal",
+                "avg_actionability_rate",
+                "avg_noise_ratio",
+                "avg_precision",
+                "avg_novel_findings",
                 "avg_snr",
                 "vote_agreement",
             ]
@@ -151,6 +260,14 @@ def generate_csv(agg: dict[str, dict[str, Any]], path: Path) -> None:
                 "avg_score": round(m["avg_score"], 4),
                 "avg_score_lo": round(m.get("avg_score_lo", m["avg_score"]), 4),
                 "avg_score_hi": round(m.get("avg_score_hi", m["avg_score"]), 4),
+                "avg_quality_adjusted_precision": round(
+                    m.get("avg_quality_adjusted_precision", 0.0), 4
+                ),
+                "avg_weighted_signal": round(m.get("avg_weighted_signal", 0.0), 4),
+                "avg_actionability_rate": round(m.get("avg_actionability_rate", 0.0), 4),
+                "avg_noise_ratio": round(m.get("avg_noise_ratio", 0.0), 4),
+                "avg_precision": round(m.get("avg_precision", 0.0), 4),
+                "avg_novel_findings": round(m.get("avg_novel_findings", 0.0), 4),
                 "avg_snr": round(m["avg_snr"], 4),
                 "vote_agreement": round(m.get("vote_agreement", 0.0), 4),
             }
@@ -238,6 +355,43 @@ def compute_cost_per_tool(
             "cost_per_detection": total_cost / detections if detections > 0 else 0.0,
         }
     return out
+
+
+def generate_fp_analysis_markdown(
+    scores: list[JudgeScore],
+    cases: dict[str, TestCase],
+) -> str:
+    """Produce a False Positive Analysis section for clean (negative control) cases."""
+    clean_scores = [
+        s
+        for s in scores
+        if cases.get(s.test_case_id, None) is not None
+        and cases[s.test_case_id].case_type == "clean"
+    ]
+    if not clean_scores:
+        return ""
+
+    by_tool: dict[str, list[JudgeScore]] = {}
+    for s in clean_scores:
+        by_tool.setdefault(s.tool, []).append(s)
+
+    lines = [
+        "## False Positive Analysis (Clean Cases)",
+        "",
+        "| Tool | Cases | Total Comments | FP | TP-novel | FP Rate |",
+        "|------|-------|---------------|-----|----------|---------|",
+    ]
+    for tool in sorted(by_tool):
+        tool_scores = by_tool[tool]
+        n_cases = len(tool_scores)
+        total_comments = sum(s.noise.total_comments for s in tool_scores)
+        fp = sum(s.noise.false_positives for s in tool_scores)
+        novel = sum(s.noise.novel_findings for s in tool_scores)
+        fp_rate = fp / total_comments if total_comments > 0 else 0.0
+        lines.append(f"| {tool} | {n_cases} | {total_comments} | {fp} | {novel} | {fp_rate:.1%} |")
+
+    lines.append("")
+    return "\n".join(lines)
 
 
 def generate_slice_markdown(
@@ -463,6 +617,7 @@ def run_analyze(run_dir: Path, cases_dir: Path, no_charts: bool = False) -> None
             "language",
             "visibility",
             "verified",
+            "case_type",
         ):
             md_lines.append(generate_slice_markdown(scores, cases, dim))
 
@@ -480,7 +635,13 @@ def run_analyze(run_dir: Path, cases_dir: Path, no_charts: bool = False) -> None
     if dx_md:
         md_lines.append(dx_md)
 
-    # Pairwise permutation p-value table (catch_rate)
+    # False Positive Analysis for clean (negative control) cases
+    if cases:
+        fp_md = generate_fp_analysis_markdown(scores, cases)
+        if fp_md:
+            md_lines.append(fp_md)
+
+    # Pairwise permutation p-value table (catch_rate) with BH FDR correction
     tools_list = sorted(agg.keys())
     if len(tools_list) >= 2:
         by_tool_catch: dict[str, list[float]] = {}
@@ -488,8 +649,25 @@ def run_analyze(run_dir: Path, cases_dir: Path, no_charts: bool = False) -> None
         for s in scores:
             val = 1.0 if s.score >= scoring.catch_threshold else 0.0
             by_tool_catch.setdefault(s.tool, []).append(val)
+
+        # Compute raw p-values for all unique pairs
+        pair_keys: list[tuple[str, str]] = []
+        raw_pvals: list[float] = []
+        for i, ta in enumerate(tools_list):
+            for tb in tools_list[i + 1 :]:
+                p = permutation_p_value(by_tool_catch.get(ta, []), by_tool_catch.get(tb, []))
+                pair_keys.append((ta, tb))
+                raw_pvals.append(p)
+
+        # Apply Benjamini-Hochberg FDR correction
+        adj_pvals = benjamini_hochberg(raw_pvals)
+        adj_lookup = {}
+        for (ta, tb), adj_p in zip(pair_keys, adj_pvals):
+            adj_lookup[(ta, tb)] = adj_p
+            adj_lookup[(tb, ta)] = adj_p
+
         pairwise_lines = [
-            "## Pairwise Detection Rate p-values (permutation test)",
+            "## Pairwise Detection Rate p-values (permutation test, Benjamini-Hochberg corrected)",
             "",
             "| | " + " | ".join(tools_list) + " |",
             "|" + "---|" * (len(tools_list) + 1),
@@ -500,8 +678,7 @@ def run_analyze(run_dir: Path, cases_dir: Path, no_charts: bool = False) -> None
                 if ta == tb:
                     row_cells.append("—")
                 else:
-                    p = permutation_p_value(by_tool_catch.get(ta, []), by_tool_catch.get(tb, []))
-                    row_cells.append(f"{p:.3f}")
+                    row_cells.append(f"{adj_lookup[(ta, tb)]:.3f}")
             pairwise_lines.append("| " + " | ".join(row_cells) + " |")
         md_lines.append("\n".join(pairwise_lines))
 
@@ -547,3 +724,96 @@ def run_analyze(run_dir: Path, cases_dir: Path, no_charts: bool = False) -> None
 def analyze(run_dir: str, cases_dir: str, no_charts: bool) -> None:
     """Aggregate judge scores into comparison tables and charts."""
     run_analyze(Path(run_dir), Path(cases_dir), no_charts)
+
+
+def compare_runs_report(
+    run_dirs: list[Path],
+    cases_dir: Path,
+) -> str:
+    """Generate a cross-run comparison table."""
+    rows: list[dict[str, object]] = []
+    for rd in run_dirs:
+        scores_dir = rd / "scores"
+        if not scores_dir.exists():
+            continue
+
+        scores: list[JudgeScore] = []
+        for p in sorted(scores_dir.glob("*.yaml")):
+            data = yaml.safe_load(p.read_text()) or {}
+            try:
+                scores.append(JudgeScore(**data))
+            except (ValueError, yaml.YAMLError):
+                continue
+
+        if not scores:
+            continue
+
+        # Read run metadata for condition label
+        meta_path = rd / "run_metadata.json"
+        label = rd.name
+        if meta_path.exists():
+            import json
+
+            meta = json.loads(meta_path.read_text())
+            ctx = meta.get("context_level", "")
+            blind = meta.get("blind", False)
+            label = f"{rd.name} ({ctx}" + (", blind" if blind else "") + ")"
+
+        agg = aggregate_scores(scores)
+        for tool, metrics in agg.items():
+            rows.append(
+                {
+                    "run": label,
+                    "tool": tool,
+                    "cases": metrics["count"],
+                    "catch_rate": metrics["catch_rate"],
+                    "avg_score": metrics["avg_score"],
+                    "avg_snr": metrics["avg_snr"],
+                    "qap": metrics.get("avg_quality_adjusted_precision", 0.0),
+                }
+            )
+
+    if not rows:
+        return "No scored runs found."
+
+    # Build markdown table
+    lines = [
+        "## Cross-Run Comparison",
+        "",
+        "| Run | Tool | Cases | Detection Rate | Avg Score | SNR | QAP |",
+        "|-----|------|-------|--------------|-----------|-----|-----|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['run']} | {r['tool']} | {r['cases']} "
+            f"| {r['catch_rate']:.1%} "
+            f"| {r['avg_score']:.2f} "
+            f"| {r['avg_snr']:.2f} "
+            f"| {r['qap']:.2f} |"
+        )
+    return "\n".join(lines)
+
+
+@click.command("compare-runs")
+@click.option(
+    "--run-dir",
+    "run_dirs",
+    multiple=True,
+    required=True,
+    type=click.Path(exists=True, dir_okay=True, file_okay=False),
+    help="Run directories to compare (specify multiple times)",
+)
+@click.option(
+    "--cases-dir",
+    default="cases/",
+    show_default=True,
+    type=click.Path(dir_okay=True, file_okay=False),
+    help="Cases directory",
+)
+def compare_runs(run_dirs: tuple[str, ...], cases_dir: str) -> None:
+    """Compare scored results across multiple runs."""
+    report = compare_runs_report(
+        [Path(d) for d in run_dirs],
+        Path(cases_dir),
+    )
+    click.echo(report)

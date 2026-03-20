@@ -1,88 +1,4374 @@
-diff --git a/src/sentry/snuba/snuba_query_validator.py b/src/sentry/snuba/snuba_query_validator.py
-index 3f9c5bedefa..6f151d6ccfe 100644
---- a/src/sentry/snuba/snuba_query_validator.py
-+++ b/src/sentry/snuba/snuba_query_validator.py
-@@ -279,12 +279,19 @@ class SnubaQueryValidator(BaseDataSourceValidator[QuerySubscription]):
-             self.context["organization"],
-             actor=self.context.get("user", None),
-         ):
--            column = get_column_from_aggregate(
--                data["aggregate"],
--                allow_mri=True,
--                allow_eap=dataset == Dataset.EventsAnalyticsPlatform,
--            )
--            if is_mri(column) and dataset != Dataset.PerformanceMetrics:
-+            try:
-+                column_is_mri = is_mri(
-+                    get_column_from_aggregate(
-+                        data["aggregate"],
-+                        allow_mri=True,
-+                        allow_eap=dataset == Dataset.EventsAnalyticsPlatform,
-+                    )
-+                )
-+            # If the column raises an invalid search query its definitely not an MRI, and validate_aggregate will
-+            # determine if there's any issues with it
-+            except InvalidSearchQuery:
-+                column_is_mri = False
-+            if column_is_mri and dataset != Dataset.PerformanceMetrics:
-                 raise serializers.ValidationError(
-                     "You can use an MRI only on alerts on performance metrics"
-                 )
-@@ -325,7 +332,10 @@ class SnubaQueryValidator(BaseDataSourceValidator[QuerySubscription]):
-             self._validate_snql_query(data, entity_subscription, projects)
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 9f17d942937a32..d366f9f37ff54d 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -2455,39 +2455,43 @@ def save_attachment(
  
-     def _validate_snql_query(
--        self, data: dict[str, Any], entity_subscription: EntitySubscription, projects: list[Project]
-+        self,
-+        data: dict[str, Any],
-+        entity_subscription: EntitySubscription,
-+        projects: list[Project],
-     ) -> None:
-         end = timezone.now()
-         start = end - timedelta(minutes=10)
-diff --git a/tests/sentry/snuba/test_validators.py b/tests/sentry/snuba/test_validators.py
-index 4bd935aa01b..99c74a43b2f 100644
---- a/tests/sentry/snuba/test_validators.py
-+++ b/tests/sentry/snuba/test_validators.py
-@@ -269,7 +269,12 @@ class SnubaQueryValidatorTest(TestCase):
-         validator = SnubaQueryValidator(data=self.valid_data, context=self.context)
+         logger.exception("Missing chunks for cache_key=%s", cache_key)
+         return
+-    from sentry import ratelimits as ratelimiter
++    # Rate limits protect against filestore write abuse. When stored_id is set,
++    # the payload is already in objectstore and putfile will read from there —
++    # no filestore write occurs, so there is nothing to limit.
++    if not attachment.stored_id:
++        from sentry import ratelimits as ratelimiter
  
-         assert validator.is_valid()
--        assert validator.validated_data["group_by"] == ["project", "environment", "release", "user"]
-+        assert validator.validated_data["group_by"] == [
-+            "project",
-+            "environment",
-+            "release",
-+            "user",
-+        ]
+-    is_limited, _, _ = ratelimiter.backend.is_limited_with_value(
+-        key="event_attachment.save_per_sec",
+-        limit=options.get("sentry.save-event-attachments.project-per-sec-limit"),
+-        project=project,
+-        window=1,
+-    )
+-    rate_limit_tag = "per_sec"
+-    if not is_limited:
+         is_limited, _, _ = ratelimiter.backend.is_limited_with_value(
+-            key="event_attachment.save_5_min",
+-            limit=options.get("sentry.save-event-attachments.project-per-5-minute-limit"),
++            key="event_attachment.save_per_sec",
++            limit=options.get("sentry.save-event-attachments.project-per-sec-limit"),
+             project=project,
+-            window=5 * 60,
+-        )
+-        rate_limit_tag = "per_five_min"
+-    if is_limited:
+-        metrics.incr(
+-            "event_manager.attachments.rate_limited", tags={"rate_limit_type": rate_limit_tag}
++            window=1,
+         )
+-        track_outcome(
+-            org_id=project.organization_id,
+-            project_id=project.id,
+-            key_id=key_id,
+-            outcome=Outcome.RATE_LIMITED,
+-            reason="rate_limited",
+-            timestamp=timestamp,
+-            event_id=event_id,
+-            category=DataCategory.ATTACHMENT,
+-            quantity=attachment.size or 1,
+-        )
+-        return
++        rate_limit_tag = "per_sec"
++        if not is_limited:
++            is_limited, _, _ = ratelimiter.backend.is_limited_with_value(
++                key="event_attachment.save_5_min",
++                limit=options.get("sentry.save-event-attachments.project-per-5-minute-limit"),
++                project=project,
++                window=5 * 60,
++            )
++            rate_limit_tag = "per_five_min"
++        if is_limited:
++            metrics.incr(
++                "event_manager.attachments.rate_limited", tags={"rate_limit_type": rate_limit_tag}
++            )
++            track_outcome(
++                org_id=project.organization_id,
++                project_id=project.id,
++                key_id=key_id,
++                outcome=Outcome.RATE_LIMITED,
++                reason="rate_limited",
++                timestamp=timestamp,
++                event_id=event_id,
++                category=DataCategory.ATTACHMENT,
++                quantity=attachment.size or 1,
++            )
++            return
  
-     def test_eap_user_misery_aggregate(self) -> None:
-         data = {
-@@ -283,3 +288,27 @@ class SnubaQueryValidatorTest(TestCase):
-         validator = SnubaQueryValidator(data=data, context=self.context)
-         assert validator.is_valid(), validator.errors
-         assert validator.validated_data["aggregate"] == "user_misery(span.duration,300)"
+     file = EventAttachment.putfile(project.id, attachment)
+ 
+diff --git a/static/app/components/core/form/field/meta.tsx b/static/app/components/core/form/field/meta.tsx
+index b72c2b0c121580..79c0b1c20c0336 100644
+--- a/static/app/components/core/form/field/meta.tsx
++++ b/static/app/components/core/form/field/meta.tsx
+@@ -68,11 +68,16 @@ function Label(props: {
+   );
+ }
+ 
+-function FieldStatus({disabled}: {disabled?: boolean | string}) {
++function FieldStatus({disabled, error}: {disabled?: boolean | string; error?: string}) {
+   const field = useFieldContext();
+ 
+-  if (!field.state.meta.isValid) {
+-    const errorMessage = field.state.meta.errors.map(e => e?.message).join(',');
++  const errorMessage =
++    error ??
++    (field.state.meta.isValid
++      ? undefined
++      : field.state.meta.errors.map(e => e?.message).join(','));
 +
-+    @with_feature(
-+        {
-+            "organizations:performance-view": True,
-+            "organizations:tracemetrics-alerts": True,
-+            "organizations:tracemetrics-enabled": True,
-+            "organizations:custom-metrics": True,
++  if (errorMessage) {
+     return (
+       <Tooltip position="bottom" title={errorMessage} forceVisible skipWrapper>
+         <Warning variant="danger" size="sm" />
+diff --git a/static/app/components/core/form/index.ts b/static/app/components/core/form/index.ts
+index 176055b2f4a29f..e70fa709164c46 100644
+--- a/static/app/components/core/form/index.ts
++++ b/static/app/components/core/form/index.ts
+@@ -3,3 +3,5 @@ export {AutoSaveField} from './field/autoSaveField';
+ export {FieldGroup} from './layout/fieldGroup';
+ export {FormSearch} from './FormSearch';
+ export {FORM_FIELD_REGISTRY} from './generatedFieldRegistry';
++// eslint-disable-next-line no-restricted-imports
++export {useStore} from '@tanstack/react-form';
+diff --git a/static/app/views/settings/components/dataScrubbing/index.tsx b/static/app/views/settings/components/dataScrubbing/index.tsx
+index 3d07cd9530d4e0..cf49f7315b9ad4 100644
+--- a/static/app/views/settings/components/dataScrubbing/index.tsx
++++ b/static/app/views/settings/components/dataScrubbing/index.tsx
+@@ -1,4 +1,4 @@
+-import {useCallback, useEffect, useMemo, useState} from 'react';
++import {useCallback, useEffect, useState} from 'react';
+ import styled from '@emotion/styled';
+ 
+ import {Button, LinkButton} from '@sentry/scraps/button';
+@@ -19,9 +19,6 @@ import {defined} from 'sentry/utils';
+ import useApi from 'sentry/utils/useApi';
+ import {useNavigate} from 'sentry/utils/useNavigate';
+ import {useParams} from 'sentry/utils/useParams';
+-import {useTraceItemAttributeKeys} from 'sentry/views/explore/hooks/useTraceItemAttributeKeys';
+-import {TraceItemDataset} from 'sentry/views/explore/types';
+-import {areScrubbingDatasetsEnabled} from 'sentry/views/settings/components/dataScrubbing/utils';
+ 
+ import Add from './modals/add';
+ import Edit from './modals/edit';
+@@ -29,7 +26,7 @@ import {convertRelayPiiConfig} from './convertRelayPiiConfig';
+ import {OrganizationRules} from './organizationRules';
+ import Rules from './rules';
+ import submitRules from './submitRules';
+-import {AllowedDataScrubbingDatasets, type AttributeResults, type Rule} from './types';
++import {type Rule} from './types';
+ 
+ const ADVANCED_DATASCRUBBING_LINK =
+   'https://docs.sentry.io/product/data-management-settings/scrubbing/advanced-datascrubbing/';
+@@ -67,21 +64,6 @@ export function DataScrubbing({
+     [onSubmitSuccess]
+   );
+ 
+-  const traceItemDatasetsEnabled = areScrubbingDatasetsEnabled(organization);
+-  const traceItemAttributeStringsResult = useTraceItemAttributeKeys({
+-    enabled: traceItemDatasetsEnabled,
+-    type: 'string',
+-    traceItemType: TraceItemDataset.LOGS,
+-    projects: project ? [project] : undefined,
+-  });
+-  const attributeResults: AttributeResults = useMemo(
+-    () => ({
+-      [AllowedDataScrubbingDatasets.DEFAULT]: null,
+-      [AllowedDataScrubbingDatasets.LOGS]: traceItemAttributeStringsResult,
+-    }),
+-    [traceItemAttributeStringsResult]
+-  );
+-
+   const handleCloseModal = useCallback(() => {
+     const path = project?.slug
+       ? `/settings/${organization.slug}/projects/${project.slug}/security-and-privacy/`
+@@ -109,7 +91,6 @@ export function DataScrubbing({
+           api={api}
+           endpoint={endpoint}
+           orgSlug={organization.slug}
+-          attributeResults={attributeResults}
+           onSubmitSuccess={response => {
+             return successfullySaved(
+               response,
+@@ -129,7 +110,6 @@ export function DataScrubbing({
+     organization.slug,
+     successfullySaved,
+     handleCloseModal,
+-    attributeResults,
+   ]);
+ 
+   useEffect(() => {
+@@ -161,7 +141,6 @@ export function DataScrubbing({
+         api={api}
+         endpoint={endpoint}
+         orgSlug={organization.slug}
+-        attributeResults={attributeResults}
+         onSubmitSuccess={response => {
+           return successfullySaved(response, t('Successfully added data scrubbing rule'));
+         }}
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/add.spec.tsx b/static/app/views/settings/components/dataScrubbing/modals/add.spec.tsx
+index a012551cce73cc..ecd72a7a6f441c 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/add.spec.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/add.spec.tsx
+@@ -2,7 +2,8 @@ import {DataScrubbingRelayPiiConfigFixture} from 'sentry-fixture/dataScrubbingRe
+ import {createMockAttributeResults} from 'sentry-fixture/log';
+ import {OrganizationFixture} from 'sentry-fixture/organization';
+ 
+-import {render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
++import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
++import selectEvent from 'sentry-test/selectEvent';
+ 
+ import {
+   makeClosableHeader,
+@@ -31,10 +32,14 @@ const successfullySaved = jest.fn();
+ const projectId = 'foo';
+ const endpoint = `/projects/${organizationSlug}/${projectId}/`;
+ const api = new MockApiClient();
+-const emptyAttributeResults = createMockAttributeResults(true);
+ const defaultAttributeResults = createMockAttributeResults();
+ 
+ describe('Add Modal', () => {
++  beforeEach(() => {
++    localStorage.clear();
++    MockApiClient.clearMockResponses();
++  });
++
+   it('open Add Rule Modal', async () => {
+     const handleCloseModal = jest.fn();
+ 
+@@ -51,7 +56,6 @@ describe('Add Modal', () => {
+         endpoint={endpoint}
+         orgSlug={organizationSlug}
+         onSubmitSuccess={successfullySaved}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -61,9 +65,7 @@ describe('Add Modal', () => {
+ 
+     // Method Field
+     expect(screen.getByText('Method')).toBeInTheDocument();
+-
+-    await userEvent.hover(screen.getAllByTestId('more-information')[0]!);
+-    expect(await screen.findByText('What to do')).toBeInTheDocument();
++    expect(screen.getByText('What to do')).toBeInTheDocument();
+ 
+     await userEvent.click(screen.getByText(getMethodLabel(MethodType.MASK).label));
+ 
+@@ -76,10 +78,8 @@ describe('Add Modal', () => {
+ 
+     // Type Field
+     expect(screen.getByText('Data Type')).toBeInTheDocument();
+-
+-    await userEvent.hover(screen.getAllByTestId('more-information')[1]!);
+     expect(
+-      await screen.findByText(
++      screen.getByText(
+         'What to look for. Use an existing pattern or define your own using regular expressions.'
+       )
+     ).toBeInTheDocument();
+@@ -101,10 +101,9 @@ describe('Add Modal', () => {
+     // Source Field
+     screen.getByRole('textbox', {name: 'Source'});
+ 
+-    await userEvent.hover(screen.getAllByTestId('more-information')[2]!);
+-
++    expect(screen.getByText('Source')).toBeInTheDocument();
+     expect(
+-      await screen.findByText(
++      screen.getByText(
+         'Where to look. In the simplest case this can be an attribute name.'
+       )
+     ).toBeInTheDocument();
+@@ -129,7 +128,6 @@ describe('Add Modal', () => {
+         endpoint={endpoint}
+         orgSlug={organizationSlug}
+         onSubmitSuccess={successfullySaved}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -143,10 +141,8 @@ describe('Add Modal', () => {
+ 
+     expect(screen.getByPlaceholderText('[Filtered]')).toBeInTheDocument();
+ 
+-    await userEvent.hover(screen.getAllByTestId('more-information')[1]!);
+-
+     expect(
+-      await screen.findByText('It will replace the default placeholder [Filtered]')
++      screen.getByText('It will replace the default placeholder [Filtered]')
+     ).toBeInTheDocument();
+   });
+ 
+@@ -164,7 +160,6 @@ describe('Add Modal', () => {
+         endpoint={endpoint}
+         orgSlug={organizationSlug}
+         onSubmitSuccess={successfullySaved}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -180,10 +175,8 @@ describe('Add Modal', () => {
+ 
+     expect(screen.getByPlaceholderText('[a-zA-Z0-9]+')).toBeInTheDocument();
+ 
+-    await userEvent.hover(screen.getAllByTestId('more-information')[2]!);
+-
+     expect(
+-      await screen.findByText('Custom regular expression (see documentation)')
++      screen.getByText('Custom regular expression (see documentation)')
+     ).toBeInTheDocument();
+   });
+ 
+@@ -213,7 +206,6 @@ describe('Add Modal', () => {
+         endpoint={endpoint}
+         orgSlug={organizationSlug}
+         onSubmitSuccess={successfullySaved}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -239,6 +231,622 @@ describe('Add Modal', () => {
+     expect(screen.getAllByRole('listitem')).toHaveLength(3);
+   });
+ 
++  it('loads source suggestions when event ID is submitted', async () => {
++    // Use a unique event ID to avoid collisions with localStorage state from other tests
++    const eventId = 'aabbccddeeff00112233445566778899';
++
++    const suggestionsRequest = MockApiClient.addMockResponse({
++      url: `/organizations/${organizationSlug}/data-scrubbing-selector-suggestions/`,
++      body: {
++        suggestions: [
++          {type: 'value', examples: ['34359738368'], value: "extra.'system.cpu.memory'"},
++          {type: 'value', value: '$frame.abs_path'},
++        ],
++      },
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={successfullySaved}
++      />
++    );
++
++    // No API call on mount
++    expect(suggestionsRequest).not.toHaveBeenCalled();
++
++    // Show event ID field if not already visible
++    const toggleButton =
++      screen.queryByRole('button', {name: 'Use event ID for auto-completion'}) ??
++      screen.getByRole('button', {name: 'Hide event ID field'});
++    if (toggleButton.textContent?.includes('Use event ID')) {
++      await userEvent.click(toggleButton);
++    }
++
++    // Clear any pre-existing event ID value from localStorage
++    const eventIdInput = screen.getByPlaceholderText('XXXXXXXXXXXXXX');
++    await userEvent.clear(eventIdInput);
++
++    await userEvent.type(eventIdInput, `${eventId}{enter}`);
++
++    // Suggestions should load — checkmark indicates LOADED status
++    expect(await screen.findByTestId('icon-check-mark')).toBeInTheDocument();
++
++    // Verify source field shows API suggestions (2 from API + 1 default = 3)
++    await userEvent.click(screen.getByRole('textbox', {name: 'Source'}));
++    expect(screen.getAllByRole('listitem')).toHaveLength(3);
++  });
++
++  it('successful submission sends correct payload', async () => {
++    const closeModal = jest.fn();
++    const onSubmitSuccess = jest.fn();
++
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={closeModal}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={onSubmitSuccess}
++      />
++    );
++
++    // Type in source field (default method=MASK, type=CREDITCARD)
++    await userEvent.type(screen.getByRole('textbox', {name: 'Source'}), '$message');
++    await userEvent.tab();
++
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    await waitFor(() => {
++      expect(mockPutRequest).toHaveBeenCalled();
++    });
++
++    // Verify the submitted PII config contains the new rule
++    const submittedData = JSON.parse(mockPutRequest.mock.calls[0][1].data.relayPiiConfig);
++
++    // The new rule (creditcard + mask on $message) should be in the config
++    // Rule index 3 is the new one (0-2 are existing)
++    expect(submittedData.rules['3']).toEqual({
++      type: 'creditcard',
++      redaction: {method: 'mask'},
++    });
++    expect(submittedData.applications.$message).toContain('3');
++
++    await waitFor(() => {
++      expect(onSubmitSuccess).toHaveBeenCalled();
++    });
++    expect(closeModal).toHaveBeenCalled();
++  });
++
++  it('submission with REPLACE method includes placeholder', async () => {
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Change method to REPLACE
++    await selectEvent.select(
++      screen.getByText(getMethodLabel(MethodType.MASK).label),
++      getMethodLabel(MethodType.REPLACE).label
++    );
++
++    // Type custom placeholder
++    await userEvent.type(screen.getByPlaceholderText('[Filtered]'), 'REDACTED');
++
++    // Fill source
++    await userEvent.type(screen.getByRole('textbox', {name: 'Source'}), '$message');
++    await userEvent.tab();
++
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    await waitFor(() => {
++      expect(mockPutRequest).toHaveBeenCalled();
++    });
++
++    const submittedData = JSON.parse(mockPutRequest.mock.calls[0][1].data.relayPiiConfig);
++    expect(submittedData.rules['3']).toEqual({
++      type: 'creditcard',
++      redaction: {method: 'replace', text: 'REDACTED'},
++    });
++  });
++
++  it('submission with PATTERN type includes pattern and replaceCaptured', async () => {
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Change type to PATTERN (Regex matches)
++    await selectEvent.select(
++      screen.getByText(getRuleLabel(RuleType.CREDITCARD)),
++      getRuleLabel(RuleType.PATTERN)
++    );
++
++    // Enter regex pattern with capture group
++    await userEvent.type(
++      screen.getByRole('textbox', {name: 'Regex matches'}),
++      '(secret).*'
++    );
++
++    // Check replaceCaptured checkbox (should be enabled due to capture group)
++    await userEvent.click(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    );
++
++    // Fill source
++    await userEvent.type(screen.getByRole('textbox', {name: 'Source'}), '$message');
++    await userEvent.tab();
++
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    await waitFor(() => {
++      expect(mockPutRequest).toHaveBeenCalled();
++    });
++
++    const submittedData = JSON.parse(mockPutRequest.mock.calls[0][1].data.relayPiiConfig);
++    expect(submittedData.rules['3']).toEqual({
++      type: 'pattern',
++      pattern: '(secret).*',
++      redaction: {method: 'mask'},
++      replaceGroups: [1],
++    });
++  });
++
++  it('validation blocks submission when source is empty', async () => {
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Select REPLACE method
++    await selectEvent.select(
++      screen.getByText(getMethodLabel(MethodType.MASK).label),
++      getMethodLabel(MethodType.REPLACE).label
++    );
++
++    // Submit without filling source — Zod validation should block submission
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    expect(await screen.findByText('This field is required')).toBeInTheDocument();
++
++    // Submission should not have happened
++    expect(mockPutRequest).not.toHaveBeenCalled();
++  });
++
++  it('validation blocks submission when pattern is empty for PATTERN type', async () => {
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Change type to PATTERN
++    await selectEvent.select(
++      screen.getByText(getRuleLabel(RuleType.CREDITCARD)),
++      getRuleLabel(RuleType.PATTERN)
++    );
++
++    // Fill source but leave pattern empty
++    await userEvent.type(screen.getByRole('textbox', {name: 'Source'}), '$message');
++    await userEvent.tab();
++
++    // Submit — Zod superRefine validation should block because pattern is empty
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    expect(await screen.findByText('This field is required')).toBeInTheDocument();
++
++    // Submission should not have happened
++    expect(mockPutRequest).not.toHaveBeenCalled();
++  });
++
++  it('changing method from REPLACE clears placeholder value', async () => {
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Select REPLACE method
++    await selectEvent.select(
++      screen.getByText(getMethodLabel(MethodType.MASK).label),
++      getMethodLabel(MethodType.REPLACE).label
++    );
++
++    // Type in placeholder
++    await userEvent.type(screen.getByPlaceholderText('[Filtered]'), 'REDACTED');
++    expect(screen.getByPlaceholderText('[Filtered]')).toHaveValue('REDACTED');
++
++    // Switch to MASK
++    await selectEvent.select(
++      screen.getByText(getMethodLabel(MethodType.REPLACE).label),
++      getMethodLabel(MethodType.MASK).label
++    );
++
++    // Placeholder field should be hidden
++    expect(screen.queryByText('Custom Placeholder (Optional)')).not.toBeInTheDocument();
++
++    // Switch back to REPLACE
++    await selectEvent.select(
++      screen.getByText(getMethodLabel(MethodType.MASK).label),
++      getMethodLabel(MethodType.REPLACE).label
++    );
++
++    // Placeholder should be empty (value was cleared)
++    expect(screen.getByPlaceholderText('[Filtered]')).toHaveValue('');
++  });
++
++  it('changing type from PATTERN clears pattern and replaceCaptured', async () => {
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Select PATTERN type
++    await selectEvent.select(
++      screen.getByText(getRuleLabel(RuleType.CREDITCARD)),
++      getRuleLabel(RuleType.PATTERN)
++    );
++
++    // Type regex with capture group
++    await userEvent.type(screen.getByRole('textbox', {name: 'Regex matches'}), '(foo)');
++
++    // Check replaceCaptured
++    await userEvent.click(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    );
++    expect(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    ).toBeChecked();
++
++    // Switch to CREDITCARD
++    await selectEvent.select(
++      screen.getAllByText(getRuleLabel(RuleType.PATTERN))[0]!,
++      getRuleLabel(RuleType.CREDITCARD)
++    );
++
++    // Regex field should disappear
++    expect(
++      screen.queryByRole('textbox', {name: 'Regex matches'})
++    ).not.toBeInTheDocument();
++
++    // Switch back to PATTERN
++    await selectEvent.select(
++      screen.getByText(getRuleLabel(RuleType.CREDITCARD)),
++      getRuleLabel(RuleType.PATTERN)
++    );
++
++    // Pattern should be empty and replaceCaptured should be unchecked
++    expect(screen.getByRole('textbox', {name: 'Regex matches'})).toHaveValue('');
++    expect(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    ).not.toBeChecked();
++  });
++
++  it('resets replaceCaptured when pattern is edited to remove capture groups', async () => {
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Select PATTERN type
++    await selectEvent.select(
++      screen.getByText(getRuleLabel(RuleType.CREDITCARD)),
++      getRuleLabel(RuleType.PATTERN)
++    );
++
++    // Type regex with capture group
++    await userEvent.type(
++      screen.getByRole('textbox', {name: 'Regex matches'}),
++      '(secret).*'
++    );
++
++    // Check replaceCaptured
++    await userEvent.click(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    );
++    expect(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    ).toBeChecked();
++
++    // Edit the pattern to remove capture groups
++    await userEvent.clear(screen.getByRole('textbox', {name: 'Regex matches'}));
++    await userEvent.type(
++      screen.getByRole('textbox', {name: 'Regex matches'}),
++      'secret.*'
++    );
++
++    // Checkbox should be disabled AND unchecked (auto-reset)
++    expect(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    ).toBeDisabled();
++    expect(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    ).not.toBeChecked();
++
++    // Fill source and submit
++    await userEvent.type(screen.getByRole('textbox', {name: 'Source'}), '$message');
++    await userEvent.tab();
++
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    await waitFor(() => {
++      expect(mockPutRequest).toHaveBeenCalled();
++    });
++
++    // Should NOT contain replaceGroups since pattern has no capture groups
++    const submittedData = JSON.parse(mockPutRequest.mock.calls[0][1].data.relayPiiConfig);
++    expect(submittedData.rules['3']).toEqual({
++      type: 'pattern',
++      pattern: 'secret.*',
++      redaction: {method: 'mask'},
++    });
++  });
++
++  it('replaceCaptured checkbox is disabled without capture groups', async () => {
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Select PATTERN type
++    await selectEvent.select(
++      screen.getByText(getRuleLabel(RuleType.CREDITCARD)),
++      getRuleLabel(RuleType.PATTERN)
++    );
++
++    // Type pattern without capture groups
++    await userEvent.type(
++      screen.getByRole('textbox', {name: 'Regex matches'}),
++      'secret.*'
++    );
++
++    // Checkbox should be disabled
++    expect(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    ).toBeDisabled();
++
++    // Clear and type pattern with capture group
++    await userEvent.clear(screen.getByRole('textbox', {name: 'Regex matches'}));
++    await userEvent.type(
++      screen.getByRole('textbox', {name: 'Regex matches'}),
++      'xx(secret)xx'
++    );
++
++    // Checkbox should now be enabled
++    expect(
++      screen.getByRole('checkbox', {name: 'Only replace first capture match'})
++    ).toBeEnabled();
++  });
++
++  it('form submits even when event ID has an error', async () => {
++    MockApiClient.addMockResponse({
++      url: `/organizations/${organizationSlug}/data-scrubbing-selector-suggestions/`,
++      body: {suggestions: []},
++    });
++
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Toggle event ID visible
++    await userEvent.click(
++      screen.getByRole('button', {name: 'Use event ID for auto-completion'})
++    );
++
++    // Enter an event ID (API returns empty suggestions → NOT_FOUND status)
++    await userEvent.type(
++      screen.getByPlaceholderText('XXXXXXXXXXXXXX'),
++      '12345678901234567890123456789012{enter}'
++    );
++
++    // Wait for NOT_FOUND status
++    expect(
++      await screen.findByText(
++        'The chosen event ID was not found in projects you have access to'
++      )
++    ).toBeInTheDocument();
++
++    // Fill source field
++    await userEvent.type(screen.getByRole('textbox', {name: 'Source'}), '$message');
++    await userEvent.tab();
++
++    // Save should still work despite event ID error
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    await waitFor(() => {
++      expect(mockPutRequest).toHaveBeenCalled();
++    });
++  });
++
++  it('pre-fills event ID from localStorage and shows event ID field expanded', () => {
++    const storedEventId = 'aabbccddeeff00112233445566778899';
++
++    localStorage.setItem(
++      'advanced-data-scrubbing',
++      JSON.stringify({
++        eventId: storedEventId,
++        sourceSuggestions: [],
++      })
++    );
++
++    render(
++      <Add
++        Header={makeClosableHeader(jest.fn())}
++        Body={ModalBody}
++        Footer={ModalFooter}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++      />
++    );
++
++    // Event ID field should be visible (expanded) because localStorage had an eventId
++    expect(screen.getByRole('button', {name: 'Hide event ID field'})).toBeInTheDocument();
++
++    // The event ID input should be pre-filled with the stored value
++    expect(screen.getByPlaceholderText('XXXXXXXXXXXXXX')).toHaveValue(storedEventId);
++  });
++
+   it('does not show dataset selector without ourlogs-enabled feature', () => {
+     const handleCloseModal = jest.fn();
+ 
+@@ -255,7 +863,6 @@ describe('Add Modal', () => {
+         endpoint={endpoint}
+         orgSlug={organizationSlug}
+         onSubmitSuccess={successfullySaved}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -305,7 +912,6 @@ describe('Add Modal with ourlogs-enabled', () => {
+           endpoint={endpoint}
+           orgSlug={organizationSlug}
+           onSubmitSuccess={successfullySaved}
+-          attributeResults={mockAttributeResults}
+         />
+       </OrganizationContext.Provider>
+     );
+@@ -345,7 +951,6 @@ describe('Add Modal with ourlogs-enabled', () => {
+           endpoint={endpoint}
+           orgSlug={organizationSlug}
+           onSubmitSuccess={successfullySaved}
+-          attributeResults={mockAttributeResults}
+         />
+       </OrganizationContext.Provider>
+     );
+@@ -376,7 +981,6 @@ describe('Add Modal with ourlogs-enabled', () => {
+           endpoint={endpoint}
+           orgSlug={organizationSlug}
+           onSubmitSuccess={successfullySaved}
+-          attributeResults={mockAttributeResults}
+         />
+       </OrganizationContext.Provider>
+     );
+@@ -384,7 +988,10 @@ describe('Add Modal with ourlogs-enabled', () => {
+     await userEvent.click(screen.getByLabelText('Errors, Transactions, Attachments'));
+ 
+     expect(screen.getByText('Source')).toBeInTheDocument();
+-    expect(screen.getByRole('button', {name: 'Hide event ID field'})).toBeInTheDocument();
++    // Event ID toggle button should be present
++    expect(
++      screen.getByRole('button', {name: 'Use event ID for auto-completion'})
++    ).toBeInTheDocument();
+     expect(screen.queryByText('Attribute')).not.toBeInTheDocument();
+   });
+ 
+@@ -418,7 +1025,6 @@ describe('Add Modal with ourlogs-enabled', () => {
+           endpoint={endpoint}
+           orgSlug={organizationSlug}
+           onSubmitSuccess={successfullySaved}
+-          attributeResults={mockAttributeResults}
+         />
+       </OrganizationContext.Provider>
+     );
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/add.tsx b/static/app/views/settings/components/dataScrubbing/modals/add.tsx
+index 3ff148131e9b91..7c4b9ad7bfdfb1 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/add.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/add.tsx
+@@ -1,21 +1,22 @@
+ import {t} from 'sentry/locale';
+ import type {Rule} from 'sentry/views/settings/components/dataScrubbing/types';
+ 
+-import ModalManager, {type ModalManagerProps} from './modalManager';
++import {DataScrubFormModal, type DataScrubFormModalProps} from './dataScrubFormModal';
+ 
+-type Props = Omit<ModalManagerProps, 'title' | 'initialValues' | 'onGetNewRules'>;
++type Props = Omit<DataScrubFormModalProps, 'title' | 'onGetNewRules'> & {
++  savedRules: Rule[];
++};
+ 
+ function Add({savedRules, ...props}: Props) {
+   const handleGetNewRules = (
+-    values: Parameters<ModalManagerProps['onGetNewRules']>[0]
++    values: Parameters<DataScrubFormModalProps['onGetNewRules']>[0]
+   ) => {
+     return [...savedRules, {...values, id: savedRules.length}] as Rule[];
+   };
+ 
+   return (
+-    <ModalManager
++    <DataScrubFormModal
+       {...props}
+-      savedRules={savedRules}
+       title={t('Add an advanced data scrubbing rule')}
+       onGetNewRules={handleGetNewRules}
+     />
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/dataScrubFormModal.tsx b/static/app/views/settings/components/dataScrubbing/modals/dataScrubFormModal.tsx
+new file mode 100644
+index 00000000000000..6467b4b369079b
+--- /dev/null
++++ b/static/app/views/settings/components/dataScrubbing/modals/dataScrubFormModal.tsx
+@@ -0,0 +1,635 @@
++import {Fragment, useCallback, useState} from 'react';
++import {css} from '@emotion/react';
++import styled from '@emotion/styled';
++import sortBy from 'lodash/sortBy';
++import {z} from 'zod';
++
++import {Alert} from '@sentry/scraps/alert';
++import {Button} from '@sentry/scraps/button';
++import {Checkbox} from '@sentry/scraps/checkbox';
++import {
++  defaultFormOptions,
++  setFieldErrors,
++  useScrapsForm,
++  useStore,
++} from '@sentry/scraps/form';
++import {Flex, Grid, Stack} from '@sentry/scraps/layout';
++import {Tooltip} from '@sentry/scraps/tooltip';
++
++import {addErrorMessage} from 'sentry/actionCreators/indicator';
++import type {ModalRenderProps} from 'sentry/actionCreators/modal';
++import type {Client} from 'sentry/api';
++import {IconChevron} from 'sentry/icons';
++import {t} from 'sentry/locale';
++import {space} from 'sentry/styles/space';
++import type {Project} from 'sentry/types/project';
++import useOrganization from 'sentry/utils/useOrganization';
++import submitRules from 'sentry/views/settings/components/dataScrubbing/submitRules';
++import type {
++  EditableRule,
++  Rule,
++  SourceSuggestion,
++} from 'sentry/views/settings/components/dataScrubbing/types';
++import {
++  AllowedDataScrubbingDatasets,
++  MethodType,
++  RuleType,
++} from 'sentry/views/settings/components/dataScrubbing/types';
++import {
++  areScrubbingDatasetsEnabled,
++  getDatasetLabelLong,
++  getMethodLabel,
++  getRuleLabel,
++  TraceItemFieldSelector,
++  validateTraceItemFieldSelector,
++} from 'sentry/views/settings/components/dataScrubbing/utils';
++
++import AttributeField from './form/attributeField';
++import EventIdField from './form/eventIdField';
++import SourceField from './form/sourceField';
++import handleError, {ErrorType} from './handleError';
++import {hasCaptureGroups, useSourceGroupData} from './utils';
++
++const dataScrubSchema = z
++  .object({
++    method: z.enum(MethodType),
++    pattern: z.string(),
++    placeholder: z.string(),
++    replaceCaptured: z.boolean(),
++    source: z.string().min(1, t('This field is required')),
++    type: z.enum(RuleType),
++    dataset: z.enum(AllowedDataScrubbingDatasets),
++    eventId: z.string(),
++  })
++  .superRefine((data, ctx) => {
++    if (data.type === RuleType.PATTERN && !data.pattern.trim()) {
++      ctx.addIssue({
++        code: 'custom',
++        message: t('This field is required'),
++        path: ['pattern'],
++      });
++    }
++  });
++
++export type DataScrubFormModalProps = ModalRenderProps & {
++  api: Client;
++  endpoint: string;
++  onGetNewRules: (values: EditableRule) => Rule[];
++  onSubmitSuccess: (data: {relayPiiConfig: string}) => void;
++  orgSlug: string;
++  title: string;
++  initialState?: Partial<EditableRule>;
++  projectId?: Project['id'];
++};
++
++export function DataScrubFormModal({
++  api,
++  endpoint,
++  onGetNewRules,
++  onSubmitSuccess,
++  orgSlug,
++  title,
++  initialState,
++  projectId,
++  closeModal,
++  Header,
++  Body,
++  Footer,
++}: DataScrubFormModalProps) {
++  const organization = useOrganization();
++  const traceItemDatasetsEnabled = areScrubbingDatasetsEnabled(organization);
++  const {sourceGroupData} = useSourceGroupData();
++
++  // Compute initial dataset from initialState
++  const initialValues = {
++    type: initialState?.type ?? RuleType.CREDITCARD,
++    method: initialState?.method ?? MethodType.MASK,
++    source: initialState?.source ?? '',
++    placeholder: initialState?.placeholder ?? '',
++    pattern: initialState?.pattern ?? '',
++    replaceCaptured: initialState?.replaceCaptured ?? false,
++  };
++
++  const tempRule = {...initialValues, id: 0} as Rule;
++  const traceItemFieldSelector = TraceItemFieldSelector.fromRule(tempRule);
++  const initialDataset =
++    traceItemFieldSelector?.getDataset() ?? AllowedDataScrubbingDatasets.DEFAULT;
++
++  const [dataset, setDataset] = useState<AllowedDataScrubbingDatasets>(initialDataset);
++  const [displayEventId, setDisplayEventId] = useState(!!sourceGroupData.eventId);
++  const [sourceSuggestions, setSourceSuggestions] = useState<SourceSuggestion[]>(
++    sourceGroupData.sourceSuggestions
++  );
++  const [eventIdError, setEventIdError] = useState<string | undefined>(undefined);
++
++  const form = useScrapsForm({
++    ...defaultFormOptions,
++    defaultValues: {
++      ...initialValues,
++      dataset: initialDataset,
++      eventId: sourceGroupData.eventId,
++    },
++    validators: {
++      onDynamic: dataScrubSchema,
++    },
++    onSubmit: async ({value}) => {
++      // Strip dataset and eventId from values before creating rules
++      const {dataset: _dataset, eventId: _eventId, ...ruleValues} = value;
++      const newRules = onGetNewRules(ruleValues as EditableRule);
++
++      try {
++        const data = await submitRules(api, endpoint, newRules);
++        onSubmitSuccess(data);
++        closeModal();
++      } catch (error: any) {
++        const parsedError = handleError(error);
++        switch (parsedError.type) {
++          case ErrorType.INVALID_SELECTOR:
++          case ErrorType.ATTRIBUTE_INVALID:
++            setFieldErrors(form, {
++              source: {message: parsedError.message},
++            });
++            break;
++          case ErrorType.REGEX_PARSE:
++            setFieldErrors(form, {
++              pattern: {message: parsedError.message},
++            });
++            break;
++          default:
++            addErrorMessage(parsedError.message);
 +        }
-+    )
-+    def test_trace_metrics_per_second_field(self) -> None:
-+        data = {
-+            "dataset": Dataset.EventsAnalyticsPlatform.value,
-+            "query": "",
-+            "aggregate": "per_second(value,sentry.apigateway.proxy_request,counter,none)",
-+            "timeWindow": 60,
-+            "environment": self.environment.name,
-+            "eventTypes": [SnubaQueryEventType.EventType.TRACE_ITEM_METRIC.name.lower()],
++      }
++    },
++  });
++
++  const type = useStore(form.store, state => state.values.type);
++
++  const handleValidateAttributeField = useCallback(
++    (value: string) => {
++      const traceItemField = TraceItemFieldSelector.fromField(dataset, value);
++
++      if (!traceItemField) {
++        return;
++      }
++
++      const validation = validateTraceItemFieldSelector(traceItemField);
++      if (!validation.isValid && validation.error) {
++        setFieldErrors(form, {
++          source: {message: validation.error},
++        });
++      }
++    },
++    [dataset, form]
++  );
++
++  const containsRootDeepWildcard = (source: string) => {
++    return /(^|[^.])\*\*$/.test(source);
++  };
++
++  const methodOptions = sortBy(Object.values(MethodType)).map(value => ({
++    ...getMethodLabel(value),
++    value,
++    details: getMethodLabel(value).description
++      ? `(${getMethodLabel(value).description})`
++      : undefined,
++  }));
++
++  const typeOptions = sortBy(Object.values(RuleType)).map(value => ({
++    label: getRuleLabel(value),
++    value,
++  }));
++
++  const eventIdFieldBlock = (
++    <form.AppField name="eventId">
++      {eventIdField => (
++        <eventIdField.Layout.Stack
++          label={t('Event ID (Optional)')}
++          hintText={t(
++            'Providing an event ID will automatically provide you a list of suggested sources'
++          )}
++          variant="compact"
++        >
++          <eventIdField.Base>
++            {fieldProps => (
++              <Flex gap="sm" align="center" flexGrow={1}>
++                <EventIdField
++                  fieldProps={fieldProps}
++                  value={eventIdField.state.value ?? ''}
++                  onChange={eventIdField.handleChange}
++                  onSuggestionsLoaded={setSourceSuggestions}
++                  onErrorChange={setEventIdError}
++                  orgSlug={orgSlug}
++                  projectId={projectId}
++                />
++                <eventIdField.Meta.Status error={eventIdError} />
++              </Flex>
++            )}
++          </eventIdField.Base>
++        </eventIdField.Layout.Stack>
++      )}
++    </form.AppField>
++  );
++
++  return (
++    <form.AppForm form={form}>
++      <Header closeButton>
++        <h5>{title}</h5>
++      </Header>
++      <Body>
++        <Stack gap={{xs: 'md', sm: 'xl'}}>
++          {traceItemDatasetsEnabled && (
++            <form.AppField name="dataset">
++              {field => (
++                <field.Radio.Group
++                  value={field.state.value}
++                  onChange={value => {
++                    field.handleChange(value as AllowedDataScrubbingDatasets);
++                    setDataset(value as AllowedDataScrubbingDatasets);
++                    form.setFieldValue('source', '');
++                  }}
++                >
++                  <field.Layout.Stack
++                    label={t('Dataset')}
++                    hintText={t('The dataset targeted by the scrubbing rule')}
++                    variant="compact"
++                  >
++                    <Flex gap="lg">
++                      {sortBy(Object.values(AllowedDataScrubbingDatasets)).map(value => (
++                        <field.Radio.Item key={value} value={value}>
++                          {getDatasetLabelLong(value)}
++                        </field.Radio.Item>
++                      ))}
++                    </Flex>
++                  </field.Layout.Stack>
++                </field.Radio.Group>
++              )}
++            </form.AppField>
++          )}
++
++          <form.Subscribe selector={state => state.values.method}>
++            {method => (
++              <Grid
++                columns={
++                  method === MethodType.REPLACE ? {xs: '1fr', sm: '1fr 1fr'} : '1fr'
++                }
++                gap={{sm: 'md'}}
++              >
++                <form.AppField
++                  name="method"
++                  listeners={{
++                    onChange: ({value}) => {
++                      if (value !== MethodType.REPLACE) {
++                        form.setFieldValue('placeholder', '');
++                      }
++                    },
++                  }}
++                >
++                  {methodField => (
++                    <methodField.Layout.Stack
++                      label={t('Method')}
++                      hintText={t('What to do')}
++                      variant="compact"
++                    >
++                      <methodField.Select
++                        placeholder={t('Select method')}
++                        options={methodOptions}
++                        value={methodField.state.value}
++                        onChange={methodField.handleChange}
++                        isSearchable={false}
++                        openOnFocus
++                      />
++                    </methodField.Layout.Stack>
++                  )}
++                </form.AppField>
++                {method === MethodType.REPLACE && (
++                  <form.AppField name="placeholder">
++                    {placeholderField => (
++                      <placeholderField.Layout.Stack
++                        label={t('Custom Placeholder (Optional)')}
++                        hintText={t('It will replace the default placeholder [Filtered]')}
++                        variant="compact"
++                      >
++                        <placeholderField.Input
++                          type="text"
++                          placeholder={`[${t('Filtered')}]`}
++                          onChange={placeholderField.handleChange}
++                          value={placeholderField.state.value}
++                        />
++                      </placeholderField.Layout.Stack>
++                    )}
++                  </form.AppField>
++                )}
++              </Grid>
++            )}
++          </form.Subscribe>
++
++          <Grid
++            columns={type === RuleType.PATTERN ? {xs: '1fr', sm: '1fr 1fr'} : '1fr'}
++            gap={{sm: 'md'}}
++          >
++            <form.AppField
++              name="type"
++              listeners={{
++                onChange: ({value}) => {
++                  if (value !== RuleType.PATTERN) {
++                    form.setFieldValue('pattern', '');
++                    form.setFieldValue('replaceCaptured', false);
++                  }
++                },
++              }}
++            >
++              {typeField => (
++                <typeField.Layout.Stack
++                  label={t('Data Type')}
++                  hintText={t(
++                    'What to look for. Use an existing pattern or define your own using regular expressions.'
++                  )}
++                  variant="compact"
++                >
++                  <typeField.Select
++                    placeholder={t('Select type')}
++                    options={typeOptions}
++                    value={typeField.state.value}
++                    onChange={typeField.handleChange}
++                    isSearchable={false}
++                    openOnFocus
++                  />
++                </typeField.Layout.Stack>
++              )}
++            </form.AppField>
++            {type === RuleType.PATTERN && (
++              <form.AppField
++                name="pattern"
++                listeners={{
++                  onChange: ({value}) => {
++                    if (!hasCaptureGroups(value)) {
++                      form.setFieldValue('replaceCaptured', false);
++                    }
++                  },
++                }}
++              >
++                {patternField => (
++                  <patternField.Layout.Stack
++                    label={t('Regex matches')}
++                    hintText={t('Custom regular expression (see documentation)')}
++                    variant="compact"
++                    required
++                  >
++                    <RegularExpressionWrapper>
++                      <patternField.Input
++                        type="text"
++                        placeholder={t('[a-zA-Z0-9]+')}
++                        onChange={patternField.handleChange}
++                        value={patternField.state.value}
++                      />
++                    </RegularExpressionWrapper>
++                    <form.AppField name="replaceCaptured">
++                      {replaceCapturedField => (
++                        <ReplaceCapturedCheckbox
++                          pattern={patternField.state.value}
++                          checked={replaceCapturedField.state.value}
++                          onChange={val => replaceCapturedField.handleChange(val)}
++                        />
++                      )}
++                    </form.AppField>
++                  </patternField.Layout.Stack>
++                )}
++              </form.AppField>
++            )}
++          </Grid>
++
++          <form.AppField name="source">
++            {sourceField => {
++              const sourceValue = sourceField.state.value;
++              const isRegExMatchesSelected = type === RuleType.PATTERN;
++
++              if (traceItemDatasetsEnabled) {
++                return (
++                  <SourceGroup>
++                    {dataset === AllowedDataScrubbingDatasets.DEFAULT ? (
++                      <Fragment>
++                        <Flex justify="end">
++                          {displayEventId ? (
++                            <Toggle
++                              priority="link"
++                              onClick={() => setDisplayEventId(false)}
++                            >
++                              {t('Hide event ID field')}
++                              <IconChevron direction="up" size="xs" />
++                            </Toggle>
++                          ) : (
++                            <Toggle
++                              priority="link"
++                              onClick={() => setDisplayEventId(true)}
++                            >
++                              {t('Use event ID for auto-completion')}
++                              <IconChevron direction="down" size="xs" />
++                            </Toggle>
++                          )}
++                        </Flex>
++                        <SourceGroup isExpanded={displayEventId}>
++                          {displayEventId && eventIdFieldBlock}
++                          <sourceField.Layout.Stack
++                            label={t('Source')}
++                            hintText={t(
++                              'Where to look. In the simplest case this can be an attribute name.'
++                            )}
++                            variant="compact"
++                            required
++                          >
++                            <sourceField.Base>
++                              {fieldProps => (
++                                <SourceField
++                                  fieldProps={fieldProps}
++                                  onChange={value => sourceField.handleChange(value)}
++                                  value={sourceValue}
++                                  isRegExMatchesSelected={isRegExMatchesSelected}
++                                  suggestions={sourceSuggestions}
++                                />
++                              )}
++                            </sourceField.Base>
++                          </sourceField.Layout.Stack>
++                          {containsRootDeepWildcard(sourceValue) && (
++                            <Alert variant="warning" style={{marginTop: space(1)}}>
++                              {t(
++                                `Deep wildcards ('**') apply to all datasets unless negated (eg. ** || !$logs.**)`
++                              )}
++                            </Alert>
++                          )}
++                        </SourceGroup>
++                      </Fragment>
++                    ) : (
++                      <sourceField.Layout.Stack
++                        label={t('Attribute')}
++                        hintText={t('The attribute to scrub')}
++                        variant="compact"
++                        required
++                      >
++                        <sourceField.Base>
++                          {fieldProps => (
++                            <AttributeField
++                              fieldProps={fieldProps}
++                              dataset={dataset}
++                              onChange={value =>
++                                sourceField.handleChange(
++                                  TraceItemFieldSelector.fromField(
++                                    dataset,
++                                    value
++                                  )?.getSelector() ?? ''
++                                )
++                              }
++                              value={sourceValue}
++                              onBlur={(value, _event) => {
++                                handleValidateAttributeField(value);
++                              }}
++                              projectId={projectId}
++                            />
++                          )}
++                        </sourceField.Base>
++                      </sourceField.Layout.Stack>
++                    )}
++                  </SourceGroup>
++                );
++              }
++
++              return (
++                <Fragment>
++                  <Flex justify="end">
++                    {displayEventId ? (
++                      <Toggle priority="link" onClick={() => setDisplayEventId(false)}>
++                        {t('Hide event ID field')}
++                        <IconChevron direction="up" size="xs" />
++                      </Toggle>
++                    ) : (
++                      <Toggle priority="link" onClick={() => setDisplayEventId(true)}>
++                        {t('Use event ID for auto-completion')}
++                        <IconChevron direction="down" size="xs" />
++                      </Toggle>
++                    )}
++                  </Flex>
++                  <SourceGroup isExpanded={displayEventId}>
++                    {displayEventId && eventIdFieldBlock}
++                    <sourceField.Layout.Stack
++                      label={t('Source')}
++                      hintText={t(
++                        'Where to look. In the simplest case this can be an attribute name.'
++                      )}
++                      variant="compact"
++                      required
++                    >
++                      <sourceField.Base>
++                        {fieldProps => (
++                          <SourceField
++                            fieldProps={fieldProps}
++                            onChange={value => sourceField.handleChange(value)}
++                            value={sourceValue}
++                            isRegExMatchesSelected={isRegExMatchesSelected}
++                            suggestions={sourceSuggestions}
++                          />
++                        )}
++                      </sourceField.Base>
++                    </sourceField.Layout.Stack>
++                  </SourceGroup>
++                </Fragment>
++              );
++            }}
++          </form.AppField>
++        </Stack>
++      </Body>
++      <Footer>
++        <Flex gap="lg">
++          <Button onClick={closeModal}>{t('Cancel')}</Button>
++          <form.SubmitButton>{t('Save Rule')}</form.SubmitButton>
++        </Flex>
++      </Footer>
++    </form.AppForm>
++  );
++}
++
++function ReplaceCapturedCheckbox({
++  pattern,
++  checked,
++  onChange,
++}: {
++  checked: boolean;
++  onChange: (value: boolean) => void;
++  pattern: string;
++}) {
++  const disabled = !hasCaptureGroups(pattern);
++  return (
++    <Tooltip
++      title={disabled ? t('This rule does not contain capture groups') : undefined}
++      disabled={!disabled}
++    >
++      <Flex gap="xs" align="center">
++        <Checkbox
++          id="replace-captured"
++          name="replaceCaptured"
++          checked={checked}
++          disabled={disabled}
++          onChange={e => onChange(e.target.checked)}
++        />
++        <ReplaceCapturedLabel htmlFor="replace-captured" disabled={disabled}>
++          {t('Only replace first capture match')}
++        </ReplaceCapturedLabel>
++      </Flex>
++    </Tooltip>
++  );
++}
++
++const SourceGroupContainer = styled('div')<{isExpanded?: boolean}>`
++  transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1) 0ms;
++  transition-property: height;
++  ${p =>
++    p.isExpanded &&
++    css`
++      border-radius: ${p.theme.radius.md};
++      border: 1px solid ${p.theme.tokens.border.primary};
++      box-shadow: ${p.theme.dropShadowMedium};
++      padding: ${p.theme.space.xl};
++    `}
++`;
++
++function SourceGroup({
++  children,
++  isExpanded,
++}: React.PropsWithChildren<{isExpanded?: boolean}>) {
++  return (
++    <SourceGroupContainer isExpanded={isExpanded}>
++      <Stack gap={{xs: 'md', sm: 'xl'}}>{children}</Stack>
++    </SourceGroupContainer>
++  );
++}
++
++const RegularExpressionWrapper = styled('div')`
++  input {
++    font-family: ${p => p.theme.font.family.mono};
++  }
++  margin-bottom: ${p => p.theme.space.md};
++`;
++
++const Toggle = styled(Button)`
++  font-weight: ${p => p.theme.font.weight.sans.medium};
++  color: ${p => p.theme.tokens.content.secondary};
++  &:hover,
++  &:focus {
++    color: ${p => p.theme.tokens.content.primary};
++  }
++  > *:first-child {
++    display: grid;
++    gap: ${p => p.theme.space.xs};
++    grid-template-columns: repeat(2, max-content);
++    align-items: center;
++  }
++`;
++
++const ReplaceCapturedLabel = styled('label')<{disabled: boolean}>`
++  font-weight: normal;
++  margin-bottom: 0;
++  line-height: 1rem;
++  ${p =>
++    p.disabled &&
++    css`
++      color: ${p.theme.tokens.content.disabled};
++    `}
++`;
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/edit.spec.tsx b/static/app/views/settings/components/dataScrubbing/modals/edit.spec.tsx
+index 2947696979de5f..4e03d9d0f7c180 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/edit.spec.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/edit.spec.tsx
+@@ -1,10 +1,10 @@
+ import {DataScrubbingRelayPiiConfigFixture} from 'sentry-fixture/dataScrubbingRelayPiiConfig';
+-import {createMockAttributeResults} from 'sentry-fixture/log';
+ import {OrganizationFixture} from 'sentry-fixture/organization';
+ 
+-import {render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
++import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+ import selectEvent from 'sentry-test/selectEvent';
+ 
++import {addErrorMessage} from 'sentry/actionCreators/indicator';
+ import {
+   makeClosableHeader,
+   makeCloseButton,
+@@ -14,7 +14,6 @@ import {
+ import {OrganizationContext} from 'sentry/views/organizationContext';
+ import {convertRelayPiiConfig} from 'sentry/views/settings/components/dataScrubbing/convertRelayPiiConfig';
+ import Edit from 'sentry/views/settings/components/dataScrubbing/modals/edit';
+-import submitRules from 'sentry/views/settings/components/dataScrubbing/submitRules';
+ import {MethodType, RuleType} from 'sentry/views/settings/components/dataScrubbing/types';
+ import {
+   getMethodLabel,
+@@ -22,6 +21,8 @@ import {
+   valueSuggestions,
+ } from 'sentry/views/settings/components/dataScrubbing/utils';
+ 
++jest.mock('sentry/actionCreators/indicator');
++
+ const relayPiiConfig = DataScrubbingRelayPiiConfigFixture();
+ const stringRelayPiiConfig = JSON.stringify(relayPiiConfig);
+ const organizationSlug = 'sentry';
+@@ -31,12 +32,12 @@ const rule = rules[2]!;
+ const projectId = 'foo';
+ const endpoint = `/projects/${organizationSlug}/${projectId}/`;
+ const api = new MockApiClient();
+-const emptyAttributeResults = createMockAttributeResults(true);
+-const mockAttributeResults = createMockAttributeResults();
+-
+-jest.mock('sentry/views/settings/components/dataScrubbing/submitRules');
+ 
+ describe('Edit Modal', () => {
++  beforeEach(() => {
++    localStorage.clear();
++  });
++
+   it('open Edit Rule Modal', async () => {
+     const handleCloseModal = jest.fn();
+ 
+@@ -54,7 +55,6 @@ describe('Edit Modal', () => {
+         orgSlug={organizationSlug}
+         onSubmitSuccess={jest.fn()}
+         rule={rule}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -64,8 +64,7 @@ describe('Edit Modal', () => {
+ 
+     // Method Field
+     expect(screen.getByText('Method')).toBeInTheDocument();
+-    await userEvent.hover(screen.getAllByTestId('more-information')[0]!);
+-    expect(await screen.findByText('What to do')).toBeInTheDocument();
++    expect(screen.getByText('What to do')).toBeInTheDocument();
+     await userEvent.click(screen.getByText('Replace'));
+ 
+     Object.values(MethodType)
+@@ -76,17 +75,15 @@ describe('Edit Modal', () => {
+ 
+     // Placeholder Field
+     expect(screen.getByText('Custom Placeholder (Optional)')).toBeInTheDocument();
+-    await userEvent.hover(screen.getAllByTestId('more-information')[1]!);
+     expect(
+-      await screen.findByText('It will replace the default placeholder [Filtered]')
++      screen.getByText('It will replace the default placeholder [Filtered]')
+     ).toBeInTheDocument();
+     expect(screen.getByPlaceholderText('[Filtered]')).toBeInTheDocument();
+ 
+     // Type Field
+     expect(screen.getByText('Data Type')).toBeInTheDocument();
+-    await userEvent.hover(screen.getAllByTestId('more-information')[2]!);
+     expect(
+-      await screen.findByText(
++      screen.getByText(
+         'What to look for. Use an existing pattern or define your own using regular expressions.'
+       )
+     ).toBeInTheDocument();
+@@ -102,14 +99,10 @@ describe('Edit Modal', () => {
+ 
+     // Regex matches Field
+     expect(screen.getAllByText('Regex matches')).toHaveLength(2);
+-    await userEvent.hover(screen.getAllByTestId('more-information')[3]!);
+     expect(
+-      await screen.findByText('Custom regular expression (see documentation)')
++      screen.getByText('Custom regular expression (see documentation)')
+     ).toBeInTheDocument();
+-    expect(screen.getByRole('textbox', {name: 'Regex matches'})).toHaveAttribute(
+-      'placeholder',
+-      '[a-zA-Z0-9]+'
+-    );
++    expect(screen.getByPlaceholderText('[a-zA-Z0-9]+')).toBeInTheDocument();
+ 
+     // Event ID
+     expect(
+@@ -118,12 +111,6 @@ describe('Edit Modal', () => {
+ 
+     // Source Field
+     expect(screen.getByText('Source')).toBeInTheDocument();
+-    await userEvent.hover(screen.getAllByTestId('more-information')[4]!);
+-    expect(
+-      await screen.findByText(
+-        'Where to look. In the simplest case this can be an attribute name.'
+-      )
+-    ).toBeInTheDocument();
+     expect(screen.getByRole('textbox', {name: 'Source'})).toHaveAttribute(
+       'placeholder',
+       'Enter a custom attribute, variable or header name'
+@@ -135,6 +122,12 @@ describe('Edit Modal', () => {
+   });
+ 
+   it('edit Rule Modal', async () => {
++    const mockPutRequest = MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      body: {relayPiiConfig: '{}'},
++    });
++
+     render(
+       <Edit
+         Body={ModalBody}
+@@ -149,7 +142,6 @@ describe('Edit Modal', () => {
+         orgSlug={organizationSlug}
+         onSubmitSuccess={jest.fn()}
+         rule={rule}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -175,25 +167,17 @@ describe('Edit Modal', () => {
+     // Save rule
+     await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
+ 
+-    expect(submitRules).toHaveBeenCalledWith(api, endpoint, [
+-      {
+-        id: 0,
+-        method: 'replace',
+-        type: 'password',
+-        source: 'password',
+-        placeholder: 'Scrubbed',
+-      },
+-      {id: 1, method: 'mask', type: 'creditcard', source: '$message'},
+-      {
+-        id: 2,
+-        method: 'mask',
+-        pattern: '',
+-        placeholder: '',
+-        replaceCaptured: false,
+-        type: 'anything',
+-        source: valueSuggestions[2]!.value,
+-      },
+-    ]);
++    await waitFor(() => {
++      expect(mockPutRequest).toHaveBeenCalled();
++    });
++
++    // Verify the submitted PII config has the edited rule
++    const submittedData = JSON.parse(mockPutRequest.mock.calls[0][1].data.relayPiiConfig);
++    // Rule at index 2 should now be "anything" type with "mask" method
++    expect(submittedData.rules['2']).toEqual({
++      type: 'anything',
++      redaction: {method: 'mask'},
++    });
+   });
+ 
+   it('does not show dataset selector without ourlogs-enabled feature', () => {
+@@ -211,7 +195,6 @@ describe('Edit Modal', () => {
+         orgSlug={organizationSlug}
+         onSubmitSuccess={jest.fn()}
+         rule={rule}
+-        attributeResults={emptyAttributeResults}
+       />
+     );
+ 
+@@ -222,6 +205,103 @@ describe('Edit Modal', () => {
+     expect(screen.queryByText('Dataset')).not.toBeInTheDocument();
+     expect(screen.queryByText('Logs')).not.toBeInTheDocument();
+   });
++
++  it('surfaces invalid selector error on source field', async () => {
++    MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      statusCode: 400,
++      body: {relayPiiConfig: ['invalid selector: \n1 | bad$$selector']},
++    });
++
++    render(
++      <Edit
++        Body={ModalBody}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        Header={makeClosableHeader(jest.fn())}
++        Footer={ModalFooter}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++        rule={rule}
++      />
++    );
++
++    await selectEvent.select(screen.getByText('Replace'), 'Mask');
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    expect(await screen.findByText(/Invalid source value/)).toBeInTheDocument();
++  });
++
++  it('surfaces regex parse error on pattern field', async () => {
++    MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      statusCode: 400,
++      body: {relayPiiConfig: ['regex parse error:\nerror: unclosed group']},
++    });
++
++    render(
++      <Edit
++        Body={ModalBody}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        Header={makeClosableHeader(jest.fn())}
++        Footer={ModalFooter}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++        rule={rule}
++      />
++    );
++
++    await selectEvent.select(screen.getByText('Replace'), 'Mask');
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    expect(await screen.findByText(/Invalid regex/)).toBeInTheDocument();
++  });
++
++  it('shows toast for unknown server error', async () => {
++    MockApiClient.addMockResponse({
++      url: endpoint,
++      method: 'PUT',
++      statusCode: 400,
++      body: {relayPiiConfig: ['something unexpected']},
++    });
++
++    render(
++      <Edit
++        Body={ModalBody}
++        closeModal={jest.fn()}
++        CloseButton={makeCloseButton(jest.fn())}
++        Header={makeClosableHeader(jest.fn())}
++        Footer={ModalFooter}
++        projectId={projectId}
++        savedRules={rules}
++        api={api}
++        endpoint={endpoint}
++        orgSlug={organizationSlug}
++        onSubmitSuccess={jest.fn()}
++        rule={rule}
++      />
++    );
++
++    await selectEvent.select(screen.getByText('Replace'), 'Mask');
++    await userEvent.click(screen.getByRole('button', {name: 'Save Rule'}));
++
++    await waitFor(() => {
++      expect(addErrorMessage).toHaveBeenCalledWith(
++        'An unknown error occurred while saving data scrubbing rule'
++      );
++    });
++  });
+ });
+ 
+ describe('Edit Modal with ourlogs-enabled', () => {
+@@ -230,6 +310,7 @@ describe('Edit Modal with ourlogs-enabled', () => {
+   });
+ 
+   beforeEach(() => {
++    localStorage.clear();
+     MockApiClient.clearMockResponses();
+     MockApiClient.addMockResponse({
+       url: `/organizations/${organization.slug}/trace-items/attributes/`,
+@@ -260,7 +341,6 @@ describe('Edit Modal with ourlogs-enabled', () => {
+           orgSlug={organizationSlug}
+           onSubmitSuccess={jest.fn()}
+           rule={rule}
+-          attributeResults={mockAttributeResults}
+         />
+       </OrganizationContext.Provider>
+     );
+@@ -286,7 +366,6 @@ describe('Edit Modal with ourlogs-enabled', () => {
+           orgSlug={organizationSlug}
+           onSubmitSuccess={jest.fn()}
+           rule={rule}
+-          attributeResults={mockAttributeResults}
+         />
+       </OrganizationContext.Provider>
+     );
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/edit.tsx b/static/app/views/settings/components/dataScrubbing/modals/edit.tsx
+index 64bdfc931cf60a..8863251161b784 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/edit.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/edit.tsx
+@@ -1,19 +1,16 @@
+ import {t} from 'sentry/locale';
+-import type {
+-  AttributeResults,
+-  Rule,
+-} from 'sentry/views/settings/components/dataScrubbing/types';
++import type {Rule} from 'sentry/views/settings/components/dataScrubbing/types';
+ 
+-import ModalManager, {type ModalManagerProps} from './modalManager';
++import {DataScrubFormModal, type DataScrubFormModalProps} from './dataScrubFormModal';
+ 
+-type Props = Omit<ModalManagerProps, 'title' | 'initialValues' | 'onGetNewRules'> & {
+-  attributeResults: AttributeResults;
++type Props = Omit<DataScrubFormModalProps, 'title' | 'initialState' | 'onGetNewRules'> & {
+   rule: Rule;
++  savedRules: Rule[];
+ };
+ 
+ function Edit({savedRules, rule, ...props}: Props) {
+   const handleGetNewRules = (
+-    values: Parameters<ModalManagerProps['onGetNewRules']>[0]
++    values: Parameters<DataScrubFormModalProps['onGetNewRules']>[0]
+   ) => {
+     const updatedRule = {...values, id: rule.id};
+ 
+@@ -28,9 +25,8 @@ function Edit({savedRules, rule, ...props}: Props) {
+   };
+ 
+   return (
+-    <ModalManager
++    <DataScrubFormModal
+       {...props}
+-      savedRules={savedRules}
+       title={t('Edit an advanced data scrubbing rule')}
+       initialState={rule}
+       onGetNewRules={handleGetNewRules}
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.spec.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.spec.tsx
+index ed875065003ec2..c0a77a4c99f489 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.spec.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.spec.tsx
+@@ -11,6 +11,15 @@ import {useLocation} from 'sentry/utils/useLocation';
+ import AttributeField from 'sentry/views/settings/components/dataScrubbing/modals/form/attributeField';
+ import {AllowedDataScrubbingDatasets} from 'sentry/views/settings/components/dataScrubbing/types';
+ 
++const defaultFieldProps = {
++  'aria-describedby': 'source-hint',
++  'aria-invalid': false,
++  disabled: false,
++  id: 'source',
++  name: 'source',
++  onBlur: jest.fn(),
++};
++
+ jest.mock('sentry/utils/useLocation');
+ const mockedUseLocation = jest.mocked(useLocation);
+ 
+@@ -69,6 +78,7 @@ describe('AttributeField', () => {
+     const value = 'user.email';
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={jest.fn()}
+         value={value}
+@@ -87,6 +97,7 @@ describe('AttributeField', () => {
+     const value = '';
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={jest.fn()}
+         value={value}
+@@ -115,6 +126,7 @@ describe('AttributeField', () => {
+     const value = 'user';
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={jest.fn()}
+         value={value}
+@@ -146,6 +158,7 @@ describe('AttributeField', () => {
+     const value = '';
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={handleOnChange}
+         value={value}
+@@ -176,6 +189,7 @@ describe('AttributeField', () => {
+ 
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={handleOnChange}
+         value={value}
+@@ -205,6 +219,7 @@ describe('AttributeField', () => {
+ 
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={handleOnChange}
+         value={value}
+@@ -232,6 +247,7 @@ describe('AttributeField', () => {
+     const value = '';
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={jest.fn()}
+         value={value}
+@@ -262,6 +278,7 @@ describe('AttributeField', () => {
+ 
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={jest.fn()}
+         onBlur={handleOnBlur}
+@@ -287,6 +304,7 @@ describe('AttributeField', () => {
+ 
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={handleOnChange}
+         value={value}
+@@ -324,6 +342,7 @@ describe('AttributeField', () => {
+ 
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={jest.fn()}
+         value={value}
+@@ -383,6 +402,7 @@ describe('AttributeField', () => {
+ 
+     render(
+       <AttributeField
++        fieldProps={defaultFieldProps}
+         dataset={AllowedDataScrubbingDatasets.LOGS}
+         onChange={jest.fn()}
+         value={value}
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.tsx
+index 9371186b9c7ee4..c4020de23e6e7f 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/form/attributeField.tsx
+@@ -3,7 +3,6 @@ import styled from '@emotion/styled';
+ 
+ import {Input} from '@sentry/scraps/input';
+ 
+-import FieldGroup from 'sentry/components/forms/fieldGroup';
+ import LoadingIndicator from 'sentry/components/loadingIndicator';
+ import TextOverflow from 'sentry/components/textOverflow';
+ import {t} from 'sentry/locale';
+@@ -22,20 +21,29 @@ import {
+ } from 'sentry/views/settings/components/dataScrubbing/types';
+ import {TraceItemFieldSelector} from 'sentry/views/settings/components/dataScrubbing/utils';
+ 
++type FieldProps = {
++  'aria-describedby': string;
++  'aria-invalid': boolean;
++  disabled: boolean;
++  id: string;
++  name: string;
++  onBlur: () => void;
++};
++
+ type Props = {
+   dataset: AllowedDataScrubbingDatasets;
++  fieldProps: FieldProps;
+   onChange: (value: string) => void;
+   value: string;
+-  error?: string;
+   onBlur?: (value: string, event: React.FocusEvent<HTMLInputElement>) => void;
+   projectId?: Project['id'];
+ };
+ 
+ export default function AttributeField({
+   dataset,
++  fieldProps,
+   onChange,
+   value,
+-  error,
+   onBlur,
+   projectId,
+ }: Props) {
+@@ -133,8 +141,9 @@ export default function AttributeField({
+         setShowSuggestions(false);
+       }, 150);
+       onBlur?.(event.target.value, event);
++      fieldProps.onBlur();
+     },
+-    [onBlur]
++    [onBlur, fieldProps]
+   );
+ 
+   const handleClickSuggestion = useCallback(
+@@ -180,48 +189,39 @@ export default function AttributeField({
+   );
+ 
+   return (
+-    <FieldGroup
+-      label={t('Attribute')}
+-      help={t('The attribute to scrub')}
+-      inline={false}
+-      flexibleControlStateSize
+-      stacked
+-      required
+-      showHelpInTooltip
+-    >
+-      <Wrapper>
+-        {traceItemAttributeStringsResult.isLoading &&
+-        !Object.keys(suggestedAttributeValues).length ? (
+-          <LoadingIndicator style={{margin: '0 auto'}} size={20} />
+-        ) : (
+-          <Fragment>
+-            <StyledInput
+-              type="text"
+-              placeholder={t('Select or type attribute')}
+-              value={_field}
+-              onChange={handleChange}
+-              onFocus={handleFocus}
+-              onBlur={handleBlur}
+-              onKeyDown={handleKeyDown}
+-              error={!!error}
+-            />
+-            {showSuggestions && filteredSuggestions.length > 0 && (
+-              <Suggestions>
+-                {filteredSuggestions.slice(0, 50).map((suggestion, index) => (
+-                  <Suggestion
+-                    key={suggestion.value}
+-                    active={index === activeSuggestion}
+-                    onClick={() => handleClickSuggestion(suggestion)}
+-                  >
+-                    <TextOverflow>{suggestion.value}</TextOverflow>
+-                  </Suggestion>
+-                ))}
+-              </Suggestions>
+-            )}
+-          </Fragment>
+-        )}
+-      </Wrapper>
+-    </FieldGroup>
++    <Wrapper>
++      {traceItemAttributeStringsResult.isLoading &&
++      !Object.keys(suggestedAttributeValues).length ? (
++        <LoadingIndicator style={{margin: '0 auto'}} size={20} />
++      ) : (
++        <Fragment>
++          <StyledInput
++            {...fieldProps}
++            type="text"
++            aria-label={t('Attribute')}
++            placeholder={t('Select or type attribute')}
++            value={_field}
++            onChange={handleChange}
++            onFocus={handleFocus}
++            onBlur={handleBlur}
++            onKeyDown={handleKeyDown}
++          />
++          {showSuggestions && filteredSuggestions.length > 0 && (
++            <Suggestions>
++              {filteredSuggestions.slice(0, 50).map((suggestion, index) => (
++                <Suggestion
++                  key={suggestion.value}
++                  active={index === activeSuggestion}
++                  onClick={() => handleClickSuggestion(suggestion)}
++                >
++                  <TextOverflow>{suggestion.value}</TextOverflow>
++                </Suggestion>
++              ))}
++            </Suggestions>
++          )}
++        </Fragment>
++      )}
++    </Wrapper>
+   );
+ }
+ 
+@@ -230,7 +230,7 @@ const Wrapper = styled('div')`
+   width: 100%;
+ `;
+ 
+-const StyledInput = styled(Input)<{error: boolean}>`
++const StyledInput = styled(Input)`
+   width: 100%;
+ `;
+ 
+@@ -242,9 +242,9 @@ const Suggestions = styled('ul')`
+   margin-bottom: 0;
+   box-shadow: 0 2px 0 rgba(37, 11, 54, 0.04);
+   border: 1px solid ${p => p.theme.tokens.border.primary};
+-  border-radius: 0 0 ${p => p.theme.space.xs} ${p => p.theme.space.xs};
++  border-radius: ${p => p.theme.space.xs};
+   background: ${p => p.theme.tokens.background.primary};
+-  top: 100%;
++  top: calc(100% + ${p => p.theme.space.xs});
+   left: 0;
+   z-index: 1002;
+   overflow: hidden;
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.spec.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.spec.tsx
+index a7e8b757850335..1f86fa16314f32 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.spec.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.spec.tsx
+@@ -1,115 +1,234 @@
+-import {render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
+-
+-import EventIdField from 'sentry/views/settings/components/dataScrubbing/modals/form/eventIdField';
+-import {EventIdStatus} from 'sentry/views/settings/components/dataScrubbing/types';
+-
+-const eventIdValue = '887ab369df634e74aea708bcafe1a175';
++import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
++
++import {valueSuggestions} from 'sentry/views/settings/components/dataScrubbing/utils';
++
++import EventIdField from './eventIdField';
++
++const VALID_EVENT_ID = '887ab369df634e74aea708bcafe1a175';
++
++const defaultFieldProps = {
++  'aria-describedby': 'hint-id',
++  'aria-invalid': false,
++  disabled: false,
++  id: 'event-id',
++  name: 'eventId',
++  onBlur: jest.fn(),
++};
++
++function renderEventIdField(
++  props: Partial<React.ComponentProps<typeof EventIdField>> = {}
++) {
++  return render(
++    <EventIdField
++      fieldProps={defaultFieldProps}
++      value=""
++      onChange={jest.fn()}
++      onSuggestionsLoaded={jest.fn()}
++      onErrorChange={jest.fn()}
++      orgSlug="test-org"
++      {...props}
++    />
++  );
++}
+ 
+ describe('EventIdField', () => {
+-  it('default render', async () => {
+-    const handleUpdateEventId = jest.fn();
+-
+-    render(
+-      <EventIdField
+-        onUpdateEventId={handleUpdateEventId}
+-        eventId={{value: '', status: EventIdStatus.UNDEFINED}}
+-      />
+-    );
++  beforeEach(() => {
++    defaultFieldProps.onBlur.mockClear();
++  });
++
++  it('renders input with placeholder', () => {
++    renderEventIdField();
+ 
+-    expect(screen.getByText('Event ID (Optional)')).toBeInTheDocument();
+     expect(screen.getByPlaceholderText('XXXXXXXXXXXXXX')).toBeInTheDocument();
+     expect(screen.getByRole('textbox')).toHaveValue('');
++  });
+ 
+-    await userEvent.hover(screen.getByTestId('more-information'));
++  it('renders with a value', () => {
++    renderEventIdField({value: VALID_EVENT_ID});
+ 
+-    expect(
+-      await screen.findByText(
+-        'Providing an event ID will automatically provide you a list of suggested sources'
+-      )
+-    ).toBeInTheDocument();
++    expect(screen.getByRole('textbox')).toHaveValue(VALID_EVENT_ID);
++  });
+ 
+-    await userEvent.type(
+-      screen.getByRole('textbox'),
+-      '887ab369df634e74aea708bcafe1a175{enter}'
+-    );
++  it('strips hyphens from input on change', async () => {
++    const handleChange = jest.fn();
++    renderEventIdField({onChange: handleChange});
+ 
+-    expect(handleUpdateEventId).toHaveBeenCalled();
++    await userEvent.type(screen.getByRole('textbox'), 'a-b');
++
++    expect(handleChange).toHaveBeenCalledWith('a');
++    expect(handleChange).not.toHaveBeenCalledWith('-');
++    expect(handleChange).toHaveBeenCalledWith('b');
+   });
+ 
+-  it('LOADING status', () => {
+-    render(
+-      <EventIdField
+-        onUpdateEventId={jest.fn()}
+-        eventId={{value: eventIdValue, status: EventIdStatus.LOADING}}
+-      />
++  it('triggers fetch on blur with valid ID', async () => {
++    const onSuggestionsLoaded = jest.fn();
++    const onErrorChange = jest.fn();
++
++    const mockRequest = MockApiClient.addMockResponse({
++      url: '/organizations/test-org/data-scrubbing-selector-suggestions/',
++      body: {suggestions: [{type: 'value', value: '$message'}]},
++    });
++
++    renderEventIdField({
++      value: VALID_EVENT_ID,
++      onSuggestionsLoaded,
++      onErrorChange,
++    });
++
++    await userEvent.click(screen.getByRole('textbox'));
++    await userEvent.tab();
++
++    await waitFor(() => expect(mockRequest).toHaveBeenCalled());
++
++    await waitFor(() =>
++      expect(onSuggestionsLoaded).toHaveBeenCalledWith([
++        {type: 'value', value: '$message'},
++      ])
+     );
++  });
+ 
+-    expect(screen.getByRole('textbox')).toHaveValue(eventIdValue);
++  it('triggers fetch on Enter with valid ID', async () => {
++    const onSuggestionsLoaded = jest.fn();
+ 
+-    expect(screen.getByTestId('saving')).toBeInTheDocument();
++    const mockRequest = MockApiClient.addMockResponse({
++      url: '/organizations/test-org/data-scrubbing-selector-suggestions/',
++      body: {suggestions: [{type: 'value', value: '$message'}]},
++    });
++
++    renderEventIdField({
++      value: VALID_EVENT_ID,
++      onSuggestionsLoaded,
++    });
++
++    await userEvent.type(screen.getByRole('textbox'), '{enter}');
++
++    await waitFor(() => expect(mockRequest).toHaveBeenCalled());
+   });
+ 
+-  it('LOADED status', () => {
+-    render(
+-      <EventIdField
+-        onUpdateEventId={jest.fn()}
+-        eventId={{value: eventIdValue, status: EventIdStatus.LOADED}}
+-      />
+-    );
++  it('shows checkmark on successful fetch with suggestions', async () => {
++    MockApiClient.addMockResponse({
++      url: '/organizations/test-org/data-scrubbing-selector-suggestions/',
++      body: {suggestions: [{type: 'value', value: '$message'}]},
++    });
++
++    renderEventIdField({value: VALID_EVENT_ID});
+ 
+-    expect(screen.getByRole('textbox')).toHaveValue(eventIdValue);
++    await userEvent.click(screen.getByRole('textbox'));
++    await userEvent.tab();
+ 
+-    expect(screen.queryByLabelText('Clear event ID')).not.toBeInTheDocument();
++    expect(await screen.findByTestId('icon-check-mark')).toBeInTheDocument();
++  });
++
++  it('calls onErrorChange with error for invalid event ID on blur', async () => {
++    const onErrorChange = jest.fn();
++    renderEventIdField({
++      value: 'tooshort',
++      onErrorChange,
++    });
++
++    await userEvent.click(screen.getByRole('textbox'));
++    await userEvent.tab();
+ 
+-    expect(screen.getByTestId('icon-check-mark')).toBeInTheDocument();
++    await waitFor(() =>
++      expect(onErrorChange).toHaveBeenCalledWith('This event ID is invalid')
++    );
+   });
+ 
+-  it('ERROR status', async () => {
+-    render(
+-      <EventIdField
+-        onUpdateEventId={jest.fn()}
+-        eventId={{value: eventIdValue, status: EventIdStatus.ERROR}}
+-      />
++  it('calls onErrorChange with error when event ID not found', async () => {
++    const onErrorChange = jest.fn();
++
++    MockApiClient.addMockResponse({
++      url: '/organizations/test-org/data-scrubbing-selector-suggestions/',
++      body: {suggestions: []},
++    });
++
++    renderEventIdField({
++      value: VALID_EVENT_ID,
++      onErrorChange,
++    });
++
++    await userEvent.click(screen.getByRole('textbox'));
++    await userEvent.tab();
++
++    await waitFor(() =>
++      expect(onErrorChange).toHaveBeenCalledWith(
++        'The chosen event ID was not found in projects you have access to'
++      )
+     );
++  });
++
++  it('calls onErrorChange with error on fetch failure', async () => {
++    const onErrorChange = jest.fn();
+ 
+-    await userEvent.hover(screen.getByTestId('icon-close'));
++    MockApiClient.addMockResponse({
++      url: '/organizations/test-org/data-scrubbing-selector-suggestions/',
++      statusCode: 500,
++      body: {detail: 'Internal Error'},
++    });
+ 
+-    expect(await screen.findByText('Clear event ID')).toBeInTheDocument();
++    renderEventIdField({
++      value: VALID_EVENT_ID,
++      onErrorChange,
++    });
+ 
+-    expect(screen.getByRole('textbox')).toHaveValue(eventIdValue);
++    await userEvent.click(screen.getByRole('textbox'));
++    await userEvent.tab();
+ 
+-    expect(
+-      screen.getByText(
++    await waitFor(() =>
++      expect(onErrorChange).toHaveBeenCalledWith(
+         'An error occurred while fetching the suggestions based on this event ID'
+       )
+-    ).toBeInTheDocument();
++    );
+   });
+ 
+-  it('INVALID status', async () => {
+-    render(
+-      <EventIdField
+-        onUpdateEventId={jest.fn()}
+-        eventId={{value: eventIdValue, status: EventIdStatus.INVALID}}
+-      />
+-    );
++  it('resets suggestions to defaults when event ID is not found', async () => {
++    const onSuggestionsLoaded = jest.fn();
++
++    MockApiClient.addMockResponse({
++      url: '/organizations/test-org/data-scrubbing-selector-suggestions/',
++      body: {suggestions: []},
++    });
+ 
+-    expect(await screen.findByRole('textbox')).toHaveValue(eventIdValue);
++    renderEventIdField({
++      value: VALID_EVENT_ID,
++      onSuggestionsLoaded,
++    });
+ 
+-    expect(screen.getByText('This event ID is invalid')).toBeInTheDocument();
++    await userEvent.click(screen.getByRole('textbox'));
++    await userEvent.tab();
++
++    await waitFor(() =>
++      expect(onSuggestionsLoaded).toHaveBeenCalledWith(valueSuggestions)
++    );
+   });
+ 
+-  it('NOTFOUND status', async () => {
+-    render(
+-      <EventIdField
+-        onUpdateEventId={jest.fn()}
+-        eventId={{value: eventIdValue, status: EventIdStatus.NOT_FOUND}}
+-      />
++  it('resets suggestions to defaults when fetch fails', async () => {
++    const onSuggestionsLoaded = jest.fn();
++
++    MockApiClient.addMockResponse({
++      url: '/organizations/test-org/data-scrubbing-selector-suggestions/',
++      statusCode: 500,
++      body: {detail: 'Internal Error'},
++    });
++
++    renderEventIdField({
++      value: VALID_EVENT_ID,
++      onSuggestionsLoaded,
++    });
++
++    await userEvent.click(screen.getByRole('textbox'));
++    await userEvent.tab();
++
++    await waitFor(() =>
++      expect(onSuggestionsLoaded).toHaveBeenCalledWith(valueSuggestions)
+     );
++  });
+ 
+-    expect(await screen.findByRole('textbox')).toHaveValue(eventIdValue);
++  it('shows nothing for UNDEFINED status initially', () => {
++    renderEventIdField();
+ 
+-    expect(
+-      screen.getByText('The chosen event ID was not found in projects you have access to')
+-    ).toBeInTheDocument();
++    expect(screen.queryByTestId('icon-check-mark')).not.toBeInTheDocument();
++    expect(screen.queryByTestId('icon-close')).not.toBeInTheDocument();
++    expect(screen.queryByTestId('loading-indicator')).not.toBeInTheDocument();
+   });
+ });
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.tsx
+index 2148d618321507..322207de91703b 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/form/eventIdField.tsx
+@@ -1,116 +1,163 @@
+-import {useEffect, useState} from 'react';
++import {useCallback, useState} from 'react';
+ import styled from '@emotion/styled';
++import {useQueryClient} from '@tanstack/react-query';
+ 
+ import {Input} from '@sentry/scraps/input';
+ import {Flex} from '@sentry/scraps/layout';
+ 
+-import FieldGroup from 'sentry/components/forms/fieldGroup';
+ import {t} from 'sentry/locale';
++import {apiOptions} from 'sentry/utils/api/apiOptions';
+ import {useSourceGroupData} from 'sentry/views/settings/components/dataScrubbing/modals/utils';
+-import type {EventId} from 'sentry/views/settings/components/dataScrubbing/types';
++import type {SourceSuggestion} from 'sentry/views/settings/components/dataScrubbing/types';
+ import {EventIdStatus} from 'sentry/views/settings/components/dataScrubbing/types';
++import {valueSuggestions} from 'sentry/views/settings/components/dataScrubbing/utils';
+ 
+ import EventIdFieldStatusIcon from './eventIdFieldStatusIcon';
+ 
++const suggestionOptions = (
++  orgSlug: string,
++  query: {eventId: string; projectId?: string}
++) =>
++  apiOptions.as<{suggestions: SourceSuggestion[]}>()(
++    '/organizations/$organizationIdOrSlug/data-scrubbing-selector-suggestions/',
++    {
++      path: {organizationIdOrSlug: orgSlug},
++      query,
++      staleTime: 0,
++    }
++  );
++
++type FieldProps = {
++  'aria-describedby': string;
++  'aria-invalid': boolean;
++  disabled: boolean;
++  id: string;
++  name: string;
++  onBlur: () => void;
++};
++
+ type Props = {
+-  eventId: EventId;
+-  onUpdateEventId: (eventId: string) => void;
+-  disabled?: boolean;
++  fieldProps: FieldProps;
++  onChange: (value: string) => void;
++  onErrorChange: (error: string | undefined) => void;
++  onSuggestionsLoaded: (suggestions: SourceSuggestion[]) => void;
++  orgSlug: string;
++  value: string;
++  projectId?: string;
+ };
+ 
+-function EventIdField({disabled, eventId, onUpdateEventId}: Props) {
+-  const [eventData, setEventData] = useState<EventId>(eventId);
+-  const {saveToSourceGroupData} = useSourceGroupData();
+-
+-  useEffect(() => {
+-    // eslint-disable-next-line react-you-might-not-need-an-effect/no-derived-state
+-    setEventData(eventId);
+-  }, [eventId]);
+-
+-  function getErrorMessage(): string | undefined {
+-    switch (eventData.status) {
+-      case EventIdStatus.INVALID:
+-        return t('This event ID is invalid');
+-      case EventIdStatus.ERROR:
+-        return t(
+-          'An error occurred while fetching the suggestions based on this event ID'
+-        );
+-      case EventIdStatus.NOT_FOUND:
+-        return t('The chosen event ID was not found in projects you have access to');
+-      default:
+-        return undefined;
+-    }
+-  }
++function EventIdField({
++  fieldProps,
++  value,
++  onChange,
++  onSuggestionsLoaded,
++  onErrorChange,
++  orgSlug,
++  projectId,
++}: Props) {
++  const queryClient = useQueryClient();
++  const {sourceGroupData, saveToSourceGroupData} = useSourceGroupData();
++  const [status, setStatus] = useState<EventIdStatus>(() =>
++    sourceGroupData.eventId ? EventIdStatus.LOADED : EventIdStatus.UNDEFINED
++  );
+ 
+-  function isEventIdValid() {
+-    if (eventData.value && eventData.value.length !== 32) {
+-      if (eventData.status !== EventIdStatus.INVALID) {
+-        saveToSourceGroupData(eventData);
+-        setEventData({...eventData, status: EventIdStatus.INVALID});
++  const handleUpdateEventId = useCallback(
++    async (eventId: string) => {
++      if (!eventId) {
++        setStatus(EventIdStatus.UNDEFINED);
++        onErrorChange(undefined);
++        onSuggestionsLoaded(valueSuggestions);
++        saveToSourceGroupData({value: '', status: EventIdStatus.UNDEFINED});
++        return;
+       }
+ 
+-      return false;
+-    }
++      if (eventId.length !== 32) {
++        setStatus(EventIdStatus.INVALID);
++        onErrorChange(t('This event ID is invalid'));
++        return;
++      }
+ 
+-    return true;
+-  }
++      setStatus(EventIdStatus.LOADING);
++      onErrorChange(undefined);
++
++      try {
++        const data = await queryClient.fetchQuery({
++          ...suggestionOptions(orgSlug, {
++            eventId,
++            ...(projectId ? {projectId} : {}),
++          }),
++          retry: false,
++        });
++
++        const {suggestions} = data.json;
++
++        if (suggestions.length > 0) {
++          setStatus(EventIdStatus.LOADED);
++          onErrorChange(undefined);
++          onSuggestionsLoaded(suggestions);
++          saveToSourceGroupData(
++            {value: eventId, status: EventIdStatus.LOADED},
++            suggestions
++          );
++        } else {
++          setStatus(EventIdStatus.NOT_FOUND);
++          onErrorChange(
++            t('The chosen event ID was not found in projects you have access to')
++          );
++          onSuggestionsLoaded(valueSuggestions);
++          saveToSourceGroupData({value: '', status: EventIdStatus.UNDEFINED});
 +        }
-+        validator = SnubaQueryValidator(data=data, context=self.context)
-+        assert validator.is_valid(), validator.errors
-+        assert (
-+            validator.validated_data["aggregate"]
-+            == "per_second(value,sentry.apigateway.proxy_request,counter,none)"
++      } catch {
++        setStatus(EventIdStatus.ERROR);
++        onErrorChange(
++          t('An error occurred while fetching the suggestions based on this event ID')
++        );
++        onSuggestionsLoaded(valueSuggestions);
++        saveToSourceGroupData({value: '', status: EventIdStatus.UNDEFINED});
++      }
++    },
++    [
++      queryClient,
++      orgSlug,
++      projectId,
++      onSuggestionsLoaded,
++      onErrorChange,
++      saveToSourceGroupData,
++    ]
++  );
++
++  const handleBlur = useCallback(() => {
++    handleUpdateEventId(value);
++    fieldProps.onBlur();
++  }, [handleUpdateEventId, value, fieldProps]);
+ 
+   return (
+-    <FieldGroup
+-      data-test-id="event-id-field"
+-      label={t('Event ID (Optional)')}
+-      help={t(
+-        'Providing an event ID will automatically provide you a list of suggested sources'
+-      )}
+-      inline={false}
+-      error={getErrorMessage()}
+-      flexibleControlStateSize
+-      stacked
+-      showHelpInTooltip
+-    >
+-      <Flex align="center" position="relative">
+-        <StyledInput
+-          type="text"
+-          name="eventId"
+-          disabled={disabled}
+-          value={eventData.value}
+-          placeholder={t('XXXXXXXXXXXXXX')}
+-          onChange={event => {
+-            const newEventId = event.target.value.replace(/-/g, '').trim();
+-
+-            if (newEventId !== eventData.value) {
+-              setEventData({
+-                value: newEventId,
+-                status: EventIdStatus.UNDEFINED,
+-              });
+-            }
+-          }}
+-          onKeyDown={event => {
+-            if (event.key === 'Enter' && isEventIdValid()) {
+-              onUpdateEventId(eventData.value);
+-            }
+-          }}
+-          onBlur={event => {
++    <Flex align="center" position="relative" flexGrow={1}>
++      <StyledInput
++        {...fieldProps}
++        type="text"
++        value={value}
++        placeholder={t('XXXXXXXXXXXXXX')}
++        onChange={event => {
++          const newValue = event.target.value.replace(/-/g, '').trim();
++          if (status !== EventIdStatus.UNDEFINED) {
++            setStatus(EventIdStatus.UNDEFINED);
++            onErrorChange(undefined);
++          }
++          onChange(newValue);
++        }}
++        onBlur={handleBlur}
++        onKeyDown={event => {
++          if (event.key === 'Enter') {
+             event.preventDefault();
+-
+-            if (isEventIdValid()) {
+-              onUpdateEventId(eventData.value);
+-            }
+-          }}
+-        />
+-        <Status>
+-          <EventIdFieldStatusIcon
+-            onClickIconClose={() => {
+-              setEventData({
+-                value: '',
+-                status: EventIdStatus.UNDEFINED,
+-              });
+-            }}
+-            status={eventData.status}
+-          />
+-        </Status>
+-      </Flex>
+-    </FieldGroup>
++            handleBlur();
++          }
++        }}
++      />
++      <Status>
++        <EventIdFieldStatusIcon status={status} />
++      </Status>
++    </Flex>
+   );
+ }
+ 
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/eventIdFieldStatusIcon.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/eventIdFieldStatusIcon.tsx
+index fd4e5f91f1cbe1..761166476a8647 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/eventIdFieldStatusIcon.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/form/eventIdFieldStatusIcon.tsx
+@@ -1,31 +1,15 @@
+-import styled from '@emotion/styled';
+-
+-import {Tooltip} from '@sentry/scraps/tooltip';
+-
+-import {ControlState} from 'sentry/components/forms/fieldGroup/controlState';
+-import {IconCheckmark, IconClose} from 'sentry/icons';
+-import {t} from 'sentry/locale';
++import LoadingIndicator from 'sentry/components/loadingIndicator';
++import {IconCheckmark} from 'sentry/icons';
+ import {EventIdStatus} from 'sentry/views/settings/components/dataScrubbing/types';
+ 
+ type Props = {
+-  onClickIconClose: () => void;
+-  status?: EventIdStatus;
++  status: EventIdStatus;
+ };
+ 
+-function EventIdFieldStatusIcon({status, onClickIconClose}: Props) {
++function EventIdFieldStatusIcon({status}: Props) {
+   switch (status) {
+-    case EventIdStatus.ERROR:
+-    case EventIdStatus.INVALID:
+-    case EventIdStatus.NOT_FOUND:
+-      return (
+-        <CloseIcon onClick={onClickIconClose}>
+-          <Tooltip title={t('Clear event ID')}>
+-            <StyledIconClose size="xs" />
+-          </Tooltip>
+-        </CloseIcon>
+-      );
+     case EventIdStatus.LOADING:
+-      return <ControlState isSaving />;
++      return <LoadingIndicator size={16} />;
+     case EventIdStatus.LOADED:
+       return <IconCheckmark variant="success" />;
+     default:
+@@ -34,17 +18,3 @@ function EventIdFieldStatusIcon({status, onClickIconClose}: Props) {
+ }
+ 
+ export default EventIdFieldStatusIcon;
+-
+-const CloseIcon = styled('div')`
+-  :first-child {
+-    line-height: 0;
+-  }
+-`;
+-
+-const StyledIconClose = styled(IconClose)`
+-  color: ${p => p.theme.colors.gray200};
+-  :hover {
+-    color: ${p => p.theme.tokens.content.secondary};
+-  }
+-  cursor: pointer;
+-`;
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/index.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/index.tsx
+deleted file mode 100644
+index c3c90ef15414b3..00000000000000
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/index.tsx
++++ /dev/null
+@@ -1,519 +0,0 @@
+-import {Component, Fragment} from 'react';
+-import {css} from '@emotion/react';
+-import styled from '@emotion/styled';
+-import sortBy from 'lodash/sortBy';
+-
+-import {Alert} from '@sentry/scraps/alert';
+-import {Button} from '@sentry/scraps/button';
+-import {Checkbox} from '@sentry/scraps/checkbox';
+-import {Input} from '@sentry/scraps/input';
+-import {Flex} from '@sentry/scraps/layout';
+-import {Tooltip} from '@sentry/scraps/tooltip';
+-
+-import FieldGroup from 'sentry/components/forms/fieldGroup';
+-import RadioField from 'sentry/components/forms/fields/radioField';
+-import {IconChevron} from 'sentry/icons';
+-import {t} from 'sentry/locale';
+-import {space} from 'sentry/styles/space';
+-import type {Organization} from 'sentry/types/organization';
+-import type {Project} from 'sentry/types/project';
+-import withOrganization from 'sentry/utils/withOrganization';
+-import {hasCaptureGroups} from 'sentry/views/settings/components/dataScrubbing/modals/utils';
+-import {
+-  AllowedDataScrubbingDatasets,
+-  MethodType,
+-  RuleType,
+-  type AttributeResults,
+-  type EditableRule,
+-  type EventId,
+-  type KeysOfUnion,
+-  type SourceSuggestion,
+-} from 'sentry/views/settings/components/dataScrubbing/types';
+-import {
+-  areScrubbingDatasetsEnabled,
+-  getDatasetLabelLong,
+-  getMethodLabel,
+-  getRuleLabel,
+-  TraceItemFieldSelector,
+-  validateTraceItemFieldSelector,
+-} from 'sentry/views/settings/components/dataScrubbing/utils';
+-
+-import AttributeField from './attributeField';
+-import EventIdField from './eventIdField';
+-import SelectField from './selectField';
+-import SourceField from './sourceField';
+-
+-type Values = EditableRule;
+-
+-type Props<V extends Values, K extends keyof V> = {
+-  attributeResults: AttributeResults;
+-  dataset: AllowedDataScrubbingDatasets;
+-  errors: Partial<V>;
+-  eventId: EventId;
+-  onAttributeError: (message: string) => void;
+-  onChange: (field: K, value: V[K]) => void;
+-  onChangeDataset: (dataset: AllowedDataScrubbingDatasets) => void;
+-  onUpdateEventId: (eventId: string) => void;
+-  onValidate: (field: K) => () => void;
+-  organization: Organization;
+-  sourceSuggestions: SourceSuggestion[];
+-  values: V;
+-  projectId?: Project['id'];
+-};
+-
+-type State = {
+-  displayEventId: boolean;
+-};
+-
+-function ReplaceCapturedCheckbox({
+-  values,
+-  onChange,
+-}: {
+-  onChange: (field: 'replaceCaptured', value: boolean) => void;
+-  values: Values;
+-}) {
+-  const disabled = !hasCaptureGroups(values.pattern);
+-  return (
+-    <Tooltip
+-      title={disabled ? t('This rule does not contain capture groups') : undefined}
+-      disabled={!disabled}
+-    >
+-      <Flex gap="xs" align="center">
+-        <Checkbox
+-          id="replace-captured"
+-          name="replaceCaptured"
+-          checked={values.replaceCaptured}
+-          disabled={disabled}
+-          onChange={e => onChange('replaceCaptured', e.target.checked)}
+-        />
+-        <ReplaceCapturedLabel htmlFor="replace-captured" disabled={disabled}>
+-          {t('Only replace first capture match')}
+-        </ReplaceCapturedLabel>
+-      </Flex>
+-    </Tooltip>
+-  );
+-}
+-
+-class Form extends Component<Props<Values, KeysOfUnion<Values>>, State> {
+-  state: State = {
+-    displayEventId: !!this.props.eventId?.value,
+-  };
+-
+-  handleChange =
+-    <K extends keyof Values>(field: K) =>
+-    (event: React.ChangeEvent<HTMLInputElement>) => {
+-      this.props.onChange(field, event.target.value as Values[K]);
+-    };
+-
+-  handleToggleEventId = () => {
+-    this.setState(prevState => ({displayEventId: !prevState.displayEventId}));
+-  };
+-
+-  handleValidateAttributeField = (value: string) => {
+-    // Value here is the event.target.value, which is the text of the attribute.
+-    const traceItemField = TraceItemFieldSelector.fromField(this.props.dataset, value);
+-
+-    if (!traceItemField) {
+-      return;
+-    }
+-
+-    const validation = validateTraceItemFieldSelector(traceItemField);
+-    if (!validation.isValid && validation.error) {
+-      this.props.onAttributeError(validation.error);
+-    }
+-  };
+-
+-  containsRootDeepWildcard = (source: string) => {
+-    // A root level deep wildcard is '**' not preceded by a period (eg. `**` is root level, vs `$attachments.**`)
+-    return /(^|[^.])\*\*$/.test(source);
+-  };
+-
+-  renderWithDatasets() {
+-    const {
+-      values,
+-      onChange,
+-      errors,
+-      onValidate,
+-      sourceSuggestions,
+-      onUpdateEventId,
+-      eventId,
+-      dataset,
+-      projectId,
+-      onChangeDataset,
+-    } = this.props;
+-    const {method, type, source} = values;
+-    const {displayEventId} = this.state;
+-    const containsRootDeepWildcard = this.containsRootDeepWildcard(source);
+-
+-    return (
+-      <Fragment>
+-        <FieldGroup
+-          label={t('Dataset')}
+-          help={t('The dataset targetted by the scrubbing rule')}
+-          inline={false}
+-          flexibleControlStateSize
+-          stacked
+-          showHelpInTooltip
+-        >
+-          <DatasetRadioField
+-            name="dataset"
+-            choices={sortBy(Object.values(AllowedDataScrubbingDatasets)).map(value => [
+-              value,
+-              getDatasetLabelLong(value),
+-            ])}
+-            value={dataset}
+-            onChange={value => {
+-              onChangeDataset(value);
+-              onChange('source', '');
+-            }}
+-          />
+-        </FieldGroup>
+-        <FieldContainer hasTwoColumns={values.method === MethodType.REPLACE}>
+-          <FieldGroup
+-            label={t('Method')}
+-            help={t('What to do')}
+-            inline={false}
+-            flexibleControlStateSize
+-            stacked
+-            showHelpInTooltip
+-          >
+-            <SelectField
+-              placeholder={t('Select method')}
+-              name="method"
+-              options={sortBy(Object.values(MethodType)).map(value => ({
+-                ...getMethodLabel(value),
+-                value,
+-              }))}
+-              value={method}
+-              onChange={value => onChange('method', value?.value)}
+-            />
+-          </FieldGroup>
+-          {values.method === MethodType.REPLACE && (
+-            <FieldGroup
+-              label={t('Custom Placeholder (Optional)')}
+-              help={t('It will replace the default placeholder [Filtered]')}
+-              inline={false}
+-              flexibleControlStateSize
+-              stacked
+-              showHelpInTooltip
+-            >
+-              <Input
+-                type="text"
+-                name="placeholder"
+-                placeholder={`[${t('Filtered')}]`}
+-                onChange={this.handleChange('placeholder')}
+-                value={values.placeholder}
+-              />
+-            </FieldGroup>
+-          )}
+-        </FieldContainer>
+-        <FieldContainer hasTwoColumns={values.type === RuleType.PATTERN}>
+-          <FieldGroup
+-            data-test-id="type-field"
+-            label={t('Data Type')}
+-            help={t(
+-              'What to look for. Use an existing pattern or define your own using regular expressions.'
+-            )}
+-            inline={false}
+-            flexibleControlStateSize
+-            stacked
+-            showHelpInTooltip
+-          >
+-            <SelectField
+-              placeholder={t('Select type')}
+-              name="type"
+-              options={sortBy(Object.values(RuleType)).map(value => ({
+-                label: getRuleLabel(value),
+-                value,
+-              }))}
+-              value={type}
+-              onChange={value => onChange('type', value?.value)}
+-            />
+-          </FieldGroup>
+-          {values.type === RuleType.PATTERN && (
+-            <FieldGroup
+-              label={t('Regex matches')}
+-              help={t('Custom regular expression (see documentation)')}
+-              inline={false}
+-              id="regex-matches"
+-              error={errors?.pattern}
+-              flexibleControlStateSize
+-              stacked
+-              required
+-              showHelpInTooltip
+-            >
+-              <RegularExpression
+-                type="text"
+-                name="pattern"
+-                placeholder={t('[a-zA-Z0-9]+')}
+-                onChange={this.handleChange('pattern')}
+-                value={values.pattern}
+-                onBlur={onValidate('pattern')}
+-                id="regex-matches"
+-              />
+-              <ReplaceCapturedCheckbox values={values} onChange={onChange} />
+-            </FieldGroup>
+-          )}
+-        </FieldContainer>
+-        <SourceGroup>
+-          {dataset === AllowedDataScrubbingDatasets.DEFAULT ? (
+-            <Fragment>
+-              <Flex justify="end">
+-                {displayEventId ? (
+-                  <Toggle priority="link" onClick={this.handleToggleEventId}>
+-                    {t('Hide event ID field')}
+-                    <IconChevron direction="up" size="xs" />
+-                  </Toggle>
+-                ) : (
+-                  <Toggle priority="link" onClick={this.handleToggleEventId}>
+-                    {t('Use event ID for auto-completion')}
+-                    <IconChevron direction="down" size="xs" />
+-                  </Toggle>
+-                )}
+-              </Flex>
+-              <SourceGroup isExpanded={displayEventId}>
+-                {displayEventId && (
+-                  <EventIdField onUpdateEventId={onUpdateEventId} eventId={eventId} />
+-                )}
+-                <SourceField
+-                  onChange={value => onChange('source', value)}
+-                  value={source}
+-                  error={errors?.source}
+-                  onBlur={onValidate('source')}
+-                  isRegExMatchesSelected={type === RuleType.PATTERN}
+-                  suggestions={sourceSuggestions}
+-                />
+-                {containsRootDeepWildcard && (
+-                  <Alert variant="warning" style={{marginTop: space(1)}}>
+-                    {t(
+-                      `Deep wildcards ('**') apply to all datasets unless negated (eg. ** || !$logs.**)`
+-                    )}
+-                  </Alert>
+-                )}
+-              </SourceGroup>
+-            </Fragment>
+-          ) : (
+-            <Fragment>
+-              <AttributeField
+-                dataset={dataset}
+-                onChange={value =>
+-                  onChange(
+-                    'source',
+-                    TraceItemFieldSelector.fromField(dataset, value)?.getSelector() ?? ''
+-                  )
+-                }
+-                value={source}
+-                error={errors?.source}
+-                onBlur={(value, _event) => {
+-                  this.handleValidateAttributeField(value);
+-                  onValidate('source')();
+-                }}
+-                projectId={projectId}
+-              />
+-            </Fragment>
+-          )}
+-        </SourceGroup>
+-      </Fragment>
+-    );
+-  }
+-
+-  render() {
+-    const {
+-      values,
+-      onChange,
+-      errors,
+-      onValidate,
+-      sourceSuggestions,
+-      onUpdateEventId,
+-      eventId,
+-    } = this.props;
+-    const {method, type, source} = values;
+-    const {displayEventId} = this.state;
+-    const traceItemDatasetsEnabled = areScrubbingDatasetsEnabled(this.props.organization);
+-    if (traceItemDatasetsEnabled) {
+-      return this.renderWithDatasets();
+-    }
+-
+-    return (
+-      <Fragment>
+-        <FieldContainer hasTwoColumns={values.method === MethodType.REPLACE}>
+-          <FieldGroup
+-            label={t('Method')}
+-            help={t('What to do')}
+-            inline={false}
+-            flexibleControlStateSize
+-            stacked
+-            showHelpInTooltip
+-          >
+-            <SelectField
+-              placeholder={t('Select method')}
+-              name="method"
+-              options={sortBy(Object.values(MethodType)).map(value => ({
+-                ...getMethodLabel(value),
+-                value,
+-              }))}
+-              value={method}
+-              onChange={value => onChange('method', value?.value)}
+-            />
+-          </FieldGroup>
+-          {values.method === MethodType.REPLACE && (
+-            <FieldGroup
+-              label={t('Custom Placeholder (Optional)')}
+-              help={t('It will replace the default placeholder [Filtered]')}
+-              inline={false}
+-              flexibleControlStateSize
+-              stacked
+-              showHelpInTooltip
+-            >
+-              <Input
+-                type="text"
+-                name="placeholder"
+-                placeholder={`[${t('Filtered')}]`}
+-                onChange={this.handleChange('placeholder')}
+-                value={values.placeholder}
+-              />
+-            </FieldGroup>
+-          )}
+-        </FieldContainer>
+-        <FieldContainer hasTwoColumns={values.type === RuleType.PATTERN}>
+-          <FieldGroup
+-            data-test-id="type-field"
+-            label={t('Data Type')}
+-            help={t(
+-              'What to look for. Use an existing pattern or define your own using regular expressions.'
+-            )}
+-            inline={false}
+-            flexibleControlStateSize
+-            stacked
+-            showHelpInTooltip
+-          >
+-            <SelectField
+-              placeholder={t('Select type')}
+-              name="type"
+-              options={sortBy(Object.values(RuleType)).map(value => ({
+-                label: getRuleLabel(value),
+-                value,
+-              }))}
+-              value={type}
+-              onChange={value => onChange('type', value?.value)}
+-            />
+-          </FieldGroup>
+-          {values.type === RuleType.PATTERN && (
+-            <FieldGroup
+-              label={t('Regex matches')}
+-              help={t('Custom regular expression (see documentation)')}
+-              inline={false}
+-              id="regex-matches"
+-              error={errors?.pattern}
+-              flexibleControlStateSize
+-              stacked
+-              required
+-              showHelpInTooltip
+-            >
+-              <RegularExpression
+-                type="text"
+-                name="pattern"
+-                placeholder={t('[a-zA-Z0-9]+')}
+-                onChange={this.handleChange('pattern')}
+-                value={values.pattern}
+-                onBlur={onValidate('pattern')}
+-                id="regex-matches"
+-              />
+-              <ReplaceCapturedCheckbox values={values} onChange={onChange} />
+-            </FieldGroup>
+-          )}
+-        </FieldContainer>
+-        <Flex justify="end">
+-          {displayEventId ? (
+-            <Toggle priority="link" onClick={this.handleToggleEventId}>
+-              {t('Hide event ID field')}
+-              <IconChevron direction="up" size="xs" />
+-            </Toggle>
+-          ) : (
+-            <Toggle priority="link" onClick={this.handleToggleEventId}>
+-              {t('Use event ID for auto-completion')}
+-              <IconChevron direction="down" size="xs" />
+-            </Toggle>
+-          )}
+-        </Flex>
+-        <SourceGroup isExpanded={displayEventId}>
+-          {displayEventId && (
+-            <EventIdField onUpdateEventId={onUpdateEventId} eventId={eventId} />
+-          )}
+-          <SourceField
+-            onChange={value => onChange('source', value)}
+-            value={source}
+-            error={errors?.source}
+-            onBlur={onValidate('source')}
+-            isRegExMatchesSelected={type === RuleType.PATTERN}
+-            suggestions={sourceSuggestions}
+-          />
+-        </SourceGroup>
+-      </Fragment>
+-    );
+-  }
+-}
+-
+-export default withOrganization(Form);
+-
+-const FieldContainer = styled('div')<{hasTwoColumns: boolean}>`
+-  display: grid;
+-  margin-bottom: ${p => p.theme.space.xl};
+-  @media (min-width: ${p => p.theme.breakpoints.sm}) {
+-    gap: ${p => p.theme.space.xl};
+-    ${p => p.hasTwoColumns && `grid-template-columns: 1fr 1fr;`}
+-    margin-bottom: ${p => p.theme.space.xl};
+-  }
+-`;
+-
+-const SourceGroup = styled('div')<{isExpanded?: boolean}>`
+-  transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1) 0ms;
+-  transition-property: height;
+-  ${p =>
+-    p.isExpanded &&
+-    css`
+-      border-radius: ${p.theme.radius.md};
+-      border: 1px solid ${p.theme.tokens.border.primary};
+-      box-shadow: ${p.theme.dropShadowMedium};
+-      margin: ${space(2)} 0 ${space(3)} 0;
+-      padding: ${space(2)};
+-    `}
+-`;
+-
+-const RegularExpression = styled(Input)`
+-  font-family: ${p => p.theme.font.family.mono};
+-  margin-bottom: ${p => p.theme.space.md};
+-`;
+-
+-const DatasetRadioField = styled(RadioField)`
+-  padding: 0px;
+-  #dataset {
+-    flex-direction: row;
+-  }
+-`;
+-
+-const Toggle = styled(Button)`
+-  font-weight: ${p => p.theme.font.weight.sans.medium};
+-  color: ${p => p.theme.tokens.content.secondary};
+-  &:hover,
+-  &:focus {
+-    color: ${p => p.theme.tokens.content.primary};
+-  }
+-  > *:first-child {
+-    display: grid;
+-    gap: ${p => p.theme.space.xs};
+-    grid-template-columns: repeat(2, max-content);
+-    align-items: center;
+-  }
+-`;
+-
+-const ReplaceCapturedLabel = styled('label')<{disabled: boolean}>`
+-  font-weight: normal;
+-  margin-bottom: 0;
+-  line-height: 1rem;
+-  ${p =>
+-    p.disabled &&
+-    css`
+-      color: ${p.theme.tokens.content.disabled};
+-    `}
+-`;
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/selectField.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/selectField.tsx
+deleted file mode 100644
+index ffb62198e321c3..00000000000000
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/selectField.tsx
++++ /dev/null
+@@ -1,41 +0,0 @@
+-import {Component, createRef} from 'react';
+-
+-import type {ControlProps} from '@sentry/scraps/select';
+-import {Select} from '@sentry/scraps/select';
+-
+-type Props = Pick<
+-  ControlProps,
+-  'value' | 'placeholder' | 'name' | 'onChange' | 'options'
+->;
+-
+-class SelectField extends Component<Props> {
+-  componentDidMount() {
+-    if (!this.selectRef.current) {
+-      return;
+-    }
+-
+-    if (this.selectRef.current?.select?.inputRef) {
+-      this.selectRef.current.select.inputRef.autocomplete = 'off';
+-    }
+-  }
+-
+-  // TODO(ts) The generics in react-select make getting a good type here hard.
+-  selectRef = createRef<any>();
+-
+-  render() {
+-    return (
+-      <Select
+-        {...this.props}
+-        isSearchable={false}
+-        options={this.props.options.map((opt: any) => ({
+-          ...opt,
+-          details: opt.description ? `(${opt.description})` : undefined,
+-        }))}
+-        ref={this.selectRef}
+-        openOnFocus
+-      />
+-    );
+-  }
+-}
+-
+-export default SelectField;
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.spec.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.spec.tsx
+index 4f302da26ee59e..c55ab2f009fe87 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.spec.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.spec.tsx
+@@ -7,10 +7,20 @@ import {
+   valueSuggestions,
+ } from 'sentry/views/settings/components/dataScrubbing/utils';
+ 
++const defaultFieldProps = {
++  'aria-describedby': 'source-hint',
++  'aria-invalid': false,
++  disabled: false,
++  id: 'source',
++  name: 'source',
++  onBlur: jest.fn(),
++};
++
+ describe('Source', () => {
+   it('default render', () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -24,6 +34,7 @@ describe('Source', () => {
+   it('display defaultSuggestions if input is empty and focused', async () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -42,6 +53,7 @@ describe('Source', () => {
+   it('display defaultSuggestions if input is empty, focused and has length 3', async () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -60,6 +72,7 @@ describe('Source', () => {
+   it('display binaryOperatorSuggestions if penultimateFieldValue has type string', async () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -82,6 +95,7 @@ describe('Source', () => {
+   it('display defaultSuggestions + unaryOperatorSuggestions, if penultimateFieldValue has type binary', async () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -102,6 +116,7 @@ describe('Source', () => {
+   it('display binaryOperatorSuggestions if penultimateFieldValue has type value', async () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -124,6 +139,7 @@ describe('Source', () => {
+   it('display binaryOperatorSuggestions if penultimateFieldValue is of typeof Array', async () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -146,6 +162,7 @@ describe('Source', () => {
+   it('display defaultSuggestions if penultimateFieldValue has type unary', async () => {
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={jest.fn()}
+@@ -171,6 +188,7 @@ describe('Source', () => {
+ 
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={handleOnChange}
+@@ -193,6 +211,7 @@ describe('Source', () => {
+ 
+     render(
+       <SourceField
++        fieldProps={defaultFieldProps}
+         isRegExMatchesSelected={false}
+         suggestions={valueSuggestions}
+         onChange={handleOnChange}
+@@ -217,4 +236,89 @@ describe('Source', () => {
+ 
+     expect(handleOnChange).toHaveBeenNthCalledWith(3, 'foo &&');
+   });
++
++  it('pressing Enter does not crash when suggestions are not visible', async () => {
++    const handleOnChange = jest.fn();
++
++    render(
++      <SourceField
++        fieldProps={defaultFieldProps}
++        isRegExMatchesSelected={false}
++        suggestions={valueSuggestions}
++        onChange={handleOnChange}
++        value="$string"
++      />
++    );
++
++    const input = screen.getByRole('textbox', {name: 'Source'});
++
++    // Focus the input to show suggestions, then select one to close the dropdown
++    await userEvent.click(input);
++    await userEvent.keyboard('{Enter}');
++
++    // Suggestions dropdown should now be hidden after selecting
++    expect(screen.queryByTestId('source-suggestions')).not.toBeInTheDocument();
++
++    // Pressing Enter again with suggestions hidden should not crash
++    await userEvent.keyboard('{Enter}');
++  });
++
++  it('pressing Enter allows form submission when suggestions are not visible', async () => {
++    Element.prototype.scrollIntoView = jest.fn();
++    const handleSubmit = jest.fn(e => e.preventDefault());
++
++    render(
++      <form onSubmit={handleSubmit}>
++        <SourceField
++          fieldProps={defaultFieldProps}
++          isRegExMatchesSelected={false}
++          suggestions={valueSuggestions}
++          onChange={jest.fn()}
++          value="foo "
++        />
++        <button type="submit">Submit</button>
++      </form>
++    );
++
++    const input = screen.getByRole('textbox', {name: 'Source'});
++
++    // Open suggestions and select one via Enter — this should NOT submit the form
++    await userEvent.click(input);
++    await userEvent.keyboard('{ArrowDown}{Enter}');
++    expect(handleSubmit).not.toHaveBeenCalled();
++
++    // Suggestions should now be hidden
++    expect(screen.queryByTestId('source-suggestions')).not.toBeInTheDocument();
++
++    // Press Enter again with suggestions hidden — this SHOULD submit the form
++    await userEvent.click(input);
++    await userEvent.keyboard('{Enter}');
++    expect(handleSubmit).toHaveBeenCalledTimes(1);
++  });
++
++  it('pressing Enter to select a suggestion does not submit the parent form', async () => {
++    const handleOnChange = jest.fn();
++    const handleSubmit = jest.fn();
++    Element.prototype.scrollIntoView = jest.fn();
++
++    render(
++      <form onSubmit={handleSubmit}>
++        <SourceField
++          fieldProps={defaultFieldProps}
++          isRegExMatchesSelected={false}
++          suggestions={valueSuggestions}
++          onChange={handleOnChange}
++          value="foo "
++        />
++      </form>
++    );
++
++    await userEvent.click(screen.getByRole('textbox', {name: 'Source'}));
++    await userEvent.keyboard('{ArrowDown}{Enter}');
++
++    // Suggestion was selected
++    expect(handleOnChange).toHaveBeenCalledWith('foo ||');
++    // Form was NOT submitted
++    expect(handleSubmit).not.toHaveBeenCalled();
++  });
+ });
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.tsx b/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.tsx
+index 2f494144276f82..54fdf9f8f05f15 100644
+--- a/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.tsx
++++ b/static/app/views/settings/components/dataScrubbing/modals/form/sourceField.tsx
+@@ -1,7 +1,9 @@
+ import {Component, createRef, Fragment} from 'react';
+ import styled from '@emotion/styled';
+ 
+-import TextField from 'sentry/components/forms/fields/textField';
++import {Input} from '@sentry/scraps/input';
++import {Text} from '@sentry/scraps/text';
++
+ import TextOverflow from 'sentry/components/textOverflow';
+ import {t} from 'sentry/locale';
+ import {defined} from 'sentry/utils';
+@@ -14,17 +16,21 @@ import {
+ 
+ import SourceSuggestionExamples from './sourceSuggestionExamples';
+ 
+-const defaultHelp = t(
+-  'Where to look. In the simplest case this can be an attribute name.'
+-);
++type FieldProps = {
++  'aria-describedby': string;
++  'aria-invalid': boolean;
++  disabled: boolean;
++  id: string;
++  name: string;
++  onBlur: () => void;
++};
+ 
+ type Props = {
++  fieldProps: FieldProps;
+   isRegExMatchesSelected: boolean;
+   onChange: (value: string) => void;
+   suggestions: SourceSuggestion[];
+   value: string;
+-  error?: string;
+-  onBlur?: (value: string, event: React.FocusEvent<HTMLInputElement>) => void;
+ };
+ 
+ type State = {
+@@ -43,7 +49,7 @@ class SourceField extends Component<Props, State> {
+     activeSuggestion: 0,
+     showSuggestions: false,
+     hideCaret: false,
+-    help: defaultHelp,
++    help: '',
+   };
+ 
+   componentDidMount() {
+@@ -300,7 +306,7 @@ class SourceField extends Component<Props, State> {
+     if (help) {
+       if (!isMaybeRegExp) {
+         this.setState({
+-          help: defaultHelp,
++          help: '',
+         });
+       }
+       return;
+@@ -346,7 +352,7 @@ class SourceField extends Component<Props, State> {
+     event.persist();
+ 
+     const {key} = event;
+-    const {activeSuggestion, suggestions} = this.state;
++    const {activeSuggestion, suggestions, showSuggestions} = this.state;
+ 
+     if (key === 'Backspace' || key === ' ') {
+       this.toggleSuggestions(true);
+@@ -354,7 +360,10 @@ class SourceField extends Component<Props, State> {
+     }
+ 
+     if (key === 'Enter') {
+-      this.handleClickSuggestionItem(suggestions[activeSuggestion]!);
++      if (showSuggestions && suggestions.length > 0) {
++        event.preventDefault();
++        this.handleClickSuggestionItem(suggestions[activeSuggestion]!);
++      }
+       return;
+     }
+ 
+@@ -384,37 +393,31 @@ class SourceField extends Component<Props, State> {
+   };
+ 
+   render() {
+-    const {error, value, onBlur} = this.props;
++    const {value, fieldProps} = this.props;
+     const {showSuggestions, suggestions, activeSuggestion, hideCaret, help} = this.state;
+ 
+     return (
+       <Wrapper ref={this.selectorField} hideCaret={hideCaret}>
+-        <StyledTextField
++        <StyledInput
++          {...fieldProps}
+           data-test-id="source-field"
+-          label={t('Source')}
+-          name="source"
++          aria-label={t('Source')}
+           placeholder={t('Enter a custom attribute, variable or header name')}
+-          onChange={this.handleChange}
++          onChange={e => this.handleChange(e.target.value)}
+           autoComplete="off"
+           value={value}
+-          error={error}
+-          help={help}
+-          onKeyDown={this.handleKeyDown}
+-          onBlur={onBlur}
++          onKeyDown={e => this.handleKeyDown(value, e)}
++          onBlur={fieldProps.onBlur}
+           onFocus={this.handleFocus}
+-          inline={false}
+-          flexibleControlStateSize
+-          stacked
+-          required
+-          showHelpInTooltip
+         />
++        {help && (
++          <Text size="sm" variant="muted">
++            {help}
++          </Text>
++        )}
+         {showSuggestions && suggestions.length > 0 && (
+           <Fragment>
+-            <Suggestions
+-              ref={this.suggestionList}
+-              error={error}
+-              data-test-id="source-suggestions"
+-            >
++            <Suggestions ref={this.suggestionList} data-test-id="source-suggestions">
+               {suggestions.slice(0, 50).map((suggestion, index) => (
+                 <Suggestion
+                   key={suggestion.value}
+@@ -456,16 +459,16 @@ const Wrapper = styled('div')<{hideCaret?: boolean}>`
+   ${p => p.hideCaret && `caret-color: transparent;`}
+ `;
+ 
+-const StyledTextField = styled(TextField)`
++const StyledInput = styled(Input)`
+   z-index: 1002;
+   :focus {
+     outline: none;
+   }
+ `;
+ 
+-const Suggestions = styled('ul')<{error?: string}>`
++const Suggestions = styled('ul')`
+   position: absolute;
+-  width: ${p => (p.error ? 'calc(100% - 34px)' : '100%')};
++  width: 100%;
+   padding-left: 0;
+   list-style: none;
+   margin-bottom: 0;
+@@ -473,7 +476,7 @@ const Suggestions = styled('ul')<{error?: string}>`
+   border: 1px solid ${p => p.theme.tokens.border.primary};
+   border-radius: 0 0 ${p => p.theme.space.xs} ${p => p.theme.space.xs};
+   background: ${p => p.theme.tokens.background.primary};
+-  top: 63px;
++  top: 40px;
+   left: 0;
+   z-index: 1002;
+   overflow: hidden;
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/modal.tsx b/static/app/views/settings/components/dataScrubbing/modals/modal.tsx
+deleted file mode 100644
+index 13a9fa54413d0e..00000000000000
+--- a/static/app/views/settings/components/dataScrubbing/modals/modal.tsx
++++ /dev/null
+@@ -1,44 +0,0 @@
+-import {Fragment} from 'react';
+-
+-import {Button} from '@sentry/scraps/button';
+-import {Grid} from '@sentry/scraps/layout';
+-
+-import type {ModalRenderProps} from 'sentry/actionCreators/modal';
+-import {t} from 'sentry/locale';
+-
+-type Props = {
+-  content: React.ReactElement;
+-  disabled: boolean;
+-  onSave: () => void;
+-  title: string;
+-} & ModalRenderProps;
+-
+-function Modal({
+-  title,
+-  onSave,
+-  content,
+-  disabled,
+-  Header,
+-  Body,
+-  Footer,
+-  closeModal,
+-}: Props) {
+-  return (
+-    <Fragment>
+-      <Header closeButton>
+-        <h5>{title}</h5>
+-      </Header>
+-      <Body>{content}</Body>
+-      <Footer>
+-        <Grid flow="column" align="center" gap="lg">
+-          <Button onClick={closeModal}>{t('Cancel')}</Button>
+-          <Button onClick={onSave} disabled={disabled} priority="primary">
+-            {t('Save Rule')}
+-          </Button>
+-        </Grid>
+-      </Footer>
+-    </Fragment>
+-  );
+-}
+-
+-export default Modal;
+diff --git a/static/app/views/settings/components/dataScrubbing/modals/modalManager.tsx b/static/app/views/settings/components/dataScrubbing/modals/modalManager.tsx
+deleted file mode 100644
+index 9fe5fbdadf59fd..00000000000000
+--- a/static/app/views/settings/components/dataScrubbing/modals/modalManager.tsx
++++ /dev/null
+@@ -1,380 +0,0 @@
+-import {Component} from 'react';
+-import * as Sentry from '@sentry/react';
+-import isEqual from 'lodash/isEqual';
+-import omit from 'lodash/omit';
+-
+-import {addErrorMessage} from 'sentry/actionCreators/indicator';
+-import type {ModalRenderProps} from 'sentry/actionCreators/modal';
+-import type {Client} from 'sentry/api';
+-import {t} from 'sentry/locale';
+-import type {Organization} from 'sentry/types/organization';
+-import type {Project} from 'sentry/types/project';
+-import submitRules from 'sentry/views/settings/components/dataScrubbing/submitRules';
+-import type {
+-  AttributeResults,
+-  KeysOfUnion,
+-  Rule,
+-} from 'sentry/views/settings/components/dataScrubbing/types';
+-import {
+-  AllowedDataScrubbingDatasets,
+-  EventIdStatus,
+-  MethodType,
+-  RuleType,
+-} from 'sentry/views/settings/components/dataScrubbing/types';
+-import {
+-  TraceItemFieldSelector,
+-  valueSuggestions,
+-} from 'sentry/views/settings/components/dataScrubbing/utils';
+-
+-import Form from './form';
+-import handleError, {ErrorType} from './handleError';
+-import Modal from './modal';
+-import {hasCaptureGroups, useSourceGroupData} from './utils';
+-
+-type FormProps = React.ComponentProps<typeof Form>;
+-type Values = FormProps['values'];
+-type EventId = NonNullable<FormProps['eventId']>;
+-type SourceSuggestions = FormProps['sourceSuggestions'];
+-
+-export type ModalManagerProps = ModalRenderProps & {
+-  api: Client;
+-  attributeResults: AttributeResults;
+-  endpoint: string;
+-  onGetNewRules: (values: Values) => Rule[];
+-  onSubmitSuccess: (data: {relayPiiConfig: string}) => void;
+-  orgSlug: Organization['slug'];
+-  savedRules: Rule[];
+-  title: string;
+-  initialState?: Partial<Values>;
+-  projectId?: Project['id'];
+-};
+-
+-type ModalManagerWithLocalStorageProps = ModalManagerProps & {
+-  saveToSourceGroupData: (
+-    eventId: EventId,
+-    sourceSuggestions?: SourceSuggestions
+-  ) => void;
+-  sourceGroupData: {eventId: string; sourceSuggestions: SourceSuggestions};
+-};
+-
+-type State = {
+-  dataset: AllowedDataScrubbingDatasets;
+-  errors: FormProps['errors'];
+-  eventId: EventId;
+-  isFormValid: boolean;
+-  requiredValues: Array<keyof Values>;
+-  sourceSuggestions: SourceSuggestions;
+-  values: Values;
+-};
+-
+-class ModalManager extends Component<ModalManagerWithLocalStorageProps, State> {
+-  state = this.getDefaultState();
+-
+-  componentDidMount() {
+-    this.handleValidateForm();
+-  }
+-
+-  componentDidUpdate(_prevProps: ModalManagerWithLocalStorageProps, prevState: State) {
+-    if (!isEqual(prevState.values, this.state.values)) {
+-      this.handleValidateForm();
+-    }
+-
+-    if (prevState.eventId.value !== this.state.eventId.value) {
+-      this.loadSourceSuggestions();
+-    }
+-    if (prevState.eventId.status !== this.state.eventId.status) {
+-      this.props.saveToSourceGroupData(this.state.eventId, this.state.sourceSuggestions);
+-    }
+-  }
+-
+-  getDefaultState(): Readonly<State> {
+-    const {eventId, sourceSuggestions} = this.props.sourceGroupData;
+-    const values = this.getInitialValues();
+-    // Create a temporary rule-like object for dataset determination
+-    const tempRule = {...values, id: 0} as Rule;
+-    const traceItemFieldSelector = TraceItemFieldSelector.fromRule(tempRule);
+-    const dataset =
+-      traceItemFieldSelector?.getDataset() ?? AllowedDataScrubbingDatasets.DEFAULT;
+-
+-    return {
+-      values,
+-      requiredValues: this.getRequiredValues(values),
+-      dataset,
+-      errors: {},
+-      isFormValid: false,
+-      eventId: {
+-        value: eventId,
+-        status: eventId ? EventIdStatus.LOADED : EventIdStatus.UNDEFINED,
+-      },
+-      sourceSuggestions,
+-    } as Readonly<State>;
+-  }
+-
+-  getInitialValues() {
+-    const {initialState} = this.props;
+-    return {
+-      type: initialState?.type ?? RuleType.CREDITCARD,
+-      method: initialState?.method ?? MethodType.MASK,
+-      source: initialState?.source ?? '',
+-      placeholder: initialState?.placeholder ?? '',
+-      pattern: initialState?.pattern ?? '',
+-      replaceCaptured: initialState?.replaceCaptured ?? false,
+-    };
+-  }
+-
+-  getRequiredValues(values: Values) {
+-    const {type} = values;
+-    const requiredValues: Array<KeysOfUnion<Values>> = ['type', 'method', 'source'];
+-
+-    if (type === RuleType.PATTERN) {
+-      requiredValues.push('pattern');
+-    }
+-
+-    return requiredValues;
+-  }
+-
+-  clearError<F extends keyof Values>(field: F) {
+-    this.setState(prevState => ({
+-      errors: omit(prevState.errors, field),
+-    }));
+-  }
+-
+-  async loadSourceSuggestions() {
+-    const {orgSlug, projectId, api} = this.props;
+-    const {eventId} = this.state;
+-
+-    if (!eventId.value) {
+-      this.setState(prevState => ({
+-        sourceSuggestions: valueSuggestions,
+-        eventId: {
+-          ...prevState.eventId,
+-          status: EventIdStatus.UNDEFINED,
+-        },
+-      }));
+-      return;
+-    }
+-
+-    this.setState(prevState => ({
+-      sourceSuggestions: valueSuggestions,
+-      eventId: {
+-        ...prevState.eventId,
+-        status: EventIdStatus.LOADING,
+-      },
+-    }));
+-
+-    try {
+-      const query: {eventId: string; projectId?: string} = {eventId: eventId.value};
+-      if (projectId) {
+-        query.projectId = projectId;
+-      }
+-      const rawSuggestions = await api.requestPromise(
+-        `/organizations/${orgSlug}/data-scrubbing-selector-suggestions/`,
+-        {query}
+-      );
+-      const sourceSuggestions: SourceSuggestions = rawSuggestions.suggestions;
+-
+-      if (sourceSuggestions && sourceSuggestions.length > 0) {
+-        this.setState(prevState => ({
+-          sourceSuggestions,
+-          eventId: {
+-            ...prevState.eventId,
+-            status: EventIdStatus.LOADED,
+-          },
+-        }));
+-        return;
+-      }
+-
+-      this.setState(prevState => ({
+-        sourceSuggestions: valueSuggestions,
+-        eventId: {
+-          ...prevState.eventId,
+-          status: EventIdStatus.NOT_FOUND,
+-        },
+-      }));
+-    } catch {
+-      this.setState(prevState => ({
+-        eventId: {
+-          ...prevState.eventId,
+-          status: EventIdStatus.ERROR,
+-        },
+-      }));
+-    }
+-  }
+-
+-  convertRequestError(error: ReturnType<typeof handleError>) {
+-    switch (error.type) {
+-      case ErrorType.INVALID_SELECTOR:
+-        this.setState(prevState => ({
+-          errors: {
+-            ...prevState.errors,
+-            source: error.message,
+-          },
+-        }));
+-        break;
+-      case ErrorType.REGEX_PARSE:
+-        this.setState(prevState => ({
+-          errors: {
+-            ...prevState.errors,
+-            pattern: error.message,
+-          },
+-        }));
+-        break;
+-      case ErrorType.ATTRIBUTE_INVALID:
+-        this.setState(prevState => ({
+-          errors: {
+-            ...prevState.errors,
+-            source: error.message,
+-          },
+-        }));
+-        break;
+-      default:
+-        addErrorMessage(error.message);
+-    }
+-  }
+-
+-  handleAttributeError = (message: string) => {
+-    this.convertRequestError({
+-      type: ErrorType.ATTRIBUTE_INVALID,
+-      message,
+-    });
+-  };
+-
+-  handleChange = <R extends Rule, K extends KeysOfUnion<R>>(field: K, value: R[K]) => {
+-    const values = {
+-      ...this.state.values,
+-      [field]: value,
+-    };
+-
+-    if (values.type !== RuleType.PATTERN) {
+-      values.pattern = '';
+-      values.replaceCaptured = false;
+-    }
+-
+-    if (values.type === RuleType.PATTERN && !hasCaptureGroups(values.pattern)) {
+-      values.replaceCaptured = false;
+-    }
+-
+-    if (values.method !== MethodType.REPLACE && values.placeholder) {
+-      values.placeholder = '';
+-    }
+-
+-    this.setState(prevState => ({
+-      values,
+-      requiredValues: this.getRequiredValues(values),
+-      errors: omit(prevState.errors, field),
+-    }));
+-  };
+-
+-  handleChangeDataset = (dataset: AllowedDataScrubbingDatasets) => {
+-    if (!dataset) {
+-      Sentry.captureException(new Error('Dataset is required'));
+-      return;
+-    }
+-    this.setState({
+-      dataset,
+-    });
+-  };
+-
+-  handleSave = async () => {
+-    const {endpoint, api, onSubmitSuccess, closeModal, onGetNewRules} = this.props;
+-    const newRules = onGetNewRules(this.state.values);
+-
+-    try {
+-      const data = await submitRules(api, endpoint, newRules);
+-      onSubmitSuccess(data);
+-      closeModal();
+-    } catch (error: any) {
+-      this.convertRequestError(handleError(error));
+-    }
+-  };
+-
+-  handleValidateForm() {
+-    const {values, requiredValues} = this.state;
+-    const isFormValid = requiredValues.every(requiredValue => !!values[requiredValue]);
+-    this.setState({isFormValid});
+-  }
+-
+-  handleValidate =
+-    <K extends keyof Values>(field: K) =>
+-    () => {
+-      const value = this.state.values[field];
+-      if (typeof value !== 'string') {
+-        return;
+-      }
+-
+-      const isFieldValueEmpty = !value.trim();
+-
+-      const fieldErrorAlreadyExist = this.state.errors[field];
+-
+-      if (isFieldValueEmpty && fieldErrorAlreadyExist) {
+-        return;
+-      }
+-
+-      if (isFieldValueEmpty && !fieldErrorAlreadyExist) {
+-        this.setState(prevState => ({
+-          errors: {
+-            ...prevState.errors,
+-            [field]: t('Field Required'),
+-          },
+-        }));
+-        return;
+-      }
+-
+-      if (!isFieldValueEmpty && fieldErrorAlreadyExist) {
+-        this.clearError(field);
+-      }
+-    };
+-
+-  handleUpdateEventId = (eventId: string) => {
+-    if (eventId === this.state.eventId.value) {
+-      return;
+-    }
+-    this.setState({
+-      eventId: {value: eventId, status: EventIdStatus.UNDEFINED},
+-    });
+-  };
+-
+-  render() {
+-    const {values, errors, isFormValid, eventId, sourceSuggestions} = this.state;
+-    const {title, attributeResults, projectId} = this.props;
+-
+-    return (
+-      <Modal
+-        {...this.props}
+-        title={title}
+-        onSave={this.handleSave}
+-        disabled={!isFormValid}
+-        content={
+-          <Form
+-            dataset={this.state.dataset}
+-            onChange={this.handleChange}
+-            onChangeDataset={this.handleChangeDataset}
+-            onValidate={this.handleValidate}
+-            onUpdateEventId={this.handleUpdateEventId}
+-            onAttributeError={this.handleAttributeError}
+-            eventId={eventId}
+-            errors={errors}
+-            values={values}
+-            sourceSuggestions={sourceSuggestions}
+-            attributeResults={attributeResults}
+-            projectId={projectId}
+-          />
+-        }
+-      />
+-    );
+-  }
+-}
+-
+-function ModalManagerWithLocalStorage(props: ModalManagerProps) {
+-  const {sourceGroupData, saveToSourceGroupData} = useSourceGroupData();
+-
+-  return (
+-    <ModalManager
+-      {...props}
+-      sourceGroupData={sourceGroupData}
+-      saveToSourceGroupData={saveToSourceGroupData}
+-    />
+-  );
+-}
+-
+-export default ModalManagerWithLocalStorage;
+diff --git a/static/app/views/settings/components/dataScrubbing/rules.tsx b/static/app/views/settings/components/dataScrubbing/rules.tsx
+index 4fa9f00854a70a..3e24f4f154b1ba 100644
+--- a/static/app/views/settings/components/dataScrubbing/rules.tsx
++++ b/static/app/views/settings/components/dataScrubbing/rules.tsx
+@@ -83,7 +83,7 @@ const List = styled('ul')<{
+   ${p =>
+     p.isDisabled &&
+     css`
+-      color: ${p.theme.colors.gray200};
++      color: ${p.theme.tokens.content.disabled};
+       background: ${p.theme.tokens.background.secondary};
+     `}
+ `;
+@@ -95,10 +95,6 @@ const ListItem = styled('li')`
+   align-items: center;
+   padding: ${p => p.theme.space.md} ${p => p.theme.space.xl};
+   border-bottom: 1px solid ${p => p.theme.tokens.border.primary};
+-  &:hover {
+-    background-color: ${p =>
+-      p.theme.tokens.interactive.transparent.neutral.background.hover};
+-  }
+   &:last-child {
+     border-bottom: 0;
+   }
+diff --git a/static/app/views/settings/components/dataScrubbing/types.tsx b/static/app/views/settings/components/dataScrubbing/types.tsx
+index 3150b68b825905..73110a2eac01d3 100644
+--- a/static/app/views/settings/components/dataScrubbing/types.tsx
++++ b/static/app/views/settings/components/dataScrubbing/types.tsx
+@@ -1,5 +1,3 @@
+-import type {useTraceItemAttributeKeys} from 'sentry/views/explore/hooks/useTraceItemAttributeKeys';
+-
+ export enum RuleType {
+   PATTERN = 'pattern',
+   CREDITCARD = 'creditcard',
+@@ -102,11 +100,6 @@ export type EditableRule = Omit<
+   'id'
+ >;
+ 
+-export type AttributeResults = Record<
+-  AllowedDataScrubbingDatasets,
+-  ReturnType<typeof useTraceItemAttributeKeys> | null
+->;
+-
+ type PiiConfigDefault = {
+   redaction: {
+     method: RuleDefault['method'];
+diff --git a/tests/js/fixtures/log.ts b/tests/js/fixtures/log.ts
+index 175ce4f769a5ed..d0796c2caa99f2 100644
+--- a/tests/js/fixtures/log.ts
++++ b/tests/js/fixtures/log.ts
+@@ -19,9 +19,13 @@ import type {
+   OurLogsResponseItem,
+ } from 'sentry/views/explore/logs/types';
+ import {OurLogKnownFieldKey} from 'sentry/views/explore/logs/types';
+-import type {AttributeResults} from 'sentry/views/settings/components/dataScrubbing/types';
+ import {AllowedDataScrubbingDatasets} from 'sentry/views/settings/components/dataScrubbing/types';
+ 
++type AttributeResults = Record<
++  AllowedDataScrubbingDatasets,
++  ReturnType<typeof useTraceItemAttributeKeys> | null
++>;
++
+ export function LogFixture({
+   [OurLogKnownFieldKey.PROJECT_ID]: projectId,
+   [OurLogKnownFieldKey.ORGANIZATION_ID]: organizationId,
+diff --git a/tests/sentry/event_manager/test_event_manager.py b/tests/sentry/event_manager/test_event_manager.py
+index d3d1542cb82625..6d2bf1f11c8a00 100644
+--- a/tests/sentry/event_manager/test_event_manager.py
++++ b/tests/sentry/event_manager/test_event_manager.py
+@@ -4463,3 +4463,39 @@ def test_processing_errors_not_recorded_when_feature_disabled(
+                 if isinstance(call[0][0], EventProcessingErrorRecorded)
+             ]
+             assert len(processing_error_calls) == 0
++
++
++class SaveAttachmentTest(TestCase):
++    def test_rate_limit_skipped_when_stored_id_set(self) -> None:
++        from sentry.event_manager import save_attachment
++
++        stored_id = "test-stored-id"
++        attachment = CachedAttachment(
++            name="test.txt",
++            stored_id=stored_id,
++            size=100,
 +        )
++
++        mock_putfile = mock.MagicMock()
++        mock_putfile.return_value.content_type = "text/plain"
++        mock_putfile.return_value.size = 100
++        mock_putfile.return_value.sha1 = "abc"
++        mock_putfile.return_value.blob_path = None
++
++        with (
++            mock.patch(
++                "sentry.ratelimits.backend.is_limited_with_value",
++                return_value=(True, 0, 0),
++            ) as mock_rate_limit,
++            mock.patch("sentry.models.eventattachment.EventAttachment.putfile", mock_putfile),
++            mock.patch("sentry.models.eventattachment.EventAttachment.objects.create"),
++        ):
++            save_attachment(
++                cache_key=None,
++                attachment=attachment,
++                project=self.project,
++                event_id="a" * 32,
++            )
++
++        mock_rate_limit.assert_not_called()
++        mock_putfile.assert_called_once()

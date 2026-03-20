@@ -1,106 +1,187 @@
-diff --git a/node/bft/src/helpers/storage.rs b/node/bft/src/helpers/storage.rs
-index a8b6968d0..7b937529b 100644
---- a/node/bft/src/helpers/storage.rs
-+++ b/node/bft/src/helpers/storage.rs
-@@ -22,7 +22,7 @@ use snarkvm::{
-         narwhal::{BatchCertificate, BatchHeader, Transmission, TransmissionID},
-     },
-     prelude::{Address, Field, Network, Result, anyhow, bail, ensure},
--    utilities::{cfg_into_iter, cfg_sorted_by},
-+    utilities::{cfg_into_iter, cfg_iter, cfg_sorted_by},
- };
- 
- use indexmap::{IndexMap, IndexSet, map::Entry};
-@@ -31,7 +31,7 @@ use locktick::parking_lot::RwLock;
- use lru::LruCache;
- #[cfg(not(feature = "locktick"))]
- use parking_lot::RwLock;
--use rayon::iter::{IntoParallelIterator, ParallelIterator};
-+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
- use std::{
-     collections::{HashMap, HashSet},
-     num::NonZeroUsize,
-@@ -497,6 +497,49 @@ impl<N: Network> Storage<N> {
-         Ok(missing_transmissions)
+diff --git a/consensus/src/consensus/inner/mod.rs b/consensus/src/consensus/inner/mod.rs
+index a0412499e..8b5f5efb8 100644
+--- a/consensus/src/consensus/inner/mod.rs
++++ b/consensus/src/consensus/inner/mod.rs
+@@ -68,7 +68,7 @@ impl ConsensusInner {
+         let canon_hashes = self
+             .storage
+             .get_block_hashes(
+-                Some(crate::OLDEST_FORK_THRESHOLD as u32 + 1),
++                Some(crate::OLDEST_FORK_THRESHOLD as u32),
+                 BlockFilter::CanonOnly(BlockOrder::Descending),
+             )
+             .await?;
+diff --git a/storage/src/storage/key_value/store.rs b/storage/src/storage/key_value/store.rs
+index 8d16eef5d..1a4bcc6df 100644
+--- a/storage/src/storage/key_value/store.rs
++++ b/storage/src/storage/key_value/store.rs
+@@ -194,14 +194,6 @@ impl<S: KeyValueStorage + Validator + 'static> SyncStorage for KeyValueStore<S>
+         Ok(())
      }
  
-+    /// Check the validity of a certificate coming from another validator.
-+    ///
-+    /// It suffices to check that the signers (author and endorsers) are members of the applicable committee
-+    /// and that they form a quorum in the committee.
-+    /// Under the fundamental fault tolerance assumption of at most `f` (stake of) faulty validators,
-+    /// the quorum check on signers guarantees that at least one correct validator
-+    /// has ensured the validity of the proposal contained in the certificate,
-+    /// either by construction (by the author) or by checking (by an endorser):
-+    /// given `N > 0` total stake, and `f` the largest integer `< N/3` (where `/` is exact rational division),
-+    /// we have `N >= 3f + 1`, which implies `N - f >= 2f + 1`, which is always `> f`;
-+    /// `N - f` is the quorum stake.
-+    pub fn check_incoming_certificate(&self, certificate: &BatchCertificate<N>) -> Result<()> {
-+        // Retrieve the certificate author and round.
-+        let certificate_author = certificate.author();
-+        let certificate_round = certificate.round();
-+
-+        // Retrieve the committee lookback.
-+        let committee_lookback = self.ledger.get_committee_lookback_for_round(certificate_round)?;
-+
-+        // Ensure that the signers of the certificate reach the quorum threshold.
-+        // Note that certificate.signatures() only returns the endorsing signatures, not the author's signature.
-+        let mut signers: HashSet<Address<N>> =
-+            certificate.signatures().map(|signature| signature.to_address()).collect();
-+        signers.insert(certificate_author);
-+        ensure!(
-+            committee_lookback.is_quorum_threshold_reached(&signers),
-+            "Certificate '{}' for round {certificate_round} does not meet quorum requirements",
-+            certificate.id()
-+        );
-+
-+        // Ensure that the signers of the certificate are in the committee.
-+        cfg_iter!(signers).try_for_each(|signer| {
-+            ensure!(
-+                committee_lookback.is_committee_member(*signer),
-+                "Signer '{signer}' of certificate '{}' for round {certificate_round} is not in the committee",
-+                certificate.id()
-+            );
-+            Ok(())
-+        })?;
-+
-+        Ok(())
-+    }
-+
-     /// Checks the given `certificate` for validity, returning the missing transmissions from storage.
-     ///
-     /// This method ensures the following invariants:
-diff --git a/node/bft/src/primary.rs b/node/bft/src/primary.rs
-index db6364e99..0720c37db 100644
---- a/node/bft/src/primary.rs
-+++ b/node/bft/src/primary.rs
-@@ -960,7 +960,20 @@ impl<N: Network> Primary<N> {
-             bail!("Received a batch certificate for myself ({author})");
-         }
+-    fn cache_block_children(&mut self, _block_hash: Digest, _block_children: Vec<Digest>) {
+-        unimplemented!();
+-    }
+-
+-    fn get_cached_block_children(&mut self, _block_hash: &Digest) -> Option<Vec<Digest>> {
+-        unimplemented!();
+-    }
+-
+     fn get_block_children(&mut self, hash: &Digest) -> Result<Vec<Digest>> {
+         Ok(self
+             .inner()
+diff --git a/storage/src/storage/sqlite/mod.rs b/storage/src/storage/sqlite/mod.rs
+index 2da941431..d1eed88ae 100644
+--- a/storage/src/storage/sqlite/mod.rs
++++ b/storage/src/storage/sqlite/mod.rs
+@@ -15,7 +15,6 @@
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
  
--        // Store the certificate, after ensuring it is valid.
-+        // Ensure that the incoming certificate is valid.
-+        self.storage.check_incoming_certificate(&certificate)?;
-+
-+        // Store the certificate, after ensuring it is valid above.
-+        // The following call recursively fetches and stores
-+        // the previous certificates referenced from this certificate.
-+        // It is critical to make the following call this after validating the certificate above.
-+        // The reason is that a sequence of malformed certificates,
-+        // with references to previous certificates with non-decreasing rounds,
-+        // cause the recursive fetching of certificates to crash the validator due to resource exhaustion.
-+        // Note that if the following call, if not returning an error, guarantees the backward closure of the DAG
-+        // (i.e. that all the referenced previous certificates are in the DAG before storing this one),
-+        // then all the validity checks in [`Storage::check_certificate`] should be redundant.
-+        // TODO: eliminate those redundant checks
-         self.sync_with_certificate_from_peer::<false>(peer_ip, certificate).await?;
+ use anyhow::*;
+-use hash_hasher::{HashBuildHasher, HashedMap, HashedSet};
+ use rusqlite::{
+     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+     Connection,
+@@ -30,14 +29,12 @@ mod sync;
  
-         // If there are enough certificates to reach quorum threshold for the certificate round,
-@@ -968,6 +981,7 @@ impl<N: Network> Primary<N> {
+ pub struct SqliteStorage {
+     conn: Connection,
+-    block_children_cache: HashedMap<Digest, HashedSet<Digest>>,
+ }
  
-         // Retrieve the committee lookback.
-         let committee_lookback = self.ledger.get_committee_lookback_for_round(certificate_round)?;
-+
-         // Retrieve the certificate authors.
-         let authors = self.storage.get_certificate_authors_for_round(certificate_round);
-         // Check if the certificates have reached the quorum threshold.
+ impl SqliteStorage {
+     pub fn new_ephemeral() -> Result<Self> {
+         Ok(Self {
+             conn: Connection::open_in_memory()?,
+-            block_children_cache: HashedMap::with_hasher(HashBuildHasher::default()),
+         })
+     }
+ 
+@@ -47,7 +44,6 @@ impl SqliteStorage {
+                 path,
+                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+             )?,
+-            block_children_cache: HashedMap::with_hasher(HashBuildHasher::default()),
+         })
+     }
+ }
+diff --git a/storage/src/storage/sqlite/sync.rs b/storage/src/storage/sqlite/sync.rs
+index d5d6688d5..33934ffa4 100644
+--- a/storage/src/storage/sqlite/sync.rs
++++ b/storage/src/storage/sqlite/sync.rs
+@@ -16,7 +16,6 @@
+ 
+ use std::convert::TryInto;
+ 
+-use hash_hasher::{HashBuildHasher, HashedSet};
+ use rusqlite::{params, OptionalExtension, Row, ToSql};
+ use snarkvm_dpc::{AleoAmount, MerkleRootHash, Network, PedersenMerkleRootHash, ProofOfSuccinctWork};
+ use tracing::*;
+@@ -159,11 +158,6 @@ impl SyncStorage for SqliteStorage {
+     fn insert_block(&mut self, block: &SerialBlock) -> Result<()> {
+         let hash = block.header.hash();
+ 
+-        self.block_children_cache
+-            .entry(block.header.previous_block_hash.clone())
+-            .or_insert_with(|| HashedSet::with_hasher(HashBuildHasher::default()))
+-            .insert(hash.clone());
+-
+         let mut block_query = self.conn.prepare_cached(
+             r"
+         INSERT INTO blocks (
+@@ -490,17 +484,53 @@ impl SyncStorage for SqliteStorage {
+         })
+     }
+ 
+-    fn cache_block_children(&mut self, block_hash: Digest, block_children: Vec<Digest>) {
+-        self.block_children_cache
+-            .entry(block_hash)
+-            .or_insert_with(|| HashedSet::with_hasher(HashBuildHasher::default()))
+-            .extend(block_children);
+-    }
++    fn longest_child_path(&mut self, block_hash: &Digest) -> Result<Vec<Digest>> {
++        /*
++        alternate total tip (slower due to no temp index)
++        total_tip(parent, remaining) AS (
++            SELECT preferred_tip.sub, preferred_tip.length - 1 FROM preferred_tip
++            UNION ALL
++            SELECT children.sub, total_tip.remaining - 1
++            FROM total_tip
++            INNER JOIN children ON children.parent = total_tip.parent
++            WHERE total_tip.remaining > 0
++        )
+ 
+-    fn get_cached_block_children(&mut self, block_hash: &Digest) -> Option<Vec<Digest>> {
+-        self.block_children_cache
+-            .get(block_hash)
+-            .map(|set| set.iter().cloned().collect())
++        */
++        let mut stmt = self.conn.prepare_cached(
++            r"
++            WITH RECURSIVE
++                children(parent, sub, length) AS (
++                    SELECT ? as hash, NULL, 0 as length
++                    UNION ALL
++                    SELECT blocks.hash, blocks.previous_block_hash, children.length + 1 FROM blocks
++                    INNER JOIN children
++                    WHERE blocks.previous_block_hash = children.parent
++                ),
++                preferred_tip AS (
++                    SELECT parent, sub, length FROM children
++                    WHERE length = (SELECT max(length) as length FROM children)
++                    ORDER BY parent
++                    LIMIT 1
++                ),
++                total_tip(parent, remaining) AS (
++                    SELECT preferred_tip.sub, preferred_tip.length - 1 FROM preferred_tip
++                    UNION ALL
++                    SELECT blocks.previous_block_hash, total_tip.remaining - 1
++                    FROM total_tip
++                    INNER JOIN blocks ON blocks.hash = total_tip.parent
++                    WHERE total_tip.remaining > 0
++                )
++                SELECT sub as hash, 0 as remaining FROM preferred_tip
++                UNION ALL
++                SELECT total_tip.parent, total_tip.remaining as hash FROM total_tip
++                order by remaining;
++        ",
++        )?;
++        let out = stmt
++            .query_map([block_hash], |row| row.get(0))?
++            .collect::<rusqlite::Result<Vec<Digest>>>()?;
++        Ok(out)
+     }
+ 
+     fn get_block_children(&mut self, hash: &Digest) -> Result<Vec<Digest>> {
+diff --git a/storage/src/storage/sync.rs b/storage/src/storage/sync.rs
+index ab9d4e8e3..33e4bc84a 100644
+--- a/storage/src/storage/sync.rs
++++ b/storage/src/storage/sync.rs
+@@ -131,13 +131,7 @@ pub trait SyncStorage {
+         loop {
+             for path in &round {
+                 let last_hash = path.last().unwrap();
+-                let children = if let Some(children) = self.get_cached_block_children(last_hash) {
+-                    children.to_vec()
+-                } else {
+-                    let children = self.get_block_children(last_hash)?;
+-                    self.cache_block_children(last_hash.clone(), children.clone());
+-                    children
+-                };
++                let children = self.get_block_children(last_hash)?;
+                 next_round.extend(children.into_iter().map(|x| {
+                     let mut path = path.clone();
+                     path.push(x);
+@@ -202,12 +196,6 @@ pub trait SyncStorage {
+         Ok(trees.remove(block_hash).expect("missing block hash tree"))
+     }
+ 
+-    /// Stores the immediate children of `block_hash` in a cache.
+-    fn cache_block_children(&mut self, block_hash: Digest, block_children: Vec<Digest>);
+-
+-    /// Attempts to get the immediate children of `block_hash` from a cache.
+-    fn get_cached_block_children(&mut self, block_hash: &Digest) -> Option<Vec<Digest>>;
+-
+     /// Gets the immediate children of `block_hash`.
+     fn get_block_children(&mut self, block_hash: &Digest) -> Result<Vec<Digest>>;
+ 

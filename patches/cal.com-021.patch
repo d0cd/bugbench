@@ -1,13 +1,110 @@
-diff --git a/apps/web/modules/feature-opt-in/components/FeatureOptInBanner.tsx b/apps/web/modules/feature-opt-in/components/FeatureOptInBanner.tsx
-index 32ebfc5e48..628bb8f83f 100644
---- a/apps/web/modules/feature-opt-in/components/FeatureOptInBanner.tsx
-+++ b/apps/web/modules/feature-opt-in/components/FeatureOptInBanner.tsx
-@@ -22,7 +22,7 @@ export function FeatureOptInBanner({
-   return (
-     <div
-       data-testid="feature-opt-in-banner"
--      className="bg-default border-subtle fixed bottom-5 right-5 z-50 max-w-xs rounded-lg border shadow-lg group">
-+      className="group fixed right-5 bottom-5 z-50 hidden max-w-xs rounded-lg border border-subtle bg-default shadow-lg md:block">
-       <div className="p-4">
-         <h3 data-testid="feature-opt-in-banner-title" className="text-emphasis text-lg font-semibold">
-           {t(featureConfig.i18n.title)}
+diff --git a/packages/features/booking-audit/lib/actions/ReassignmentAuditActionService.ts b/packages/features/booking-audit/lib/actions/ReassignmentAuditActionService.ts
+index db2b6c1ba0d0f7..8f812a960383d9 100644
+--- a/packages/features/booking-audit/lib/actions/ReassignmentAuditActionService.ts
++++ b/packages/features/booking-audit/lib/actions/ReassignmentAuditActionService.ts
+@@ -17,7 +17,7 @@ import type {
+ 
+ // Module-level because it is passed to IAuditActionService type outside the class scope
+ const fieldsSchemaV1 = z.object({
+-  organizerUuid: StringChangeSchema,
++  organizerUuid: StringChangeSchema.optional(),
+   hostAttendeeUpdated: z
+     .object({
+       id: z.number().optional(),
+@@ -85,8 +85,8 @@ export class ReassignmentAuditActionService implements IAuditActionService {
+   getDisplayJson({ storedData }: GetDisplayJsonParams): ReassignmentAuditDisplayData {
+     const { fields } = this.parseStored(storedData);
+     return {
+-      previousOrganizerUuid: fields.organizerUuid.old ?? null,
+-      newOrganizerUuid: fields.organizerUuid.new ?? null,
++      previousOrganizerUuid: fields.organizerUuid?.old ?? null,
++      newOrganizerUuid: fields.organizerUuid?.new ?? null,
+       hostAttendeeIdUpdated: fields.hostAttendeeUpdated?.id ?? null,
+       hostAttendeeUserUuidNew: fields.hostAttendeeUpdated?.withUserUuid?.new ?? null,
+       hostAttendeeUserUuidOld: fields.hostAttendeeUpdated?.withUserUuid?.old ?? null,
+@@ -98,10 +98,10 @@ export class ReassignmentAuditActionService implements IAuditActionService {
+     const hasAttendeeUpdated = fields.hostAttendeeUpdated != null;
+     const newHostUuid = hasAttendeeUpdated
+       ? fields.hostAttendeeUpdated?.withUserUuid?.new
+-      : fields.organizerUuid.new;
++      : fields.organizerUuid?.new;
+     const previousHostUuid = hasAttendeeUpdated
+       ? fields.hostAttendeeUpdated?.withUserUuid?.old
+-      : fields.organizerUuid.old;
++      : fields.organizerUuid?.old;
+ 
+     const newUser = newHostUuid ? await this.userRepository.findByUuid({ uuid: newHostUuid }) : null;
+     const previousUser = previousHostUuid
+diff --git a/packages/features/ee/round-robin/roundRobinManualReassignment.test.ts b/packages/features/ee/round-robin/roundRobinManualReassignment.test.ts
+index b3bc4bc5c613d8..a0bd9454fd16dd 100644
+--- a/packages/features/ee/round-robin/roundRobinManualReassignment.test.ts
++++ b/packages/features/ee/round-robin/roundRobinManualReassignment.test.ts
+@@ -1227,7 +1227,8 @@ describe("roundRobinManualReassignment - Audit Data Verification", () => {
+     expect(callArgs.actor).toEqual({ identifiedBy: "user", userUuid: reassigningUser.uuid });
+     expect(callArgs.organizationId).toBe(null);
+     expect(callArgs.source).toBe("WEBAPP");
+-    expect(callArgs.auditData.organizerUuid).toEqual({ old: fixedHost.uuid, new: fixedHost.uuid });
++    // organizerUuid should NOT be included when organizer hasn't changed (fixed host scenario)
++    expect(callArgs.auditData.organizerUuid).toBeUndefined();
+     expect(callArgs.auditData.reassignmentType).toBe("manual");
+     expect(callArgs.auditData.reassignmentReason).toBe("Test reason");
+     expect(callArgs.auditData.hostAttendeeUpdated).toBeDefined();
+diff --git a/packages/features/ee/round-robin/roundRobinManualReassignment.ts b/packages/features/ee/round-robin/roundRobinManualReassignment.ts
+index 7d009cb8a8d46b..38bde4dcc10d07 100644
+--- a/packages/features/ee/round-robin/roundRobinManualReassignment.ts
++++ b/packages/features/ee/round-robin/roundRobinManualReassignment.ts
+@@ -255,7 +255,6 @@ export const roundRobinManualReassignment = async ({
+   }
+ 
+   const bookingEventHandlerService = getBookingEventHandlerService();
+-  const newOrganizerUuid = hasOrganizerChanged ? newUser.uuid : originalOrganizer.uuid;
+ 
+   await bookingEventHandlerService.onReassignment({
+     bookingUid: booking.uid,
+@@ -263,7 +262,9 @@ export const roundRobinManualReassignment = async ({
+     organizationId: orgId,
+     source: actionSource,
+     auditData: {
+-      organizerUuid: { old: originalOrganizer.uuid ?? null, new: newOrganizerUuid ?? null },
++      ...(hasOrganizerChanged
++        ? { organizerUuid: { old: originalOrganizer.uuid, new: newUser.uuid } }
++        : null),
+       ...(attendeeUpdatedId
+         ? {
+             hostAttendeeUpdated: {
+diff --git a/packages/features/ee/round-robin/roundRobinReassignment.test.ts b/packages/features/ee/round-robin/roundRobinReassignment.test.ts
+index e8ce65fcd3e46e..8be59a6f712293 100644
+--- a/packages/features/ee/round-robin/roundRobinReassignment.test.ts
++++ b/packages/features/ee/round-robin/roundRobinReassignment.test.ts
+@@ -690,7 +690,8 @@ describe("roundRobinReassignment - Audit Data Verification", () => {
+     expect(callArgs.actor).toEqual({ identifiedBy: "user", userUuid: reassigningUser.uuid });
+     expect(callArgs.organizationId).toBe(null);
+     expect(callArgs.source).toBe("WEBAPP");
+-    expect(callArgs.auditData.organizerUuid).toEqual({ old: fixedHost.uuid, new: fixedHost.uuid });
++    // organizerUuid should NOT be included when organizer hasn't changed (fixed host scenario)
++    expect(callArgs.auditData.organizerUuid).toBeUndefined();
+     expect(callArgs.auditData.reassignmentType).toBe("roundRobin");
+     expect(callArgs.auditData.reassignmentReason).toBe(null);
+     expect(callArgs.auditData.hostAttendeeUpdated).toBeDefined();
+diff --git a/packages/features/ee/round-robin/roundRobinReassignment.ts b/packages/features/ee/round-robin/roundRobinReassignment.ts
+index 2553a88161a3af..90464a23aac0d3 100644
+--- a/packages/features/ee/round-robin/roundRobinReassignment.ts
++++ b/packages/features/ee/round-robin/roundRobinReassignment.ts
+@@ -293,14 +293,15 @@ export const roundRobinReassignment = async ({
+   }
+ 
+   const bookingEventHandlerService = getBookingEventHandlerService();
+-  const newOrganizerUuid = hasOrganizerChanged ? reassignedRRHost.uuid : originalOrganizer.uuid;
+   await bookingEventHandlerService.onReassignment({
+     bookingUid: booking.uid,
+     actor: makeUserActor(reassignedByUuid),
+     organizationId: orgId,
+     source: actionSource,
+     auditData: {
+-      organizerUuid: { old: originalOrganizer.uuid ?? null, new: newOrganizerUuid ?? null },
++      ...(hasOrganizerChanged
++        ? { organizerUuid: { old: originalOrganizer.uuid, new: reassignedRRHost.uuid } }
++        : null),
+       ...(attendeeUpdatedId
+         ? {
+             hostAttendeeUpdated: {

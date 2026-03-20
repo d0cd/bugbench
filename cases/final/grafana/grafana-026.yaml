@@ -1,6 +1,6 @@
 id: grafana-026
 repo: grafana/grafana
-base_commit: 38e8def7e0862c88b3ed125fb42e5ee4bde57c09^
+base_commit: 4c0f84d73f5f79c6dc2b4b92e41786fc9de1385e
 head_commit: 38e8def7e0862c88b3ed125fb42e5ee4bde57c09
 fix_commit: 38e8def7e0862c88b3ed125fb42e5ee4bde57c09
 category: performance
@@ -15,19 +15,77 @@ description: 'The integration test workflow''s `actions/setup-go` steps use `cac
   misses (root-only changes triggering full re-downloads), degrading CI performance.'
 expected_findings:
 - file: .github/workflows/pr-test-integration.yml
-  line: 0
-  summary: 'Missing `cache-dependency-path` on `actions/setup-go` steps: in a multi-module
-    workspace the default cache key only hashes the root `go.sum`, causing stale hits
-    and false misses. Add `cache-dependency-path: "**/*.sum"` to all setup-go steps.'
+  line: 68
+  summary: 'setup-go uses `cache: true` without `cache-dependency-path`, so the cache
+    key only hashes the root go.sum instead of all *.sum files across the multi-module
+    workspace, causing stale/missed caches'
   line_side: pre_fix
-stats: null
+- file: public/app/features/manage-dashboards/import/utils/inputs.ts
+  line: 65
+  summary: extractV2Inputs is synchronous and calls extractV2Inputs without await,
+    so built-in datasource filtering cannot work since getDataSourceSrv().get() is
+    async
+  line_side: pre_fix
+- file: public/app/features/manage-dashboards/import/utils/inputs.ts
+  line: 529
+  summary: processPanel only replaces target datasource UIDs when the panel-level
+    datasource starts with '$', so targets under built-in datasources like Mixed (uid
+    '-- Mixed --') are never resolved
+  line_side: pre_fix
+stats:
+  lines_added: 1317
+  lines_deleted: 192
+  files_changed: 28
+  hunks: 81
 visibility: public
 needs_manual_review: false
-verified: false
-verified_by: auto-heuristic
+verified: true
+verified_by: auto-v3
 valid_for_code_review: true
 introducing_commit: null
-pr_number: null
-reviewer_notes: []
+case_type: fix
+pr_number: 119968
+reviewer_notes:
+- "[thread] go.mod is supposed to be used for cache keying I believe (correct me if\
+  \ I'm wrong). https://github.com/actions/setup-go/issues/478\r \r NVM i am wrong,\
+  \ maybe? The conclusion of that issue is very confusing and the `main` branch in\
+  \ setup-go still uses `go.sum`, despite the issue being closed because th"
 reviewer_findings: []
 quality_flags: []
+pr_title: 'CI: Fix Go module cache key for integration tests'
+pr_body: "## Summary\n\nAdd `cache-dependency-path: \"**/*.sum\"` to all 6 `actions/setup-go`\
+  \ steps in the integration test workflow.\n\n### Problem\n\nThe integration test\
+  \ workflow uses `actions/setup-go` with `cache: true` but without `cache-dependency-path`.\
+  \ This causes the cache key to only hash the root `go.sum` file, missing the 48\
+  \ other `go.sum` files and `go.work.sum` across the 39-module Go workspace.\n\n\
+  `actions/setup-go` computes a cache key like:\n\n```\nsetup-go-<runner.os>-<runner.arch>-go-<version>-<hash-of-dependency-files>\n\
+  ```\n\nWithout `cache-dependency-path`, only the root `go.sum` is hashed. This leads\
+  \ to:\n\n- **Stale hits**: A sub-module's `go.sum` changes (new dependency) but\
+  \ the root `go.sum` doesn't. The cache key matches an old archive missing the new\
+  \ modules, so Go re-downloads them anyway.\n- **False misses**: The root `go.sum`\
+  \ changes (e.g. `go mod tidy`) but actual dependencies are the same. The key doesn't\
+  \ match, so the entire GOMODCACHE is re-downloaded from scratch across all 36+ shard\
+  \ jobs.\n\n### How `actions/setup-go` caching works\n\n```mermaid\nflowchart TD\n\
+  \    A[\"Compute cache key from:\\n- runner.os\\n- runner.arch\\n- Go version\\\
+  n- hash of dependency files\"] --> B{\"Exact key match\\nin GitHub cache?\"}\n \
+  \   B -->|Yes| C[\"Restore GOMODCACHE + GOCACHE\\nfrom cache archive\"]\n    C -->\
+  \ D[\"cache-hit = true\\n(no downloads needed)\"]\n    B -->|No| E{\"Partial prefix\\\
+  nmatch?\"}\n    E -->|Yes| F[\"Restore best partial match\\n(some downloads needed)\"\
+  ]\n    E -->|No| G[\"No cache restored\\n(full download of ~400 modules)\"]\n  \
+  \  F --> H[\"Post-job: save updated\\ncache under new key\"]\n    G --> H\n```\n\
+  \n**Before (root `go.sum` only):** The dependency hash misses changes in 48 sub-module\
+  \ `go.sum` files and `go.work.sum`, causing frequent stale hits or false misses.\n\
+  \n**After (`**/*.sum`):** The dependency hash covers all 49 `go.sum` files and `go.work.sum`,\
+  \ so the cache key accurately reflects the full workspace dependency state.\n\n\
+  ### Fix\n\nSet `cache-dependency-path: \"**/*.sum\"` so the cache key hashes all\
+  \ 49 `go.sum` files **and** `go.work.sum`, accurately reflecting the full workspace\
+  \ dependency state and improving cache hit rates.\n\nSee [actions/setup-go: Caching\
+  \ in multi-module repositories](https://github.com/actions/setup-go/blob/main/docs/advanced-usage.md#caching-in-multi-module-repositories)\
+  \ for the recommended pattern.\n\n## Test plan\n\n- [ ] Verify cache hit behavior\
+  \ on a follow-up push to this PR (second run should show `cache-hit: true` in the\
+  \ `Setup Go` step logs)\n- [ ] Compare `Setup Go` step duration between this PR\
+  \ and a recent `main` run\n- [ ] Confirm no `go: downloading ...` output during\
+  \ test execution when cache is warm"
+pr_commit_messages:
+- 'CI: Fix Go module cache key for integration tests'
+- trigger CI

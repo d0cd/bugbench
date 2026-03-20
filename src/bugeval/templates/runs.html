@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}bugeval — Runs{% endblock %}
+{% block content %}
+<h1>Runs</h1>
+
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+  <h2 style="margin:0;">Experiments</h2>
+  <button class="btn btn-primary btn-sm" onclick="showNewModal()">New Experiment</button>
+</div>
+
+<div id="experiments-loading" class="card text-muted">Loading...</div>
+<div id="experiments-content" style="display:none;">
+  <div id="active-experiments"></div>
+
+  <h2>All Runs</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Run</th>
+        <th>Raw</th>
+        <th>Normalized</th>
+        <th>Scored</th>
+        <th>Analysis</th>
+        <th>Experiment</th>
+      </tr>
+    </thead>
+    <tbody id="runs-table-body"></tbody>
+  </table>
+
+  <div id="archived-section" style="display:none;margin-top:24px;">
+    <h2 style="cursor:pointer;" onclick="toggleArchived()">
+      Archived <span id="archived-toggle">&#9654;</span>
+    </h2>
+    <div id="archived-experiments" style="display:none;"></div>
+  </div>
+</div>
+
+<!-- New Experiment Modal -->
+<div id="new-exp-modal" style="display:none;position:fixed;inset:0;
+  background:rgba(0,0,0,0.3);z-index:100;
+  align-items:center;justify-content:center;">
+  <div class="card" style="width:480px;max-width:90vw;">
+    <h2 style="margin-top:0;">New Experiment</h2>
+    <form id="new-exp-form" onsubmit="createExperiment(event)">
+      <div class="form-row">
+        <label for="exp-name">Name</label>
+        <input type="text" id="exp-name" required>
+      </div>
+      <div class="form-row">
+        <label for="exp-notes">Notes</label>
+        <textarea id="exp-notes" rows="3"></textarea>
+      </div>
+      <div class="form-row">
+        <label for="exp-runs">Runs</label>
+        <div id="exp-runs-checkboxes" class="text-muted">Loading runs...</div>
+      </div>
+      <div class="actions-bar">
+        <button type="submit" class="btn btn-primary">Create</button>
+        <button type="button" class="btn btn-secondary" onclick="hideNewModal()">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+let _allRuns = [];
+let _archivedOpen = false;
+
+function stageClass(val, total) {
+  if (total <= 0) return 'stage-missing';
+  const pct = val / total * 100;
+  if (pct >= 100) return 'stage-done';
+  if (pct > 0) return 'stage-partial';
+  return 'stage-missing';
+}
+
+function expCard(exp) {
+  const notes = exp.notes.length > 120 ? exp.notes.slice(0, 120) + '...' : exp.notes;
+  return `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+      <div>
+        <h3 style="margin:0 0 4px;text-transform:none;letter-spacing:normal;font-size:14px;">${exp.name}</h3>
+        ${notes ? '<div class="text-muted" style="margin-bottom:6px;">' + notes + '</div>' : ''}
+        <div class="text-muted">${exp.runs.length} run(s) &middot; created ${exp.created || 'unknown'}</div>
+      </div>
+      <div style="display:flex;gap:4px;">
+        <button class="btn btn-secondary btn-sm" onclick="archiveExperiment('${exp.id}')">
+          ${exp.status === 'archived' ? 'Unarchive' : 'Archive'}
+        </button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function render(data) {
+  const active = data.experiments.filter(e => e.status !== 'archived');
+  const archived = data.experiments.filter(e => e.status === 'archived');
+
+  const activeEl = document.getElementById('active-experiments');
+  activeEl.innerHTML = active.length
+    ? active.map(expCard).join('')
+    : '<div class="card text-muted">No active experiments.</div>';
+
+  // Build run->experiment lookup
+  const runExpMap = {};
+  for (const exp of data.experiments) {
+    for (const r of exp.runs) {
+      runExpMap[r.name] = exp.name;
+    }
+  }
+
+  // All runs table
+  const allRuns = [...data.ungrouped];
+  for (const exp of data.experiments) {
+    for (const r of exp.runs) allRuns.push(r);
+  }
+  allRuns.sort((a, b) => b.name.localeCompare(a.name));
+
+  const tbody = document.getElementById('runs-table-body');
+  tbody.innerHTML = allRuns.map(r => `<tr>
+    <td><a href="/runs/${r.name}">${r.name}</a></td>
+    <td>${r.raw_count}</td>
+    <td>${r.normalized_count}</td>
+    <td>${r.scored_count}</td>
+    <td>${r.has_analysis ? '<span class="badge badge-green">done</span>' : '<span class="badge badge-gray">-</span>'}</td>
+    <td>${runExpMap[r.name] || '<span class="text-muted">-</span>'}</td>
+  </tr>`).join('');
+
+  _allRuns = data.ungrouped.map(r => r.name);
+
+  // Archived
+  const archivedEl = document.getElementById('archived-experiments');
+  const archivedSec = document.getElementById('archived-section');
+  if (archived.length) {
+    archivedSec.style.display = '';
+    archivedEl.innerHTML = archived.map(expCard).join('');
+  }
+
+  document.getElementById('experiments-loading').style.display = 'none';
+  document.getElementById('experiments-content').style.display = '';
+}
+
+function loadData() {
+  fetch('/api/experiments').then(r => r.json()).then(render);
+}
+
+function toggleArchived() {
+  _archivedOpen = !_archivedOpen;
+  document.getElementById('archived-experiments').style.display = _archivedOpen ? '' : 'none';
+  document.getElementById('archived-toggle').innerHTML = _archivedOpen ? '&#9660;' : '&#9654;';
+}
+
+function showNewModal() {
+  const modal = document.getElementById('new-exp-modal');
+  modal.style.display = 'flex';
+  const container = document.getElementById('exp-runs-checkboxes');
+  container.innerHTML = _allRuns.length
+    ? _allRuns.map(r => `<label style="display:block;margin:2px 0;"><input type="checkbox" name="runs" value="${r}"> ${r}</label>`).join('')
+    : '<span class="text-muted">No ungrouped runs</span>';
+}
+
+function hideNewModal() {
+  document.getElementById('new-exp-modal').style.display = 'none';
+  document.getElementById('new-exp-form').reset();
+}
+
+function createExperiment(e) {
+  e.preventDefault();
+  const name = document.getElementById('exp-name').value.trim();
+  const notes = document.getElementById('exp-notes').value.trim();
+  const checks = document.querySelectorAll('#exp-runs-checkboxes input:checked');
+  const runs = Array.from(checks).map(c => c.value);
+  fetch('/api/experiments', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, notes, runs}),
+  }).then(r => { if (r.ok) { hideNewModal(); loadData(); } else r.json().then(d => alert(d.error || 'Error')); });
+}
+
+function archiveExperiment(id) {
+  fetch(`/api/experiments/${id}/archive`, {method: 'POST'}).then(() => loadData());
+}
+
+loadData();
+</script>
+{% endblock %}

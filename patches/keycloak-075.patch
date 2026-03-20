@@ -1,0 +1,343 @@
+diff --git a/core/src/main/java/org/keycloak/representations/idm/RealmRepresentation.java b/core/src/main/java/org/keycloak/representations/idm/RealmRepresentation.java
+index f3182df55faa..06f388da280d 100755
+--- a/core/src/main/java/org/keycloak/representations/idm/RealmRepresentation.java
++++ b/core/src/main/java/org/keycloak/representations/idm/RealmRepresentation.java
+@@ -240,7 +240,7 @@ public class RealmRepresentation {
+     @Deprecated
+     protected List<ClientTemplateRepresentation> clientTemplates;
+ 
+-    private Boolean scimEnabled;
++    private Boolean scimApiEnabled;
+ 
+     public String getId() {
+         return id;
+@@ -1503,12 +1503,12 @@ public void addOrganization(OrganizationRepresentation org) {
+         organizations.add(org);
+     }
+ 
+-    public void setScimEnabled(Boolean scimEnabled) {
+-        this.scimEnabled = scimEnabled;
++    public void setScimApiEnabled(Boolean scimApiEnabled) {
++        this.scimApiEnabled = scimApiEnabled;
+     }
+ 
+-    public Boolean isScimEnabled() {
+-        return scimEnabled;
++    public Boolean isScimApiEnabled() {
++        return scimApiEnabled;
+     }
+ 
+     public enum BruteForceStrategy {
+diff --git a/js/apps/admin-ui/maven-resources/theme/keycloak.v2/admin/messages/messages_en.properties b/js/apps/admin-ui/maven-resources/theme/keycloak.v2/admin/messages/messages_en.properties
+index 186fef511708..25b065d3957a 100644
+--- a/js/apps/admin-ui/maven-resources/theme/keycloak.v2/admin/messages/messages_en.properties
++++ b/js/apps/admin-ui/maven-resources/theme/keycloak.v2/admin/messages/messages_en.properties
+@@ -1140,7 +1140,7 @@ deleteConditionError=Failed to delete condition\: {{error}}
+ clientProfile=Client profile details
+ syncAllUsers=Sync all users
+ allowedClockSkewHelp=Clock skew in seconds that is tolerated when validating identity provider tokens. Default value is zero.
+-disableConfirmIdentityProvider=Are you sure you want to disable the provider '{{provider}}'
++disableConfirmIdentityProvider=Are you sure you want to disable the provider '{{provider}}'?
+ clientSaveError=Client could not be updated\: {{error}}
+ tokenSaveError=Could not create initial access token {{error}}
+ certificate=Certificate
+@@ -3773,3 +3773,5 @@ role_impersonation=Impersonation
+ role_read-token=Read token
+ role_offline-access=Offline access
+ role_uma_authorization=Obtain permissions
++scimApiEnabled=SCIM API
++scimApiEnabledHelp=If enabled, exposes realm resources through an API based on the System for Cross-domain Identity Management (SCIM) specification, namely RFC7643 and RFC7644.
+\ No newline at end of file
+diff --git a/js/apps/admin-ui/src/realm-settings/GeneralTab.tsx b/js/apps/admin-ui/src/realm-settings/GeneralTab.tsx
+index a76aa731bc1a..7cc8c5391f24 100644
+--- a/js/apps/admin-ui/src/realm-settings/GeneralTab.tsx
++++ b/js/apps/admin-ui/src/realm-settings/GeneralTab.tsx
+@@ -119,6 +119,7 @@ function RealmSettingsGeneralTabForm({
+   const isStepUpAuthenticationSaml = isFeatureEnabled(
+     Feature.StepUpAuthenticationSaml,
+   );
++  const isScimApiEnabled = isFeatureEnabled(Feature.ScimApi);
+ 
+   const setupForm = () => {
+     convertToFormValues(realm, setValue);
+@@ -259,6 +260,13 @@ function RealmSettingsGeneralTabForm({
+               labelIcon={t("verifiableCredentialsEnabledHelp")}
+             />
+           )}
++          {isScimApiEnabled && (
++            <DefaultSwitchControl
++              name="scimApiEnabled"
++              label={t("scimApiEnabled")}
++              labelIcon={t("scimApiEnabledHelp")}
++            />
++          )}
+           <SelectControl
+             name="unmanagedAttributePolicy"
+             label={t("unmanagedAttributes")}
+@@ -322,6 +330,16 @@ function RealmSettingsGeneralTabForm({
+                   />
+                 </StackItem>
+               )}
++              {isScimApiEnabled && realm.scimApiEnabled && (
++                <StackItem>
++                  <FormattedLink
++                    href={`${addTrailingSlash(
++                      serverBaseUrl,
++                    )}realms/${realmName}/scim/v2`}
++                    title={t("SCIM Endpoint")}
++                  />
++                </StackItem>
++              )}
+             </Stack>
+           </FormGroup>
+           <FixedButtonsGroup
+diff --git a/js/apps/admin-ui/src/utils/useIsFeatureEnabled.ts b/js/apps/admin-ui/src/utils/useIsFeatureEnabled.ts
+index c97081941511..3ee1607e9f3a 100644
+--- a/js/apps/admin-ui/src/utils/useIsFeatureEnabled.ts
++++ b/js/apps/admin-ui/src/utils/useIsFeatureEnabled.ts
+@@ -21,6 +21,7 @@ export enum Feature {
+   ClientAuthFederated = "CLIENT_AUTH_FEDERATED",
+   Workflows = "WORKFLOWS",
+   StepUpAuthenticationSaml = "STEP_UP_AUTHENTICATION_SAML",
++  ScimApi = "SCIM_API",
+ }
+ 
+ export default function useIsFeatureEnabled() {
+diff --git a/js/libs/keycloak-admin-client/src/defs/realmRepresentation.ts b/js/libs/keycloak-admin-client/src/defs/realmRepresentation.ts
+index 33f17013223d..e620920f3585 100644
+--- a/js/libs/keycloak-admin-client/src/defs/realmRepresentation.ts
++++ b/js/libs/keycloak-admin-client/src/defs/realmRepresentation.ts
+@@ -131,6 +131,7 @@ export default interface RealmRepresentation {
+   users?: UserRepresentation[];
+   verifyEmail?: boolean;
+   waitIncrementSeconds?: number;
++  scimApiEnabled?: boolean;
+ }
+ 
+ export type PartialImportRealmRepresentation = RealmRepresentation & {
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmAdapter.java b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmAdapter.java
+index cdd64c87351b..a331a484add4 100755
+--- a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmAdapter.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmAdapter.java
+@@ -1919,15 +1919,15 @@ public void setVerifiableCredentialsEnabled(boolean verifiableCredentialsEnabled
+     }
+ 
+     @Override
+-    public boolean isScimEnabled() {
+-        if (isUpdated()) return featureAwareIsEnabled(Feature.SCIM_API, updated.isScimEnabled());
+-        return featureAwareIsEnabled(Feature.SCIM_API, cached.isScimEnabled());
++    public boolean isScimApiEnabled() {
++        if (isUpdated()) return featureAwareIsEnabled(Feature.SCIM_API, updated.isScimApiEnabled());
++        return featureAwareIsEnabled(Feature.SCIM_API, cached.isScimApiEnabled());
+     }
+ 
+     @Override
+-    public void setScimEnabled(boolean enabled) {
++    public void setScimApiEnabled(boolean enabled) {
+         getDelegateForUpdate();
+-        updated.setScimEnabled(enabled);
++        updated.setScimApiEnabled(enabled);
+     }
+ 
+     private boolean featureAwareIsEnabled(Profile.Feature feature, boolean isEnabled) {
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRealm.java b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRealm.java
+index 5701651b2562..3b09a6811e5b 100755
+--- a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRealm.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRealm.java
+@@ -78,7 +78,7 @@ public class CachedRealm extends AbstractExtendableRevisioned {
+     protected boolean organizationsEnabled;
+     protected boolean adminPermissionsEnabled;
+     protected boolean verifiableCredentialsEnabled;
+-    protected boolean scimEnabled;
++    protected boolean scimApiEnabled;
+     //--- brute force settings
+     protected boolean bruteForceProtected;
+     protected boolean permanentLockout;
+@@ -196,7 +196,7 @@ public CachedRealm(long revision, RealmModel model) {
+         organizationsEnabled = model.isOrganizationsEnabled();
+         adminPermissionsEnabled = model.isAdminPermissionsEnabled();
+         verifiableCredentialsEnabled = model.isVerifiableCredentialsEnabled();
+-        scimEnabled = model.isScimEnabled();
++        scimApiEnabled = model.isScimApiEnabled();
+         //--- brute force settings
+         bruteForceProtected = model.isBruteForceProtected();
+         permanentLockout = model.isPermanentLockout();
+@@ -768,7 +768,7 @@ public Map<String, RequiredActionConfigModel> getRequiredActionProviderConfigs()
+         return requiredActionProviderConfigs;
+     }
+ 
+-    public boolean isScimEnabled() {
+-        return scimEnabled;
++    public boolean isScimApiEnabled() {
++        return scimApiEnabled;
+     }
+ }
+diff --git a/model/jpa/src/main/java/org/keycloak/models/jpa/RealmAdapter.java b/model/jpa/src/main/java/org/keycloak/models/jpa/RealmAdapter.java
+index 6a675d08f0ff..da209b94e236 100755
+--- a/model/jpa/src/main/java/org/keycloak/models/jpa/RealmAdapter.java
++++ b/model/jpa/src/main/java/org/keycloak/models/jpa/RealmAdapter.java
+@@ -1312,13 +1312,13 @@ public void setVerifiableCredentialsEnabled(boolean verifiableCredentialsEnabled
+     }
+ 
+     @Override
+-    public void setScimEnabled(boolean enabled) {
+-        setAttribute(RealmAttributes.SCIM_ENABLED, enabled);
++    public void setScimApiEnabled(boolean enabled) {
++        setAttribute(RealmAttributes.SCIM_API_ENABLED, enabled);
+     }
+ 
+     @Override
+-    public boolean isScimEnabled() {
+-        return getAttribute(RealmAttributes.SCIM_ENABLED, Boolean.FALSE);
++    public boolean isScimApiEnabled() {
++        return getAttribute(RealmAttributes.SCIM_API_ENABLED, Boolean.FALSE);
+     }
+ 
+     @Override
+diff --git a/model/jpa/src/main/java/org/keycloak/models/jpa/entities/RealmAttributes.java b/model/jpa/src/main/java/org/keycloak/models/jpa/entities/RealmAttributes.java
+index 3de2e04ecfcd..6f1000afe709 100644
+--- a/model/jpa/src/main/java/org/keycloak/models/jpa/entities/RealmAttributes.java
++++ b/model/jpa/src/main/java/org/keycloak/models/jpa/entities/RealmAttributes.java
+@@ -62,5 +62,5 @@ public interface RealmAttributes {
+     String ORGANIZATIONS_ENABLED = "organizationsEnabled";
+     String ADMIN_PERMISSIONS_ENABLED = "adminPermissionsEnabled";
+     String ADMIN_PERMISSIONS_CLIENT_ID = "adminPermissionsClientId";
+-    String SCIM_ENABLED = "scimEnabled";
++    String SCIM_API_ENABLED = "scimApiEnabled";
+ }
+diff --git a/model/storage-private/src/main/java/org/keycloak/storage/datastore/DefaultExportImportManager.java b/model/storage-private/src/main/java/org/keycloak/storage/datastore/DefaultExportImportManager.java
+index 6c2586dee788..44e76c5a1562 100644
+--- a/model/storage-private/src/main/java/org/keycloak/storage/datastore/DefaultExportImportManager.java
++++ b/model/storage-private/src/main/java/org/keycloak/storage/datastore/DefaultExportImportManager.java
+@@ -311,7 +311,7 @@ public void importRealm(RealmRepresentation rep, RealmModel newRealm, Runnable u
+         if (rep.isResetPasswordAllowed() != null) newRealm.setResetPasswordAllowed(rep.isResetPasswordAllowed());
+         if (rep.isEditUsernameAllowed() != null) newRealm.setEditUsernameAllowed(rep.isEditUsernameAllowed());
+         if (rep.isOrganizationsEnabled() != null) newRealm.setOrganizationsEnabled(rep.isOrganizationsEnabled());
+-        if (rep.isScimEnabled() != null) newRealm.setScimEnabled(rep.isScimEnabled());
++        if (rep.isScimApiEnabled() != null) newRealm.setScimApiEnabled(rep.isScimApiEnabled());
+         if (rep.isAdminPermissionsEnabled() != null) newRealm.setAdminPermissionsEnabled(rep.isAdminPermissionsEnabled());
+         if (rep.getLoginTheme() != null) newRealm.setLoginTheme(rep.getLoginTheme());
+         if (rep.getAccountTheme() != null) newRealm.setAccountTheme(rep.getAccountTheme());
+@@ -824,7 +824,7 @@ public void updateRealm(RealmRepresentation rep, RealmModel realm) {
+         if (rep.isResetPasswordAllowed() != null) realm.setResetPasswordAllowed(rep.isResetPasswordAllowed());
+         if (rep.isEditUsernameAllowed() != null) realm.setEditUsernameAllowed(rep.isEditUsernameAllowed());
+         if (rep.isOrganizationsEnabled() != null) realm.setOrganizationsEnabled(rep.isOrganizationsEnabled());
+-        if (rep.isScimEnabled() != null) realm.setScimEnabled(rep.isScimEnabled());
++        if (rep.isScimApiEnabled() != null) realm.setScimApiEnabled(rep.isScimApiEnabled());
+         if (rep.isAdminPermissionsEnabled() != null) realm.setAdminPermissionsEnabled(rep.isAdminPermissionsEnabled());
+         if (rep.isVerifiableCredentialsEnabled() != null) realm.setVerifiableCredentialsEnabled(rep.isVerifiableCredentialsEnabled());
+         if (rep.getSslRequired() != null) realm.setSslRequired(SslRequired.valueOf(rep.getSslRequired().toUpperCase()));
+diff --git a/scim/services/src/main/java/org/keycloak/scim/services/ScimRealmResourceFactory.java b/scim/services/src/main/java/org/keycloak/scim/services/ScimRealmResourceFactory.java
+index 80b6c87a2db2..9500fb8ae9a7 100644
+--- a/scim/services/src/main/java/org/keycloak/scim/services/ScimRealmResourceFactory.java
++++ b/scim/services/src/main/java/org/keycloak/scim/services/ScimRealmResourceFactory.java
+@@ -20,7 +20,7 @@ public class ScimRealmResourceFactory implements RealmResourceProviderFactory, E
+     public RealmResourceProvider create(KeycloakSession session) {
+         RealmModel realm = session.getContext().getRealm();
+ 
+-        if (realm.isScimEnabled()) {
++        if (realm.isScimApiEnabled()) {
+             return new RealmResourceProvider() {
+ 
+                 @Override
+diff --git a/server-spi-private/src/main/java/org/keycloak/models/utils/ModelToRepresentation.java b/server-spi-private/src/main/java/org/keycloak/models/utils/ModelToRepresentation.java
+index f082f23dc69f..d14c215976db 100755
+--- a/server-spi-private/src/main/java/org/keycloak/models/utils/ModelToRepresentation.java
++++ b/server-spi-private/src/main/java/org/keycloak/models/utils/ModelToRepresentation.java
+@@ -510,7 +510,7 @@ public static RealmRepresentation toRepresentation(KeycloakSession session, Real
+         rep.setOrganizationsEnabled(realm.isOrganizationsEnabled());
+         rep.setAdminPermissionsEnabled(realm.isAdminPermissionsEnabled());
+         rep.setVerifiableCredentialsEnabled(realm.isVerifiableCredentialsEnabled());
+-        rep.setScimEnabled(realm.isScimEnabled());
++        rep.setScimApiEnabled(realm.isScimApiEnabled());
+         rep.setDefaultSignatureAlgorithm(realm.getDefaultSignatureAlgorithm());
+         rep.setRevokeRefreshToken(realm.isRevokeRefreshToken());
+         rep.setRefreshTokenMaxReuse(realm.getRefreshTokenMaxReuse());
+diff --git a/server-spi-private/src/main/java/org/keycloak/models/utils/RealmModelDelegate.java b/server-spi-private/src/main/java/org/keycloak/models/utils/RealmModelDelegate.java
+index d613ac616594..ce07d42e8f75 100644
+--- a/server-spi-private/src/main/java/org/keycloak/models/utils/RealmModelDelegate.java
++++ b/server-spi-private/src/main/java/org/keycloak/models/utils/RealmModelDelegate.java
+@@ -1192,12 +1192,12 @@ public void setVerifiableCredentialsEnabled(boolean verifiableCredentialsEnabled
+     }
+ 
+     @Override
+-    public void setScimEnabled(boolean enabled) {
+-        delegate.setScimEnabled(enabled);
++    public void setScimApiEnabled(boolean enabled) {
++        delegate.setScimApiEnabled(enabled);
+     }
+ 
+     @Override
+-    public boolean isScimEnabled() {
+-        return delegate.isScimEnabled();
++    public boolean isScimApiEnabled() {
++        return delegate.isScimApiEnabled();
+     }
+ }
+diff --git a/server-spi-private/src/test/java/org/keycloak/broker/provider/util/IdentityBrokerStateTestHelpers.java b/server-spi-private/src/test/java/org/keycloak/broker/provider/util/IdentityBrokerStateTestHelpers.java
+index 204ee1fed297..85a9166c2d26 100644
+--- a/server-spi-private/src/test/java/org/keycloak/broker/provider/util/IdentityBrokerStateTestHelpers.java
++++ b/server-spi-private/src/test/java/org/keycloak/broker/provider/util/IdentityBrokerStateTestHelpers.java
+@@ -1867,12 +1867,12 @@ public void setVerifiableCredentialsEnabled(boolean verifiableCredentialsEnabled
+         }
+ 
+         @Override
+-        public void setScimEnabled(boolean enabled) {
++        public void setScimApiEnabled(boolean enabled) {
+ 
+         }
+ 
+         @Override
+-        public boolean isScimEnabled() {
++        public boolean isScimApiEnabled() {
+             return false;
+         }
+     }
+diff --git a/server-spi/src/main/java/org/keycloak/models/RealmModel.java b/server-spi/src/main/java/org/keycloak/models/RealmModel.java
+index 0c8a5da8892d..284fe7e5bab3 100755
+--- a/server-spi/src/main/java/org/keycloak/models/RealmModel.java
++++ b/server-spi/src/main/java/org/keycloak/models/RealmModel.java
+@@ -125,9 +125,9 @@ interface RealmAttributeUpdateEvent extends ProviderEvent {
+ 
+     void setVerifiableCredentialsEnabled(boolean verifiableCredentialsEnabled);
+ 
+-    void setScimEnabled(boolean enabled);
++    void setScimApiEnabled(boolean enabled);
+ 
+-    boolean isScimEnabled();
++    boolean isScimApiEnabled();
+ 
+     void setAttribute(String name, String value);
+     default void setAttribute(String name, Boolean value) {
+diff --git a/services/src/test/java/org/keycloak/protocol/saml/SamlProtocolTest.java b/services/src/test/java/org/keycloak/protocol/saml/SamlProtocolTest.java
+index 30e7e0d397d2..fcd35a14cb2c 100644
+--- a/services/src/test/java/org/keycloak/protocol/saml/SamlProtocolTest.java
++++ b/services/src/test/java/org/keycloak/protocol/saml/SamlProtocolTest.java
+@@ -1527,12 +1527,12 @@ public void setVerifiableCredentialsEnabled(boolean verifiableCredentialsEnabled
+         }
+ 
+         @Override
+-        public void setScimEnabled(boolean enabled) {
++        public void setScimApiEnabled(boolean enabled) {
+             // noop
+         }
+ 
+         @Override
+-        public boolean isScimEnabled() {
++        public boolean isScimApiEnabled() {
+             return false;
+         }
+ 
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/realm/RealmConfigBuilder.java b/test-framework/core/src/main/java/org/keycloak/testframework/realm/RealmConfigBuilder.java
+index c2d58a8d2453..7662413bcbdf 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/realm/RealmConfigBuilder.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/realm/RealmConfigBuilder.java
+@@ -397,7 +397,7 @@ public RealmConfigBuilder webAuthnPolicyAcceptableAaguids(List<String> aaguids)
+     }
+ 
+     public RealmConfigBuilder scimEnabled(boolean enabled) {
+-        rep.setScimEnabled(enabled);
++        rep.setScimApiEnabled(enabled);
+         return this;
+     }
+ 

@@ -1,0 +1,3074 @@
+diff --git a/src/sentry/api/endpoints/project_rule_details.py b/src/sentry/api/endpoints/project_rule_details.py
+index b6e6bd1fa98a8d..1f3932f4462bc7 100644
+--- a/src/sentry/api/endpoints/project_rule_details.py
++++ b/src/sentry/api/endpoints/project_rule_details.py
+@@ -45,6 +45,7 @@
+ from sentry.sentry_apps.utils.errors import SentryAppBaseError
+ from sentry.signals import alert_rule_edited
+ from sentry.types.actor import Actor
++from sentry.workflow_engine.models.alertrule_workflow import AlertRuleWorkflow
+ from sentry.workflow_engine.models.workflow import Workflow
+ from sentry.workflow_engine.utils.legacy_metric_tracking import (
+     report_used_legacy_models,
+@@ -418,12 +419,40 @@ def delete(self, request: Request, project: Project, rule: Rule | Workflow) -> R
+          - Actions: specify what should happen when the trigger conditions are met and the filters match.
+         """
+         if isinstance(rule, Workflow):
+-            audit_id = "WORKFLOW_REMOVE"
+             with transaction.atomic(router.db_for_write(Workflow)):
+                 rule.update(status=ObjectStatus.PENDING_DELETION)
+                 scheduled = RegionScheduledDeletion.schedule(rule, days=0, actor=request.user)
++            self.create_audit_entry(
++                request=request,
++                organization=project.organization,
++                target_object=rule.id,
++                event=audit_log.get_event_id("WORKFLOW_REMOVE"),
++                data=rule.get_audit_log_data(),
++                transaction_id=scheduled.id,
++            )
++            try:
++                ard = AlertRuleWorkflow.objects.get(workflow_id=rule.id)
++                rule = Rule.objects.get(id=ard.rule_id, project=project)
++
++                report_used_legacy_models()
++                with transaction.atomic(router.db_for_write(Rule)):
++                    rule.update(status=ObjectStatus.PENDING_DELETION)
++                    RuleActivity.objects.create(
++                        rule=rule, user_id=request.user.id, type=RuleActivityType.DELETED.value
++                    )
++                    scheduled = RegionScheduledDeletion.schedule(rule, days=0, actor=request.user)
++                self.create_audit_entry(
++                    request=request,
++                    organization=project.organization,
++                    target_object=rule.id,
++                    event=audit_log.get_event_id("RULE_REMOVE"),
++                    data=rule.get_audit_log_data(),
++                    transaction_id=scheduled.id,
++                )
++            except (AlertRuleWorkflow.DoesNotExist, Rule.DoesNotExist):
++                return Response(status=202)
++
+         else:
+-            audit_id = "RULE_REMOVE"
+             report_used_legacy_models()
+             with transaction.atomic(router.db_for_write(Rule)):
+                 rule.update(status=ObjectStatus.PENDING_DELETION)
+@@ -432,12 +461,12 @@ def delete(self, request: Request, project: Project, rule: Rule | Workflow) -> R
+                 )
+                 scheduled = RegionScheduledDeletion.schedule(rule, days=0, actor=request.user)
+ 
+-        self.create_audit_entry(
+-            request=request,
+-            organization=project.organization,
+-            target_object=rule.id,
+-            event=audit_log.get_event_id(audit_id),
+-            data=rule.get_audit_log_data(),
+-            transaction_id=scheduled.id,
+-        )
++            self.create_audit_entry(
++                request=request,
++                organization=project.organization,
++                target_object=rule.id,
++                event=audit_log.get_event_id("RULE_REMOVE"),
++                data=rule.get_audit_log_data(),
++                transaction_id=scheduled.id,
++            )
+         return Response(status=202)
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 65adf98f472181..5818a4eca6ceec 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -492,6 +492,7 @@ def env(
+     "sentry.releases",
+     "sentry.prevent",
+     "sentry.seer",
++    "sentry.scm",
+ )
+ 
+ # Silence internal hints from Django's system checks
+@@ -902,6 +903,7 @@ def SOCIAL_AUTH_DEFAULT_USERNAME() -> str:
+     "sentry.relocation.tasks.transfer",
+     "sentry.replays.data_export",
+     "sentry.replays.tasks",
++    "sentry.scm.private.ipc",
+     "sentry.sentry_apps.tasks.sentry_apps",
+     "sentry.sentry_apps.tasks.service_hooks",
+     "sentry.seer.autofix.issue_summary",
+diff --git a/src/sentry/integrations/github/webhook.py b/src/sentry/integrations/github/webhook.py
+index ab9c39938c275a..a176ebc870a750 100644
+--- a/src/sentry/integrations/github/webhook.py
++++ b/src/sentry/integrations/github/webhook.py
+@@ -4,6 +4,7 @@
+ import hmac
+ import inspect
+ import logging
++import time
+ from abc import ABC
+ from collections.abc import Mapping, MutableMapping, Sequence
+ from datetime import timezone
+@@ -59,11 +60,13 @@
+     get_integration_repository_provider,
+ )
+ from sentry.preprod.vcs.webhooks import handle_preprod_check_run_event
++from sentry.scm.stream_producer import produce_event_to_scm_stream
+ from sentry.seer.autofix.webhooks import handle_github_pr_webhook_for_autofix
+ from sentry.seer.code_review.webhooks.handlers import (
+     handle_webhook_event as code_review_handle_webhook_event,
+ )
+ from sentry.shared_integrations.exceptions import ApiError
++from sentry.silo.base import SiloMode
+ from sentry.tasks.organization_contributors import assign_seat_to_organization_contributor
+ from sentry.users.services.user.service import user_service
+ from sentry.utils import metrics
+@@ -1111,4 +1114,25 @@ def handle(self, request: HttpRequest) -> HttpResponse:
+                     github_event=github_event,
+                     github_delivery_id=github_delivery_id,
+                 )
++
++        # Publish the request to the unified SCM (source control management) subscription's
++        # platform. This is a replacement for the handlers defined above. Handlers should be
++        # defined as consumers of the SCM subscriptions Kafka topic.
++        #
++        # NOTE: Publication of the event assumes the event has been properly authorized (as it has
++        #       been above).
++        # NOTE: We are in the correct region silo at this stage. The IntegrationControlMiddleware
++        #       middleware has handled routing.
++        produce_event_to_scm_stream(
++            {
++                "event_type_hint": request.headers.get(GITHUB_WEBHOOK_TYPE_HEADER_KEY),
++                "event": request.body.decode("utf-8"),
++                "extra": {},
++                "received_at": int(time.time()),
++                "sentry_meta": None,
++                "type": IntegrationProviderSlug.GITHUB.value,
++            },
++            silo="region" if SiloMode.get_current_mode() == SiloMode.REGION else "control",
++        )
++
+         return HttpResponse(status=204)
+diff --git a/src/sentry/integrations/github_enterprise/webhook.py b/src/sentry/integrations/github_enterprise/webhook.py
+index c33afc981e8aaa..bb22570a502027 100644
+--- a/src/sentry/integrations/github_enterprise/webhook.py
++++ b/src/sentry/integrations/github_enterprise/webhook.py
+@@ -4,6 +4,7 @@
+ import hmac
+ import logging
+ import re
++import time
+ 
+ import orjson
+ import sentry_sdk
+@@ -27,6 +28,7 @@
+ )
+ from sentry.integrations.utils.metrics import IntegrationWebhookEvent
+ from sentry.integrations.utils.scope import clear_tags_and_context
++from sentry.scm.stream_producer import produce_event_to_scm_stream
+ from sentry.utils import metrics
+ 
+ logger = logging.getLogger("sentry.webhooks")
+@@ -211,6 +213,8 @@ def _handle(self, request: HttpRequest) -> HttpResponse:
+             logger.warning("github_enterprise.webhook.missing-integration", extra=extra)
+             return HttpResponse(status=400)
+ 
++        skipped_authentication = False
++
+         try:
+             sha256_signature = request.headers.get("x-hub-signature-256")
+             sha1_signature = request.headers.get("x-hub-signature")
+@@ -273,6 +277,7 @@ def _handle(self, request: HttpRequest) -> HttpResponse:
+                 sentry_sdk.capture_exception(e)
+                 return HttpResponse(MISSING_SIGNATURE_HEADERS_ERROR, status=400)
+             else:
++                skipped_authentication = True
+                 # the host is allowed to skip signature verification
+                 # log it, and continue on.
+                 extra["github_enterprise_version"] = request.headers.get(
+@@ -305,6 +310,31 @@ def _handle(self, request: HttpRequest) -> HttpResponse:
+             ).capture():
+                 event_handler(event, host=host, github_event=github_event)
+ 
++        # Publish the request to the unified SCM (source control management) subscription's
++        # platform. This is a replacement for the handlers defined above. Handlers should be
++        # defined as consumers of the SCM subscriptions Kafka topic.
++        #
++        # NOTE: Publication of the event assumes the event has been properly authorized (as it has
++        #       been above).
++        # NOTE: We are in the correct region silo at this stage. The IntegrationControlMiddleware
++        #       middleware has handled routing.
++        produce_event_to_scm_stream(
++            {
++                "event_type_hint": request.headers.get("X-GitHub-Event"),
++                "event": request.body.decode("utf-8"),
++                "extra": {
++                    "host": host,
++                    "skipped-authentication": skipped_authentication,
++                    "enterprise-version": request.headers.get("x-github-enterprise-version"),
++                    "ip-address": request.headers.get("x-real-ip"),
++                },
++                "received_at": int(time.time()),
++                "sentry_meta": None,
++                "type": IntegrationProviderSlug.GITHUB_ENTERPRISE.value,
++            },
++            silo="region",
++        )
++
+         return HttpResponse(status=204)
+ 
+ 
+diff --git a/src/sentry/migrations/1040_drop_fk_projecttemplate.py b/src/sentry/migrations/1040_drop_fk_projecttemplate.py
+index 2e87fb9e4574ac..3b36e7d0eb16c3 100644
+--- a/src/sentry/migrations/1040_drop_fk_projecttemplate.py
++++ b/src/sentry/migrations/1040_drop_fk_projecttemplate.py
+@@ -26,6 +26,7 @@ class Migration(CheckedMigration):
+ 
+     dependencies = [
+         ("sentry", "1039_widget_description_to_textfield"),
++        ("monitors", "0008_fix_processing_error_keys"),
+     ]
+ 
+     operations = [
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index c3c3eff1e27231..ef62384e0d05c1 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -4119,6 +4119,15 @@
+     flags=FLAG_ALLOW_EMPTY | FLAG_AUTOMATOR_MODIFIABLE,
+ )
+ 
++# SCM
++
++register(
++    "sentry.scm.stream.rollout",
++    type=Float,
++    default=0.0,
++    flags=FLAG_ALLOW_EMPTY | FLAG_PRIORITIZE_DISK | FLAG_AUTOMATOR_MODIFIABLE,
++)
++
+ # TODO(telkins): Remove once we no longer need integration_id on SLO metrics
+ register(
+     "integrations.slo.integration-id-tag-enabled",
+diff --git a/src/sentry/scm/app.py b/src/sentry/scm/app.py
+new file mode 100644
+index 00000000000000..9f83b9c5e7c5be
+--- /dev/null
++++ b/src/sentry/scm/app.py
+@@ -0,0 +1,8 @@
++from django.apps import AppConfig
++
++
++class Config(AppConfig):
++    name = "sentry.scm"
++
++    def ready(self) -> None:
++        import sentry.scm.stream  # NOQA
+diff --git a/src/sentry/scm/errors.py b/src/sentry/scm/errors.py
+index 4feefa7225ecf8..eefee2d872309d 100644
+--- a/src/sentry/scm/errors.py
++++ b/src/sentry/scm/errors.py
+@@ -6,6 +6,7 @@
+     "repository_organization_mismatch",
+     "rate_limit_exceeded",
+     "integration_not_found",
++    "unsupported_integration",
+ ]
+ 
+ ERROR_CODES: dict[ErrorCode, str] = {
+@@ -14,6 +15,7 @@
+     "repository_organization_mismatch": "A repository was found but it did not belong to your organization.",
+     "rate_limit_exceeded": "Exhausted allocated service-provider quota.",
+     "integration_not_found": "An unsupported integration provider was found.",
++    "unsupported_integration": "An unsupported integration provider was found.",
+ }
+ 
+ 
+@@ -34,3 +36,7 @@ class SCMUnhandledException(SCMError):
+ 
+ class SCMProviderException(SCMError):
+     pass
++
++
++class SCMProviderNotSupported(SCMError):
++    pass
+diff --git a/src/sentry/scm/helpers.py b/src/sentry/scm/helpers.py
+index 3a3b0c7cd607f8..42d1260b53a62b 100644
+--- a/src/sentry/scm/helpers.py
++++ b/src/sentry/scm/helpers.py
+@@ -66,7 +66,7 @@ def map_integration_to_provider(
+     if integration.provider == "github":
+         return GitHubProvider(client, repository)
+     else:
+-        raise SCMCodedError(integration.provider, code="integration_not_found")
++        raise SCMCodedError(integration.provider, code="unsupported_integration")
+ 
+ 
+ def map_repository_model_to_repository(repository: RepositoryModel) -> Repository:
+diff --git a/src/sentry/scm/private/event_stream.py b/src/sentry/scm/private/event_stream.py
+new file mode 100644
+index 00000000000000..9ffbbe5ed69465
+--- /dev/null
++++ b/src/sentry/scm/private/event_stream.py
+@@ -0,0 +1,114 @@
++from collections.abc import Callable
++from typing import Literal, overload
++
++from sentry.scm.types import CheckRunEvent, CommentEvent, PullRequestEvent
++
++type CheckRunEventListener = Callable[[CheckRunEvent], None]
++type CommentEventListener = Callable[[CommentEvent], None]
++type PullRequestEventListener = Callable[[PullRequestEvent], None]
++
++
++class SourceCodeManagerEventStream:
++    def __init__(self):
++        self.check_run_listeners: dict[str, CheckRunEventListener] = {}
++        self.comment_listeners: dict[str, CommentEventListener] = {}
++        self.pull_request_listeners: dict[str, PullRequestEventListener] = {}
++
++    def listen_for_check_run(self, fn: CheckRunEventListener) -> CheckRunEventListener:
++        self.check_run_listeners[fn.__name__] = fn
++        return fn
++
++    def listen_for_comment(self, fn: CommentEventListener) -> CommentEventListener:
++        self.comment_listeners[fn.__name__] = fn
++        return fn
++
++    def listen_for_pull_request(self, fn: PullRequestEventListener) -> PullRequestEventListener:
++        self.pull_request_listeners[fn.__name__] = fn
++        return fn
++
++    @overload
++    def listen_for(
++        self, event_type: Literal["check_run"]
++    ) -> Callable[[CheckRunEventListener], CheckRunEventListener]: ...
++
++    @overload
++    def listen_for(
++        self, event_type: Literal["comment"]
++    ) -> Callable[[CommentEventListener], CommentEventListener]: ...
++
++    @overload
++    def listen_for(
++        self, event_type: Literal["pull_request"]
++    ) -> Callable[[PullRequestEventListener], PullRequestEventListener]: ...
++
++    def listen_for(self, event_type: str):
++        """
++        Decorator to register a callback for a specific event type.
++
++        Usage:
++            @scm_event_stream.listen_for(event_type="check_run")
++            def handle_check_run(event: CheckRunEvent) -> None:
++                ...
++
++            @scm_event_stream.listen_for(event_type="comment")
++            def handle_comment(event: CommentEvent) -> None:
++                ...
++
++            @scm_event_stream.listen_for(event_type="pull_request")
++            def handle_pr(event: PullRequestEvent) -> None:
++                ...
++        """
++        if event_type == "check_run":
++            return self.listen_for_check_run
++        elif event_type == "comment":
++            return self.listen_for_comment
++        elif event_type == "pull_request":
++            return self.listen_for_pull_request
++        else:
++            raise ValueError(
++                f"Invalid event_type: {event_type}. "
++                f"Must be 'check_run', 'comment', or 'pull_request'"
++            )
++
++
++scm_event_stream = SourceCodeManagerEventStream()
++"""
++The source code manager (SCM) event-stream singleton allows developers to listen to events from SCM
++providers such as GitHub and GitLab. Events are mapped into a standard type before being passed to
++registered listeners.
++
++Listeners can be registered by using the `listen_for` method on the `scm_event_stream` singleton.
++
++```
++@scm_event_stream.listen_for(event_type="check_run")
++def handle_check_run(event: CheckRunEvent) -> None:
++    ...
++
++@scm_event_stream.listen_for(event_type="comment")
++def handle_comment(event: CommentEvent) -> None:
++    ...
++
++@scm_event_stream.listen_for(event_type="pull_request")
++def handle_pr(event: PullRequestEvent) -> None:
++    ...
++```
++
++When registering listeners it is critical that these listeners are imported into the listeners
++module at src/sentry/scm/stream.py. Importing the module registers it with the scm_event_stream
++singleton and ensures we can dispatch events to your listener.
++
++Listeners run asynchronously on a task queue; specifically taskbroker. Listeners run in the region
++they were scheduled (either a region or control silo). Listeners are logically isolated from one
++another. Unhandled exceptions within a listener will only impact that listener and not other
++listeners.
++
++SCM listeners will be default collect numerous metrics about runtime performance, total system
++performance, and failure-rate. It will also instrument Sentry by default. Every listener has a
++trace waterfall in Sentry.
++
++Events will include the raw event bytes received from the SCM service provider. This is provided
++as a stop gap measure in case our default event parsing logic does not encompass your use case. The
++SCM team has written specialized parsers which will parse the request faster than simple JSON
++loading. Please inform us of your use case and we will extend the SCM platform to include your
++fields if we are able.
++"""
+diff --git a/src/sentry/scm/private/ipc.py b/src/sentry/scm/private/ipc.py
+new file mode 100644
+index 00000000000000..aa58deca6729b6
+--- /dev/null
++++ b/src/sentry/scm/private/ipc.py
+@@ -0,0 +1,538 @@
++"""
++This file implements a parallel SubscriptionEvent type. Its in the msgspec format rather than a
++typed dictionary. We maintain a mapping between the two types. Msgspec gives us typed
++deserialization and the typed dictionary gives us an import free calling convention when
++serializing.
++
++Both types are owned by the SCM platform and should not diverge without the team's knowledge.
++Exposing the msgspec type is not preferred. It is an internal implementation detail. It is both an
++optimization and a convenient, typed deserialization library.
++"""
++
++import time
++from collections.abc import Callable
++from typing import assert_never, cast
++
++import msgspec
++import sentry_sdk
++
++from sentry.scm.errors import SCMProviderNotSupported
++from sentry.scm.private.event_stream import SourceCodeManagerEventStream, scm_event_stream
++from sentry.scm.private.webhooks.github import deserialize_github_event
++from sentry.scm.types import (
++    CheckRunAction,
++    CheckRunEvent,
++    CommentAction,
++    CommentEvent,
++    CommentType,
++    EventType,
++    EventTypeHint,
++    HybridCloudSilo,
++    ProviderName,
++    PullRequestAction,
++    PullRequestEvent,
++    SubscriptionEvent,
++)
++from sentry.silo.base import SiloMode
++from sentry.tasks.base import instrumented_task
++from sentry.taskworker.namespaces import scm_tasks
++from sentry.utils import metrics
++
++
++class SubscriptionEventParser(msgspec.Struct, gc=False, frozen=True):
++    event_type_hint: str | None
++    event: str
++    extra: dict[str, str | None | bool | int | float]
++    received_at: int
++    sentry_meta: list["SubscriptionEventSentryMetaParser"] | None
++    type: ProviderName
++
++
++class SubscriptionEventSentryMetaParser(msgspec.Struct, gc=False, frozen=True):
++    id: int | None
++    integration_id: int | None
++    organization_id: int | None
++
++
++class AuthorParser(msgspec.Struct, gc=False, frozen=True):
++    id: str
++    username: str
++
++
++class CheckRunEventDataParser(msgspec.Struct, gc=False, frozen=True):
++    external_id: str
++    html_url: str
++
++
++class CheckRunEventParser(msgspec.Struct, gc=False, frozen=True):
++    action: CheckRunAction
++    check_run: CheckRunEventDataParser
++    subscription_event: SubscriptionEventParser
++
++
++class CommentEventDataParser(msgspec.Struct, gc=False, frozen=True):
++    id: str
++    body: str | None
++    author: AuthorParser | None
++
++
++class CommentEventParser(msgspec.Struct, gc=False, frozen=True):
++    action: CommentAction
++    comment_type: CommentType
++    comment: CommentEventDataParser
++    subscription_event: SubscriptionEventParser
++
++
++class PullRequestBranchParser(msgspec.Struct, gc=False, frozen=True):
++    ref: str
++    sha: str
++
++
++class PullRequestEventDataParser(msgspec.Struct, gc=False, frozen=True):
++    id: str
++    title: str
++    description: str | None
++    head: PullRequestBranchParser
++    base: PullRequestBranchParser
++    is_private_repo: bool
++    author: AuthorParser | None
++
++
++class PullRequestEventParser(msgspec.Struct, gc=False, frozen=True):
++    action: PullRequestAction
++    pull_request: PullRequestEventDataParser
++    subscription_event: SubscriptionEventParser
++
++
++check_run_event_decoder = msgspec.json.Decoder(CheckRunEventParser)
++comment_event_decoder = msgspec.json.Decoder(CommentEventParser)
++pull_request_event_decoder = msgspec.json.Decoder(PullRequestEventParser)
++
++
++def _map_subscription_event(parsed: SubscriptionEventParser) -> SubscriptionEvent:
++    return {
++        "event": parsed.event,
++        "event_type_hint": parsed.event_type_hint,
++        "extra": parsed.extra,
++        "received_at": parsed.received_at,
++        "sentry_meta": (
++            [
++                {
++                    "id": item.id,
++                    "integration_id": item.integration_id,
++                    "organization_id": item.organization_id,
++                }
++                for item in parsed.sentry_meta
++            ]
++            if parsed.sentry_meta
++            else None
++        ),
++        "type": parsed.type,
++    }
++
++
++def _map_subscription_event_parser(event: SubscriptionEvent) -> SubscriptionEventParser:
++    return SubscriptionEventParser(
++        event=event["event"],
++        event_type_hint=event["event_type_hint"],
++        extra=event["extra"],
++        received_at=event["received_at"],
++        sentry_meta=(
++            [
++                SubscriptionEventSentryMetaParser(
++                    id=item["id"],
++                    integration_id=item["integration_id"],
++                    organization_id=item["organization_id"],
++                )
++                for item in event["sentry_meta"]
++            ]
++            if event["sentry_meta"]
++            else None
++        ),
++        type=event["type"],
++    )
++
++
++def deserialize_check_run_event(event_data: str) -> CheckRunEvent:
++    parsed = check_run_event_decoder.decode(event_data)
++    return CheckRunEvent(
++        action=parsed.action,
++        check_run={
++            "external_id": parsed.check_run.external_id,
++            "html_url": parsed.check_run.html_url,
++        },
++        subscription_event=_map_subscription_event(parsed.subscription_event),
++    )
++
++
++def deserialize_comment_event(event_data: str) -> CommentEvent:
++    parsed = comment_event_decoder.decode(event_data)
++    return CommentEvent(
++        action=parsed.action,
++        comment_type=parsed.comment_type,
++        comment={
++            "id": parsed.comment.id,
++            "body": parsed.comment.body,
++            "author": (
++                {"id": parsed.comment.author.id, "username": parsed.comment.author.username}
++                if parsed.comment.author
++                else None
++            ),
++        },
++        subscription_event=_map_subscription_event(parsed.subscription_event),
++    )
++
++
++def deserialize_pull_request_event(event_data: str) -> PullRequestEvent:
++    parsed = pull_request_event_decoder.decode(event_data)
++    return PullRequestEvent(
++        action=parsed.action,
++        pull_request={
++            "id": parsed.pull_request.id,
++            "title": parsed.pull_request.title,
++            "description": parsed.pull_request.description,
++            "head": {"ref": parsed.pull_request.head.ref, "sha": parsed.pull_request.head.sha},
++            "base": {"ref": parsed.pull_request.base.ref, "sha": parsed.pull_request.base.sha},
++            "is_private_repo": parsed.pull_request.is_private_repo,
++            "author": (
++                {
++                    "id": parsed.pull_request.author.id,
++                    "username": parsed.pull_request.author.username,
++                }
++                if parsed.pull_request.author
++                else None
++            ),
++        },
++        subscription_event=_map_subscription_event(parsed.subscription_event),
++    )
++
++
++encoder = msgspec.json.Encoder()
++
++
++def serialize_check_run_event(event: CheckRunEvent) -> str:
++    check_run_data = CheckRunEventDataParser(
++        external_id=event.check_run["external_id"],
++        html_url=event.check_run["html_url"],
++    )
++    structured_event = CheckRunEventParser(
++        action=event.action,
++        check_run=check_run_data,
++        subscription_event=_map_subscription_event_parser(event.subscription_event),
++    )
++    return encoder.encode(structured_event).decode("utf-8")
++
++
++def serialize_comment_event(event: CommentEvent) -> str:
++    comment_data = CommentEventDataParser(
++        id=event.comment["id"],
++        body=event.comment["body"],
++        author=(
++            AuthorParser(
++                id=event.comment["author"]["id"], username=event.comment["author"]["username"]
++            )
++            if event.comment["author"]
++            else None
++        ),
++    )
++    structured_event = CommentEventParser(
++        action=event.action,
++        comment_type=event.comment_type,
++        comment=comment_data,
++        subscription_event=_map_subscription_event_parser(event.subscription_event),
++    )
++    return encoder.encode(structured_event).decode("utf-8")
++
++
++def serialize_pull_request_event(event: PullRequestEvent) -> str:
++    pull_request_data = PullRequestEventDataParser(
++        id=event.pull_request["id"],
++        title=event.pull_request["title"],
++        description=event.pull_request["description"],
++        head=PullRequestBranchParser(
++            ref=event.pull_request["head"]["ref"],
++            sha=event.pull_request["head"]["sha"],
++        ),
++        base=PullRequestBranchParser(
++            ref=event.pull_request["base"]["ref"],
++            sha=event.pull_request["base"]["sha"],
++        ),
++        is_private_repo=event.pull_request["is_private_repo"],
++        author=(
++            AuthorParser(
++                id=event.pull_request["author"]["id"],
++                username=event.pull_request["author"]["username"],
++            )
++            if event.pull_request["author"]
++            else None
++        ),
++    )
++    structured_event = PullRequestEventParser(
++        action=event.action,
++        pull_request=pull_request_data,
++        subscription_event=_map_subscription_event_parser(event.subscription_event),
++    )
++    return encoder.encode(structured_event).decode("utf-8")
++
++
++def deserialize_event(event: str, event_type: EventTypeHint) -> EventType:
++    """
++    Given an encoded string return a deserialized event.
++    """
++    if event_type == "check_run":
++        return deserialize_check_run_event(event)
++    elif event_type == "comment":
++        return deserialize_comment_event(event)
++    elif event_type == "pull_request":
++        return deserialize_pull_request_event(event)
++    else:
++        assert_never(event_type)
++
++
++def deserialize_raw_event(event: SubscriptionEvent) -> EventType | None:
++    """
++    Subscription events are the raw data received by Sentry. We can deserialize them into a more
++    specific type (e.g. a pull-request or check-run). This function transforms the raw payload
++    into its specific type and also returns a string identifier indicating what type of event was
++    deserialized.
++
++    The type hint string value could be derived from an isinstance check but then typed
++    dictionaries would not work.
++    """
++    if event["type"] == "github":
++        return deserialize_github_event(event)
++    elif event["type"] == "github_enterprise":
++        return deserialize_github_event(event)
++    elif event["type"] == "bitbucket":
++        raise SCMProviderNotSupported("Bitbucket has not been implemented.")
++    elif event["type"] == "gitlab":
++        raise SCMProviderNotSupported("GitLab has not been implemented.")
++    else:
++        assert_never(event["type"])
++
++
++def serialize_event(event: EventType) -> str:
++    """
++    EventType serialization function. Serializes a payload based on its type hint. Again could be
++    handled by an isinstance check. Or a type protocol which enforces that EventTypes provide a
++    serialization method.
++    """
++    if isinstance(event, CheckRunEvent):
++        return serialize_check_run_event(event)
++    elif isinstance(event, CommentEvent):
++        return serialize_comment_event(event)
++    elif isinstance(event, PullRequestEvent):
++        return serialize_pull_request_event(event)
++    else:
++        assert_never(event)
++
++
++# $$$$$$$\            $$\       $$\ $$\           $$\
++# $$  __$$\           $$ |      $$ |\__|          $$ |
++# $$ |  $$ |$$\   $$\ $$$$$$$\  $$ |$$\  $$$$$$$\ $$$$$$$\   $$$$$$\   $$$$$$\
++# $$$$$$$  |$$ |  $$ |$$  __$$\ $$ |$$ |$$  _____|$$  __$$\ $$  __$$\ $$  __$$\
++# $$  ____/ $$ |  $$ |$$ |  $$ |$$ |$$ |\$$$$$$\  $$ |  $$ |$$$$$$$$ |$$ |  \__|
++# $$ |      $$ |  $$ |$$ |  $$ |$$ |$$ | \____$$\ $$ |  $$ |$$   ____|$$ |
++# $$ |      \$$$$$$  |$$$$$$$  |$$ |$$ |$$$$$$$  |$$ |  $$ |\$$$$$$$\ $$ |
++# \__|       \______/ \_______/ \__|\__|\_______/ \__|  \__| \_______|\__|
++
++
++PRODUCE_TO_LISTENER = Callable[[str, EventTypeHint, str, HybridCloudSilo], None]
++
++
++def produce_to_listeners(
++    event: SubscriptionEvent,
++    silo: HybridCloudSilo,
++    produce_to_listener: PRODUCE_TO_LISTENER,
++    stream: SourceCodeManagerEventStream = scm_event_stream,
++) -> None:
++    """
++    Accepts a raw SubscriptionEvent and attempts to determine its type before sending it to the
++    event-type's listeners to be processed.
++
++    :param event:
++    :param silo: Events are processed in the hybrid-cloud silo they are received in.
++    :param produce_to_listener:
++    """
++    parsed_event = deserialize_raw_event(event)
++
++    # Most events are not supported. We drop them. They could be processed elsewhere but they're
++    # not processed by the unified SCM platform.
++    if parsed_event is None:
++        return None
++
++    message = serialize_event(parsed_event)
++
++    if isinstance(parsed_event, CheckRunEvent):
++        event_type_hint = "check_run"
++        listeners = list(stream.check_run_listeners.keys())
++    elif isinstance(parsed_event, CommentEvent):
++        event_type_hint = "comment"
++        listeners = list(stream.comment_listeners.keys())
++    elif isinstance(parsed_event, PullRequestEvent):
++        event_type_hint = "pull_request"
++        listeners = list(stream.pull_request_listeners.keys())
++    else:
++        assert_never(parsed_event)
++
++    for listener in listeners:
++        produce_to_listener(message, cast(EventTypeHint, event_type_hint), listener, silo)
++
++
++def produce_to_listener(
++    message: str,
++    event_type_hint: EventTypeHint,
++    listener_name: str,
++    silo: HybridCloudSilo,
++) -> None:
++    if silo == "control":
++        run_webhook_handler_control_task.delay(listener_name, message, event_type_hint)
++    elif silo == "region":
++        run_webhook_handler_region_task.delay(listener_name, message, event_type_hint)
++    else:
++        assert_never(silo)
++
++
++@instrumented_task(
++    silo_mode=SiloMode.CONTROL,
++    name="sentry.scm.run_webhook_handler_control_task",
++    namespace=scm_tasks,
++    processing_deadline_duration=10,
++)
++def run_webhook_handler_control_task(
++    listener: str, message: str, event_type_hint: EventTypeHint
++) -> None:
++    run_listener(
++        listener,
++        message,
++        event_type_hint,
++        stream=scm_event_stream,
++        get_current_time=time.time,
++        report_error=report_error_to_sentry,
++        record_count=record_count_metric,
++        record_distribution=record_distribution_metric,
++        record_timer=record_timer_metric,
++    )
++
++
++@instrumented_task(
++    silo_mode=SiloMode.REGION,
++    name="sentry.scm.run_webhook_handler_region_task",
++    namespace=scm_tasks,
++    processing_deadline_duration=10,
++)
++def run_webhook_handler_region_task(
++    listener: str, message: str, event_type_hint: EventTypeHint
++) -> None:
++    run_listener(
++        listener,
++        message,
++        event_type_hint,
++        stream=scm_event_stream,
++        get_current_time=time.time,
++        report_error=report_error_to_sentry,
++        record_count=record_count_metric,
++        record_distribution=record_distribution_metric,
++        record_timer=record_timer_metric,
++    )
++
++
++def report_error_to_sentry(e: Exception) -> None:
++    """Typing wrapper around sentry_sdk.capture_exception."""
++    sentry_sdk.capture_exception(e)
++
++
++def record_count_metric(key: str, amount: int, tags: dict[str, str]) -> None:
++    """Typing wrapper around metrics.incr."""
++    metrics.incr(key, amount, tags=tags)
++
++
++def record_distribution_metric(key: str, amount: int, tags: dict[str, str], unit: str) -> None:
++    """Typing wrapper around metrics.distribution."""
++    metrics.distribution(key, amount, tags=tags, unit=unit)
++
++
++def record_timer_metric(key: str, amount: float, tags: dict[str, str]) -> None:
++    """Typing wrapper around metrics.distribution."""
++    metrics.distribution(key, amount, tags=tags)
++
++
++METRIC_PREFIX = "sentry.scm.run_listener"
++
++
++def run_listener(
++    listener: str,
++    event_data: str,
++    event_type_hint: EventTypeHint,
++    *,
++    stream: SourceCodeManagerEventStream,
++    get_current_time: Callable[[], float] = time.monotonic,
++    report_error: Callable[[Exception], None] = report_error_to_sentry,
++    record_count: Callable[[str, int, dict[str, str]], None] = record_count_metric,
++    record_distribution: Callable[
++        [str, int, dict[str, str], str], None
++    ] = record_distribution_metric,
++    record_timer: Callable[[str, float, dict[str, str]], None] = record_timer_metric,
++) -> None:
++    """Execute an SCM platform listener."""
++    start = get_current_time()
++
++    try:
++        event = deserialize_event(event_data, event_type_hint)
++    except msgspec.MsgspecError as e:
++        report_error(e)
++        record_count(f"{METRIC_PREFIX}.failed", 1, {"reason": "parse", "fn": listener})
++        return None
++
++    if isinstance(event, CheckRunEvent):
++        exec_listener(listener, stream.check_run_listeners, event, record_count)
++    elif isinstance(event, CommentEvent):
++        exec_listener(listener, stream.comment_listeners, event, record_count)
++    elif isinstance(event, PullRequestEvent):
++        exec_listener(listener, stream.pull_request_listeners, event, record_count)
++    else:
++        assert_never(event)
++
++    end = get_current_time()
++    received_at = event.subscription_event["received_at"]
++
++    # Success and timing metrics are tracked below. These metrics enable us to validate the
++    # performance of the platform. Failure metrics are recorded elsewhere but follow the same
++    # pattern. Failed listeners should never influence timing metrics. Failures can execute
++    # abnormally quickly because they are not performing the full computation.
++    #
++    # Metrics are tagged by the listener's name so we can break down a metric by listener and
++    # identify slow listeners.
++    #
++    #   * real_time indicates the total time taken from webhook received to webhook processed.
++    #   * task_time indicates the total time taken to process the task from start to finish.
++    #   * queue_time identifies the time from webhook received to task started. It measures total
++    #     system latency.
++    record_count(f"{METRIC_PREFIX}.success", 1, {"fn": listener})
++    record_distribution(
++        f"{METRIC_PREFIX}.message.size",
++        len(event_data),
++        {"provider": event.subscription_event["type"], "event_type_hint": event_type_hint},
++        "byte",
++    )
++    record_timer(f"{METRIC_PREFIX}.queue_time", start - received_at, {"fn": listener})
++    record_timer(f"{METRIC_PREFIX}.task_time", end - start, {"fn": listener})
++    record_timer(f"{METRIC_PREFIX}.real_time", end - received_at, {"fn": listener})
++
++
++def exec_listener[T](
++    listener: str,
++    listeners: dict[str, Callable[[T], None]],
++    arg: T,
++    record_count: Callable[[str, int, dict[str, str]], None],
++) -> None:
++    """Record error metrics before raising."""
++    if listener not in listeners:
++        record_count(f"{METRIC_PREFIX}.failed", 1, {"reason": "not-found", "fn": listener})
++        return None
++
++    try:
++        return listeners[listener](arg)
++    except Exception:
++        record_count(f"{METRIC_PREFIX}.failed", 1, {"reason": "internal", "fn": listener})
++        raise
+diff --git a/src/sentry/scm/private/webhooks/github.py b/src/sentry/scm/private/webhooks/github.py
+new file mode 100644
+index 00000000000000..0addcdc6609133
+--- /dev/null
++++ b/src/sentry/scm/private/webhooks/github.py
+@@ -0,0 +1,176 @@
++from typing import Optional
++
++import msgspec
++
++from sentry.scm.types import (
++    CheckRunAction,
++    CheckRunEvent,
++    CommentAction,
++    CommentEvent,
++    EventType,
++    EventTypeHint,
++    PullRequestAction,
++    PullRequestEvent,
++    SubscriptionEvent,
++)
++
++# Remaining types in use:
++#   * "installation"
++#   * "installation_repositories"
++#   * "issues"
++#   * "pull_request_review"
++#   * "pull_request_review_comment"
++#   * "push"
++
++
++class GitHubUser(msgspec.Struct):
++    id: int
++    login: str  # Username
++    type: str | None = None
++
++
++class GitHubCheckRunEvent(msgspec.Struct, gc=False):
++    action: CheckRunAction
++    check_run: "GitHubCheckRun"
++
++
++class GitHubCheckRun(msgspec.Struct, gc=False):
++    external_id: str
++    html_url: str
++
++
++class GitHubIssueCommentEvent(msgspec.Struct, gc=False):
++    action: CommentAction
++    comment: "GitHubIssueComment"
++    issue: "GitHubIssue"
++
++
++class GitHubIssueComment(msgspec.Struct, gc=False):
++    id: int
++    user: GitHubUser | None
++    body: str | None = None
++
++
++class GitHubIssueCommentPullRequest(msgspec.Struct, gc=False):
++    pass
++
++
++class GitHubIssue(msgspec.Struct, gc=False):
++    number: int
++    pull_request: GitHubIssueCommentPullRequest | None = None
++
++
++class GitHubPullRequestEvent(msgspec.Struct, gc=False):
++    action: PullRequestAction
++    number: int
++    pull_request: "GitHubPullRequest"
++
++
++class GitHubPullRequest(msgspec.Struct, gc=False):
++    body: str | None
++    head: "GitHubPullRequestHead"
++    base: "GitHubPullRequestBase"
++    merge_commit_sha: str | None
++    title: str
++    user: GitHubUser
++    merged: bool | None = None
++
++
++class GitHubPullRequestBase(msgspec.Struct, gc=False):
++    ref: str
++    repo: "GitHubPullRequestRepo"
++    sha: str
++
++
++class GitHubPullRequestHead(msgspec.Struct, gc=False):
++    ref: str
++    repo: Optional["GitHubPullRequestRepo"]
++    sha: str
++
++
++class GitHubPullRequestRepo(msgspec.Struct, gc=False):
++    private: bool
++
++
++check_run_decoder = msgspec.json.Decoder(GitHubCheckRunEvent)
++issue_comment_decoder = msgspec.json.Decoder(GitHubIssueCommentEvent)
++pull_request_decoder = msgspec.json.Decoder(GitHubPullRequestEvent)
++
++
++def deserialize_github_check_run_event(event: SubscriptionEvent) -> CheckRunEvent:
++    e = check_run_decoder.decode(event["event"])
++
++    return CheckRunEvent(
++        action=e.action,
++        check_run={
++            "external_id": e.check_run.external_id,
++            "html_url": e.check_run.html_url,
++        },
++        subscription_event=event,
++    )
++
++
++def deserialize_github_comment_event(event: SubscriptionEvent) -> CommentEvent:
++    e = issue_comment_decoder.decode(event["event"])
++
++    return CommentEvent(
++        action=e.action,
++        comment_type="pull_request" if e.issue.pull_request is not None else "issue",
++        comment={
++            "author": (
++                {
++                    "id": str(e.comment.user.id),
++                    "username": e.comment.user.login,
++                }
++                if e.comment.user
++                else None
++            ),
++            "body": e.comment.body,
++            "id": str(e.comment.id),
++        },
++        subscription_event=event,
++    )
++
++
++def deserialize_github_pull_request_event(event: SubscriptionEvent) -> PullRequestEvent:
++    e = pull_request_decoder.decode(event["event"])
++
++    repo = e.pull_request.head.repo or e.pull_request.base.repo
++
++    return PullRequestEvent(
++        action=e.action,
++        pull_request={
++            "author": {"id": str(e.pull_request.user.id), "username": e.pull_request.user.login},
++            "base": {"ref": e.pull_request.base.ref, "sha": e.pull_request.base.sha},
++            "description": e.pull_request.body,
++            "head": {"ref": e.pull_request.head.ref, "sha": e.pull_request.head.sha},
++            "id": str(e.number),
++            "is_private_repo": repo.private,
++            "title": e.pull_request.title,
++        },
++        subscription_event=event,
++    )
++
++
++def deserialize_github_event_type_hint(event: SubscriptionEvent) -> EventTypeHint | None:
++    if event["event_type_hint"] == "pull_request":
++        return "pull_request"
++    elif event["event_type_hint"] == "issue_comment":
++        return "comment"
++    elif event["event_type_hint"] == "check_run":
++        return "check_run"
++    else:
++        return None
++
++
++def deserialize_github_event(event: SubscriptionEvent) -> EventType | None:
++    event_type_hint = deserialize_github_event_type_hint(event)
++    if not event_type_hint:
++        return None
++
++    if event_type_hint == "check_run":
++        return deserialize_github_check_run_event(event)
++    elif event_type_hint == "comment":
++        return deserialize_github_comment_event(event)
++    else:
++        return deserialize_github_pull_request_event(event)
+diff --git a/src/sentry/scm/stream.py b/src/sentry/scm/stream.py
+new file mode 100644
+index 00000000000000..df49b7c0086569
+--- /dev/null
++++ b/src/sentry/scm/stream.py
+@@ -0,0 +1,45 @@
++# Import your listeners below this line. You'll need to ensure your listener is
++# uniquely named. You can alias it here as "my_check_run_listener" or name it
++# uniquely by default.
++#
++# Example:
++#
++#    from sentry.my_module import check_run_listener, pull_request_listener
++from sentry.scm.private.event_stream import scm_event_stream
++from sentry.scm.types import (
++    CheckRunEvent,
++    CommentEvent,
++    EventType,
++    PullRequestEvent,
++    SubscriptionEvent,
++)
++
++# DEFAULT LISTENERS
++#
++# TODO: Remove after production testing.
++
++
++@scm_event_stream.listen_for(event_type="check_run")
++def listen_for_check_run(e):
++    return None
++
++
++@scm_event_stream.listen_for(event_type="comment")
++def listen_for_comment(e):
++    return None
++
++
++@scm_event_stream.listen_for(event_type="pull_request")
++def listen_for_pull_request(e):
++    return None
++
++
++# Do not re-export your listener here.
++__all__ = [
++    "scm_event_stream",
++    "EventType",
++    "CommentEvent",
++    "PullRequestEvent",
++    "CheckRunEvent",
++    "SubscriptionEvent",
++]
+diff --git a/src/sentry/scm/stream_producer.py b/src/sentry/scm/stream_producer.py
+new file mode 100644
+index 00000000000000..0ec687c7b030a7
+--- /dev/null
++++ b/src/sentry/scm/stream_producer.py
+@@ -0,0 +1,50 @@
++from collections.abc import Callable
++
++from sentry.scm.errors import SCMProviderNotSupported
++from sentry.scm.private.ipc import (
++    PRODUCE_TO_LISTENER,
++    produce_to_listener,
++    produce_to_listeners,
++    record_count_metric,
++    report_error_to_sentry,
++)
++from sentry.scm.types import HybridCloudSilo, SubscriptionEvent
++from sentry.scm.utils import check_rollout_option
++
++PREFIX = "sentry.scm.produce_event_to_scm_stream"
++
++
++def produce_event_to_scm_stream(
++    event: SubscriptionEvent,
++    silo: HybridCloudSilo,
++    *,
++    produce_to_listener: PRODUCE_TO_LISTENER = produce_to_listener,
++    record_count: Callable[[str, int, dict[str, str]], None] = record_count_metric,
++    report_error: Callable[[Exception], None] = report_error_to_sentry,
++    rollout_enabled: Callable[[str], bool] = check_rollout_option,
++) -> None:
++    """
++    Publish source code management service provider subscription events.
++
++    Messages published to the topic have had their provenance asserted. They are genuine requests
++    and can be trusted. Untrusted messages are only published to the stream under one condition:
++    they are github_enterprise webhooks with their skipped_validation explicitly marked. There is
++    no guarantee or requirement for down-stream consumers to validate their message's authenticity.
++    """
++    if not rollout_enabled("sentry.scm.stream.rollout"):
++        return None
++
++    try:
++        produce_to_listeners(event, silo, produce_to_listener=produce_to_listener)
++        record_count(f"{PREFIX}.success", 1, {})
++    except SCMProviderNotSupported:
++        record_count(f"{PREFIX}.failed", 1, {"reason": "not-supported", "provider": event["type"]})
++    except Exception as e:
++        record_count(f"{PREFIX}.failed", 1, {"reason": "processing"})
++        report_error(e)
++
++
++__all__ = [
++    "SubscriptionEvent",
++    "produce_event_to_scm_stream",
++]
+diff --git a/src/sentry/scm/types.py b/src/sentry/scm/types.py
+index 621e806fd9c603..cc07427b5eef3f 100644
+--- a/src/sentry/scm/types.py
++++ b/src/sentry/scm/types.py
+@@ -1,6 +1,13 @@
++from dataclasses import dataclass
+ from datetime import datetime
+ from typing import Any, Literal, Protocol, Required, TypedDict
+ 
++type Action = Literal["check_run", "comment", "pull_request"]
++type EventType = "CheckRunEvent" | "CommentEvent" | "PullRequestEvent"
++type EventTypeHint = Literal["check_run", "comment", "pull_request"]
++type HybridCloudSilo = Literal["control", "region"]
++
++
+ type ProviderName = Literal["bitbucket", "github", "github_enterprise", "gitlab"]
+ """The SCM provider that owns an integration or repository."""
+ 
+@@ -644,3 +651,196 @@ def update_check_run(
+     ) -> ActionResult[CheckRun]: ...
+ 
+     def minimize_comment(self, comment_node_id: str, reason: str) -> None: ...
++
++
++class SubscriptionEvent(TypedDict):
++    """
++    A "SubscriptionEvent" is an event that was sent by a source control management (SCM)
++    service-provider. This type wraps the event and appends special metadata to aid processing
++    and monitoring.
++
++    All service provider events must be validated as authentic prior to being transformed to this
++    type.
++    """
++
++    received_at: int
++    """The UTC timestamp (in seconds) the event was received by Sentry's servers."""
++
++    type: ProviderName
++    """
++    The name of the service provider who sent the event. A stringy enum value of "github",
++    "gitlab", etc. For more information see the "ProviderName" type definition.
++    """
++
++    event_type_hint: str | None
++    """
++    Source control management service providers may send headers which hint at the event's
++    contents. This hint is optionally provided to the consuming process and may be used to ignore
++    unwanted events without deserializing the event body itself.
++    """
++
++    event: str
++    """
++    The event sent by the service provider. Typically a JSON object. The exact format is
++    determined by the "type" field.
++    """
++
++    extra: dict[str, str | None | bool | int | float]
++    """
++    An arbitrary mapping of key, value pairs extracted from the request headers of the message or
++    the local Sentry environment. The type is provider specific and can be determined by
++    investigating the target integrations webhook.py file.
++    """
++
++    sentry_meta: list["SubscriptionEventSentryMeta"] | None
++    """
++    If the event is opportunistically associated with internal Sentry metadata then that metadata
++    is specified here. If this data is not present your process will need to derive it from the
++    event.
++
++    This is included with GitLab requests but not with GitHub requests. This is because it is
++    necessary to derive this metadata to authenticate the request. GitHub requests do not need to
++    query for this metadata to authenticate their requests. Querying for Sentry metadata is left
++    as an exercise for the implementer if not provided.
++    """
++
++
++class SubscriptionEventSentryMeta(TypedDict):
++    id: int | None
++    """
++    "OrganizationIntegration" model identifier. Optionally specified. Only specified if the
++    installation has been explicitly queried.
++    """
++
++    integration_id: int | None
++    """
++    "Integration" model identifier.
++    """
++
++    organization_id: int | None
++    """
++    "Organization" model identifier.
++    """
++
++
++type CheckRunAction = Literal["completed", "created", "requested_action", "rerequested"]
++
++
++class CheckRunEventData(TypedDict):
++    external_id: str
++    html_url: str
++
++
++@dataclass(frozen=True)
++class CheckRunEvent:
++    action: CheckRunAction
++    """The action that triggered the event. An enumeration of string values."""
++
++    check_run: CheckRunEventData
++    """"""
++
++    subscription_event: SubscriptionEvent
++    """
++    The subscription event that was received by Sentry. This field contains the raw instructions
++    which parsed the action and check_run fields. You can use this field to perform additional
++    parsing if the default implementation is lacking.
++
++    This field will also include any extra metadata that was generated prior to being submitted to
++    the listener. In some cases, Sentry will query the database for information. This information
++    is stored in the "sentry_meta" field and is accessible without performing redundant queries.
++    """
++
++
++type CommentAction = Literal["created", "deleted", "edited", "pinned", "unpinned"]
++type CommentType = Literal["issue", "pull_request"]
++
++
++class CommentEventData(TypedDict):
++    id: str
++    body: str | None
++    author: Author | None
++
++
++@dataclass(frozen=True)
++class CommentEvent:
++    """ """
++
++    action: CommentAction
++    """The action that triggered the event. An enumeration of string values."""
++
++    comment_type: CommentType
++    """"""
++
++    comment: CommentEventData
++    """"""
++
++    subscription_event: SubscriptionEvent
++    """
++    The subscription event that was received by Sentry. This field contains the raw instructions
++    which parsed the action and comment fields. You can use this field to perform additional
++    parsing if the default implementation is lacking.
++
++    This field will also include any extra metadata that was generated prior to being submitted to
++    the listener. In some cases, Sentry will query the database for information. This information
++    is stored in the "sentry_meta" field and is accessible without performing redundant queries.
++    """
++
++
++type PullRequestAction = Literal[
++    "assigned",
++    "auto_merge_disabled",
++    "auto_merge_enabled",
++    "closed",
++    "converted_to_draft",
++    "demilestoned",  # Removed a milestone.
++    "dequeued",  # Removed from merge queue.
++    "edited",
++    "enqueued",  # Added to merge queue.
++    "labeled",
++    "locked",
++    "milestoned",  # Added a milestone.
++    "opened",
++    "ready_for_review",
++    "reopened",
++    "review_request_removed",
++    "review_requested",
++    "synchronize",  # Commits were pushed.
++    "unassigned",
++    "unlabeled",
++    "unlocked",
++]
++
++
++class PullRequestEventData(TypedDict):
++    id: str
++    title: str
++    description: str | None
++    head: PullRequestBranch
++    base: PullRequestBranch
++    is_private_repo: bool
++    author: Author | None
++
++
++@dataclass(frozen=True)
++class PullRequestEvent:
++    """
++    Pull request event type. This event is received when an action was performed on a pull-request.
++    For example, opened, closed, or ready for review.
++    """
++
++    action: PullRequestAction
++    """The action that triggered the event. An enumeration of string values."""
++
++    pull_request: PullRequestEventData
++    """The pull-request that was acted upon."""
++
++    subscription_event: SubscriptionEvent
++    """
++    The subscription event that was received by Sentry. This field contains the raw instructions
++    which parsed the action and pull_request fields. You can use this field to perform additional
++    parsing if the default implementation is lacking.
++
++    This field will also include any extra metadata that was generated prior to being submitted to
++    the listener. In some cases, Sentry will query the database for information. This information
++    is stored in the "sentry_meta" field and is accessible without performing redundant queries.
++    """
+diff --git a/src/sentry/scm/utils.py b/src/sentry/scm/utils.py
+new file mode 100644
+index 00000000000000..29fc713da76683
+--- /dev/null
++++ b/src/sentry/scm/utils.py
+@@ -0,0 +1,11 @@
++import random
++
++from sentry import options
++
++
++def check_rollout(cohort: float, cutoff: float) -> bool:
++    return cutoff > 0 and cohort <= cutoff
++
++
++def check_rollout_option(option_name: str) -> bool:
++    return check_rollout(cohort=random.random(), cutoff=float(options.get(option_name)))
+diff --git a/src/sentry/taskworker/namespaces.py b/src/sentry/taskworker/namespaces.py
+index 0d0a12df1a1efc..2daca183a58eac 100644
+--- a/src/sentry/taskworker/namespaces.py
++++ b/src/sentry/taskworker/namespaces.py
+@@ -195,6 +195,11 @@
+     app_feature="shared",
+ )
+ 
++scm_tasks = app.taskregistry.create_namespace(
++    "scm",
++    app_feature="scm",
++)
++
+ sdk_tasks = app.taskregistry.create_namespace(
+     "sdk",
+     app_feature="shared",
+diff --git a/static/app/chartcuterie/performance.tsx b/static/app/chartcuterie/performance.tsx
+index 79dedabace2156..98cf03958e9066 100644
+--- a/static/app/chartcuterie/performance.tsx
++++ b/static/app/chartcuterie/performance.tsx
+@@ -6,7 +6,6 @@ import {transformToLineSeries} from 'sentry/components/charts/lineChart';
+ import getBreakpointChartOptionsFromData, {
+   type EventBreakpointChartData,
+ } from 'sentry/components/events/eventStatisticalDetector/breakpointChartOptions';
+-import type {EventsStatsSeries} from 'sentry/types/organization';
+ import {transformStatsResponse} from 'sentry/utils/profiling/hooks/utils';
+ import type {NormalizedTrendsTransaction} from 'sentry/views/performance/trends/types';
+ 
+@@ -14,10 +13,6 @@ import {DEFAULT_FONT_FAMILY, makeSlackChartDefaults, slackChartSize} from './sla
+ import type {RenderDescriptor} from './types';
+ import {ChartType} from './types';
+ 
+-export type FunctionRegressionPercentileData = {
+-  data: EventsStatsSeries<'p95()'>;
+-};
+-
+ type FunctionRegressionChartData = {
+   evidenceData: NormalizedTrendsTransaction;
+   rawResponse: unknown;
+@@ -85,12 +80,8 @@ export function makePerformanceCharts(theme: Theme): Array<RenderDescriptor<Char
+         data.rawResponse
+       );
+ 
+-      const percentileData = {
+-        data: transformed,
+-      };
+-
+-      const param = {
+-        percentileData: percentileData as FunctionRegressionPercentileData,
++      const param: EventBreakpointChartData = {
++        percentileData: transformed,
+         evidenceData: data.evidenceData,
+       };
+ 
+diff --git a/static/app/components/events/eventStatisticalDetector/breakpointChart.spec.tsx b/static/app/components/events/eventStatisticalDetector/breakpointChart.spec.tsx
+index 417c5cea970c15..70eaa33e8873a0 100644
+--- a/static/app/components/events/eventStatisticalDetector/breakpointChart.spec.tsx
++++ b/static/app/components/events/eventStatisticalDetector/breakpointChart.spec.tsx
+@@ -40,7 +40,7 @@ describe('EventBreakpointChart', () => {
+     const link = await screen.findByRole('button', {name: 'Open in Explore'});
+     expect(link).toHaveAttribute(
+       'href',
+-      '/organizations/org-slug/explore/traces/?end=2017-10-17T02%3A41%3A20.000&environment=prod&mode=aggregate&project=-1&query=transaction%3A%22%2Fapi%2Forders%22%20is_transaction%3ATrue&start=2024-01-18T00%3A00%3A00.000&utc=true&visualize=%7B%22yAxes%22%3A%5B%22p95%28span.duration%29%22%5D%7D'
++      '/organizations/org-slug/explore/traces/?end=2017-10-17T02%3A41%3A20.000&environment=prod&mode=samples&project=-1&query=transaction%3A%22%2Fapi%2Forders%22%20is_transaction%3ATrue&start=2024-01-18T00%3A00%3A00.000&utc=true&visualize=%7B%22yAxes%22%3A%5B%22p95%28span.duration%29%22%5D%7D'
+     );
+   });
+ });
+diff --git a/static/app/components/events/eventStatisticalDetector/breakpointChart.tsx b/static/app/components/events/eventStatisticalDetector/breakpointChart.tsx
+index b1d0a84abfe758..77e637a5f30379 100644
+--- a/static/app/components/events/eventStatisticalDetector/breakpointChart.tsx
++++ b/static/app/components/events/eventStatisticalDetector/breakpointChart.tsx
+@@ -1,5 +1,3 @@
+-import snakeCase from 'lodash/snakeCase';
+-
+ import {LinkButton} from '@sentry/scraps/button';
+ 
+ import {ChartType} from 'sentry/chartcuterie/types';
+@@ -21,8 +19,8 @@ import {Mode} from 'sentry/views/explore/queryParams/mode';
+ import {getExploreUrl} from 'sentry/views/explore/utils';
+ import {SectionKey} from 'sentry/views/issueDetails/streamline/context';
+ import {InterimSection} from 'sentry/views/issueDetails/streamline/interimSection';
+-import type {NormalizedTrendsTransaction} from 'sentry/views/performance/trends/types';
+ 
++import type {BreakpointEvidenceData} from './breakpointChartOptions';
+ import {RELATIVE_DAYS_WINDOW} from './consts';
+ import Chart from './lineChart';
+ 
+@@ -34,7 +32,8 @@ function EventBreakpointChart({event}: EventBreakpointChartProps) {
+   const organization = useOrganization();
+   const location = useLocation();
+ 
+-  const {transaction, breakpoint} = event?.occurrence?.evidenceData ?? {};
++  const occurrenceEvidenceData = event?.occurrence?.evidenceData;
++  const {transaction, breakpoint} = occurrenceEvidenceData ?? {};
+ 
+   const eventView = EventView.fromLocation(location);
+   eventView.query = `event.type:transaction transaction:"${transaction}"`;
+@@ -60,7 +59,7 @@ function EventBreakpointChart({event}: EventBreakpointChartProps) {
+     typeof transaction === 'string' && typeof breakpoint === 'number'
+       ? getExploreUrl({
+           organization,
+-          mode: Mode.AGGREGATE,
++          mode: Mode.SAMPLES,
+           query: `transaction:"${transaction}" is_transaction:True`,
+           visualize: [{yAxes: ['p95(span.duration)']}],
+           selection: {
+@@ -71,14 +70,11 @@ function EventBreakpointChart({event}: EventBreakpointChartProps) {
+         })
+       : undefined;
+ 
+-  // The evidence data keys are returned to us in camelCase, but we need to
+-  // convert them to snake_case to match the NormalizedTrendsTransaction type
+-  const normalizedOccurrenceEvent = Object.entries(
+-    event?.occurrence?.evidenceData ?? {}
+-  ).reduce<Record<string, unknown>>((acc, [key, value]) => {
+-    acc[snakeCase(key)] = value;
+-    return acc;
+-  }, {}) as NormalizedTrendsTransaction;
++  const normalizedOccurrenceEvent: BreakpointEvidenceData = {
++    aggregate_range_1: occurrenceEvidenceData?.aggregateRange1,
++    aggregate_range_2: occurrenceEvidenceData?.aggregateRange2,
++    breakpoint: occurrenceEvidenceData?.breakpoint,
++  };
+ 
+   const {data, isPending} = useGenericDiscoverQuery<
+     {
+diff --git a/static/app/components/events/eventStatisticalDetector/breakpointChartOptions.tsx b/static/app/components/events/eventStatisticalDetector/breakpointChartOptions.tsx
+index c6de1774051d4f..dd82909d485a3d 100644
+--- a/static/app/components/events/eventStatisticalDetector/breakpointChartOptions.tsx
++++ b/static/app/components/events/eventStatisticalDetector/breakpointChartOptions.tsx
+@@ -1,10 +1,9 @@
+ import type {Theme} from '@emotion/react';
+ 
+-import type {FunctionRegressionPercentileData} from 'sentry/chartcuterie/performance';
+ import {ChartType} from 'sentry/chartcuterie/types';
++import type {BaseChartProps} from 'sentry/components/charts/baseChart';
+ import VisualMap from 'sentry/components/charts/components/visualMap';
+-import type {LineChart as EChartsLineChart} from 'sentry/components/charts/lineChart';
+-import type {EventsStatsData} from 'sentry/types/organization';
++import type {EventsStatsData, EventsStatsSeries} from 'sentry/types/organization';
+ import {
+   axisLabelFormatter,
+   getDurationUnit,
+@@ -20,43 +19,60 @@ import transformEventStats from 'sentry/views/performance/trends/utils/transform
+ import {getIntervalLine} from 'sentry/views/performance/utils/getIntervalLine';
+ 
+ export type EventBreakpointChartData = {
+-  evidenceData: NormalizedTrendsTransaction;
+-  percentileData: EventsStatsData | FunctionRegressionPercentileData;
++  evidenceData: BreakpointEvidenceData;
++  percentileData: EventsStatsData | EventsStatsSeries<'p95()'>;
+ };
+ 
++export type BreakpointEvidenceData = Pick<
++  NormalizedTrendsTransaction,
++  'aggregate_range_1' | 'aggregate_range_2' | 'breakpoint'
++>;
++
++function transformFunctionStatsToEventsStatsData(
++  stats?: EventsStatsSeries<'p95()'>
++): EventsStatsData {
++  const rawData = stats?.data.find(({axis}) => axis === 'p95()');
++  const timestamps = stats?.timestamps;
++  if (!timestamps || !rawData) {
++    return [];
++  }
++  return timestamps.map((timestamp, i) => [timestamp, [{count: rawData.values[i] ?? 0}]]);
++}
++
++function isEventsStatsData(
++  percentileData: EventBreakpointChartData['percentileData']
++): percentileData is EventsStatsData {
++  return Array.isArray(percentileData);
++}
++
++function toEventsStatsData(
++  chartType: ChartType,
++  percentileData: EventBreakpointChartData['percentileData']
++): EventsStatsData {
++  if (chartType === ChartType.SLACK_PERFORMANCE_FUNCTION_REGRESSION) {
++    return transformFunctionStatsToEventsStatsData(
++      isEventsStatsData(percentileData) ? undefined : percentileData
++    );
++  }
++
++  return isEventsStatsData(percentileData) ? percentileData : [];
++}
++
+ function getBreakpointChartOptionsFromData(
+   {percentileData, evidenceData}: EventBreakpointChartData,
+   chartType: ChartType,
+   theme: Theme
+ ) {
+-  const trendFunctionName: Partial<Record<ChartType, string>> = {
+-    [ChartType.SLACK_PERFORMANCE_ENDPOINT_REGRESSION]: 'transaction.duration',
+-    [ChartType.SLACK_PERFORMANCE_FUNCTION_REGRESSION]: 'function.duration',
+-  };
+-
+-  const defaultTransform = (stats: any) => stats;
+-
+-  const transformFunctionStats = (stats: any) => {
+-    const rawData = stats?.data?.data?.find(({axis}: any) => axis === 'p95()');
+-    const timestamps = stats?.data?.timestamps;
+-    if (!timestamps) {
+-      return [];
+-    }
+-    return timestamps.map((timestamp: any, i: any) => [
+-      timestamp,
+-      [{count: rawData.values[i]}],
+-    ]);
+-  };
+-
+-  // Mapping from BreakpointType to transformation functions
+-  const transformFunction: Partial<Record<ChartType, (arg: any) => EventsStatsData>> = {
+-    [ChartType.SLACK_PERFORMANCE_ENDPOINT_REGRESSION]: defaultTransform,
+-    [ChartType.SLACK_PERFORMANCE_FUNCTION_REGRESSION]: transformFunctionStats,
+-  };
++  const transformedPercentileData = toEventsStatsData(chartType, percentileData);
++  const trendFunction =
++    chartType === ChartType.SLACK_PERFORMANCE_FUNCTION_REGRESSION
++      ? 'function.duration'
++      : 'transaction.duration';
++  const breakpointMs = evidenceData.breakpoint ? evidenceData.breakpoint * 1000 : 0;
+ 
+   const transformedSeries = transformEventStats(
+-    transformFunction[chartType]!(percentileData),
+-    generateTrendFunctionAsString(TrendFunctionField.P95, trendFunctionName[chartType]!)
++    transformedPercentileData,
++    generateTrendFunctionAsString(TrendFunctionField.P95, trendFunction)
+   );
+ 
+   const intervalSeries = getIntervalLine(
+@@ -74,11 +90,12 @@ function getBreakpointChartOptionsFromData(
+     right: 16,
+     top: 12,
+     data: transformedSeries.map(s => s.seriesName),
+-  };
++    selectedMode: false,
++  } satisfies BaseChartProps['legend'];
+ 
+   const durationUnit = getDurationUnit(series);
+ 
+-  const chartOptions: Omit<React.ComponentProps<typeof EChartsLineChart>, 'series'> = {
++  const chartOptions = {
+     axisPointer: {
+       link: [
+         {
+@@ -87,7 +104,7 @@ function getBreakpointChartOptionsFromData(
+         },
+       ],
+     },
+-    colors: [theme.colors.gray200, theme.colors.gray800],
++    colors: [theme.colors.gray800, theme.colors.gray800],
+     grid: {
+       top: '40px',
+       bottom: '0px',
+@@ -117,17 +134,17 @@ function getBreakpointChartOptionsFromData(
+         pieces: [
+           {
+             gte: 0,
+-            lt: evidenceData?.breakpoint ? evidenceData.breakpoint * 1000 : 0,
++            lt: breakpointMs,
+             color: theme.colors.gray800,
+           },
+           {
+-            gte: evidenceData?.breakpoint ? evidenceData.breakpoint * 1000 : 0,
++            gte: breakpointMs,
+             color: theme.colors.red400,
+           },
+         ],
+       }),
+     },
+-  };
++  } satisfies BaseChartProps;
+   return {
+     series,
+     chartOptions,
+diff --git a/static/app/components/events/eventStatisticalDetector/functionBreakpointChart.tsx b/static/app/components/events/eventStatisticalDetector/functionBreakpointChart.tsx
+index a766ff880a7340..3f77f7393fcdd4 100644
+--- a/static/app/components/events/eventStatisticalDetector/functionBreakpointChart.tsx
++++ b/static/app/components/events/eventStatisticalDetector/functionBreakpointChart.tsx
+@@ -2,6 +2,7 @@ import {useEffect} from 'react';
+ import * as Sentry from '@sentry/react';
+ 
+ import {ChartType} from 'sentry/chartcuterie/types';
++import {type BreakpointEvidenceData} from 'sentry/components/events/eventStatisticalDetector/breakpointChartOptions';
+ import Chart from 'sentry/components/events/eventStatisticalDetector/lineChart';
+ import {t} from 'sentry/locale';
+ import type {Event} from 'sentry/types/event';
+@@ -10,7 +11,6 @@ import {useProfileEventsStats} from 'sentry/utils/profiling/hooks/useProfileEven
+ import {useRelativeDateTime} from 'sentry/utils/profiling/hooks/useRelativeDateTime';
+ import {SectionKey} from 'sentry/views/issueDetails/streamline/context';
+ import {InterimSection} from 'sentry/views/issueDetails/streamline/interimSection';
+-import type {NormalizedTrendsTransaction} from 'sentry/views/performance/trends/types';
+ 
+ import {RELATIVE_DAYS_WINDOW} from './consts';
+ 
+@@ -69,7 +69,7 @@ function EventFunctionBreakpointChartInner({
+     relativeDays: RELATIVE_DAYS_WINDOW,
+   });
+ 
+-  const functionStats = useProfileEventsStats({
++  const {data: functionPercentileData} = useProfileEventsStats({
+     dataset: 'profileFunctions',
+     datetime,
+     query: `fingerprint:${fingerprint}`,
+@@ -77,11 +77,11 @@ function EventFunctionBreakpointChartInner({
+     yAxes: SERIES,
+   });
+ 
+-  const normalizedOccurrenceEvent = {
++  const normalizedOccurrenceEvent: BreakpointEvidenceData = {
+     aggregate_range_1: evidenceData.aggregateRange1 / 1e6,
+     aggregate_range_2: evidenceData.aggregateRange2 / 1e6,
+     breakpoint: evidenceData.breakpoint,
+-  } as NormalizedTrendsTransaction;
++  };
+ 
+   return (
+     <InterimSection
+@@ -89,7 +89,7 @@ function EventFunctionBreakpointChartInner({
+       title={t('Regression Breakpoint Chart')}
+     >
+       <Chart
+-        percentileData={functionStats}
++        percentileData={functionPercentileData}
+         evidenceData={normalizedOccurrenceEvent}
+         datetime={datetime}
+         chartType={ChartType.SLACK_PERFORMANCE_FUNCTION_REGRESSION}
+diff --git a/static/app/components/events/eventStatisticalDetector/lineChart.tsx b/static/app/components/events/eventStatisticalDetector/lineChart.tsx
+index 955571953409f6..68d0e806395c15 100644
+--- a/static/app/components/events/eventStatisticalDetector/lineChart.tsx
++++ b/static/app/components/events/eventStatisticalDetector/lineChart.tsx
+@@ -1,25 +1,30 @@
+ import {useMemo} from 'react';
+ import {useTheme} from '@emotion/react';
+ 
+-import type {FunctionRegressionPercentileData} from 'sentry/chartcuterie/performance';
+ import type {ChartType} from 'sentry/chartcuterie/types';
+-import ChartZoom from 'sentry/components/charts/chartZoom';
+ import {LineChart as EChartsLineChart} from 'sentry/components/charts/lineChart';
+-import getBreakpointChartOptionsFromData from 'sentry/components/events/eventStatisticalDetector/breakpointChartOptions';
++import getBreakpointChartOptionsFromData, {
++  type BreakpointEvidenceData,
++  type EventBreakpointChartData,
++} from 'sentry/components/events/eventStatisticalDetector/breakpointChartOptions';
+ import type {PageFilters} from 'sentry/types/core';
+-import type {EventsStatsData} from 'sentry/types/organization';
+-import type {NormalizedTrendsTransaction} from 'sentry/views/performance/trends/types';
++import {getUtcToLocalDateObject} from 'sentry/utils/dates';
+ 
+ interface ChartProps {
+   chartType: ChartType;
+   datetime: PageFilters['datetime'];
+-  evidenceData: NormalizedTrendsTransaction;
+-  percentileData: EventsStatsData | FunctionRegressionPercentileData;
+-  trendFunctionName?: string;
++  evidenceData: BreakpointEvidenceData;
++  percentileData: EventBreakpointChartData['percentileData'];
+ }
+ 
+ function LineChart({datetime, percentileData, evidenceData, chartType}: ChartProps) {
+   const theme = useTheme();
++  const normalizedDateTime = {
++    period: datetime.period,
++    start: datetime.start ? getUtcToLocalDateObject(datetime.start) : undefined,
++    end: datetime.end ? getUtcToLocalDateObject(datetime.end) : undefined,
++    utc: datetime.utc ?? undefined,
++  };
+ 
+   const {series, chartOptions} = useMemo(() => {
+     return getBreakpointChartOptionsFromData(
+@@ -30,11 +35,13 @@ function LineChart({datetime, percentileData, evidenceData, chartType}: ChartPro
+   }, [percentileData, evidenceData, chartType, theme]);
+ 
+   return (
+-    <ChartZoom {...datetime}>
+-      {zoomRenderProps => (
+-        <EChartsLineChart {...zoomRenderProps} {...chartOptions} series={series} />
+-      )}
+-    </ChartZoom>
++    <EChartsLineChart
++      {...normalizedDateTime}
++      {...chartOptions}
++      isGroupedByDate
++      showTimeInTooltip
++      series={series}
++    />
+   );
+ }
+ 
+diff --git a/static/app/views/issueDetails/streamline/sidebar/metricDetectorTriggeredSection.tsx b/static/app/views/issueDetails/streamline/sidebar/metricDetectorTriggeredSection.tsx
+index 2879104a66eeca..0a9de4e3b295df 100644
+--- a/static/app/views/issueDetails/streamline/sidebar/metricDetectorTriggeredSection.tsx
++++ b/static/app/views/issueDetails/streamline/sidebar/metricDetectorTriggeredSection.tsx
+@@ -264,6 +264,7 @@ function ContributingIssues({
+     end,
+     limit: 5,
+     sort: aggregate === 'count_unique(user)' ? 'user' : 'freq',
++    groupStatsPeriod: 'auto',
+   };
+ 
+   const discoverUrl: LocationDescriptor = {
+@@ -304,7 +305,7 @@ function ContributingIssues({
+           <GroupList
+             queryParams={queryParams}
+             canSelectGroups={false}
+-            withChart={false}
++            withChart
+             withPagination={false}
+             source="metric-issue-contributing-issues"
+             numPlaceholderRows={3}
+diff --git a/static/app/views/performance/utils/getIntervalLine.tsx b/static/app/views/performance/utils/getIntervalLine.tsx
+index 6e6a178e7a86ff..dd9ed7573ba844 100644
+--- a/static/app/views/performance/utils/getIntervalLine.tsx
++++ b/static/app/views/performance/utils/getIntervalLine.tsx
+@@ -6,9 +6,10 @@ import type {LineChartSeries} from 'sentry/components/charts/lineChart';
+ import {t} from 'sentry/locale';
+ import type {Series} from 'sentry/types/echarts';
+ import {tooltipFormatter} from 'sentry/utils/discover/charts';
+-import type {NormalizedTrendsTransaction} from 'sentry/views/performance/trends/types';
+ import {getPerformanceDuration} from 'sentry/views/performance/utils/getPerformanceDuration';
+-import transformTransaction from 'sentry/views/performance/utils/transformTransaction';
++import transformTransaction, {
++  type BreakpointTransaction,
++} from 'sentry/views/performance/utils/transformTransaction';
+ 
+ const DEFAULT_CHART_HEIGHT = 200;
+ const X_AXIS_MARGIN_OFFSET = 23;
+@@ -18,7 +19,7 @@ export function getIntervalLine(
+   series: Series[],
+   intervalRatio: number,
+   label: boolean,
+-  transaction?: NormalizedTrendsTransaction,
++  transaction?: BreakpointTransaction,
+   useRegressionFormat?: boolean
+ ): LineChartSeries[] {
+   if (!transaction || !series.length || !series[0]!.data?.length) {
+diff --git a/static/app/views/performance/utils/transformTransaction.tsx b/static/app/views/performance/utils/transformTransaction.tsx
+index 03ddddd4d95bb7..05f60d6a19fd83 100644
+--- a/static/app/views/performance/utils/transformTransaction.tsx
++++ b/static/app/views/performance/utils/transformTransaction.tsx
+@@ -1,8 +1,13 @@
+ import type {NormalizedTrendsTransaction} from 'sentry/views/performance/trends/types';
+ 
++export type BreakpointTransaction = Pick<
++  NormalizedTrendsTransaction,
++  'aggregate_range_1' | 'aggregate_range_2' | 'breakpoint'
++>;
++
+ export default function transformTransaction(
+-  transaction: NormalizedTrendsTransaction
+-): NormalizedTrendsTransaction {
++  transaction: BreakpointTransaction
++): BreakpointTransaction {
+   if (transaction?.breakpoint) {
+     return {
+       ...transaction,
+diff --git a/tests/sentry/api/endpoints/test_project_rule_details.py b/tests/sentry/api/endpoints/test_project_rule_details.py
+index 3dcff698b5b2fb..c9f893fa0845bb 100644
+--- a/tests/sentry/api/endpoints/test_project_rule_details.py
++++ b/tests/sentry/api/endpoints/test_project_rule_details.py
+@@ -1654,6 +1654,43 @@ def test_single_written_workflow_passed(self) -> None:
+         assert not DataConditionGroup.objects.filter(id=self.workflow_triggers.id).exists()
+         assert not Action.objects.filter(id=self.action.id).exists()
+ 
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    def test_dual_delete_workflow_engine_flag_enabled(self) -> None:
++        rule = self.create_project_rule(
++            self.project,
++            condition_data=[
++                {
++                    "id": "sentry.rules.conditions.first_seen_event.FirstSeenEventCondition",
++                    "name": "A new issue is created",
++                },
++                {
++                    "id": "sentry.rules.filters.latest_release.LatestReleaseFilter",
++                    "name": "The event occurs",
++                },
++            ],
++        )
++
++        alert_rule_workflow = AlertRuleWorkflow.objects.get(rule_id=rule.id)
++        workflow = alert_rule_workflow.workflow
++        when_dcg = workflow.when_condition_group
++        assert when_dcg
++        if_dcg = WorkflowDataConditionGroup.objects.get(workflow=workflow).condition_group
++
++        self.get_success_response(
++            self.organization.slug, rule.project.slug, rule.id, status_code=202
++        )
++
++        with self.tasks():
++            run_scheduled_deletions()
++
++        assert not AlertRuleWorkflow.objects.filter(rule_id=rule.id).exists()
++        assert not Workflow.objects.filter(id=workflow.id).exists()
++        assert not DataConditionGroup.objects.filter(id=when_dcg.id).exists()
++        assert not DataConditionGroup.objects.filter(id=if_dcg.id).exists()
++        assert not DataCondition.objects.filter(condition_group=when_dcg).exists()
++        assert not DataCondition.objects.filter(condition_group=if_dcg).exists()
++        assert not Rule.objects.filter(id=rule.id).exists()
++
+     def test_dual_delete_workflow_engine(self) -> None:
+         rule = self.create_project_rule(
+             self.project,
+diff --git a/tests/sentry/scm/integration/test_helpers.py b/tests/sentry/scm/integration/test_helpers.py
+index 828f8c3951d33b..93497caf67f0e9 100644
+--- a/tests/sentry/scm/integration/test_helpers.py
++++ b/tests/sentry/scm/integration/test_helpers.py
+@@ -128,7 +128,7 @@ def test_returns_github_provider_for_github_integration(self):
+     def test_raises_error_for_unsupported_provider(self):
+         integration = self.create_integration(
+             organization=self.organization,
+-            provider="unsupported_provider",
++            provider="integrations:github",
+             name="Unsupported Provider Test",
+             external_id="1",
+         )
+@@ -147,7 +147,7 @@ def test_raises_error_for_unsupported_provider(self):
+                 get_installation=lambda _, oid: MagicMock(),
+             )
+ 
+-        assert exc_info.value.code == "integration_not_found"
++        assert exc_info.value.code == "unsupported_integration"
+ 
+ 
+ class TestFetchServiceProvider(TestCase):
+@@ -423,7 +423,7 @@ def test_scm_coded_error_is_reraised(self):
+         repository = _make_active_repository(org_id)
+ 
+         def raise_scm_coded_error(provider):
+-            raise SCMCodedError(code="integration_not_found")
++            raise SCMCodedError(code="unsupported_integration")
+ 
+         with pytest.raises(SCMCodedError) as exc_info:
+             exec_provider_fn(
+@@ -433,7 +433,7 @@ def raise_scm_coded_error(provider):
+                 fetch_service_provider=lambda _, __: _make_provider(),
+                 provider_fn=raise_scm_coded_error,
+             )
+-        assert exc_info.value.code == "integration_not_found"
++        assert exc_info.value.code == "unsupported_integration"
+ 
+     def test_generic_exception_wrapped_in_scm_unhandled_exception(self):
+         """Non-SCMError exceptions should be wrapped in SCMUnhandledException."""
+diff --git a/tests/sentry/scm/integration/test_ipc_integration.py b/tests/sentry/scm/integration/test_ipc_integration.py
+new file mode 100644
+index 00000000000000..d8a9bc3752a802
+--- /dev/null
++++ b/tests/sentry/scm/integration/test_ipc_integration.py
+@@ -0,0 +1,44 @@
++from unittest.mock import patch
++
++from sentry.scm.private.ipc import (
++    produce_to_listener,
++    run_webhook_handler_control_task,
++    run_webhook_handler_region_task,
++)
++from sentry.testutils.cases import TestCase
++from sentry.testutils.helpers import TaskRunner
++from sentry.testutils.silo import control_silo_test, region_silo_test
++
++
++class TestProduceToListenerIntegration(TestCase):
++    def test_produce_to_listener_control_silo(self):
++        """Test that produce_to_listener calls control silo task delay correctly."""
++        with patch(
++            "sentry.scm.private.ipc.run_webhook_handler_control_task.delay"
++        ) as mock_control_delay:
++            produce_to_listener("", "check_run", "test_listener", "control")
++            mock_control_delay.assert_called_once_with("test_listener", "", "check_run")
++
++    def test_produce_to_listener_region_silo(self):
++        """Test that produce_to_listener calls region silo task delay correctly."""
++        with patch(
++            "sentry.scm.private.ipc.run_webhook_handler_region_task.delay"
++        ) as mock_region_delay:
++            produce_to_listener("", "check_run", "my_handler", "region")
++            mock_region_delay.assert_called_once_with("my_handler", "", "check_run")
++
++
++@control_silo_test
++class TestWebhookHandlerControlTaskIntegration(TestCase):
++    def test_run_webhook_handler_control_task_success(self):
++        """Test the task can be delayed without error."""
++        with TaskRunner():
++            run_webhook_handler_control_task.delay("anything", "", "check_run")
++
++
++@region_silo_test
++class TestWebhookHandlerRegionTaskIntegration(TestCase):
++    def test_run_webhook_handler_region_task_success(self):
++        """Test the task can be delayed without error."""
++        with TaskRunner():
++            run_webhook_handler_region_task.delay("anything", "", "check_run")
+diff --git a/tests/sentry/scm/unit/private/test_ipc.py b/tests/sentry/scm/unit/private/test_ipc.py
+new file mode 100644
+index 00000000000000..d5dc08e5bbda81
+--- /dev/null
++++ b/tests/sentry/scm/unit/private/test_ipc.py
+@@ -0,0 +1,792 @@
++from unittest import mock
++
++import msgspec
++import pytest
++
++from sentry.scm.private.event_stream import SourceCodeManagerEventStream
++from sentry.scm.private.ipc import (
++    AuthorParser,
++    CheckRunEventDataParser,
++    CheckRunEventParser,
++    CommentEventDataParser,
++    CommentEventParser,
++    PullRequestBranchParser,
++    PullRequestEventDataParser,
++    PullRequestEventParser,
++    SubscriptionEventParser,
++    deserialize_check_run_event,
++    deserialize_comment_event,
++    deserialize_event,
++    deserialize_pull_request_event,
++    exec_listener,
++    produce_to_listeners,
++    run_listener,
++    serialize_check_run_event,
++    serialize_comment_event,
++    serialize_event,
++    serialize_pull_request_event,
++)
++from sentry.scm.types import (
++    CheckRunEvent,
++    CommentEvent,
++    EventType,
++    PullRequestEvent,
++    SubscriptionEvent,
++)
++
++
++def test_exec_listener():
++    """
++    Test successful execution of a listener.
++    """
++    count = 0
++
++    def record_count(a, b, c):
++        nonlocal count
++        count += 1
++
++    exec_listener("name", {"name": lambda a: None}, 1, record_count)
++    assert count == 0, "Listener could not be executed or failed"
++
++
++def test_exec_listener_missing_listener():
++    """
++    Assert the developers listener was removed prior to channel drain.
++    """
++    key = None
++    tags = None
++
++    def record_count(k, a, t):
++        nonlocal key, tags
++        key = k
++        tags = t
++
++    exec_listener("name", {}, 1, record_count)
++    assert key == "sentry.scm.run_listener.failed"
++    assert tags == {"reason": "not-found", "fn": "name"}
++
++
++def test_exec_listener_failed():
++    """
++    Assert the developers listener failed.
++    """
++    key = None
++    tags = None
++
++    def listener(e):
++        raise Exception("whatever")
++
++    def record_count(k, a, t):
++        nonlocal key, tags
++        key = k
++        tags = t
++
++    with pytest.raises(Exception):
++        exec_listener("name", {"name": listener}, 1, record_count)
++        assert key == "sentry.scm.run_listener.failed"
++        assert tags == {"reason": "internal", "fn": "name"}
++
++
++def test_run_check_run_listener():
++    event = None
++
++    scm = SourceCodeManagerEventStream()
++
++    @scm.listen_for("check_run")
++    def call_me_maybe(e):
++        nonlocal event
++        event = e
++
++    check_run_event = CheckRunEventParser(
++        action="completed",
++        check_run=CheckRunEventDataParser("1", "2"),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, [], "github"),
++    )
++    message = msgspec.json.encode(check_run_event).decode("utf-8")
++
++    run_listener(
++        "call_me_maybe",
++        message,
++        "check_run",
++        stream=scm,
++        get_current_time=lambda: 0.0,
++        report_error=lambda e: None,
++        record_count=lambda a, b, c: None,
++        record_timer=lambda a, b, c: None,
++    )
++
++    assert isinstance(event, CheckRunEvent), "Parsing from type hint failed."
++
++
++def test_run_comment_listener():
++    """
++    Test that comment events are properly deserialized and routed to comment listeners.
++    """
++    event: EventType | None = None
++
++    scm = SourceCodeManagerEventStream()
++
++    @scm.listen_for("comment")
++    def comment_handler(e):
++        nonlocal event
++        event = e
++
++    comment_event = CommentEventParser(
++        action="created",
++        comment_type="issue",
++        comment=CommentEventDataParser(
++            id="123",
++            body="Test comment",
++            author=AuthorParser(id="456", username="testuser"),
++        ),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, [], "github"),
++    )
++    message = msgspec.json.encode(comment_event).decode("utf-8")
++
++    run_listener(
++        "comment_handler",
++        message,
++        "comment",
++        stream=scm,
++        get_current_time=lambda: 0.0,
++        report_error=lambda e: None,
++        record_count=lambda a, b, c: None,
++        record_timer=lambda a, b, c: None,
++    )
++
++    assert isinstance(event, CommentEvent)
++    assert event.action == "created"
++    assert event.comment["id"] == "123"
++    assert event.comment["body"] == "Test comment"
++    assert event.comment["author"] is not None
++    assert event.comment["author"]["username"] == "testuser"
++
++
++def test_run_pull_request_listener():
++    """
++    Test that pull request events are properly deserialized and routed to PR listeners.
++    """
++    event = None
++
++    scm = SourceCodeManagerEventStream()
++
++    @scm.listen_for("pull_request")
++    def pr_handler(e):
++        nonlocal event
++        event = e
++
++    pr_event = PullRequestEventParser(
++        action="opened",
++        pull_request=PullRequestEventDataParser(
++            id="789",
++            title="Test PR",
++            description="Test description",
++            head=PullRequestBranchParser(ref="feature-branch", sha="abc123"),
++            base=PullRequestBranchParser(ref="main", sha="def456"),
++            is_private_repo=False,
++            author=AuthorParser(id="456", username="testuser"),
++        ),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, [], "github"),
++    )
++    message = msgspec.json.encode(pr_event).decode("utf-8")
++
++    run_listener(
++        "pr_handler",
++        message,
++        "pull_request",
++        stream=scm,
++        get_current_time=lambda: 0.0,
++        report_error=lambda e: None,
++        record_count=lambda a, b, c: None,
++        record_timer=lambda a, b, c: None,
++    )
++
++    assert isinstance(event, PullRequestEvent)
++    assert event.action == "opened"
++    assert event.pull_request["id"] == "789"
++    assert event.pull_request["title"] == "Test PR"
++    assert event.pull_request["head"]["ref"] == "feature-branch"
++    assert event.pull_request["base"]["ref"] == "main"
++
++
++def test_run_listener_metrics_recorded():
++    """
++    Test that success metrics and timing metrics are properly recorded.
++    """
++    distributions = None
++    metrics = []
++    timers = []
++
++    scm = SourceCodeManagerEventStream()
++
++    @scm.listen_for("check_run")
++    def handler(e):
++        pass
++
++    check_run_event = CheckRunEventParser(
++        action="completed",
++        check_run=CheckRunEventDataParser("1", "2"),
++        subscription_event=SubscriptionEventParser(None, "", {}, 100, [], "github"),
++    )
++    message = msgspec.json.encode(check_run_event).decode("utf-8")
++
++    def record_count(key, amount, tags):
++        metrics.append((key, amount, tags))
++
++    def record_distribution(key, amount, tags, unit):
++        nonlocal distributions
++        distributions = (key, amount, tags, unit)
++
++    def record_timer(key, amount, tags):
++        timers.append((key, amount, tags))
++
++    run_listener(
++        "handler",
++        message,
++        "check_run",
++        stream=scm,
++        get_current_time=lambda: 200.0,
++        report_error=lambda e: None,
++        record_count=record_count,
++        record_distribution=record_distribution,
++        record_timer=record_timer,
++    )
++
++    assert ("sentry.scm.run_listener.success", 1, {"fn": "handler"}) in metrics
++    assert distributions == (
++        "sentry.scm.run_listener.message.size",
++        len(message),
++        {"provider": "github", "event_type_hint": "check_run"},
++        "byte",
++    )
++    assert any(key == "sentry.scm.run_listener.queue_time" for key, _, _ in timers)
++    assert any(key == "sentry.scm.run_listener.task_time" for key, _, _ in timers)
++    assert any(key == "sentry.scm.run_listener.real_time" for key, _, _ in timers)
++
++
++def test_run_listener_not_found():
++    """
++    Test that calling a non-existent listener doesn't raise an exception.
++    """
++    metrics = []
++
++    def record_count(key, amount, tags):
++        metrics.append((key, amount, tags))
++
++    check_run_event = CheckRunEventParser(
++        action="completed",
++        check_run=CheckRunEventDataParser("1", "2"),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, [], "github"),
++    )
++    message = msgspec.json.encode(check_run_event).decode("utf-8")
++
++    # Should not raise exception even though listener doesn't exist
++    run_listener(
++        "nonexistent_handler",
++        message,
++        "check_run",
++        stream=SourceCodeManagerEventStream(),
++        get_current_time=lambda: 0.0,
++        report_error=lambda e: None,
++        record_count=record_count,
++        record_timer=lambda a, b, c: None,
++    )
++
++    assert (
++        "sentry.scm.run_listener.failed",
++        1,
++        {"reason": "not-found", "fn": "nonexistent_handler"},
++    ) in metrics
++
++
++def test_run_listener_exception_propagates():
++    """
++    Test that exceptions from listeners are properly propagated and metrics recorded.
++    """
++    metrics = []
++
++    scm = SourceCodeManagerEventStream()
++
++    @scm.listen_for("check_run")
++    def failing_handler(e):
++        raise ValueError("Something went wrong")
++
++    def record_count(key, amount, tags):
++        metrics.append((key, amount, tags))
++
++    check_run_event = CheckRunEventParser(
++        action="completed",
++        check_run=CheckRunEventDataParser("1", "2"),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, [], "github"),
++    )
++    message = msgspec.json.encode(check_run_event).decode("utf-8")
++
++    with pytest.raises(ValueError, match="Something went wrong"):
++        run_listener(
++            "failing_handler",
++            message,
++            "check_run",
++            stream=scm,
++            get_current_time=lambda: 0.0,
++            report_error=lambda e: None,
++            record_count=record_count,
++            record_timer=lambda a, b, c: None,
++        )
++
++    assert (
++        "sentry.scm.run_listener.failed",
++        1,
++        {"reason": "internal", "fn": "failing_handler"},
++    ) in metrics
++
++
++def test_run_listener_malformed_input():
++    error = None
++    metrics = []
++
++    def report_error(e):
++        nonlocal error
++        error = e
++
++    def record_count(a, b, c):
++        metrics.append((a, b, c))
++
++    # Implicitly tests no exception was raised.
++    run_listener(
++        "t",
++        "",
++        "check_run",
++        stream=SourceCodeManagerEventStream(),
++        get_current_time=lambda: 0.0,
++        report_error=report_error,
++        record_count=record_count,
++        record_timer=lambda a, b, c: None,
++    )
++
++    assert isinstance(error, msgspec.MsgspecError)
++    assert metrics == [("sentry.scm.run_listener.failed", 1, {"reason": "parse", "fn": "t"})]
++
++
++def test_serialize_deserialize_check_run_event():
++    """
++    Test round-trip serialization and deserialization of check run events.
++    """
++    event = CheckRunEvent(
++        action="completed",
++        check_run={"external_id": "12345", "html_url": "https://example.com/check"},
++        subscription_event={
++            "event": "raw_event_data",
++            "event_type_hint": "check_run",
++            "extra": {"key": "value", "number": 42},
++            "received_at": 1234567890,
++            "sentry_meta": [
++                {"id": 1, "integration_id": 100, "organization_id": 200},
++                {"id": None, "integration_id": 101, "organization_id": 201},
++            ],
++            "type": "github",
++        },
++    )
++
++    serialized = serialize_check_run_event(event)
++    assert isinstance(serialized, str)
++
++    deserialized = deserialize_check_run_event(serialized)
++    assert deserialized.action == event.action
++    assert deserialized.check_run["external_id"] == event.check_run["external_id"]
++    assert deserialized.check_run["html_url"] == event.check_run["html_url"]
++    assert deserialized.subscription_event["event"] == event.subscription_event["event"]
++    assert deserialized.subscription_event["type"] == event.subscription_event["type"]
++    assert deserialized.subscription_event["sentry_meta"] == event.subscription_event["sentry_meta"]
++
++
++def test_serialize_deserialize_comment_event():
++    """
++    Test round-trip serialization and deserialization of comment events.
++    """
++    event = CommentEvent(
++        action="created",
++        comment_type="issue",
++        comment={
++            "id": "comment-123",
++            "body": "This is a comment",
++            "author": {"id": "user-456", "username": "testuser"},
++        },
++        subscription_event={
++            "event": "raw_event_data",
++            "event_type_hint": "comment",
++            "extra": {},
++            "received_at": 1234567890,
++            "sentry_meta": None,
++            "type": "github",
++        },
++    )
++
++    serialized = serialize_comment_event(event)
++    assert isinstance(serialized, str)
++
++    deserialized = deserialize_comment_event(serialized)
++    assert deserialized.action == event.action
++    assert deserialized.comment_type == event.comment_type
++    assert deserialized.comment["id"] == event.comment["id"]
++    assert deserialized.comment["body"] == event.comment["body"]
++    assert deserialized.comment["author"] is not None
++    assert event.comment["author"] is not None
++    assert deserialized.comment["author"]["username"] == event.comment["author"]["username"]
++
++
++def test_serialize_deserialize_comment_event_no_author():
++    """
++    Test serialization/deserialization of comment events with null author.
++    """
++    event = CommentEvent(
++        action="deleted",
++        comment_type="pull_request",
++        comment={
++            "id": "comment-789",
++            "body": None,
++            "author": None,
++        },
++        subscription_event={
++            "event": "",
++            "event_type_hint": None,
++            "extra": {},
++            "received_at": 0,
++            "sentry_meta": None,
++            "type": "github",
++        },
++    )
++
++    serialized = serialize_comment_event(event)
++    deserialized = deserialize_comment_event(serialized)
++
++    assert deserialized.comment["author"] is None
++    assert deserialized.comment["body"] is None
++
++
++def test_serialize_deserialize_pull_request_event():
++    """
++    Test round-trip serialization and deserialization of pull request events.
++    """
++    event = PullRequestEvent(
++        action="opened",
++        pull_request={
++            "id": "pr-123",
++            "title": "Add new feature",
++            "description": "This PR adds a new feature",
++            "head": {"ref": "feature-branch", "sha": "abc123def456"},
++            "base": {"ref": "main", "sha": "fedcba654321"},
++            "is_private_repo": True,
++            "author": {"id": "user-789", "username": "contributor"},
++        },
++        subscription_event={
++            "event": "raw_event_data",
++            "event_type_hint": "pull_request",
++            "extra": {"repo": "test-repo"},
++            "received_at": 9876543210,
++            "sentry_meta": [{"id": 5, "integration_id": 50, "organization_id": 500}],
++            "type": "github",
++        },
++    )
++
++    serialized = serialize_pull_request_event(event)
++    assert isinstance(serialized, str)
++
++    deserialized = deserialize_pull_request_event(serialized)
++    assert deserialized.action == event.action
++    assert deserialized.pull_request["id"] == event.pull_request["id"]
++    assert deserialized.pull_request["title"] == event.pull_request["title"]
++    assert deserialized.pull_request["head"]["ref"] == event.pull_request["head"]["ref"]
++    assert deserialized.pull_request["base"]["sha"] == event.pull_request["base"]["sha"]
++    assert deserialized.pull_request["is_private_repo"] is True
++
++
++def test_serialize_deserialize_pull_request_event_no_author():
++    """
++    Test serialization/deserialization of PR events with null author and description.
++    """
++    event = PullRequestEvent(
++        action="closed",
++        pull_request={
++            "id": "pr-456",
++            "title": "Fix bug",
++            "description": None,
++            "head": {"ref": "bugfix", "sha": "aaa"},
++            "base": {"ref": "develop", "sha": "bbb"},
++            "is_private_repo": False,
++            "author": None,
++        },
++        subscription_event={
++            "event": "",
++            "event_type_hint": None,
++            "extra": {},
++            "received_at": 0,
++            "sentry_meta": None,
++            "type": "github",
++        },
++    )
++
++    serialized = serialize_pull_request_event(event)
++    deserialized = deserialize_pull_request_event(serialized)
++
++    assert deserialized.pull_request["author"] is None
++    assert deserialized.pull_request["description"] is None
++
++
++def test_serialize_event_dispatches_correctly():
++    """
++    Test that serialize_event dispatches to the correct serializer based on event type.
++    """
++    check_run_event = CheckRunEvent(
++        action="completed",
++        check_run={"external_id": "1", "html_url": "url"},
++        subscription_event={
++            "event": "",
++            "event_type_hint": None,
++            "extra": {},
++            "received_at": 0,
++            "sentry_meta": None,
++            "type": "github",
++        },
++    )
++
++    comment_event = CommentEvent(
++        action="created",
++        comment_type="issue",
++        comment={"id": "1", "body": None, "author": None},
++        subscription_event={
++            "event": "",
++            "event_type_hint": None,
++            "extra": {},
++            "received_at": 0,
++            "sentry_meta": None,
++            "type": "github",
++        },
++    )
++
++    pr_event = PullRequestEvent(
++        action="opened",
++        pull_request={
++            "id": "1",
++            "title": "Test",
++            "description": None,
++            "head": {"ref": "a", "sha": "b"},
++            "base": {"ref": "c", "sha": "d"},
++            "is_private_repo": False,
++            "author": None,
++        },
++        subscription_event={
++            "event": "",
++            "event_type_hint": None,
++            "extra": {},
++            "received_at": 0,
++            "sentry_meta": None,
++            "type": "github",
++        },
++    )
++
++    check_run_bytes = serialize_event(check_run_event)
++    comment_bytes = serialize_event(comment_event)
++    pr_bytes = serialize_event(pr_event)
++
++    assert isinstance(check_run_bytes, str)
++    assert isinstance(comment_bytes, str)
++    assert isinstance(pr_bytes, str)
++
++    # Verify they can be deserialized back
++    assert isinstance(deserialize_check_run_event(check_run_bytes), CheckRunEvent)
++    assert isinstance(deserialize_comment_event(comment_bytes), CommentEvent)
++    assert isinstance(deserialize_pull_request_event(pr_bytes), PullRequestEvent)
++
++
++def test_deserialize_event_dispatches_correctly():
++    """
++    Test that deserialize_event dispatches to the correct deserializer based on type hint.
++    """
++    check_run_parser = CheckRunEventParser(
++        action="completed",
++        check_run=CheckRunEventDataParser("1", "url"),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, None, "github"),
++    )
++    check_run_bytes = msgspec.json.encode(check_run_parser).decode("utf-8")
++
++    comment_parser = CommentEventParser(
++        action="created",
++        comment_type="issue",
++        comment=CommentEventDataParser("1", None, None),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, None, "github"),
++    )
++    comment_bytes = msgspec.json.encode(comment_parser).decode("utf-8")
++
++    pr_parser = PullRequestEventParser(
++        action="opened",
++        pull_request=PullRequestEventDataParser(
++            "1",
++            "Test",
++            None,
++            PullRequestBranchParser("a", "b"),
++            PullRequestBranchParser("c", "d"),
++            False,
++            None,
++        ),
++        subscription_event=SubscriptionEventParser(None, "", {}, 0, None, "github"),
++    )
++    pr_bytes = msgspec.json.encode(pr_parser).decode("utf-8")
++
++    assert isinstance(deserialize_event(check_run_bytes, "check_run"), CheckRunEvent)
++    assert isinstance(deserialize_event(comment_bytes, "comment"), CommentEvent)
++    assert isinstance(deserialize_event(pr_bytes, "pull_request"), PullRequestEvent)
++
++
++def test_produce_to_listeners_check_run():
++    """
++    Test that produce_to_listeners correctly routes check run events to registered listeners.
++    """
++    produced_messages = []
++
++    def mock_produce(message, event_type_hint, listener_name, silo):
++        produced_messages.append((message, event_type_hint, listener_name, silo))
++
++    subscription_event: SubscriptionEvent = {
++        "event": '{"action": "completed"}',
++        "event_type_hint": "check_run",
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": None,
++        "type": "github",
++    }
++
++    def mock_deserialize(event):
++        return CheckRunEvent(
++            action="completed",
++            check_run={"external_id": "1", "html_url": "url"},
++            subscription_event=event,
++        )
++
++    mock_stream = SourceCodeManagerEventStream()
++
++    @mock_stream.listen_for("check_run")
++    def listener_one(e):
++        pass
++
++    @mock_stream.listen_for("check_run")
++    def listener_two(e):
++        pass
++
++    with mock.patch("sentry.scm.private.ipc.deserialize_raw_event", mock_deserialize):
++        produce_to_listeners(subscription_event, "control", mock_produce, stream=mock_stream)
++
++        assert len(produced_messages) == 2
++        assert all(event_type == "check_run" for _, event_type, _, _ in produced_messages)
++        assert all(silo == "control" for _, _, _, silo in produced_messages)
++        listener_names = {listener_name for _, _, listener_name, _ in produced_messages}
++        assert listener_names == {"listener_one", "listener_two"}
++
++
++def test_produce_to_listeners_comment():
++    """
++    Test that produce_to_listeners correctly routes comment events to registered listeners.
++    """
++    produced_messages = []
++
++    def mock_produce(message, event_type_hint, listener_name, silo):
++        produced_messages.append((message, event_type_hint, listener_name, silo))
++
++    subscription_event: SubscriptionEvent = {
++        "event": "{}",
++        "event_type_hint": "comment",
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": None,
++        "type": "github",
++    }
++
++    def mock_deserialize(event):
++        return CommentEvent(
++            action="created",
++            comment_type="issue",
++            comment={"id": "1", "body": "test", "author": None},
++            subscription_event=event,
++        )
++
++    mock_stream = SourceCodeManagerEventStream()
++
++    @mock_stream.listen_for("comment")
++    def comment_listener(e):
++        pass
++
++    with mock.patch("sentry.scm.private.ipc.deserialize_raw_event", mock_deserialize):
++        produce_to_listeners(subscription_event, "region", mock_produce, stream=mock_stream)
++
++        assert len(produced_messages) == 1
++        assert produced_messages[0][1] == "comment"
++        assert produced_messages[0][3] == "region"
++
++
++def test_produce_to_listeners_pull_request():
++    """
++    Test that produce_to_listeners correctly routes PR events to registered listeners.
++    """
++    produced_messages = []
++
++    def mock_produce(message, event_type_hint, listener_name, silo):
++        produced_messages.append((message, event_type_hint, listener_name, silo))
++
++    subscription_event: SubscriptionEvent = {
++        "event": "",
++        "event_type_hint": "pull_request",
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": None,
++        "type": "github",
++    }
++
++    def mock_deserialize(event):
++        return PullRequestEvent(
++            action="opened",
++            pull_request={
++                "id": "1",
++                "title": "Test",
++                "description": None,
++                "head": {"ref": "a", "sha": "b"},
++                "base": {"ref": "c", "sha": "d"},
++                "is_private_repo": False,
++                "author": None,
++            },
++            subscription_event=event,
++        )
++
++    mock_stream = SourceCodeManagerEventStream()
++
++    @mock_stream.listen_for("pull_request")
++    def pr_listener(e):
++        pass
++
++    with mock.patch("sentry.scm.private.ipc.deserialize_raw_event", mock_deserialize):
++        produce_to_listeners(subscription_event, "control", mock_produce, stream=mock_stream)
++
++        assert len(produced_messages) == 1
++        assert produced_messages[0][1] == "pull_request"
++        assert produced_messages[0][3] == "control"
++
++
++def test_produce_to_listeners_returns_none_for_unsupported_events():
++    """
++    Test that produce_to_listeners returns None when deserialize_raw_event returns None.
++    """
++    produced_messages = []
++
++    def mock_produce(message, event_type_hint, listener_name, silo):
++        produced_messages.append((message, event_type_hint, listener_name, silo))
++
++    subscription_event: SubscriptionEvent = {
++        "event": "unsupported",
++        "event_type_hint": None,
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": None,
++        "type": "github",
++    }
++
++    with mock.patch("sentry.scm.private.ipc.deserialize_raw_event", lambda e: None):
++        produce_to_listeners(subscription_event, "region", mock_produce)
++        assert len(produced_messages) == 0
+diff --git a/tests/sentry/scm/unit/test_scm_utils.py b/tests/sentry/scm/unit/test_scm_utils.py
+new file mode 100644
+index 00000000000000..510688fa621f88
+--- /dev/null
++++ b/tests/sentry/scm/unit/test_scm_utils.py
+@@ -0,0 +1,20 @@
++import pytest
++
++from sentry.scm.utils import check_rollout
++
++
++@pytest.mark.parametrize(
++    "cohort,cutoff,expected",
++    [
++        (0, 0, False),
++        (1, 0, False),
++        (0.5, 0, False),
++        (0, 1, True),
++        (0.1, 1, True),
++        (0.1, 0.5, True),
++        (0.5, 0.5, True),
++        (1, 1, True),
++    ],
++)
++def test_check_rollout(cohort: float, cutoff: float, expected: bool):
++    assert check_rollout(cohort, cutoff) is expected
+diff --git a/tests/sentry/scm/unit/test_stream.py b/tests/sentry/scm/unit/test_stream.py
+new file mode 100644
+index 00000000000000..4e0abaf8483f99
+--- /dev/null
++++ b/tests/sentry/scm/unit/test_stream.py
+@@ -0,0 +1,29 @@
++from sentry.scm.private.event_stream import SourceCodeManagerEventStream
++
++
++def test_listener_registration():
++    scm = SourceCodeManagerEventStream()
++
++    @scm.listen_for("check_run")
++    def cr_listener(event):
++        pass
++
++    @scm.listen_for("comment")
++    def comment_listener(event):
++        pass
++
++    @scm.listen_for("pull_request")
++    def pr_listener(event):
++        pass
++
++    @scm.listen_for("pull_request")
++    def pr_listener_2(event):
++        pass
++
++    # Assert our scm instance had listeners registered to it.
++    assert scm.check_run_listeners == {cr_listener.__name__: cr_listener}
++    assert scm.comment_listeners == {comment_listener.__name__: comment_listener}
++    assert scm.pull_request_listeners == {
++        pr_listener.__name__: pr_listener,
++        pr_listener_2.__name__: pr_listener_2,
++    }
+diff --git a/tests/sentry/scm/unit/test_stream_producer.py b/tests/sentry/scm/unit/test_stream_producer.py
+new file mode 100644
+index 00000000000000..d4eb3bf449ac1f
+--- /dev/null
++++ b/tests/sentry/scm/unit/test_stream_producer.py
+@@ -0,0 +1,124 @@
++import msgspec
++
++from fixtures.github import PULL_REQUEST_OPENED_EVENT_EXAMPLE
++from sentry.scm.stream_producer import produce_event_to_scm_stream
++from sentry.scm.types import SubscriptionEvent
++
++
++def test_produce_to_scm_stream():
++    metrics = []
++
++    def record_count(k, a, t):
++        metrics.append((k, a, t))
++
++    event: SubscriptionEvent = {
++        "event": PULL_REQUEST_OPENED_EVENT_EXAMPLE.decode("utf-8"),
++        "event_type_hint": "pull_request",
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": [],
++        "type": "github",
++    }
++    produce_event_to_scm_stream(
++        event,
++        "control",
++        produce_to_listener=lambda a, b, c, d: None,
++        record_count=record_count,
++        rollout_enabled=lambda _: True,
++    )
++    assert metrics == [("sentry.scm.produce_event_to_scm_stream.success", 1, {})]
++
++
++def test_produce_to_scm_stream_unsupported_provider():
++    metrics = []
++
++    def record_count(k, a, t):
++        metrics.append((k, a, t))
++
++    event: SubscriptionEvent = {
++        "event": "",
++        "event_type_hint": None,
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": [],
++        "type": "bitbucket",
++    }
++    produce_event_to_scm_stream(
++        event,
++        "control",
++        record_count=record_count,
++        rollout_enabled=lambda _: True,
++    )
++
++    assert metrics == [
++        (
++            "sentry.scm.produce_event_to_scm_stream.failed",
++            1,
++            {"reason": "not-supported", "provider": event["type"]},
++        )
++    ]
++
++
++def test_produce_to_scm_stream_invalid_payload():
++    metrics = []
++    reported_exception = None
++
++    def record_count(k, a, t):
++        metrics.append((k, a, t))
++
++    def report_error(e):
++        nonlocal reported_exception
++        reported_exception = e
++
++    event: SubscriptionEvent = {
++        "event": "",
++        "event_type_hint": "pull_request",
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": [],
++        "type": "github",
++    }
++    produce_event_to_scm_stream(
++        event,
++        "control",
++        record_count=record_count,
++        report_error=report_error,
++        rollout_enabled=lambda _: True,
++    )
++
++    assert isinstance(reported_exception, msgspec.MsgspecError)
++    assert metrics == [
++        ("sentry.scm.produce_event_to_scm_stream.failed", 1, {"reason": "processing"})
++    ]
++
++
++def test_produce_to_scm_stream_rollout_disabled():
++    metrics = []
++    reported_exception = None
++
++    def record_count(k, a, t):
++        metrics.append((k, a, t))
++
++    def report_error(e):
++        nonlocal reported_exception
++        reported_exception = e
++
++    event: SubscriptionEvent = {
++        "event": "",
++        "event_type_hint": "pull_request",
++        "extra": {},
++        "received_at": 0,
++        "sentry_meta": [],
++        "type": "github",
++    }
++    produce_event_to_scm_stream(
++        event,
++        "control",
++        record_count=record_count,
++        report_error=report_error,
++        rollout_enabled=lambda _: False,
++    )
++
++    # Would have raised if enabled.
++    assert reported_exception is None
++    assert metrics == []

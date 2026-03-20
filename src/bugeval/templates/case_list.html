@@ -1,91 +1,236 @@
 {% extends "base.html" %}
 {% block title %}Cases — bugeval{% endblock %}
 {% block content %}
-<h1>Cases <span class="text-muted">({{ total }} matching)</span></h1>
+<h1>Cases <span class="text-muted" id="total-label"></span></h1>
 
-{% if next_unreviewed %}
-<div style="margin-bottom:12px;">
-  <a href="/cases/{{ next_unreviewed }}" class="btn btn-primary">Next Unreviewed (needs_manual_review) →</a>
-</div>
-{% endif %}
-
-<form method="get" class="filter-bar">
-  <select name="repo">
-    <option value="">All repos</option>
-    {% for r in repos %}<option value="{{ r }}" {% if filters.repo == r %}selected{% endif %}>{{ r }}</option>{% endfor %}
-  </select>
-  <select name="category">
-    <option value="">All categories</option>
-    {% for c in categories %}<option value="{{ c }}" {% if filters.category == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
-  </select>
-  <select name="difficulty">
-    <option value="">All difficulties</option>
-    {% for d in difficulties %}<option value="{{ d }}" {% if filters.difficulty == d %}selected{% endif %}>{{ d }}</option>{% endfor %}
-  </select>
-  <select name="severity">
-    <option value="">All severities</option>
-    {% for s in severities %}<option value="{{ s }}" {% if filters.severity == s %}selected{% endif %}>{{ s }}</option>{% endfor %}
-  </select>
-  <select name="needs_manual_review">
-    <option value="">Any review flag</option>
-    <option value="true" {% if filters.needs_manual_review == "true" %}selected{% endif %}>Needs review</option>
-    <option value="false" {% if filters.needs_manual_review == "false" %}selected{% endif %}>No review needed</option>
-  </select>
-  <select name="reviewed">
+<div class="filter-bar" id="filter-bar">
+  <select id="f-repo"><option value="">All repos</option></select>
+  <select id="f-category"><option value="">All categories</option></select>
+  <select id="f-difficulty"><option value="">All difficulties</option></select>
+  <select id="f-severity"><option value="">All severities</option></select>
+  <select id="f-reviewed">
     <option value="">Any reviewed state</option>
-    <option value="true" {% if filters.reviewed == "true" %}selected{% endif %}>Reviewed</option>
-    <option value="false" {% if filters.reviewed == "false" %}selected{% endif %}>Unreviewed</option>
+    <option value="true">Reviewed</option>
+    <option value="false">Unreviewed</option>
   </select>
-  <button type="submit" class="btn btn-primary btn-sm">Filter</button>
-  <a href="/cases" class="btn btn-secondary btn-sm">Reset</a>
-</form>
+  <select id="f-needs_manual_review">
+    <option value="">Any review flag</option>
+    <option value="true">Needs review</option>
+    <option value="false">No review needed</option>
+  </select>
+  <input type="text" id="f-q" placeholder="Search..." style="min-width:160px;">
+  <button class="btn btn-primary btn-sm" onclick="fetchCases(1)">Filter</button>
+  <button class="btn btn-secondary btn-sm" onclick="resetFilters()">Reset</button>
+</div>
 
-<table>
+<div id="loading" style="padding:24px;text-align:center;">Loading...</div>
+
+<table id="cases-table" style="display:none;">
   <thead>
     <tr>
-      <th><a href="/cases?sort=id{% if filter_query %}&{{ filter_query }}{% endif %}">ID</a></th>
-      <th><a href="/cases?sort=repo{% if filter_query %}&{{ filter_query }}{% endif %}">Repo</a></th>
-      <th>Category</th>
-      <th>Difficulty</th>
-      <th>Severity</th>
-      <th title="Needs Manual Review">NMR</th>
-      <th>Reviewed</th>
-      <th>Action</th>
+      <th class="sortable" data-sort="id">ID</th>
+      <th class="sortable" data-sort="repo">Repo</th>
+      <th class="sortable" data-sort="category">Category</th>
+      <th class="sortable" data-sort="difficulty">Difficulty</th>
+      <th class="sortable" data-sort="severity">Severity</th>
+      <th>PR Size</th>
+      <th>Findings</th>
+      <th>Status</th>
     </tr>
   </thead>
-  <tbody>
-    {% for case in cases %}
-    <tr>
-      <td><a href="/cases/{{ case.id }}">{{ case.id }}</a></td>
-      <td>{{ case.repo }}</td>
-      <td><span class="badge badge-blue">{{ case.category.value }}</span></td>
-      <td>
-        {% if case.difficulty.value == "easy" %}<span class="badge badge-green">easy</span>
-        {% elif case.difficulty.value == "medium" %}<span class="badge badge-yellow">medium</span>
-        {% else %}<span class="badge badge-red">hard</span>{% endif %}
-      </td>
-      <td>
-        {% if case.severity.value == "critical" %}<span class="badge badge-red">critical</span>
-        {% elif case.severity.value == "high" %}<span class="badge badge-yellow">high</span>
-        {% else %}<span class="badge badge-gray">{{ case.severity.value }}</span>{% endif %}
-      </td>
-      <td>{% if case.needs_manual_review %}<span class="badge badge-yellow">⚑</span>{% endif %}</td>
-      <td>
-        {% if case.id in reviewed_ids %}<span class="badge badge-green">✓</span>
-        {% else %}<span class="badge badge-gray">–</span>{% endif %}
-      </td>
-      <td><a href="/cases/{{ case.id }}" class="btn btn-primary btn-sm">Review</a></td>
-    </tr>
-    {% endfor %}
-  </tbody>
+  <tbody id="cases-body"></tbody>
 </table>
 
-{% if total_pages > 1 %}
-{% set pq = "sort=" ~ filters.sort ~ ("&" ~ filter_query if filter_query else "") %}
-<div class="pagination">
-  {% if page > 1 %}<a href="?page={{ page - 1 }}&{{ pq }}">← Prev</a>{% endif %}
-  <span class="current">{{ page }} / {{ total_pages }}</span>
-  {% if page < total_pages %}<a href="?page={{ page + 1 }}&{{ pq }}">Next →</a>{% endif %}
-</div>
-{% endif %}
+<div class="pagination" id="pagination" style="display:none;"></div>
+
+<script>
+(function() {
+  var currentSort = "id";
+  var currentPage = 1;
+
+  var diffBadge = {easy:"badge-green",medium:"badge-yellow",hard:"badge-red"};
+  var sevBadge = {critical:"badge-red",high:"badge-yellow",medium:"badge-gray",low:"badge-gray"};
+
+  function qs() {
+    var p = [];
+    p.push("page=" + currentPage);
+    p.push("sort=" + encodeURIComponent(currentSort));
+    var ids = ["repo","category","difficulty","severity","reviewed","needs_manual_review"];
+    for (var i = 0; i < ids.length; i++) {
+      var v = document.getElementById("f-" + ids[i]).value;
+      if (v) p.push(ids[i] + "=" + encodeURIComponent(v));
+    }
+    var q = document.getElementById("f-q").value.trim();
+    if (q) p.push("q=" + encodeURIComponent(q));
+    return p.join("&");
+  }
+
+  function populateDropdown(id, values, labelPrefix) {
+    var sel = document.getElementById(id);
+    var cur = sel.value;
+    while (sel.options.length > 1) sel.remove(1);
+    for (var i = 0; i < values.length; i++) {
+      var opt = document.createElement("option");
+      opt.value = values[i];
+      opt.textContent = values[i];
+      sel.appendChild(opt);
+    }
+    sel.value = cur;
+  }
+
+  function renderRow(c) {
+    var tr = document.createElement("tr");
+    tr.style.cursor = "pointer";
+    tr.onclick = function() { window.location = "/cases/" + c.id; };
+
+    var tdId = document.createElement("td");
+    var a = document.createElement("a");
+    a.href = "/cases/" + c.id;
+    a.textContent = c.id;
+    tdId.appendChild(a);
+    tr.appendChild(tdId);
+
+    var tdRepo = document.createElement("td");
+    tdRepo.textContent = c.repo;
+    tr.appendChild(tdRepo);
+
+    var tdCat = document.createElement("td");
+    tdCat.innerHTML = '<span class="badge badge-blue">' + esc(c.category) + '</span>';
+    tr.appendChild(tdCat);
+
+    var tdDiff = document.createElement("td");
+    var dc = diffBadge[c.difficulty] || "badge-gray";
+    tdDiff.innerHTML = '<span class="badge ' + dc + '">' + esc(c.difficulty) + '</span>';
+    tr.appendChild(tdDiff);
+
+    var tdSev = document.createElement("td");
+    var sc = sevBadge[c.severity] || "badge-gray";
+    tdSev.innerHTML = '<span class="badge ' + sc + '">' + esc(c.severity) + '</span>';
+    tr.appendChild(tdSev);
+
+    var tdSize = document.createElement("td");
+    tdSize.textContent = c.pr_size;
+    tr.appendChild(tdSize);
+
+    var tdFindings = document.createElement("td");
+    tdFindings.textContent = c.findings_count;
+    tr.appendChild(tdFindings);
+
+    var tdStatus = document.createElement("td");
+    var parts = [];
+    if (c.reviewed) parts.push('<span class="badge badge-green">reviewed</span>');
+    if (c.needs_manual_review) parts.push('<span class="badge badge-yellow">needs review</span>');
+    if (c.verified) parts.push('<span class="badge badge-green">verified</span>');
+    tdStatus.innerHTML = parts.join(" ") || '<span class="badge badge-gray">-</span>';
+    tr.appendChild(tdStatus);
+
+    return tr;
+  }
+
+  function esc(s) {
+    var d = document.createElement("div");
+    d.appendChild(document.createTextNode(s));
+    return d.innerHTML;
+  }
+
+  function renderPagination(page, pages) {
+    var el = document.getElementById("pagination");
+    el.innerHTML = "";
+    if (pages <= 1) { el.style.display = "none"; return; }
+    el.style.display = "flex";
+
+    if (page > 1) {
+      var prev = document.createElement("a");
+      prev.href = "#";
+      prev.textContent = "Prev";
+      prev.onclick = function(e) { e.preventDefault(); fetchCases(page - 1); };
+      el.appendChild(prev);
+    }
+
+    var start = Math.max(1, page - 2);
+    var end = Math.min(pages, page + 2);
+    for (var i = start; i <= end; i++) {
+      var span = document.createElement(i === page ? "span" : "a");
+      span.textContent = i;
+      if (i === page) {
+        span.className = "current";
+      } else {
+        span.href = "#";
+        (function(n) { span.onclick = function(e) { e.preventDefault(); fetchCases(n); }; })(i);
+      }
+      el.appendChild(span);
+    }
+
+    if (page < pages) {
+      var next = document.createElement("a");
+      next.href = "#";
+      next.textContent = "Next";
+      next.onclick = function(e) { e.preventDefault(); fetchCases(page + 1); };
+      el.appendChild(next);
+    }
+  }
+
+  window.fetchCases = function(page) {
+    currentPage = page || 1;
+    var loading = document.getElementById("loading");
+    var table = document.getElementById("cases-table");
+    loading.style.display = "block";
+    table.style.display = "none";
+
+    fetch("/api/cases?" + qs())
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        // Populate dropdowns on first load
+        if (data.filters) {
+          populateDropdown("f-repo", data.filters.repos);
+          populateDropdown("f-category", data.filters.categories);
+          populateDropdown("f-difficulty", data.filters.difficulties);
+          populateDropdown("f-severity", data.filters.severities);
+        }
+
+        document.getElementById("total-label").textContent =
+          "(" + data.total + " matching)";
+
+        var body = document.getElementById("cases-body");
+        body.innerHTML = "";
+        for (var i = 0; i < data.cases.length; i++) {
+          body.appendChild(renderRow(data.cases[i]));
+        }
+
+        loading.style.display = "none";
+        table.style.display = "";
+        renderPagination(data.page, data.pages);
+      });
+  };
+
+  window.resetFilters = function() {
+    var ids = ["repo","category","difficulty","severity","reviewed","needs_manual_review"];
+    for (var i = 0; i < ids.length; i++) {
+      document.getElementById("f-" + ids[i]).value = "";
+    }
+    document.getElementById("f-q").value = "";
+    currentSort = "id";
+    fetchCases(1);
+  };
+
+  // Sort header clicks
+  document.querySelectorAll("th.sortable").forEach(function(th) {
+    th.style.cursor = "pointer";
+    th.onclick = function() {
+      var key = th.getAttribute("data-sort");
+      if (currentSort === key) currentSort = "-" + key;
+      else currentSort = key;
+      fetchCases(1);
+    };
+  });
+
+  // Search on Enter
+  document.getElementById("f-q").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") { e.preventDefault(); fetchCases(1); }
+  });
+
+  // Initial load
+  fetchCases(1);
+})();
+</script>
 {% endblock %}

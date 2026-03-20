@@ -190,8 +190,13 @@ def _get_diff_for_case(case: TestCase, patches_dir: Path | None) -> str:
         repo = case.repo
         owner, name = repo.split("/", 1)
         try:
-            cmd = ["gh", "api", f"repos/{owner}/{name}/pulls/{case.pr_number}",
-                   "--header", "Accept: application/vnd.github.v3.diff"]
+            cmd = [
+                "gh",
+                "api",
+                f"repos/{owner}/{name}/pulls/{case.pr_number}",
+                "--header",
+                "Accept: application/vnd.github.v3.diff",
+            ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
                 return result.stdout
@@ -330,8 +335,7 @@ def groundedness_check(
         to_check = all_case_paths[:limit]
 
     click.echo(
-        f"Checking groundedness of {len(to_check)} cases "
-        f"(model={model}, workers={workers})..."
+        f"Checking groundedness of {len(to_check)} cases (model={model}, workers={workers})..."
     )
 
     passed = failed = skipped = 0
@@ -371,8 +375,6 @@ def groundedness_check(
                     if not dry_run:
                         save_case(updated, path)
 
-    click.echo(
-        f"\nGroundedness check: {passed} passed, {failed} failed, {skipped} skipped"
-    )
+    click.echo(f"\nGroundedness check: {passed} passed, {failed} failed, {skipped} skipped")
     if failed > 0 and not dry_run:
         click.echo(f"{failed} cases marked with quality_flags: ['groundedness-failed']")

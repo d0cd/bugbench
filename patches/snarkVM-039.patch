@@ -1,68 +1,619 @@
-diff --git a/ledger/query/src/query.rs b/ledger/query/src/query.rs
-index f925c51b3..6ed2f707a 100644
---- a/ledger/query/src/query.rs
-+++ b/ledger/query/src/query.rs
-@@ -66,7 +66,9 @@ impl<N: Network, B: BlockStorage<N>> QueryTrait<N> for Query<N, B> {
-         match self {
-             Self::VM(block_store) => Ok(block_store.current_state_root()),
-             Self::REST(url) => match N::ID {
--                3 => Ok(Self::get_request(&format!("{url}/mainnet/latest/stateRoot"))?.into_json()?),
-+                console::network::MainnetV0::ID => {
-+                    Ok(Self::get_request(&format!("{url}/mainnet/latest/stateRoot"))?.into_json()?)
-+                }
-                 _ => bail!("Unsupported network ID in inclusion query"),
-             },
+diff --git a/console/network/environment/src/lib.rs b/console/network/environment/src/lib.rs
+index 05f748ab7..4a7aad0f8 100644
+--- a/console/network/environment/src/lib.rs
++++ b/console/network/environment/src/lib.rs
+@@ -76,6 +76,7 @@ pub mod prelude {
+         FromBits as _,
+         FromBytes,
+         FromBytesDeserializer,
++        LimitedWriter,
+         TestRng,
+         ToBits as _,
+         ToBytes,
+diff --git a/console/network/src/lib.rs b/console/network/src/lib.rs
+index 63af2ab15..a2aab373e 100644
+--- a/console/network/src/lib.rs
++++ b/console/network/src/lib.rs
+@@ -192,6 +192,10 @@ pub trait Network:
+     /// The maximum number of certificates in a batch.
+     const MAX_CERTIFICATES: u16;
+ 
++    /// The maximum number of bytes in a transaction.
++    // Note: This value must **not** be decreased as it would invalidate existing transactions.
++    const MAX_TRANSACTION_SIZE: usize = 128_000; // 128 kB
++
+     /// The state root type.
+     type StateRoot: Bech32ID<Field<Self>>;
+     /// The block hash type.
+diff --git a/ledger/Cargo.toml b/ledger/Cargo.toml
+index be34ffd2b..e75f892a8 100644
+--- a/ledger/Cargo.toml
++++ b/ledger/Cargo.toml
+@@ -21,6 +21,11 @@ name = "block"
+ path = "benches/block.rs"
+ harness = false
+ 
++[[bench]]
++name = "bonded_mapping"
++path = "benches/bonded_mapping.rs"
++harness = false
++
+ [[bench]]
+ name = "transaction"
+ path = "benches/transaction.rs"
+diff --git a/ledger/benches/bonded_mapping.rs b/ledger/benches/bonded_mapping.rs
+new file mode 100644
+index 000000000..94d9e7b96
+--- /dev/null
++++ b/ledger/benches/bonded_mapping.rs
+@@ -0,0 +1,110 @@
++// Copyright (C) 2019-2023 Aleo Systems Inc.
++// This file is part of the snarkVM library.
++
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at:
++// http://www.apache.org/licenses/LICENSE-2.0
++
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#[macro_use]
++extern crate criterion;
++
++use console::{
++    account::{Address, Field, PrivateKey},
++    collections::U64,
++    network::MainnetV0,
++    program::{Identifier, Literal, Plaintext, ProgramID, Value},
++};
++use ledger_committee::{MAX_DELEGATORS, MIN_DELEGATOR_STAKE};
++#[cfg(not(feature = "rocks"))]
++use ledger_store::helpers::memory::ConsensusMemory;
++#[cfg(feature = "rocks")]
++use ledger_store::helpers::rocksdb::ConsensusDB;
++use ledger_store::ConsensusStore;
++use synthesizer::VM;
++
++use criterion::Criterion;
++use indexmap::indexmap;
++use std::{str::FromStr, time::Duration};
++
++pub type CurrentNetwork = MainnetV0;
++#[cfg(feature = "rocks")]
++pub type CurrentStorage = ConsensusDB<CurrentNetwork>;
++#[cfg(not(feature = "rocks"))]
++pub type CurrentStorage = ConsensusMemory<CurrentNetwork>;
++
++pub const BONDED_INTERVALS: &[usize; 7] = &[10, 5_000, 10_000, 20_000, 40_000, 80_000, 100_000];
++
++fn bench_bonded_mappings(c: &mut Criterion) {
++    // Construct the credits.aleo program ID.
++    let credits_program_id = ProgramID::from_str("credits.aleo").unwrap();
++    // Construct the bonded mapping name.
++    let bonded_mapping = Identifier::from_str("bonded").unwrap();
++    // Construct the bond_state identifiers.
++    let validator_identifier = Identifier::from_str("validator").unwrap();
++    let microcredits_identifier = Identifier::from_str("microcredits").unwrap();
++    // Create a DB store for the consensus.
++    let store = ConsensusStore::<CurrentNetwork, CurrentStorage>::open(None).unwrap();
++    // Create a VM from the store.
++    let vm = VM::from(store).unwrap();
++    // Create a sample validator address.
++    let validator_address =
++        Address::from_str("aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px").unwrap();
++
++    // Generate 100_000 bonded mapping entries.
++    let bonded_map = (0..(MAX_DELEGATORS as u64))
++        .map(|i| {
++            // Generate a staker address.
++            let private_key = PrivateKey::try_from(Field::from_u64(i)).unwrap();
++            let staker_address = Address::<CurrentNetwork>::try_from(&private_key).unwrap();
++
++            // Create the bonded state.
++            let bonded_state = indexmap! {
++                validator_identifier => Plaintext::from(Literal::Address(validator_address)),
++                microcredits_identifier => Plaintext::from(Literal::U64(U64::new(MIN_DELEGATOR_STAKE))),
++            };
++            (
++                Plaintext::from(Literal::Address(staker_address)),
++                Value::Plaintext(Plaintext::Struct(bonded_state, Default::default())),
++            )
++        })
++        .collect::<Vec<(Plaintext<CurrentNetwork>, Value<CurrentNetwork>)>>();
++
++    // Get a key that exists within the bonded mapping.
++    let private_key = PrivateKey::try_from(Field::from_u64(5)).unwrap();
++    let staker_address = Address::<CurrentNetwork>::try_from(&private_key).unwrap();
++    let key = Plaintext::from(Literal::Address(staker_address));
++
++    // Insert increasing numbers of entries into the bonded mapping and bench get_value_speculative and get_value_confirmed at each interval.
++    BONDED_INTERVALS.iter().for_each(|num_entries| {
++        let entries = bonded_map.iter().take(*num_entries).cloned().collect::<Vec<_>>();
++        vm.finalize_store().replace_mapping(credits_program_id, bonded_mapping, entries).unwrap();
++
++        // Benchmark get_value_speculative on the bonded mapping.
++        c.bench_function(&format!("bonded mapping - get_value_speculative - {num_entries} entries"), |b| {
++            b.iter(|| {
++                vm.finalize_store().get_value_speculative(credits_program_id, bonded_mapping, &key).unwrap();
++            })
++        });
++
++        // Benchmark get_value_confirmed on the bonded mapping.
++        c.bench_function(&format!("bonded mapping - get_value_confirmed - {num_entries} entries"), |b| {
++            b.iter(|| {
++                vm.finalize_store().get_value_confirmed(credits_program_id, bonded_mapping, &key).unwrap();
++            })
++        });
++    });
++}
++
++criterion_group! {
++    name = mappings;
++    config = Criterion::default().sample_size(100).measurement_time(Duration::from_secs(10));
++    targets = bench_bonded_mappings
++}
++criterion_main!(mappings);
+diff --git a/ledger/block/src/transition/serialize.rs b/ledger/block/src/transition/serialize.rs
+index fa7ebd38e..619615a32 100644
+--- a/ledger/block/src/transition/serialize.rs
++++ b/ledger/block/src/transition/serialize.rs
+@@ -19,7 +19,7 @@ impl<N: Network> Serialize for Transition<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut transition = serializer.serialize_struct("Transition", 7)?;
++                let mut transition = serializer.serialize_struct("Transition", 8)?;
+                 transition.serialize_field("id", &self.id)?;
+                 transition.serialize_field("program", &self.program_id)?;
+                 transition.serialize_field("function", &self.function_name)?;
+diff --git a/ledger/puzzle/src/lib.rs b/ledger/puzzle/src/lib.rs
+index b9a0e0679..c4fd8d7a4 100644
+--- a/ledger/puzzle/src/lib.rs
++++ b/ledger/puzzle/src/lib.rs
+@@ -59,6 +59,8 @@ use rayon::prelude::*;
+ 
+ /// The arity of the Merkle tree.
+ const ARITY: u8 = 8;
++/// The size of the cache.
++const CACHE_SIZE: usize = 1 << 10;
+ 
+ /// The Merkle tree for the puzzle.
+ type MerkleTree = KaryMerkleTree<Sha3_256, Sha3_256, 8, { ARITY }>;
+@@ -90,7 +92,7 @@ impl<N: Network> Puzzle<N> {
+     pub fn new<P: PuzzleTrait<N> + 'static>() -> Self {
+         Self {
+             inner: Arc::new(P::new()),
+-            proof_target_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(1 << 10).unwrap()))),
++            proof_target_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_SIZE).unwrap()))),
          }
-@@ -78,7 +80,9 @@ impl<N: Network, B: BlockStorage<N>> QueryTrait<N> for Query<N, B> {
-         match self {
-             Self::VM(block_store) => Ok(block_store.current_state_root()),
-             Self::REST(url) => match N::ID {
--                3 => Ok(Self::get_request_async(&format!("{url}/mainnet/latest/stateRoot")).await?.json().await?),
-+                console::network::MainnetV0::ID => {
-+                    Ok(Self::get_request_async(&format!("{url}/mainnet/latest/stateRoot")).await?.json().await?)
-+                }
-                 _ => bail!("Unsupported network ID in inclusion query"),
-             },
-         }
-@@ -89,7 +93,9 @@ impl<N: Network, B: BlockStorage<N>> QueryTrait<N> for Query<N, B> {
-         match self {
-             Self::VM(block_store) => block_store.get_state_path_for_commitment(commitment),
-             Self::REST(url) => match N::ID {
--                3 => Ok(Self::get_request(&format!("{url}/mainnet/statePath/{commitment}"))?.into_json()?),
-+                console::network::MainnetV0::ID => {
-+                    Ok(Self::get_request(&format!("{url}/mainnet/statePath/{commitment}"))?.into_json()?)
-+                }
-                 _ => bail!("Unsupported network ID in inclusion query"),
-             },
-         }
-@@ -101,7 +107,7 @@ impl<N: Network, B: BlockStorage<N>> QueryTrait<N> for Query<N, B> {
-         match self {
-             Self::VM(block_store) => block_store.get_state_path_for_commitment(commitment),
-             Self::REST(url) => match N::ID {
--                3 => {
-+                console::network::MainnetV0::ID => {
-                     Ok(Self::get_request_async(&format!("{url}/mainnet/statePath/{commitment}")).await?.json().await?)
-                 }
-                 _ => bail!("Unsupported network ID in inclusion query"),
-@@ -118,7 +124,9 @@ impl<N: Network, B: BlockStorage<N>> Query<N, B> {
-                 block_store.get_program(program_id)?.ok_or_else(|| anyhow!("Program {program_id} not found in storage"))
+     }
+ 
+@@ -124,15 +126,8 @@ impl<N: Network> Puzzle<N> {
+ 
+         // Construct the leaves of the Merkle tree.
+         let leaves = self.get_leaves(solution)?;
+-        // Construct the Merkle tree.
+-        let merkle_tree = MerkleTree::new(&Sha3_256::default(), &Sha3_256::default(), &leaves)?;
+-        // Retrieve the Merkle tree root.
+-        let root = merkle_tree.root();
+-        // Truncate to a u64.
+-        let proof_target = match *U64::<N>::from_bits_be(&root[0..64])? {
+-            0 => u64::MAX,
+-            value => u64::MAX / value,
+-        };
++        // Get the proof target.
++        let proof_target = Self::leaves_to_proof_target(&leaves)?;
+ 
+         // Insert the proof target into the cache.
+         self.proof_target_cache.write().put(solution.id(), proof_target);
+@@ -167,15 +162,8 @@ impl<N: Network> Puzzle<N> {
+             let targets_subset = cfg_iter!(leaves)
+                 .zip(cfg_keys!(solutions_subset))
+                 .map(|(leaves, solution_id)| {
+-                    // Construct the Merkle tree.
+-                    let merkle_tree = MerkleTree::new(&Sha3_256::default(), &Sha3_256::default(), leaves)?;
+-                    // Retrieve the Merkle tree root.
+-                    let root = merkle_tree.root();
+-                    // Truncate to a u64.
+-                    let proof_target = match *U64::<N>::from_bits_be(&root[0..64])? {
+-                        0 => u64::MAX,
+-                        value => u64::MAX / value,
+-                    };
++                    // Get the proof target.
++                    let proof_target = Self::leaves_to_proof_target(leaves)?;
+                     // Insert the proof target into the cache.
+                     self.proof_target_cache.write().put(*solution_id, proof_target);
+                     // Return the proof target.
+@@ -184,7 +172,7 @@ impl<N: Network> Puzzle<N> {
+                 .collect::<Result<IndexMap<_, _>>>()?;
+ 
+             // Recombine the proof targets.
+-            for (i, id, _) in to_compute.iter() {
++            for (i, id, _) in &to_compute {
+                 targets[*i] = targets_subset[id];
              }
-             Self::REST(url) => match N::ID {
--                3 => Ok(Self::get_request(&format!("{url}/mainnet/program/{program_id}"))?.into_json()?),
-+                console::network::MainnetV0::ID => {
-+                    Ok(Self::get_request(&format!("{url}/mainnet/program/{program_id}"))?.into_json()?)
-+                }
-                 _ => bail!("Unsupported network ID in inclusion query"),
-             },
          }
-@@ -132,7 +140,9 @@ impl<N: Network, B: BlockStorage<N>> Query<N, B> {
-                 block_store.get_program(program_id)?.ok_or_else(|| anyhow!("Program {program_id} not found in storage"))
+@@ -287,6 +275,19 @@ impl<N: Network> Puzzle<N> {
+         finish!(timer, "Verify each solution");
+         Ok(())
+     }
++
++    /// A helper function that takes leaves of a Merkle tree and returns the proof target.
++    fn leaves_to_proof_target(leaves: &[Vec<bool>]) -> Result<u64> {
++        // Construct the Merkle tree.
++        let merkle_tree = MerkleTree::new(&Sha3_256::default(), &Sha3_256::default(), leaves)?;
++        // Retrieve the Merkle tree root.
++        let root = merkle_tree.root();
++        // Truncate to a u64.
++        match *U64::<N>::from_bits_be(&root[0..64])? {
++            0 => Ok(u64::MAX),
++            value => Ok(u64::MAX / value),
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/ledger/puzzle/src/solutions/serialize.rs b/ledger/puzzle/src/solutions/serialize.rs
+index b377c7ce6..0c429c157 100644
+--- a/ledger/puzzle/src/solutions/serialize.rs
++++ b/ledger/puzzle/src/solutions/serialize.rs
+@@ -19,7 +19,7 @@ impl<N: Network> Serialize for PuzzleSolutions<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut solutions = serializer.serialize_struct("CoinbaseSolution", 1)?;
++                let mut solutions = serializer.serialize_struct("PuzzleSolutions", 1)?;
+                 solutions.serialize_field("solutions", &self.solutions.values().collect::<Vec<_>>())?;
+                 solutions.end()
              }
-             Self::REST(url) => match N::ID {
--                3 => Ok(Self::get_request_async(&format!("{url}/mainnet/program/{program_id}")).await?.json().await?),
-+                console::network::MainnetV0::ID => {
-+                    Ok(Self::get_request_async(&format!("{url}/mainnet/program/{program_id}")).await?.json().await?)
-+                }
-                 _ => bail!("Unsupported network ID in inclusion query"),
-             },
-         }
+diff --git a/ledger/src/tests.rs b/ledger/src/tests.rs
+index 71039d8b0..b4bd1b35a 100644
+--- a/ledger/src/tests.rs
++++ b/ledger/src/tests.rs
+@@ -1726,6 +1726,71 @@ fn test_max_committee_limit_with_bonds() {
+     // Check that the second validator was not added to the committee.
+     let committee = ledger.latest_committee().unwrap();
+     assert!(!committee.is_committee_member(second_address));
++
++    // Check that unbonding a validator first allows the second validator to bond in.
++
++    let unbond_first_validator = ledger
++        .vm()
++        .execute(
++            &first_private_key,
++            ("credits.aleo", "unbond_public"),
++            vec![Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap()].iter(),
++            None,
++            0,
++            None,
++            rng,
++        )
++        .unwrap();
++
++    // Attempt to bond the second validator.
++    let bond_second_validator = ledger
++        .vm()
++        .execute(
++            &second_private_key,
++            ("credits.aleo", "bond_public"),
++            vec![
++                Value::<CurrentNetwork>::from_str(&second_address.to_string()).unwrap(),
++                Value::<CurrentNetwork>::from_str(&second_address.to_string()).unwrap(),
++                Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap(),
++            ]
++            .iter(),
++            None,
++            0,
++            None,
++            rng,
++        )
++        .unwrap();
++
++    // Create a block.
++    let block = ledger
++        .prepare_advance_to_next_beacon_block(
++            validators.keys().next().unwrap(),
++            vec![],
++            vec![],
++            vec![unbond_first_validator, bond_second_validator],
++            rng,
++        )
++        .unwrap();
++
++    // Ensure that no transactions are rejected.
++    assert_eq!(block.transactions().num_rejected(), 0);
++    assert_eq!(block.transactions().num_accepted(), 2);
++
++    // Check that the next block is valid.
++    ledger.check_next_block(&block, rng).unwrap();
++
++    // Check that the first validator is in the committee and the second validator is not.
++    let committee = ledger.latest_committee().unwrap();
++    assert!(!committee.is_committee_member(second_address));
++    assert!(committee.is_committee_member(first_address));
++
++    // Add the block to the ledger.
++    ledger.advance_to_next_block(&block).unwrap();
++
++    // Check that the first validator was removed and the second validator was added to the committee.
++    let committee = ledger.latest_committee().unwrap();
++    assert!(committee.is_committee_member(second_address));
++    assert!(!committee.is_committee_member(first_address));
+ }
+ 
+ #[test]
+diff --git a/ledger/test-helpers/src/lib.rs b/ledger/test-helpers/src/lib.rs
+index 501aa1696..8e315a0d6 100644
+--- a/ledger/test-helpers/src/lib.rs
++++ b/ledger/test-helpers/src/lib.rs
+@@ -15,7 +15,7 @@
+ use console::{
+     account::{Address, PrivateKey},
+     prelude::*,
+-    program::{Ciphertext, Literal, Plaintext, ProgramOwner, Record},
++    program::{Ciphertext, Literal, Plaintext, ProgramOwner, Record, Value},
+     types::Field,
+ };
+ use ledger_block::{
+@@ -313,6 +313,34 @@ pub fn sample_fee_public(deployment_or_execution_id: Field<CurrentNetwork>, rng:
+     Fee::from_str(&fee.to_string()).unwrap()
+ }
+ 
++/******************************************** Program *********************************************/
++
++/// Deploy a program that produces large transitions.
++pub fn small_and_large_transaction_program() -> Program<CurrentNetwork> {
++    Program::from_str(
++            r"
++program testing.aleo;
++function small_transaction:
++    cast 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field into r0 as [field; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r1 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r2 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r3 as [[field; 32u32]; 32u32];
++    output r1 as [[field; 32u32]; 32u32].public;
++    output r2 as [[field; 32u32]; 32u32].public;
++    output r3 as [[field; 32u32]; 32u32].public;
++
++function large_transaction:
++    cast 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field into r0 as [field; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r1 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r2 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r3 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r4 as [[field; 32u32]; 32u32];
++    output r1 as [[field; 32u32]; 32u32].public;
++    output r2 as [[field; 32u32]; 32u32].public;
++    output r3 as [[field; 32u32]; 32u32].public;
++    output r4 as [[field; 32u32]; 32u32].public;").unwrap()
++}
++
+ /****************************************** Transaction *******************************************/
+ 
+ /// Samples a random deployment transaction with a private or public fee.
+@@ -354,6 +382,61 @@ pub fn sample_execution_transaction_with_fee(is_fee_private: bool, rng: &mut Tes
+     Transaction::from_execution(execution, Some(fee)).unwrap()
+ }
+ 
++/// Samples a large transaction.
++pub fn sample_large_execution_transaction(rng: &mut TestRng) -> Transaction<CurrentNetwork> {
++    static INSTANCE: once_cell::sync::OnceCell<Execution<CurrentNetwork>> = once_cell::sync::OnceCell::new();
++
++    let execution = INSTANCE
++        .get_or_init(|| {
++            // Initialize a program that produces large transactions.
++            let program = small_and_large_transaction_program();
++
++            // Construct the process.
++            let mut process = synthesizer_process::Process::load().unwrap();
++            // Add the program.
++            process.add_program(&program).unwrap();
++
++            // Initialize a private key.
++            let private_key = PrivateKey::new(rng).unwrap();
++
++            // Authorize the function.
++            let authorization = process
++                .authorize::<CurrentAleo, _>(
++                    &private_key,
++                    "testing.aleo",
++                    "large_transaction",
++                    Vec::<Value<CurrentNetwork>>::new().iter(),
++                    rng,
++                )
++                .unwrap();
++            // Execute the function.
++            let (_, mut trace) = process.execute::<CurrentAleo, _>(authorization, rng).unwrap();
++
++            // Initialize a new block store.
++            let block_store =
++                ledger_store::BlockStore::<CurrentNetwork, ledger_store::helpers::memory::BlockMemory<_>>::open(None)
++                    .unwrap();
++
++            // Prepare the assignments.
++            trace.prepare(ledger_query::Query::from(block_store)).unwrap();
++            // Compute the proof and construct the execution.
++            let execution = trace.prove_execution::<CurrentAleo, _>("testing.aleo", rng).unwrap();
++            // Reconstruct the execution from bytes.
++            // This is a hack to get around Rust dependency resolution.
++            Execution::from_bytes_le(&execution.to_bytes_le().unwrap()).unwrap()
++        })
++        .clone();
++
++    // Compute the execution ID.
++    let execution_id = execution.to_execution_id().unwrap();
++
++    // Sample the fee.
++    let fee = crate::sample_fee_public(execution_id, rng);
++
++    // Construct an execution transaction.
++    Transaction::from_execution(execution, Some(fee)).unwrap()
++}
++
+ /// Samples a random private fee transaction.
+ pub fn sample_fee_private_transaction(rng: &mut TestRng) -> Transaction<CurrentNetwork> {
+     // Sample a private fee.
+diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
+index 5c78a84fb..434290246 100644
+--- a/synthesizer/src/vm/mod.rs
++++ b/synthesizer/src/vm/mod.rs
+@@ -450,6 +450,7 @@ pub(crate) mod test_helpers {
+     };
+     use ledger_block::{Block, Header, Metadata, Transition};
+     use ledger_store::helpers::memory::ConsensusMemory;
++    use ledger_test_helpers::small_and_large_transaction_program;
+     use synthesizer_program::Program;
+ 
+     use indexmap::IndexMap;
+@@ -2253,6 +2254,85 @@ finalize transfer_public_to_private:
+         );
+     }
+ 
++    #[test]
++    fn test_large_transaction_is_aborted() {
++        let rng = &mut TestRng::default();
++
++        // Initialize a new caller.
++        let caller_private_key = crate::vm::test_helpers::sample_genesis_private_key(rng);
++
++        // Initialize the genesis block.
++        let genesis = crate::vm::test_helpers::sample_genesis_block(rng);
++
++        // Initialize the VM.
++        let vm = crate::vm::test_helpers::sample_vm();
++
++        // Update the VM.
++        vm.add_next_block(&genesis).unwrap();
++
++        // Deploy a program that produces large transactions.
++        let program = small_and_large_transaction_program();
++
++        // Deploy the program.
++        let deployment = vm.deploy(&caller_private_key, &program, None, 0, None, rng).unwrap();
++
++        // Add the deployment to a block and update the VM.
++        let block = sample_next_block(&vm, &caller_private_key, &[deployment], rng).unwrap();
++
++        // Update the VM.
++        vm.add_next_block(&block).unwrap();
++
++        // Call the program to produce the small transaction.
++        let transaction = vm
++            .execute(
++                &caller_private_key,
++                ("testing.aleo", "small_transaction"),
++                Vec::<Value<CurrentNetwork>>::new().iter(),
++                None,
++                0,
++                None,
++                rng,
++            )
++            .unwrap();
++
++        // Verify the transaction.
++        vm.check_transaction(&transaction, None, rng).unwrap();
++
++        // Add the transaction to a block and update the VM.
++        let block = sample_next_block(&vm, &caller_private_key, &[transaction], rng).unwrap();
++
++        // Check that the transaction was accepted.
++        assert_eq!(block.transactions().num_accepted(), 1);
++
++        // Update the VM.
++        vm.add_next_block(&block).unwrap();
++
++        // Call the program to produce a large transaction.
++        let transaction = vm
++            .execute(
++                &caller_private_key,
++                ("testing.aleo", "large_transaction"),
++                Vec::<Value<CurrentNetwork>>::new().iter(),
++                None,
++                0,
++                None,
++                rng,
++            )
++            .unwrap();
++
++        // Verify that the transaction is invalid.
++        assert!(vm.check_transaction(&transaction, None, rng).is_err());
++
++        // Add the transaction to a block and update the VM.
++        let block = sample_next_block(&vm, &caller_private_key, &[transaction], rng).unwrap();
++
++        // Check that the transaction was aborted.
++        assert_eq!(block.aborted_transaction_ids().len(), 1);
++
++        // Update the VM.
++        vm.add_next_block(&block).unwrap();
++    }
++
+     #[test]
+     fn test_vm_puzzle() {
+         // Attention: This test is used to ensure that the VM has performed downcasting correctly for
+diff --git a/synthesizer/src/vm/verify.rs b/synthesizer/src/vm/verify.rs
+index 5979498bd..2e74251ca 100644
+--- a/synthesizer/src/vm/verify.rs
++++ b/synthesizer/src/vm/verify.rs
+@@ -76,6 +76,13 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+ 
+         /* Transaction */
+ 
++        // Allocate a buffer to write the transaction.
++        let mut buffer = Vec::with_capacity(N::MAX_TRANSACTION_SIZE);
++        // Ensure that the transaction is well formed and does not exceed the maximum size.
++        if let Err(error) = transaction.write_le(LimitedWriter::new(&mut buffer, N::MAX_TRANSACTION_SIZE)) {
++            bail!("Transaction '{}' is not well-formed: {error}", transaction.id())
++        }
++
+         // Ensure the transaction ID is unique.
+         if self.block_store().contains_transaction_id(&transaction.id())? {
+             bail!("Transaction '{}' already exists in the ledger", transaction.id())
+diff --git a/utilities/src/bytes.rs b/utilities/src/bytes.rs
+index d49bea08f..d49ac74db 100644
+--- a/utilities/src/bytes.rs
++++ b/utilities/src/bytes.rs
+@@ -478,6 +478,40 @@ pub fn bytes_from_bits_le(bits: &[bool]) -> Vec<u8> {
+     bytes
+ }
+ 
++/// A wrapper around a `Write` instance that limits the number of bytes that can be written.
++pub struct LimitedWriter<W: Write> {
++    writer: W,
++    limit: usize,
++    remaining: usize,
++}
++
++impl<W: Write> LimitedWriter<W> {
++    pub fn new(writer: W, limit: usize) -> Self {
++        Self { writer, limit, remaining: limit }
++    }
++}
++
++impl<W: Write> Write for LimitedWriter<W> {
++    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
++        if self.remaining == 0 && !buf.is_empty() {
++            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Byte limit exceeded: {}", self.limit)));
++        }
++
++        let max_write = std::cmp::min(buf.len(), self.remaining);
++        match self.writer.write(&buf[..max_write]) {
++            Ok(n) => {
++                self.remaining -= n;
++                Ok(n)
++            }
++            Err(e) => Err(e),
++        }
++    }
++
++    fn flush(&mut self) -> IoResult<()> {
++        self.writer.flush()
++    }
++}
++
+ #[cfg(test)]
+ mod test {
+     use super::*;

@@ -1,0 +1,147 @@
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index fddbd17f65396f..c709b17c7bcb2c 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -16,4 +16,3 @@ jobs:
+       - uses: ./.github/actions/yarn-install
+       - name: Run Lint
+         run: yarn lint
+-        continue-on-error: true
+diff --git a/lint-staged.config.mjs b/lint-staged.config.mjs
+index f9a62c74056f68..7c5909bd8c1e49 100644
+--- a/lint-staged.config.mjs
++++ b/lint-staged.config.mjs
+@@ -1,11 +1,5 @@
+-const skipWarnings = ["1", "true", "yes", "on"].includes(
+-  (process.env.SKIP_WARNINGS ?? "").toLowerCase()
+-);
+-
+ export default {
+   "(apps|packages|companion)/**/*.{js,ts,jsx,tsx}": (files) =>
+-    skipWarnings
+-      ? `biome lint --config-path=biome-staged.json ${files.join(" ")}`
+-      : `biome lint --config-path=biome-staged.json --error-on-warnings ${files.join(" ")}`,
++    `biome lint --config-path=biome-staged.json ${files.join(" ")}`,
+   "packages/prisma/schema.prisma": ["prisma format"],
+ };
+diff --git a/packages/lib/server/defaultResponder.test.ts b/packages/lib/server/defaultResponder.test.ts
+index 8f4b967241cec5..53a8c7f551d2db 100644
+--- a/packages/lib/server/defaultResponder.test.ts
++++ b/packages/lib/server/defaultResponder.test.ts
+@@ -3,10 +3,19 @@ import { describe, expect, it, vi } from "vitest";
+ 
+ import { ErrorCode } from "@calcom/lib/errorCodes";
+ 
+-import { TRPCError } from "@trpc/server";
+-
+ import { defaultResponder } from "./defaultResponder";
+ 
++/**
++ * Creates a mock TRPC-like error for testing purposes.
++ * This avoids importing from @trpc/server in the lib package.
++ */
++function createMockTRPCError(code: string): Error {
++  const error = new Error(`TRPC Error: ${code}`);
++  error.name = "TRPCError";
++  (error as Error & { code: string }).code = code;
++  return error;
++}
++
+ describe("defaultResponder", () => {
+   it("should call res.json when response is still writable and result is not null", async () => {
+     const f = vi.fn().mockResolvedValue({});
+@@ -43,7 +52,7 @@ describe("defaultResponder", () => {
+     expect(res.status).toHaveBeenCalledWith(409);
+   });
+   it("Rate limit should respond with a 429 status code", async () => {
+-    const f = vi.fn().mockRejectedValue(new TRPCError({ code: "TOO_MANY_REQUESTS" }));
++    const f = vi.fn().mockRejectedValue(createMockTRPCError("TOO_MANY_REQUESTS"));
+     const req = {} as NextApiRequest;
+     const res = {
+       status: vi.fn().mockReturnThis(),
+diff --git a/packages/lib/server/defaultResponder.ts b/packages/lib/server/defaultResponder.ts
+index 7e2438820904fb..09a60cae7fc8ef 100644
+--- a/packages/lib/server/defaultResponder.ts
++++ b/packages/lib/server/defaultResponder.ts
+@@ -1,8 +1,5 @@
+ import type { NextApiRequest, NextApiResponse } from "next";
+ 
+-import { TRPCError } from "@trpc/server";
+-import { getHTTPStatusCodeFromError } from "@trpc/server/http";
+-
+ import { type TraceContext } from "@calcom/lib/tracing";
+ import { TracedError } from "@calcom/lib/tracing/error";
+ import { distributedTracing } from "@calcom/lib/tracing/factory";
+@@ -11,6 +8,7 @@ import { HttpError } from "../http-error";
+ import { safeStringify } from "../safeStringify";
+ import { getServerErrorFromUnknown } from "./getServerErrorFromUnknown";
+ import { performance } from "./perfObserver";
++import { getHTTPStatusCodeFromTRPCErrorLike, isTRPCErrorLike } from "./trpcErrorUtils";
+ 
+ export interface TracedRequest extends NextApiRequest {
+   traceContext: TraceContext;
+@@ -58,8 +56,8 @@ export function defaultResponder<T>(
+       tracingLogger.error(`${operation} request failed`, safeStringify(err));
+       const tracedError = TracedError.createFromError(err, traceContext);
+       let error: HttpError;
+-      if (err instanceof TRPCError) {
+-        const statusCode = getHTTPStatusCodeFromError(err);
++      if (isTRPCErrorLike(err)) {
++        const statusCode = getHTTPStatusCodeFromTRPCErrorLike(err);
+         error = new HttpError({ statusCode, message: err.message });
+       } else {
+         error = getServerErrorFromUnknown(tracedError);
+diff --git a/packages/lib/server/trpcErrorUtils.ts b/packages/lib/server/trpcErrorUtils.ts
+new file mode 100644
+index 00000000000000..abd160311b1e1d
+--- /dev/null
++++ b/packages/lib/server/trpcErrorUtils.ts
+@@ -0,0 +1,48 @@
++/**
++ * Utility functions for handling TRPC-like errors without importing from @trpc/server.
++ * This avoids circular dependencies in the lib package.
++ */
++
++const TRPC_ERROR_CODES_TO_HTTP: Record<string, number> = {
++  PARSE_ERROR: 400,
++  BAD_REQUEST: 400,
++  UNAUTHORIZED: 401,
++  NOT_FOUND: 404,
++  FORBIDDEN: 403,
++  METHOD_NOT_SUPPORTED: 405,
++  TIMEOUT: 408,
++  CONFLICT: 409,
++  PRECONDITION_FAILED: 412,
++  PAYLOAD_TOO_LARGE: 413,
++  UNPROCESSABLE_CONTENT: 422,
++  TOO_MANY_REQUESTS: 429,
++  CLIENT_CLOSED_REQUEST: 499,
++  INTERNAL_SERVER_ERROR: 500,
++  NOT_IMPLEMENTED: 501,
++  BAD_GATEWAY: 502,
++  SERVICE_UNAVAILABLE: 503,
++  GATEWAY_TIMEOUT: 504,
++};
++
++interface TRPCErrorLike {
++  name: string;
++  code: string;
++  message: string;
++}
++
++export function isTRPCErrorLike(err: unknown): err is TRPCErrorLike {
++  return (
++    err !== null &&
++    typeof err === "object" &&
++    "name" in err &&
++    err.name === "TRPCError" &&
++    "code" in err &&
++    typeof (err as TRPCErrorLike).code === "string" &&
++    "message" in err &&
++    typeof (err as TRPCErrorLike).message === "string"
++  );
++}
++
++export function getHTTPStatusCodeFromTRPCErrorLike(err: TRPCErrorLike): number {
++  return TRPC_ERROR_CODES_TO_HTTP[err.code] ?? 500;
++}

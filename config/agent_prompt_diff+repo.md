@@ -191,5 +191,14 @@ If the patch is genuinely clean, return: `[]`
 - Unrelated pre-existing issues clearly outside the scope of this patch
 
 Walk through your reasoning for each concern, then end your response with the JSON
-array. Include bugs and meaningful code review comments. Return `[]` only if the
-patch is genuinely clean.
+array. Include bugs found in the old code (the `-` lines), issues introduced by the
+new code (the `+` lines), and any other meaningful code review comments.
+
+If the PR is a bug fix, always describe the bug being fixed — even if the fix is correct.
+A good review confirms understanding of the original issue.
+
+Return `[]` only if the patch is genuinely clean (e.g., documentation-only changes).
+
+End your response with:
+1. The JSON array of findings (in a ```json code block)
+2. Your review verdict: **approve** (no blocking issues) or **request changes** (significant bugs or concerns that must be addressed before merging)

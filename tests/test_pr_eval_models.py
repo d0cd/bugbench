@@ -234,6 +234,12 @@ def test_default_scoring_returns_scoring_config() -> None:
     assert sc.scale == [0, 1, 2, 3]
 
 
+def test_scoring_config_severity_actionability_weights() -> None:
+    sc = default_scoring()
+    assert sc.severity_weights == {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    assert sc.actionability_weights == {"actionable": 1.0, "directional": 0.6, "vague": 0.3}
+
+
 def test_scoring_config_custom() -> None:
     sc = ScoringConfig(scale=[0, 1, 2], labels={0: "no", 1: "partial", 2: "yes"}, catch_threshold=1)
     assert sc.scale == [0, 1, 2]
@@ -398,6 +404,49 @@ def test_load_eval_config_parses_pricing(tmp_path: Path) -> None:
 def test_eval_config_max_concurrent_default() -> None:
     config = EvalConfig(eval_org="test-org", tools=[])
     assert config.max_concurrent == 1
+
+
+def test_tool_def_fresh_repo_default_false() -> None:
+    tool = ToolDef(name="coderabbit", type=ToolType.pr)
+    assert tool.fresh_repo is False
+
+
+def test_tool_def_fresh_repo_parsed() -> None:
+    tool = ToolDef(name="github-copilot", type=ToolType.pr, fresh_repo=True)
+    assert tool.fresh_repo is True
+
+
+def test_case_tool_status_preparing() -> None:
+    assert CaseToolStatus.preparing == "preparing"
+
+
+def test_load_eval_config_parses_fresh_repo(tmp_path: Path) -> None:
+    config_data = {
+        "github": {"eval_org": "test-org"},
+        "tools": [
+            {
+                "name": "github-copilot",
+                "type": "pr",
+                "github_app": "copilot",
+                "fresh_repo": True,
+                "cooldown_seconds": 30,
+            },
+            {
+                "name": "coderabbit",
+                "type": "pr",
+                "github_app": "coderabbit-ai",
+                "cooldown_seconds": 30,
+            },
+        ],
+        "repos": {},
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.dump(config_data))
+    config = load_eval_config(config_path)
+    copilot = next(t for t in config.tools if t.name == "github-copilot")
+    coderabbit = next(t for t in config.tools if t.name == "coderabbit")
+    assert copilot.fresh_repo is True
+    assert coderabbit.fresh_repo is False
 
 
 def test_load_eval_config_parses_max_concurrent(tmp_path: Path) -> None:

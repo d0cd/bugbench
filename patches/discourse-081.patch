@@ -1,0 +1,382 @@
+diff --git a/app/controllers/webhooks_controller.rb b/app/controllers/webhooks_controller.rb
+index acd118650e885..763c31d07aa22 100644
+--- a/app/controllers/webhooks_controller.rb
++++ b/app/controllers/webhooks_controller.rb
+@@ -38,7 +38,7 @@ def sendgrid
+         # so we set the error code to 5.1.2 which translates to permanent failure bad destination system address.
+         error_code = "5.1.2" if !error_code && event["type"] == "blocked"
+ 
+-        if error_code[Email::SMTP_STATUS_TRANSIENT_FAILURE]
++        if error_code&.[](Email::SMTP_STATUS_TRANSIENT_FAILURE)
+           process_bounce(message_id, to_address, SiteSetting.soft_bounce_score, error_code)
+         else
+           process_bounce(message_id, to_address, SiteSetting.hard_bounce_score, error_code)
+@@ -241,7 +241,7 @@ def handle_mailgun_legacy(params)
+     # only handle soft bounces, because hard bounces are also handled
+     # by the "dropped" event and we don't want to increase bounce score twice
+     # for the same message
+-    if event == "bounced" && params["error"][Email::SMTP_STATUS_TRANSIENT_FAILURE]
++    if event == "bounced" && params["error"]&.[](Email::SMTP_STATUS_TRANSIENT_FAILURE)
+       process_bounce(message_id, to_address, SiteSetting.soft_bounce_score, error_code)
+     elsif event == "dropped"
+       process_bounce(message_id, to_address, SiteSetting.hard_bounce_score, error_code)
+@@ -280,6 +280,8 @@ def handle_mailgun_new(params)
+   def valid_sendgrid_signature?
+     signature = request.headers["X-Twilio-Email-Event-Webhook-Signature"]
+     timestamp = request.headers["X-Twilio-Email-Event-Webhook-Timestamp"]
++    return false if signature.blank? || timestamp.blank?
++
+     request.body.rewind
+     payload = request.body.read
+ 
+@@ -297,11 +299,13 @@ def valid_sendgrid_signature?
+   end
+ 
+   def valid_mailjet_token?
++    return false if params[:t].blank?
+     ActiveSupport::SecurityUtils.secure_compare(params[:t], SiteSetting.mailjet_webhook_token)
+   end
+ 
+   def valid_mandrill_signature?
+     signature = request.headers["X-Mandrill-Signature"]
++    return false if signature.blank?
+ 
+     payload = "#{Discourse.base_url}/webhooks/mandrill"
+     params
+@@ -322,10 +326,12 @@ def valid_mandrill_signature?
+   end
+ 
+   def valid_postmark_token?
++    return false if params[:t].blank?
+     ActiveSupport::SecurityUtils.secure_compare(params[:t], SiteSetting.postmark_webhook_token)
+   end
+ 
+   def valid_sparkpost_token?
++    return false if params[:t].blank?
+     ActiveSupport::SecurityUtils.secure_compare(params[:t], SiteSetting.sparkpost_webhook_token)
+   end
+ 
+diff --git a/app/models/post_revision.rb b/app/models/post_revision.rb
+index 921267d3a0811..9c9c32363c3e9 100644
+--- a/app/models/post_revision.rb
++++ b/app/models/post_revision.rb
+@@ -4,6 +4,8 @@ class PostRevision < ActiveRecord::Base
+   belongs_to :post
+   belongs_to :user
+ 
++  attr_accessor :silent
++
+   serialize :modifications, type: Hash, coder: YAML
+ 
+   after_create :create_notification
+diff --git a/app/services/post_action_notifier.rb b/app/services/post_action_notifier.rb
+index c90fa520349f0..698d2362935fb 100644
+--- a/app/services/post_action_notifier.rb
++++ b/app/services/post_action_notifier.rb
+@@ -105,6 +105,7 @@ def self.after_create_post_revision(post_revision)
+     return if post_revision.user.blank?
+     return if post.topic.blank?
+     return if post.topic.private_message?
++    return if post_revision.silent
+     return if notification_is_disabled?(post_revision)
+ 
+     user_ids = []
+diff --git a/lib/post_revisor.rb b/lib/post_revisor.rb
+index ae85f470b0551..1f4ef6e5b5fba 100644
+--- a/lib/post_revisor.rb
++++ b/lib/post_revisor.rb
+@@ -625,13 +625,15 @@ def create_revision
+     end
+ 
+     @post_revision =
+-      PostRevision.create!(
++      PostRevision.new(
+         user_id: @post.last_editor_id,
+         post_id: @post.id,
+         number: @post.version,
+         modifications:,
+         hidden: @hidden_revision,
+       )
++    @post_revision.silent = @silent
++    @post_revision.save!
+   end
+ 
+   def update_revision
+diff --git a/plugins/poll/assets/stylesheets/common/poll.scss b/plugins/poll/assets/stylesheets/common/poll.scss
+index 102bf487a7bf2..5e175bc811c9c 100644
+--- a/plugins/poll/assets/stylesheets/common/poll.scss
++++ b/plugins/poll/assets/stylesheets/common/poll.scss
+@@ -34,11 +34,22 @@ div.poll-outer {
+       button {
+         background-color: transparent;
+         border: none;
+-        text-align: left;
+-        padding-left: 23px;
+-        text-indent: -23px;
+         width: 100%;
+         cursor: pointer;
++        display: flex;
++        align-items: flex-start;
++        gap: 0.5em;
++        text-align: left;
++      }
++
++      button svg {
++        flex: 0 0 auto;
++        margin-top: 0.15em;
++      }
++
++      .option-text {
++        flex: 1 1 auto;
++        min-width: 0;
+       }
+     }
+ 
+diff --git a/spec/lib/topics_bulk_action_spec.rb b/spec/lib/topics_bulk_action_spec.rb
+index 9787eef2dc8d9..43d91464372c3 100644
+--- a/spec/lib/topics_bulk_action_spec.rb
++++ b/spec/lib/topics_bulk_action_spec.rb
+@@ -160,84 +160,45 @@
+     fab!(:first_post) { Fabricate(:post, topic: topic) }
+ 
+     describe "silent option" do
+-      fab!(:topic_watcher, :user)
+-      fab!(:category_watcher, :user)
+       fab!(:admin)
+ 
+       before do
+         Jobs.run_immediately!
++        PostActionNotifier.enable
++        SiteSetting.create_revision_on_bulk_topic_moves = true
+         TopicUser.change(
+-          topic_watcher,
++          Fabricate(:user),
+           topic.id,
+           notification_level: TopicUser.notification_levels[:watching],
+         )
+         CategoryUser.set_notification_level_for_category(
+-          category_watcher,
++          Fabricate(:user),
+           CategoryUser.notification_levels[:watching_first_post],
+           category.id,
+         )
+       end
+ 
+-      shared_examples "silent option suppresses notifications" do
+-        it "notifies topic watchers when silent is false" do
+-          expect do
+-            TopicsBulkAction.new(
+-              admin,
+-              [topic.id],
+-              type: "change_category",
+-              category_id: category.id,
+-            ).perform!
+-          end.to change { Notification.where(user: topic_watcher).count }
+-        end
+-
+-        it "does not notify topic watchers when silent is true" do
+-          expect do
+-            TopicsBulkAction.new(
+-              admin,
+-              [topic.id],
+-              type: "change_category",
+-              category_id: category.id,
+-              silent: true,
+-            ).perform!
+-          end.to not_change { Notification.where(user: topic_watcher).count }
+-        end
+-
+-        it "notifies category watchers when silent is false" do
+-          expect do
+-            TopicsBulkAction.new(
+-              admin,
+-              [topic.id],
+-              type: "change_category",
+-              category_id: category.id,
+-            ).perform!
+-          end.to change { Notification.where(user: category_watcher).count }.by(1)
+-
+-          expect(Notification.where(user: category_watcher).last.notification_type).to eq(
+-            Notification.types[:watching_first_post],
+-          )
+-        end
+-
+-        it "does not notify category watchers when silent is true" do
+-          expect do
+-            TopicsBulkAction.new(
+-              admin,
+-              [topic.id],
+-              type: "change_category",
+-              category_id: category.id,
+-              silent: true,
+-            ).perform!
+-          end.to not_change { Notification.where(user: category_watcher).count }
+-        end
+-      end
+-
+-      context "when create_revision_on_bulk_topic_moves is enabled" do
+-        before { SiteSetting.create_revision_on_bulk_topic_moves = true }
+-        include_examples "silent option suppresses notifications"
++      it "does not create any notifications when silent is true" do
++        expect do
++          TopicsBulkAction.new(
++            admin,
++            [topic.id],
++            type: "change_category",
++            category_id: category.id,
++            silent: true,
++          ).perform!
++        end.to not_change { Notification.count }
+       end
+ 
+-      context "when create_revision_on_bulk_topic_moves is disabled" do
+-        before { SiteSetting.create_revision_on_bulk_topic_moves = false }
+-        include_examples "silent option suppresses notifications"
++      it "creates notifications when silent is false" do
++        expect do
++          TopicsBulkAction.new(
++            admin,
++            [topic.id],
++            type: "change_category",
++            category_id: category.id,
++          ).perform!
++        end.to change { Notification.count }
+       end
+     end
+ 
+diff --git a/spec/requests/webhooks_controller_spec.rb b/spec/requests/webhooks_controller_spec.rb
+index a4076d367e410..bd4a52ec0eee0 100644
+--- a/spec/requests/webhooks_controller_spec.rb
++++ b/spec/requests/webhooks_controller_spec.rb
+@@ -197,6 +197,35 @@
+ 
+       expect(response.status).to eq(406)
+     end
++
++    it "returns error if signature header is missing" do
++      SiteSetting.sendgrid_verification_key =
++        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE83T4O/n84iotIvIW4mdBgQ/7dAfSmpqIM8kF9mN1flpVKS3GRqe62gw+2fNNRaINXvVpiglSI8eNEc6wEA3F+g=="
++
++      post "/webhooks/sendgrid.json",
++           headers: {
++             "X-Twilio-Email-Event-Webhook-Timestamp" => "1600112492",
++           },
++           params:
++             "[{\"email\":\"hello@world.com\",\"event\":\"dropped\",\"reason\":\"Bounced Address\",\"sg_event_id\":\"ZHJvcC0xMDk5NDkxOS1MUnpYbF9OSFN0T0doUTRrb2ZTbV9BLTA\",\"sg_message_id\":\"LRzXl_NHStOGhQ4kofSm_A.filterdrecv-p3mdw1-756b745b58-kmzbl-18-5F5FC76C-9.0\",\"smtp-id\":\"<LRzXl_NHStOGhQ4kofSm_A@ismtpd0039p1iad1.sendgrid.net>\",\"timestamp\":1600112492}]\r\n"
++
++      expect(response.status).to eq(406)
++    end
++
++    it "returns error if timestamp header is missing" do
++      SiteSetting.sendgrid_verification_key =
++        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE83T4O/n84iotIvIW4mdBgQ/7dAfSmpqIM8kF9mN1flpVKS3GRqe62gw+2fNNRaINXvVpiglSI8eNEc6wEA3F+g=="
++
++      post "/webhooks/sendgrid.json",
++           headers: {
++             "X-Twilio-Email-Event-Webhook-Signature" =>
++               "MEUCIGHQVtGj+Y3LkG9fLcxf3qfI10QysgDWmMOVmxG0u6ZUAiEAyBiXDWzM+uOe5W0JuG+luQAbPIqHh89M15TluLtEZtM=",
++           },
++           params:
++             "[{\"email\":\"hello@world.com\",\"event\":\"dropped\",\"reason\":\"Bounced Address\",\"sg_event_id\":\"ZHJvcC0xMDk5NDkxOS1MUnpYbF9OSFN0T0doUTRrb2ZTbV9BLTA\",\"sg_message_id\":\"LRzXl_NHStOGhQ4kofSm_A.filterdrecv-p3mdw1-756b745b58-kmzbl-18-5F5FC76C-9.0\",\"smtp-id\":\"<LRzXl_NHStOGhQ4kofSm_A@ismtpd0039p1iad1.sendgrid.net>\",\"timestamp\":1600112492}]\r\n"
++
++      expect(response.status).to eq(406)
++    end
+   end
+ 
+   describe "#mailjet" do
+@@ -253,6 +282,23 @@
+       expect(response.status).to eq(406)
+       expect(email_log.reload.bounced).to eq(false)
+     end
++
++    it "returns error if token param is missing" do
++      SiteSetting.mailjet_webhook_token = "foo"
++      user = Fabricate(:user, email: email)
++      email_log = Fabricate(:email_log, user: user, message_id: message_id, to_address: email)
++
++      post "/webhooks/mailjet.json",
++           params: {
++             "event" => "bounce",
++             "email" => email,
++             "hard_bounce" => true,
++             "CustomID" => message_id,
++           }
++
++      expect(response.status).to eq(406)
++      expect(email_log.reload.bounced).to eq(false)
++    end
+   end
+ 
+   describe "#mailpace" do
+@@ -367,6 +413,14 @@
+ 
+       expect(response.status).to eq(406)
+     end
++
++    it "returns error if signature header is missing" do
++      SiteSetting.mandrill_authentication_key = "wr_JeJNO9OI65RFDrvk3Zw"
++
++      post "/webhooks/mandrill.json", params: payload
++
++      expect(response.status).to eq(406)
++    end
+   end
+ 
+   describe "#mandrill_head" do
+@@ -445,6 +499,22 @@
+       expect(response.status).to eq(406)
+       expect(email_log.reload.bounced).to eq(false)
+     end
++
++    it "returns error if token param is missing" do
++      SiteSetting.postmark_webhook_token = "foo"
++      user = Fabricate(:user, email: email)
++      email_log = Fabricate(:email_log, user: user, message_id: message_id, to_address: email)
++
++      post "/webhooks/postmark.json",
++           params: {
++             "Type" => "HardBounce",
++             "MessageID" => message_id,
++             "Email" => email,
++           }
++
++      expect(response.status).to eq(406)
++      expect(email_log.reload.bounced).to eq(false)
++    end
+   end
+ 
+   describe "#sparkpost" do
+@@ -530,6 +600,33 @@
+       expect(response.status).to eq(406)
+       expect(email_log.reload.bounced).to eq(false)
+     end
++
++    it "returns error if token param is missing" do
++      SiteSetting.sparkpost_webhook_token = "foo"
++      user = Fabricate(:user, email: email)
++      email_log = Fabricate(:email_log, user: user, message_id: message_id, to_address: email)
++
++      post "/webhooks/sparkpost.json",
++           params: {
++             "_json" => [
++               {
++                 "msys" => {
++                   "message_event" => {
++                     "bounce_class" => 10,
++                     "error_code" => "554",
++                     "rcpt_to" => email,
++                     "rcpt_meta" => {
++                       "message_id" => message_id,
++                     },
++                   },
++                 },
++               },
++             ],
++           }
++
++      expect(response.status).to eq(406)
++      expect(email_log.reload.bounced).to eq(false)
++    end
+   end
+ 
+   describe "#aws" do

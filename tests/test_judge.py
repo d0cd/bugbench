@@ -82,7 +82,15 @@ def _make_mock_response(score: int) -> MagicMock:
         {
             "score": score,
             "reasoning": f"Score is {score}",
-            "comment_judgments": [{"id": 0, "classification": "TP", "relevance": "direct"}],
+            "comment_judgments": [
+                {
+                    "id": 0,
+                    "classification": "TP-expected",
+                    "severity": "high",
+                    "actionability": "actionable",
+                    "relevance": "direct",
+                }
+            ],
         }
     )
     return response
@@ -325,8 +333,8 @@ def test_judge_normalized_results_returns_count(tmp_path: Path) -> None:
 
 
 class TestJudgeViaCli:
-    def test_via_cli_calls_subprocess(self, tmp_path: Path) -> None:
-        """via_cli=True calls run_claude_cli with max_turns=1 and returns parsed score."""
+    def test_cli_judge_calls_subprocess(self, tmp_path: Path) -> None:
+        """judges=['claude-cli-opus'] calls run_claude_cli with max_turns=1."""
         from unittest.mock import patch
 
         from bugeval.agent_models import AgentResult
@@ -339,15 +347,15 @@ class TestJudgeViaCli:
         mock_agent_result = AgentResult(stdout=valid_stdout, model="claude-opus-4-6")
 
         with patch("bugeval.judge.run_claude_cli", return_value=mock_agent_result) as mock_cli:
-            score = judge_case(case, result, system_prompt="judge this", via_cli=True, n_votes=1)
+            score = judge_case(case, result, system_prompt="judge this", judges=["claude-cli-opus"])
 
         mock_cli.assert_called_once()
         call_kwargs = mock_cli.call_args
         assert call_kwargs.kwargs.get("max_turns") == 1 or call_kwargs.args[2] == 1
         assert score.score == 2
 
-    def test_via_cli_dry_run_skips_subprocess(self, tmp_path: Path) -> None:
-        """dry_run=True + via_cli=True → no subprocess call, returns score 0."""
+    def test_cli_judge_dry_run_skips_subprocess(self, tmp_path: Path) -> None:
+        """dry_run=True + judges=['claude-cli-opus'] → no subprocess call, returns score 0."""
         from unittest.mock import patch
 
         from tests.conftest import make_case
@@ -356,12 +364,14 @@ class TestJudgeViaCli:
         result = _make_result()
 
         with patch("bugeval.judge.run_claude_cli") as mock_cli:
-            score = judge_case(case, result, system_prompt="p", dry_run=True, via_cli=True)
+            score = judge_case(
+                case, result, system_prompt="p", dry_run=True, judges=["claude-cli-opus"]
+            )
 
         mock_cli.assert_not_called()
         assert score.score == 0
 
-    def test_via_cli_parse_failure_returns_zero(self, tmp_path: Path) -> None:
+    def test_cli_judge_parse_failure_returns_zero(self, tmp_path: Path) -> None:
         """run_claude_cli returns non-JSON stdout → score defaults to 0."""
         from unittest.mock import patch
 
@@ -374,7 +384,7 @@ class TestJudgeViaCli:
         bad_result = AgentResult(stdout="I cannot determine the score.", model="claude-opus-4-6")
 
         with patch("bugeval.judge.run_claude_cli", return_value=bad_result):
-            score = judge_case(case, result, system_prompt="judge this", via_cli=True, n_votes=1)
+            score = judge_case(case, result, system_prompt="judge this", judges=["claude-cli-opus"])
 
         assert score.score == 0
         assert "failed to parse" in score.reasoning
@@ -438,3 +448,539 @@ def test_judge_case_retries_on_rate_limit() -> None:
 
     assert score.score == 2
     assert mock_client.messages.create.call_count == 4  # 1 failure + 3 successes
+
+
+# ---------------------------------------------------------------------------
+# Cross-provider judging (Gemini / OpenAI)
+# ---------------------------------------------------------------------------
+
+
+def test_judge_case_gemini_model_uses_google_sdk() -> None:
+    """A gemini-* model in the vote list should call the Google SDK, not Anthropic."""
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+
+    judge_json = json.dumps(
+        {
+            "score": 2,
+            "reasoning": "found it",
+            "comment_judgments": [],
+        }
+    )
+
+    with (
+        patch("bugeval.judge.default_judging") as mock_judging,
+        patch("bugeval.judge._call_google_judge", return_value=judge_json) as mock_g,
+        patch("bugeval.judge.Anthropic") as mock_anthropic,
+    ):
+        mock_judging.return_value = MagicMock(models=["gemini-2.5-flash"], model="")
+        score = judge_case(case, result, system_prompt="judge this")
+
+    mock_g.assert_called_once()
+    mock_anthropic.assert_not_called()
+    assert score.score == 2
+
+
+def test_judge_case_openai_model_uses_openai_sdk() -> None:
+    """A gpt-*/o4-* model in the vote list should call the OpenAI SDK."""
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+
+    judge_json = json.dumps(
+        {
+            "score": 3,
+            "reasoning": "good fix",
+            "comment_judgments": [],
+        }
+    )
+
+    with (
+        patch("bugeval.judge.default_judging") as mock_judging,
+        patch("bugeval.judge._call_openai_judge", return_value=judge_json) as mock_o,
+        patch("bugeval.judge.Anthropic") as mock_anthropic,
+    ):
+        mock_judging.return_value = MagicMock(models=["gpt-5.4-mini"], model="")
+        score = judge_case(case, result, system_prompt="judge this")
+
+    mock_o.assert_called_once()
+    mock_anthropic.assert_not_called()
+    assert score.score == 3
+
+
+def test_build_judge_prompt_includes_diff() -> None:
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+    prompt = _build_judge_prompt(case, result, diff_content="--- a/f.rs\n+++ b/f.rs\n")
+    assert "--- a/f.rs" in prompt
+    assert "### Diff" in prompt
+
+
+def test_build_judge_prompt_truncates_long_diff() -> None:
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+    long_diff = "x" * 6000
+    prompt = _build_judge_prompt(case, result, diff_content=long_diff)
+    assert "(truncated)" in prompt
+    assert len(prompt) < len(long_diff) + 2000  # prompt overhead
+
+
+def test_build_judge_prompt_no_diff_section_when_empty() -> None:
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+    prompt = _build_judge_prompt(case, result, diff_content="")
+    assert "### Diff" not in prompt
+
+
+def test_build_judge_prompt_omits_case_id() -> None:
+    """case.id reveals the repo name — judge prompt must not include it."""
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+    prompt = _build_judge_prompt(case, result)
+    # The prompt should not contain the case ID value
+    assert case.id not in prompt
+    # Guard against any case-id-like patterns leaking
+    assert "case-001" not in prompt
+
+
+def test_extract_judge_json_with_multiple_json_objects() -> None:
+    """Greedy regex must not merge two separate JSON objects."""
+    text = (
+        'The tool found {"file": "foo.rs"} in the code.\n'
+        '{"score": 2, "reasoning": "Found it", "comment_judgments": []}'
+    )
+    result = _extract_judge_json(text)
+    assert result is not None
+    assert result["score"] == 2
+
+
+def test_judge_case_mixed_ensemble() -> None:
+    """An ensemble with mixed providers dispatches each vote to the right SDK."""
+    from tests.conftest import make_case
+
+    case = make_case()
+    result = _make_result()
+
+    judge_json = json.dumps(
+        {
+            "score": 2,
+            "reasoning": "ok",
+            "comment_judgments": [],
+        }
+    )
+
+    with (
+        patch("bugeval.judge.default_judging") as mock_judging,
+        patch("bugeval.judge._call_google_judge", return_value=judge_json) as mock_g,
+        patch("bugeval.judge._call_openai_judge", return_value=judge_json) as mock_o,
+        patch("bugeval.judge._call_anthropic_judge", return_value=judge_json) as mock_a,
+    ):
+        mock_judging.return_value = MagicMock(
+            models=["claude-sonnet-4-6", "gemini-2.5-flash", "gpt-5.4-mini"],
+            model="",
+        )
+        score = judge_case(case, result, system_prompt="judge this")
+
+    mock_a.assert_called_once()
+    mock_g.assert_called_once()
+    mock_o.assert_called_once()
+    assert score.score == 2
+
+
+# ---------------------------------------------------------------------------
+# resolve_judge_runner
+# ---------------------------------------------------------------------------
+
+
+class TestResolveJudgeRunner:
+    def test_claude_cli_runner(self) -> None:
+        from bugeval.judge import resolve_judge_runner
+
+        kind, model = resolve_judge_runner("claude-cli-sonnet")
+        assert kind == "claude-cli"
+        assert model == "claude-sonnet-4-6"
+
+    def test_gemini_cli_runner(self) -> None:
+        from bugeval.judge import resolve_judge_runner
+
+        kind, model = resolve_judge_runner("gemini-cli-flash")
+        assert kind == "gemini-cli"
+        assert model == "gemini-2.5-flash"
+
+    def test_codex_cli_runner(self) -> None:
+        from bugeval.judge import resolve_judge_runner
+
+        kind, model = resolve_judge_runner("codex-cli-mini")
+        assert kind == "codex-cli"
+        assert model == "gpt-5.4-mini"
+
+    def test_bare_anthropic_model(self) -> None:
+        from bugeval.judge import resolve_judge_runner
+
+        kind, model = resolve_judge_runner("claude-sonnet-4-6")
+        assert kind == "api"
+        assert model == "claude-sonnet-4-6"
+
+    def test_bare_gemini_model(self) -> None:
+        from bugeval.judge import resolve_judge_runner
+
+        kind, model = resolve_judge_runner("gemini-2.5-flash")
+        assert kind == "api"
+        assert model == "gemini-2.5-flash"
+
+    def test_bare_openai_model(self) -> None:
+        from bugeval.judge import resolve_judge_runner
+
+        kind, model = resolve_judge_runner("o4-mini")
+        assert kind == "api"
+        assert model == "o4-mini"
+
+
+# ---------------------------------------------------------------------------
+# --judges flag on judge_case
+# ---------------------------------------------------------------------------
+
+
+class TestJudgesParam:
+    def test_judges_overrides_config_models(self) -> None:
+        """When judges= is passed, it overrides config judging.models."""
+        from tests.conftest import make_case
+
+        case = make_case()
+        result = _make_result()
+
+        judge_json = json.dumps({"score": 2, "reasoning": "ok", "comment_judgments": []})
+
+        with patch("bugeval.judge._call_anthropic_judge", return_value=judge_json) as mock_a:
+            score = judge_case(
+                case,
+                result,
+                system_prompt="judge",
+                judges=["claude-sonnet-4-6"],
+            )
+
+        assert mock_a.call_count == 1
+        assert score.score == 2
+
+    def test_judges_cli_runner_dispatches_to_run_claude_cli(self) -> None:
+        """judges=['claude-cli-sonnet'] should call run_claude_cli."""
+        from bugeval.agent_models import AgentResult
+        from tests.conftest import make_case
+
+        case = make_case()
+        result = _make_result()
+
+        valid_stdout = json.dumps({"score": 2, "reasoning": "found it", "comment_judgments": []})
+        mock_agent_result = AgentResult(stdout=valid_stdout, model="claude-sonnet-4-6")
+
+        with patch("bugeval.judge.run_claude_cli", return_value=mock_agent_result) as mock_cli:
+            score = judge_case(
+                case,
+                result,
+                system_prompt="judge",
+                judges=["claude-cli-sonnet"],
+            )
+
+        mock_cli.assert_called_once()
+        assert score.score == 2
+
+    def test_judges_gemini_cli_dispatches_to_run_gemini_cli(self) -> None:
+        """judges=['gemini-cli-flash'] should call run_gemini_cli."""
+        from bugeval.agent_models import AgentResult
+        from tests.conftest import make_case
+
+        case = make_case()
+        result = _make_result()
+
+        valid_stdout = json.dumps({"score": 3, "reasoning": "great", "comment_judgments": []})
+        mock_agent_result = AgentResult(response_text=valid_stdout, model="gemini-2.5-flash")
+
+        with patch("bugeval.judge.run_gemini_cli", return_value=mock_agent_result) as mock_cli:
+            score = judge_case(
+                case,
+                result,
+                system_prompt="judge",
+                judges=["gemini-cli-flash"],
+            )
+
+        mock_cli.assert_called_once()
+        assert score.score == 3
+
+    def test_judges_codex_cli_dispatches_to_run_codex_cli(self) -> None:
+        """judges=['codex-cli-mini'] should call run_codex_cli."""
+        from bugeval.agent_models import AgentResult
+        from tests.conftest import make_case
+
+        case = make_case()
+        result = _make_result()
+
+        valid_stdout = json.dumps({"score": 2, "reasoning": "ok", "comment_judgments": []})
+        mock_agent_result = AgentResult(response_text=valid_stdout, model="gpt-5.4-mini")
+
+        with patch("bugeval.judge.run_codex_cli", return_value=mock_agent_result) as mock_cli:
+            score = judge_case(
+                case,
+                result,
+                system_prompt="judge",
+                judges=["codex-cli-mini"],
+            )
+
+        mock_cli.assert_called_once()
+        assert score.score == 2
+
+    def test_judges_mixed_cli_and_api(self) -> None:
+        """judges can mix CLI and API runners."""
+        from bugeval.agent_models import AgentResult
+        from tests.conftest import make_case
+
+        case = make_case()
+        result = _make_result()
+
+        judge_json = json.dumps({"score": 2, "reasoning": "ok", "comment_judgments": []})
+        mock_agent_result = AgentResult(response_text=judge_json, model="claude-sonnet-4-6")
+
+        with (
+            patch("bugeval.judge.run_claude_cli", return_value=mock_agent_result) as mock_cli,
+            patch("bugeval.judge._call_google_judge", return_value=judge_json) as mock_g,
+        ):
+            score = judge_case(
+                case,
+                result,
+                system_prompt="judge",
+                judges=["claude-cli-sonnet", "gemini-2.5-flash"],
+            )
+
+        mock_cli.assert_called_once()
+        mock_g.assert_called_once()
+        assert score.score == 2
+
+
+# ---------------------------------------------------------------------------
+# --judges CLI flag
+# ---------------------------------------------------------------------------
+
+
+class TestJudgesCLIFlag:
+    def test_help_shows_judges_flag(self) -> None:
+        from click.testing import CliRunner
+
+        from bugeval.cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["judge", "--help"])
+        assert result.exit_code == 0
+        assert "--judges" in result.output
+
+    def test_help_does_not_show_via_cli(self) -> None:
+        from click.testing import CliRunner
+
+        from bugeval.cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["judge", "--help"])
+        assert result.exit_code == 0
+        assert "--via-cli" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# review_quality & noise stats parsing
+# ---------------------------------------------------------------------------
+
+
+def _make_case():  # type: ignore[no-untyped-def]
+    from tests.conftest import make_case
+
+    return make_case()
+
+
+def test_default_prompt_has_severity_actionability() -> None:
+    """Default prompt should include severity and actionability sections."""
+    from bugeval.judge import _DEFAULT_JUDGE_PROMPT
+
+    assert "severity" in _DEFAULT_JUDGE_PROMPT.lower()
+    assert "actionability" in _DEFAULT_JUDGE_PROMPT.lower()
+    assert "review_quality" not in _DEFAULT_JUDGE_PROMPT.lower()
+    # Should not contain old review quality section
+    assert "Review quality score" not in _DEFAULT_JUDGE_PROMPT
+
+
+def test_build_judge_prompt_clean_case_no_expected_findings() -> None:
+    """For clean cases (no expected findings), judge prompt should say no known bugs."""
+    from tests.conftest import make_case
+
+    case = make_case(expected_findings=[], case_type="clean")
+    result = _make_result()
+    prompt = _build_judge_prompt(case, result)
+    assert "no known bugs" in prompt.lower()
+    assert "Expected Bug" not in prompt
+
+
+def test_judge_case_clean_case_score_zero() -> None:
+    """For clean cases, bug detection score is always 0 regardless of judge output."""
+    from tests.conftest import make_case
+
+    case = make_case(expected_findings=[], case_type="clean")
+    result = _make_result()
+
+    # Judge might return score=2 but clean cases should force score=0
+    response = json.dumps(
+        {
+            "score": 2,
+            "reasoning": "Found something",
+            "comment_judgments": [
+                {
+                    "id": 0,
+                    "classification": "TP-novel",
+                    "severity": "medium",
+                    "actionability": "directional",
+                    "relevance": "direct",
+                },
+            ],
+        }
+    )
+    with patch("bugeval.judge._call_anthropic_judge", return_value=response):
+        score = judge_case(
+            case,
+            result,
+            system_prompt="test",
+            model="claude-sonnet-4-6",
+            n_votes=1,
+        )
+    assert score.score == 0
+
+
+def test_judge_case_parses_severity_actionability() -> None:
+    """judge_case should parse severity and actionability from judge response."""
+    case = _make_case()
+    result = _make_result()
+    response = json.dumps(
+        {
+            "score": 2,
+            "reasoning": "Good review",
+            "comment_judgments": [
+                {
+                    "id": 0,
+                    "classification": "TP-expected",
+                    "severity": "high",
+                    "actionability": "actionable",
+                    "relevance": "direct",
+                },
+            ],
+        }
+    )
+    with patch("bugeval.judge._call_anthropic_judge", return_value=response):
+        score = judge_case(
+            case,
+            result,
+            system_prompt="test",
+            model="claude-sonnet-4-6",
+            n_votes=1,
+        )
+    assert score.noise.true_positives == 1
+    assert score.noise.novel_findings == 0
+    assert score.noise.weighted_signal == pytest.approx(3.0)  # high(3) * actionable(1.0)
+    assert score.noise.actionability_rate == pytest.approx(1.0)
+    assert score.comment_judgments[0].severity == "high"
+    assert score.comment_judgments[0].actionability == "actionable"
+
+
+def test_judge_case_parses_tp_novel() -> None:
+    """judge_case should parse TP-novel classification correctly."""
+    case = _make_case()
+    result = _make_result()
+    response = json.dumps(
+        {
+            "score": 0,
+            "reasoning": "Missed main bug but found real secondary issue",
+            "comment_judgments": [
+                {
+                    "id": 0,
+                    "classification": "TP-novel",
+                    "severity": "medium",
+                    "actionability": "directional",
+                    "relevance": "direct",
+                },
+            ],
+        }
+    )
+    with patch("bugeval.judge._call_anthropic_judge", return_value=response):
+        score = judge_case(
+            case,
+            result,
+            system_prompt="test",
+            model="claude-sonnet-4-6",
+            n_votes=1,
+        )
+    assert score.score == 0
+    assert score.noise.novel_findings == 1
+    assert score.noise.true_positives == 0
+    assert score.noise.false_positives == 0
+    assert score.noise.weighted_signal == pytest.approx(1.2)  # medium(2) * directional(0.6)
+
+
+def test_judge_case_noise_stats_all_classifications() -> None:
+    """All four classification types should be counted correctly."""
+    case = _make_case()
+    # Need 4 comments for 4 classifications
+    result = NormalizedResult(
+        test_case_id="case-001",
+        tool="greptile",
+        comments=[
+            Comment(body="a", file="a.rs", line=1),
+            Comment(body="b", file="b.rs", line=2),
+            Comment(body="c", file="c.rs", line=3),
+            Comment(body="d", file="d.rs", line=4),
+        ],
+    )
+    response = json.dumps(
+        {
+            "score": 2,
+            "reasoning": "ok",
+            "comment_judgments": [
+                {
+                    "id": 0,
+                    "classification": "TP-expected",
+                    "severity": "high",
+                    "actionability": "actionable",
+                    "relevance": "direct",
+                },
+                {
+                    "id": 1,
+                    "classification": "TP-novel",
+                    "severity": "medium",
+                    "actionability": "directional",
+                    "relevance": "direct",
+                },
+                {"id": 2, "classification": "FP", "relevance": "unrelated"},
+                {"id": 3, "classification": "low-value", "relevance": "unrelated"},
+            ],
+        }
+    )
+    with patch("bugeval.judge._call_anthropic_judge", return_value=response):
+        score = judge_case(
+            case,
+            result,
+            system_prompt="test",
+            model="claude-sonnet-4-6",
+            n_votes=1,
+        )
+    assert score.noise.total_comments == 4
+    assert score.noise.true_positives == 1
+    assert score.noise.novel_findings == 1
+    assert score.noise.false_positives == 1
+    assert score.noise.low_value == 1
+    assert score.noise.snr == pytest.approx(0.5)  # (1+1)/4
+    # weighted: high(3)*actionable(1.0) + medium(2)*directional(0.6) = 4.2
+    assert score.noise.weighted_signal == pytest.approx(4.2)
+    assert score.noise.actionability_rate == pytest.approx(0.5)  # 1 actionable / 2 TPs

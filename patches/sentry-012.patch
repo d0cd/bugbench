@@ -1,30 +1,1486 @@
-diff --git a/src/sentry/grouping/parameterization.py b/src/sentry/grouping/parameterization.py
-index 10483064fa3..8c457ee30ef 100644
---- a/src/sentry/grouping/parameterization.py
-+++ b/src/sentry/grouping/parameterization.py
-@@ -142,7 +142,7 @@ DEFAULT_PARAMETERIZATION_REGEXES = [
-             )
-             |
-             # Kitchen
--            ([1-9]\d?:\d{2}(:\d{2})?(?: [aApP][Mm])?)
-+            ([1-9]\d?:\d{2}(:\d{2})?(?:\s?[aApP][Mm])?)
-             |
-             # Date
-             (\d{4}-[01]\d-[0-3]\d)
-diff --git a/tests/sentry/grouping/test_parameterization.py b/tests/sentry/grouping/test_parameterization.py
-index 49157912bbd..75e20b57deb 100644
---- a/tests/sentry/grouping/test_parameterization.py
-+++ b/tests/sentry/grouping/test_parameterization.py
-@@ -76,7 +76,11 @@ standard_cases = [
-     ("date - datetime compressed T-separated", "20060102T150405", "<date>"),
-     ("date - datetime compressed T-separated UTC", "20060102T150405Z", "<date>"),
-     ("date - datetime compressed T-separated w offset", "20060102T150405+0100", "<date>"),
--    ("date - kitchen", "3:04PM", "<date>"),
-+    ("date - kitchen uppercase without space", "11:21PM", "<date>"),
-+    ("date - kitchen uppercase with space", "12:31 PM", "<date>"),
-+    ("date - kitchen lowercase without space", "11:21pm", "<date>"),
-+    ("date - kitchen lowercase with space", "12:31 pm", "<date>"),
-+    ("date - kitchen 24-hour", "23:21", "<date>"),
-     ("date - time", "15:04:05", "<date>"),
-     ("date - basic", "Mon Jan 02, 1999", "<date>"),
-     ("date - datetime compressed date", "20240220 11:55:33.546593", "<date>"),
+diff --git a/src/sentry/api/serializers/rest_framework/dashboard.py b/src/sentry/api/serializers/rest_framework/dashboard.py
+index 4cb974a1715bbb..4956096566a2f3 100644
+--- a/src/sentry/api/serializers/rest_framework/dashboard.py
++++ b/src/sentry/api/serializers/rest_framework/dashboard.py
+@@ -1017,15 +1017,15 @@ def _update_or_create_field_links(
+             if len(linked_fields) != len(set(linked_fields)):
+                 raise serializers.ValidationError("Duplicate fields in linked dashboards")
+ 
+-            # check if the linked dashboard appears in the fields of the query
++            # check if the linked dashboard field appears in the columns (group bys) of the query
+             if not all(
+-                field in query.fields
++                field in (query.columns or [])
+                 for field in [
+                     linked_dashboard.get("field") for linked_dashboard in linked_dashboards
+                 ]
+             ):
+                 raise serializers.ValidationError(
+-                    "Linked dashboard does not appear in the fields of the query"
++                    "Linked dashboard field does not appear in the columns of the widget query"
+                 )
+ 
+             # Validate all linked dashboard IDs belong to this organization
+diff --git a/src/sentry/hybridcloud/tasks/deliver_webhooks.py b/src/sentry/hybridcloud/tasks/deliver_webhooks.py
+index d9b871da0c7bc0..ded29aea27a784 100644
+--- a/src/sentry/hybridcloud/tasks/deliver_webhooks.py
++++ b/src/sentry/hybridcloud/tasks/deliver_webhooks.py
+@@ -399,10 +399,14 @@ def _discard_stale_mailbox_payloads(payload: WebhookPayload) -> None:
+ 
+ 
+ def _get_github_delivery_time_tags(payload: WebhookPayload) -> dict[str, str]:
+-    """Extract GitHub event type and action from payload for delivery_time_ms metric tags."""
++    """Extract GitHub event and action from payload for delivery_time_ms metric tags.
++
++    Returns a single tag github_event_and_action as "<event>.<action>", using "unknown"
++    when the request body has no action (e.g. push, ping).
++    """
+     if payload.provider != "github":
+         return {}
+-    tags: dict[str, str] = {}
++    event_type: str | None = None
+     try:
+         headers = orjson.loads(payload.request_headers)
+     except orjson.JSONDecodeError:
+@@ -410,17 +414,21 @@ def _get_github_delivery_time_tags(payload: WebhookPayload) -> dict[str, str]:
+     if isinstance(headers, dict):
+         for key, value in headers.items():
+             if key.upper() == "X-GITHUB-EVENT" and isinstance(value, str) and value:
+-                tags["github_event_type"] = value
++                event_type = value
+                 break
++    if not event_type:
++        return {}
++    action = "unknown"
+     try:
+         body = orjson.loads(payload.request_body)
+     except orjson.JSONDecodeError:
+-        return tags
+-    if isinstance(body, dict):
+-        action = body.get("action")
+-        if isinstance(action, str) and action:
+-            tags["github_action"] = action
+-    return tags
++        pass
++    else:
++        if isinstance(body, dict):
++            body_action = body.get("action")
++            if isinstance(body_action, str) and body_action:
++                action = body_action
++    return {"github_event_and_action": f"{event_type}.{action}"}
+ 
+ 
+ def _record_delivery_time_metrics(payload: WebhookPayload) -> None:
+diff --git a/static/app/api.tsx b/static/app/api.tsx
+index b5fa77b21ce129..5e85035789ef75 100644
+--- a/static/app/api.tsx
++++ b/static/app/api.tsx
+@@ -237,9 +237,6 @@ export function hasProjectBeenRenamed(response: ResponseMeta) {
+   return true;
+ }
+ 
+-// TODO(ts): move this somewhere
+-export type APIRequestMethod = 'POST' | 'GET' | 'DELETE' | 'PUT';
+-
+ type FunctionCallback<Args extends any[] = any[]> = (...args: Args) => void;
+ 
+ export type RequestCallbacks = {
+@@ -279,7 +276,7 @@ export type RequestOptions = RequestCallbacks & {
+   /**
+    * The HTTP method to use when making the API request
+    */
+-  method?: APIRequestMethod;
++  method?: 'DELETE' | 'GET' | 'POST' | 'PUT';
+   /**
+    * Because of the async nature of API requests, errors will happen outside of
+    * the stack that initated the request. a preservedError can be passed to
+diff --git a/static/app/components/externalIssues/externalIssueForm.tsx b/static/app/components/externalIssues/externalIssueForm.tsx
+index a23de6fa6f8786..01c73819483226 100644
+--- a/static/app/components/externalIssues/externalIssueForm.tsx
++++ b/static/app/components/externalIssues/externalIssueForm.tsx
+@@ -34,6 +34,7 @@ import type {
+ } from 'sentry/types/integrations';
+ import type {Organization} from 'sentry/types/organization';
+ import {trackAnalytics} from 'sentry/utils/analytics';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import {getAnalyticsDataForGroup} from 'sentry/utils/events';
+ import {
+@@ -124,11 +125,13 @@ export function ExternalIssueForm({
+   const api = useApi({persistInFlight: true});
+   const [model] = useState(() => new FormModel());
+   const organization = useOrganization();
+-  const endpointString = makeIntegrationIssueConfigQueryKey({
+-    orgSlug: organization.slug,
+-    groupId: group.id,
+-    integrationId: integration.id,
+-  })[0];
++  const {url: endpointString} = parseQueryKey(
++    makeIntegrationIssueConfigQueryKey({
++      orgSlug: organization.slug,
++      groupId: group.id,
++      integrationId: integration.id,
++    })
++  );
+   const queryClient = useQueryClient();
+   const title = tct('[integration] Issue', {integration: integration.provider.name});
+ 
+diff --git a/static/app/components/externalIssues/ticketRuleModal.tsx b/static/app/components/externalIssues/ticketRuleModal.tsx
+index f159ea35675d09..1360df66ef28fb 100644
+--- a/static/app/components/externalIssues/ticketRuleModal.tsx
++++ b/static/app/components/externalIssues/ticketRuleModal.tsx
+@@ -28,6 +28,7 @@ import type {TicketActionData} from 'sentry/types/alerts';
+ import type {Choices} from 'sentry/types/core';
+ import type {IntegrationIssueConfig, IssueConfigField} from 'sentry/types/integrations';
+ import {defined} from 'sentry/utils';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import {
+   setApiQueryData,
+@@ -107,10 +108,12 @@ export function TicketRuleModal({
+   const {cache, updateCache} = useAsyncOptionsCache(initialOptionsCache);
+   const [isDynamicallyRefetching, setIsDynamicallyRefetching] = useState(false);
+ 
+-  const endpointString = makeIntegrationIssueConfigTicketRuleQueryKey({
+-    orgSlug: organization.slug,
+-    integrationId: instance.integration,
+-  })[0];
++  const {url: endpointString} = parseQueryKey(
++    makeIntegrationIssueConfigTicketRuleQueryKey({
++      orgSlug: organization.slug,
++      integrationId: instance.integration,
++    })
++  );
+ 
+   const initialConfigQuery = useMemo(() => {
+     return (instance.dynamic_form_fields || [])
+diff --git a/static/app/components/featureFlags/hooks/useOrganizationFlagLog.tsx b/static/app/components/featureFlags/hooks/useOrganizationFlagLog.tsx
+index 792ccd8e76e24d..cee939b709667e 100644
+--- a/static/app/components/featureFlags/hooks/useOrganizationFlagLog.tsx
++++ b/static/app/components/featureFlags/hooks/useOrganizationFlagLog.tsx
+@@ -55,7 +55,7 @@ export function useOrganizationFlagLogInfinite({
+ 
+   const apiQuery = useInfiniteApiQuery<RawFlagData>({
+     queryKey: [
+-      'infinite' as const,
++      {infinite: true, version: 'v1'},
+       getApiUrl('/organizations/$organizationIdOrSlug/flags/logs/', {
+         path: {
+           organizationIdOrSlug: organization.slug,
+diff --git a/static/app/components/feedback/list/feedbackList.tsx b/static/app/components/feedback/list/feedbackList.tsx
+index 2f09596c04100d..0f047aa7534b58 100644
+--- a/static/app/components/feedback/list/feedbackList.tsx
++++ b/static/app/components/feedback/list/feedbackList.tsx
+@@ -38,7 +38,9 @@ interface Props {
+ export function FeedbackList({onItemSelect}: Props) {
+   const {listQueryKey} = useFeedbackQueryKeys();
+   const queryResult = useInfiniteApiQuery<FeedbackIssueListItem[]>({
+-    queryKey: listQueryKey ?? (['infinite', ''] as unknown as InfiniteApiQueryKey),
++    queryKey:
++      listQueryKey ??
++      ([{infinite: true, version: 'v1'}, ''] as unknown as InfiniteApiQueryKey),
+     enabled: Boolean(listQueryKey),
+   });
+ 
+diff --git a/static/app/components/feedback/useFeedbackQueryKeys.tsx b/static/app/components/feedback/useFeedbackQueryKeys.tsx
+index df25c89ea3aa31..cfec24799086ed 100644
+--- a/static/app/components/feedback/useFeedbackQueryKeys.tsx
++++ b/static/app/components/feedback/useFeedbackQueryKeys.tsx
+@@ -4,6 +4,7 @@ import {createContext, useCallback, useContext, useRef, useState} from 'react';
+ import getFeedbackItemQueryKey from 'sentry/components/feedback/getFeedbackItemQueryKey';
+ import useFeedbackListQueryKey from 'sentry/components/feedback/useFeedbackListQueryKey';
+ import type {Organization} from 'sentry/types/organization';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import type {ApiQueryKey, InfiniteApiQueryKey} from 'sentry/utils/queryClient';
+ 
+ interface Props {
+@@ -78,7 +79,7 @@ export function FeedbackQueryKeys({children, organization}: Props) {
+         getItemQueryKeys,
+         listHeadTime,
+         listPrefetchQueryKey,
+-        listQueryKey: listQueryKey ? ['infinite', ...listQueryKey] : undefined,
++        listQueryKey: getInfiniteListQueryKey(listQueryKey),
+         resetListHeadTime,
+       }}
+     >
+@@ -87,6 +88,14 @@ export function FeedbackQueryKeys({children, organization}: Props) {
+   );
+ }
+ 
++function getInfiniteListQueryKey(listQueryKey: ApiQueryKey | undefined) {
++  if (!listQueryKey) {
++    return undefined;
++  }
++  const {url, options} = parseQueryKey(listQueryKey);
++  return [{infinite: true, version: 'v1'}, url, options] as InfiniteApiQueryKey;
++}
++
+ export default function useFeedbackQueryKeys() {
+   return useContext(FeedbackQueryKeysProvider);
+ }
+diff --git a/static/app/components/feedback/useMutateFeedback.tsx b/static/app/components/feedback/useMutateFeedback.tsx
+index 17218ff8f25cdf..4011e072d2f2bf 100644
+--- a/static/app/components/feedback/useMutateFeedback.tsx
++++ b/static/app/components/feedback/useMutateFeedback.tsx
+@@ -5,6 +5,7 @@ import useFeedbackQueryKeys from 'sentry/components/feedback/useFeedbackQueryKey
+ import type {Actor} from 'sentry/types/core';
+ import type {GroupStatus} from 'sentry/types/group';
+ import type {Organization} from 'sentry/types/organization';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import type {MutateOptions} from 'sentry/utils/queryClient';
+ import {fetchMutation, useMutation} from 'sentry/utils/queryClient';
+ 
+@@ -45,10 +46,14 @@ export default function useMutateFeedback({
+       // TODO: it would be excellent if `PUT /issues/` could return the same data
+       // as `GET /issues/` when query params are set. IE: it should expand inbox & owners
+       // Then we could push new data into the cache instead of re-fetching it again
++
++      const listQueryKeyOptions = listQueryKey
++        ? (parseQueryKey(listQueryKey).options ?? {})
++        : {};
+       const options = isSingleId
+         ? {}
+         : ids === 'all'
+-          ? listQueryKey?.[2]!
++          ? listQueryKeyOptions
+           : {query: {id: ids, project: projectIds}};
+       return fetchMutation({method: 'PUT', url, options, data: payload});
+     },
+diff --git a/static/app/components/forms/model.tsx b/static/app/components/forms/model.tsx
+index 6f222b575b2f81..09cc31f4bce004 100644
+--- a/static/app/components/forms/model.tsx
++++ b/static/app/components/forms/model.tsx
+@@ -3,13 +3,13 @@ import type {ObservableMap} from 'mobx';
+ import {action, computed, makeObservable, observable} from 'mobx';
+ 
+ import {addErrorMessage} from 'sentry/actionCreators/indicator';
+-import type {APIRequestMethod} from 'sentry/api';
+ import {Client} from 'sentry/api';
+ import {addUndoableFormChangeMessage} from 'sentry/components/forms/formIndicators';
+ import FormState from 'sentry/components/forms/state';
+ import {t} from 'sentry/locale';
+ import type {Choice} from 'sentry/types/core';
+ import {defined} from 'sentry/utils';
++import type {RequestMethod} from 'sentry/utils/api/apiQueryKey';
+ import {isDemoModeActive} from 'sentry/utils/demoMode';
+ 
+ export const fieldIsRequiredMessage = t('Field is required');
+@@ -40,7 +40,7 @@ export type FormOptions = {
+   /**
+    * API method used to save the form model
+    */
+-  apiMethod?: APIRequestMethod;
++  apiMethod?: RequestMethod;
+   /**
+    * Options passed to the API Client
+    */
+@@ -420,7 +420,7 @@ class FormModel {
+   }: {
+     data: Record<PropertyKey, unknown>;
+     apiEndpoint?: string;
+-    apiMethod?: APIRequestMethod;
++    apiMethod?: RequestMethod;
+   }) {
+     const endpoint = apiEndpoint || this.options.apiEndpoint || '';
+     const method = apiMethod || this.options.apiMethod;
+diff --git a/static/app/components/replays/list/__stories__/replayList.stories.tsx b/static/app/components/replays/list/__stories__/replayList.stories.tsx
+index ff9226f18ca761..eb7c4a60b301f5 100644
+--- a/static/app/components/replays/list/__stories__/replayList.stories.tsx
++++ b/static/app/components/replays/list/__stories__/replayList.stories.tsx
+@@ -8,6 +8,7 @@ import {ReplayList} from 'sentry/components/replays/list/__stories__/replayList'
+ import {EnvironmentPicker} from 'sentry/components/replays/player/__stories__/environmentPicker';
+ import {ProjectPicker} from 'sentry/components/replays/player/__stories__/projectPicker';
+ import * as Storybook from 'sentry/stories';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import {useInfiniteApiQuery} from 'sentry/utils/queryClient';
+ import useReplayListQueryKey from 'sentry/utils/replays/hooks/useReplayListQueryKey';
+ import useOrganization from 'sentry/utils/useOrganization';
+@@ -32,8 +33,9 @@ export default Storybook.story('ReplayList', story => {
+       organization,
+       queryReferrer: 'replayList',
+     });
++    const {url, options} = parseQueryKey(listQueryKey);
+     const queryResult = useInfiniteApiQuery<{data: ReplayListRecord[]}>({
+-      queryKey: ['infinite', ...(listQueryKey ?? '')],
++      queryKey: [{infinite: true, version: 'v1'}, url, options ?? {}],
+       enabled: Boolean(listQueryKey),
+     });
+ 
+@@ -77,8 +79,9 @@ export default Storybook.story('ReplayList', story => {
+       organization,
+       queryReferrer: 'replayList',
+     });
++    const {url, options} = parseQueryKey(listQueryKey);
+     const queryResult = useInfiniteApiQuery<{data: ReplayListRecord[]}>({
+-      queryKey: ['infinite', ...(listQueryKey ?? '')],
++      queryKey: [{infinite: true, version: 'v1'}, url, options ?? {}],
+       enabled: Boolean(listQueryKey),
+     });
+ 
+diff --git a/static/app/components/replays/player/__stories__/replaySlugChooser.tsx b/static/app/components/replays/player/__stories__/replaySlugChooser.tsx
+index 29857ac580d3b9..8afb4f644ab6f8 100644
+--- a/static/app/components/replays/player/__stories__/replaySlugChooser.tsx
++++ b/static/app/components/replays/player/__stories__/replaySlugChooser.tsx
+@@ -11,6 +11,7 @@ import {EnvironmentPicker} from 'sentry/components/replays/player/__stories__/en
+ import {ProjectPicker} from 'sentry/components/replays/player/__stories__/projectPicker';
+ import {Providers} from 'sentry/components/replays/player/__stories__/providers';
+ import {ReplayLoadingState} from 'sentry/components/replays/player/replayLoadingState';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import {useInfiniteApiQuery} from 'sentry/utils/queryClient';
+ import useLoadReplayReader from 'sentry/utils/replays/hooks/useLoadReplayReader';
+ import useReplayListQueryKey from 'sentry/utils/replays/hooks/useReplayListQueryKey';
+@@ -40,8 +41,9 @@ export function ReplaySlugChooser({children}: Props) {
+     organization,
+     queryReferrer: 'replayList',
+   });
++  const {url, options} = parseQueryKey(listQueryKey);
+   const queryResult = useInfiniteApiQuery<{data: ReplayListRecord[]}>({
+-    queryKey: ['infinite', ...(listQueryKey ?? '')],
++    queryKey: [{infinite: true, version: 'v1'}, url, options ?? {}],
+     enabled: Boolean(listQueryKey),
+   });
+ 
+diff --git a/static/app/components/replays/table/replayTableHeader.tsx b/static/app/components/replays/table/replayTableHeader.tsx
+index b6247fdd632263..9dcea113cd1feb 100644
+--- a/static/app/components/replays/table/replayTableHeader.tsx
++++ b/static/app/components/replays/table/replayTableHeader.tsx
+@@ -11,9 +11,9 @@ import {
+ } from 'sentry/components/replays/table/replayTableColumns';
+ import {SimpleTable} from 'sentry/components/tables/simpleTable';
+ import {t, tct, tn} from 'sentry/locale';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import type {Sort} from 'sentry/utils/discover/fields';
+ import {useListItemCheckboxContext} from 'sentry/utils/list/useListItemCheckboxState';
+-import {parseQueryKey} from 'sentry/utils/queryClient';
+ import type {ReplayListRecord} from 'sentry/views/replays/types';
+ 
+ type Props = {
+diff --git a/static/app/utils/api/apiFetch.tsx b/static/app/utils/api/apiFetch.tsx
+index d1126dd642c951..d740bff2e09c8c 100644
+--- a/static/app/utils/api/apiFetch.tsx
++++ b/static/app/utils/api/apiFetch.tsx
+@@ -1,8 +1,9 @@
+ import type {QueryFunctionContext} from '@tanstack/react-query';
+ 
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
++import type {ApiQueryKey, InfiniteApiQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import type {ParsedHeader} from 'sentry/utils/parseLinkHeader';
+-import type {ApiQueryKey, InfiniteApiQueryKey} from 'sentry/utils/queryClient';
+-import {parseQueryKey, QUERY_API_CLIENT} from 'sentry/utils/queryClient';
++import {QUERY_API_CLIENT} from 'sentry/utils/queryClient';
+ 
+ export type ApiResponse<TResponseData = unknown> = {
+   headers: {
+diff --git a/static/app/utils/api/apiOptions.spec.tsx b/static/app/utils/api/apiOptions.spec.tsx
+index afd13dd92453af..0123732c5bba22 100644
+--- a/static/app/utils/api/apiOptions.spec.tsx
++++ b/static/app/utils/api/apiOptions.spec.tsx
+@@ -6,6 +6,7 @@ import {renderHookWithProviders, waitFor} from 'sentry-test/reactTestingLibrary'
+ 
+ import type {ApiResponse} from 'sentry/utils/api/apiFetch';
+ import {apiOptions} from 'sentry/utils/api/apiOptions';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ 
+ type Promisable<T> = T | Promise<T>;
+ type QueryFunctionResult<T> = Promisable<ApiResponse<T>>;
+@@ -23,7 +24,8 @@ describe('apiOptions', () => {
+       }
+     );
+ 
+-    expect(options.queryKey[0]).toBe('/organizations/my-org/releases/v%201.0.0/');
++    const {url} = parseQueryKey(options.queryKey);
++    expect(url).toBe('/organizations/my-org/releases/v%201.0.0/');
+   });
+ 
+   it('should not include empty options in queryKey', () => {
+@@ -32,7 +34,10 @@ describe('apiOptions', () => {
+       path: {tokenId: '123'},
+     });
+ 
+-    expect(options.queryKey).toEqual(['/api-tokens/123/']);
++    expect(options.queryKey).toEqual([
++      {infinite: false, version: 'v2'},
++      '/api-tokens/123/',
++    ]);
+   });
+ 
+   it('should stringify number path params', () => {
+@@ -41,7 +46,8 @@ describe('apiOptions', () => {
+       path: {tokenId: 123},
+     });
+ 
+-    expect(options.queryKey[0]).toBe('/api-tokens/123/');
++    const {url} = parseQueryKey(options.queryKey);
++    expect(url).toBe('/api-tokens/123/');
+   });
+ 
+   it('should not do accidental replacements', () => {
+@@ -51,7 +57,10 @@ describe('apiOptions', () => {
+       path: {id: '123', id1: '456'},
+     });
+ 
+-    expect(options.queryKey).toEqual(['/projects/456/123']);
++    expect(options.queryKey).toEqual([
++      {infinite: false, version: 'v2'},
++      '/projects/456/123',
++    ]);
+   });
+ 
+   it('should allow skipToken as path', () => {
+@@ -63,9 +72,15 @@ describe('apiOptions', () => {
+     }
+ 
+     expect(getOptions('123').queryFn).toEqual(expect.any(Function));
+-    expect(getOptions('123').queryKey).toEqual(['/api-tokens/123/']);
++    expect(getOptions('123').queryKey).toEqual([
++      {infinite: false, version: 'v2'},
++      '/api-tokens/123/',
++    ]);
+     expect(getOptions(null).queryFn).toEqual(skipToken);
+-    expect(getOptions(null).queryKey).toEqual(['/api-tokens/$tokenId/']);
++    expect(getOptions(null).queryKey).toEqual([
++      {infinite: false, version: 'v2'},
++      '/api-tokens/$tokenId/',
++    ]);
+   });
+ 
+   it('should extract content data per default', async () => {
+diff --git a/static/app/utils/api/apiOptions.ts b/static/app/utils/api/apiOptions.ts
+index 741f4a6d9508d5..6e56375c2b0056 100644
+--- a/static/app/utils/api/apiOptions.ts
++++ b/static/app/utils/api/apiOptions.ts
+@@ -1,17 +1,18 @@
++import type {SkipToken} from '@tanstack/react-query';
++import {infiniteQueryOptions, queryOptions, skipToken} from '@tanstack/react-query';
++
+ import apiFetch, {apiFetchInfinite} from 'sentry/utils/api/apiFetch';
+ import type {ApiResponse} from 'sentry/utils/api/apiFetch';
++import type {
++  ApiQueryKey,
++  InfiniteApiQueryKey,
++  QueryKeyEndpointOptions,
++} from 'sentry/utils/api/apiQueryKey';
+ import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import type {ExtractPathParams, OptionalPathParams} from 'sentry/utils/api/getApiUrl';
+ import type {KnownGetsentryApiUrls} from 'sentry/utils/api/knownGetsentryApiUrls';
+ import type {KnownSentryApiUrls} from 'sentry/utils/api/knownSentryApiUrls.generated';
+ import parseLinkHeader from 'sentry/utils/parseLinkHeader';
+-import {infiniteQueryOptions, queryOptions, skipToken} from 'sentry/utils/queryClient';
+-import type {
+-  ApiQueryKey,
+-  InfiniteApiQueryKey,
+-  QueryKeyEndpointOptions,
+-  SkipToken,
+-} from 'sentry/utils/queryClient';
+ 
+ type KnownApiUrls = KnownGetsentryApiUrls | KnownSentryApiUrls;
+ 
+@@ -40,8 +41,8 @@ function _apiOptions<
+   return queryOptions({
+     queryKey:
+       Object.keys(options).length > 0
+-        ? ([url, options] as ApiQueryKey)
+-        : ([url] as ApiQueryKey),
++        ? ([{infinite: false, version: 'v2'}, url, options] as ApiQueryKey)
++        : ([{infinite: false, version: 'v2'}, url] as ApiQueryKey),
+     queryFn: pathParams === skipToken ? skipToken : apiFetch<TActualData>,
+     enabled: pathParams !== skipToken,
+     staleTime,
+@@ -74,8 +75,8 @@ function _apiOptionsInfinite<
+   return infiniteQueryOptions({
+     queryKey:
+       Object.keys(options).length > 0
+-        ? (['infinite', url, options] as InfiniteApiQueryKey)
+-        : (['infinite', url] as InfiniteApiQueryKey),
++        ? ([{infinite: true, version: 'v2'}, url, options] as InfiniteApiQueryKey)
++        : ([{infinite: true, version: 'v2'}, url] as InfiniteApiQueryKey),
+     queryFn: pathParams === skipToken ? skipToken : apiFetchInfinite<TActualData>,
+     getPreviousPageParam: parsePageParam('previous'),
+     getNextPageParam: parsePageParam('next'),
+diff --git a/static/app/utils/api/apiQueryKey.spec.ts b/static/app/utils/api/apiQueryKey.spec.ts
+new file mode 100644
+index 00000000000000..022be9c2a8c599
+--- /dev/null
++++ b/static/app/utils/api/apiQueryKey.spec.ts
+@@ -0,0 +1,125 @@
++import {
++  parseQueryKey,
++  type ApiQueryKey,
++  type InfiniteApiQueryKey,
++} from 'sentry/utils/api/apiQueryKey';
++import getApiUrl from 'sentry/utils/api/getApiUrl';
++
++describe('apiQueryKey', () => {
++  describe('parseQueryKey', () => {
++    describe('v1', () => {
++      it('can parse a v1 query key, without options', () => {
++        const queryKey: ApiQueryKey = [getApiUrl('/api-tokens/')];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v1',
++          isInfinite: false,
++          url: '/api-tokens/',
++          options: undefined,
++        });
++      });
++
++      it('can parse a simple query key, with options', () => {
++        const queryKey: ApiQueryKey = [
++          getApiUrl('/api-tokens/'),
++          {query: {filter: 'red'}},
++        ];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v1',
++          isInfinite: false,
++          url: '/api-tokens/',
++          options: {query: {filter: 'red'}},
++        });
++      });
++
++      it('can parse an v1 infinite query key, without options', () => {
++        const queryKey: InfiniteApiQueryKey = [
++          {infinite: true, version: 'v1'},
++          getApiUrl('/api-tokens/'),
++        ];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v1',
++          isInfinite: true,
++          url: '/api-tokens/',
++          options: undefined,
++        });
++      });
++
++      it('can parse a v2 infinite query key, with options', () => {
++        const queryKey: InfiniteApiQueryKey = [
++          {infinite: true, version: 'v1'},
++          getApiUrl('/api-tokens/'),
++          {query: {filter: 'red'}},
++        ];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v1',
++          isInfinite: true,
++          url: '/api-tokens/',
++          options: {query: {filter: 'red'}},
++        });
++      });
++    });
++    describe('v2', () => {
++      it('can parse a v2 query key, without options', () => {
++        const queryKey: ApiQueryKey = [
++          {infinite: false, version: 'v2'},
++          getApiUrl('/api-tokens/'),
++        ];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v2',
++          isInfinite: false,
++          url: '/api-tokens/',
++          options: undefined,
++        });
++      });
++
++      it('can parse a v2 query key, with options', () => {
++        const queryKey: ApiQueryKey = [
++          {infinite: false, version: 'v2'},
++          getApiUrl('/api-tokens/'),
++          {query: {filter: 'red'}},
++        ];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v2',
++          isInfinite: false,
++          url: '/api-tokens/',
++          options: {query: {filter: 'red'}},
++        });
++      });
++
++      it('can parse an v2 infinite query key, without options', () => {
++        const queryKey: InfiniteApiQueryKey = [
++          {infinite: true, version: 'v2'},
++          getApiUrl('/api-tokens/'),
++        ];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v2',
++          isInfinite: true,
++          url: '/api-tokens/',
++          options: undefined,
++        });
++      });
++
++      it('can parse a v2 infinite query key, with options', () => {
++        const queryKey: InfiniteApiQueryKey = [
++          {infinite: true, version: 'v2'},
++          getApiUrl('/api-tokens/'),
++          {query: {filter: 'red'}},
++        ];
++        const result = parseQueryKey(queryKey);
++        expect(result).toEqual({
++          version: 'v2',
++          isInfinite: true,
++          url: '/api-tokens/',
++          options: {query: {filter: 'red'}},
++        });
++      });
++    });
++  });
++});
+diff --git a/static/app/utils/api/apiQueryKey.ts b/static/app/utils/api/apiQueryKey.ts
+new file mode 100644
+index 00000000000000..26223a9dd61233
+--- /dev/null
++++ b/static/app/utils/api/apiQueryKey.ts
+@@ -0,0 +1,78 @@
++import type getApiUrl from 'sentry/utils/api/getApiUrl';
++
++export type RequestMethod = 'DELETE' | 'GET' | 'POST' | 'PUT';
++
++type ApiUrl = ReturnType<typeof getApiUrl>;
++
++export type QueryKeyEndpointOptions<
++  Headers = Record<string, string>,
++  Query = Record<string, any>,
++  Data = Record<string, any>,
++> = {
++  data?: Data;
++  headers?: Headers;
++  host?: string;
++  method?: RequestMethod;
++  query?: Query;
++};
++
++/**
++ * @deprecated Prefer using `apiOptions.as<T>()(...args)` whenever possible.
++ */
++type V1QueryKey =
++  | readonly [url: ApiUrl]
++  | readonly [url: ApiUrl, options: QueryKeyEndpointOptions];
++type V2QueryKey =
++  | readonly [{infinite: false; version: 'v2'}, url: ApiUrl]
++  | readonly [
++      {infinite: false; version: 'v2'},
++      url: ApiUrl,
++      options: QueryKeyEndpointOptions,
++    ];
++
++export type ApiQueryKey = V1QueryKey | V2QueryKey;
++
++/**
++ * @deprecated Prefer using `apiOptions.asInfinite<T>()(...args)` whenever possible.
++ */
++type V1InfiniteQueryKey =
++  | readonly [{infinite: true; version: 'v1'}, url: ApiUrl]
++  | readonly [
++      {infinite: true; version: 'v1'},
++      url: ApiUrl,
++      options: QueryKeyEndpointOptions,
++    ];
++type V2InfiniteQueryKey =
++  | readonly [{infinite: true; version: 'v2'}, url: ApiUrl]
++  | readonly [
++      {infinite: true; version: 'v2'},
++      url: ApiUrl,
++      options: QueryKeyEndpointOptions,
++    ];
++
++export type InfiniteApiQueryKey = V1InfiniteQueryKey | V2InfiniteQueryKey;
++
++function isV2QueryKey(
++  queryKey: ApiQueryKey | InfiniteApiQueryKey
++): queryKey is V2QueryKey | V2InfiniteQueryKey {
++  return typeof queryKey[0] === 'object' && queryKey[0].version === 'v2';
++}
++function isInfiniteQueryKey(
++  queryKey: ApiQueryKey | InfiniteApiQueryKey
++): queryKey is V1InfiniteQueryKey | V2InfiniteQueryKey {
++  return typeof queryKey[0] === 'object' && queryKey[0].infinite;
++}
++
++export function parseQueryKey(queryKey: ApiQueryKey | InfiniteApiQueryKey) {
++  if (isInfiniteQueryKey(queryKey)) {
++    return {
++      version: isV2QueryKey(queryKey) ? 'v2' : 'v1',
++      isInfinite: true,
++      url: queryKey[1],
++      options: queryKey[2],
++    };
++  }
++  return isV2QueryKey(queryKey)
++    ? {version: 'v2', isInfinite: false, url: queryKey[1], options: queryKey[2]}
++    : {version: 'v1', isInfinite: false, url: queryKey[0], options: queryKey[1]};
++}
+diff --git a/static/app/utils/queryClient.spec.tsx b/static/app/utils/queryClient.spec.tsx
+index 7b8b530d0326c0..69dcc57b14bc3f 100644
+--- a/static/app/utils/queryClient.spec.tsx
++++ b/static/app/utils/queryClient.spec.tsx
+@@ -3,12 +3,7 @@ import {Fragment} from 'react';
+ import {render, screen} from 'sentry-test/reactTestingLibrary';
+ 
+ import getApiUrl from 'sentry/utils/api/getApiUrl';
+-import {
+-  parseQueryKey,
+-  useApiQuery,
+-  type ApiQueryKey,
+-  type InfiniteApiQueryKey,
+-} from 'sentry/utils/queryClient';
++import {useApiQuery} from 'sentry/utils/queryClient';
+ 
+ type ResponseData = {
+   value: number;
+@@ -19,52 +14,6 @@ beforeEach(() => {
+ });
+ 
+ describe('queryClient', () => {
+-  describe('parseQueryKey', () => {
+-    it('can parse a simple query key, without options', () => {
+-      const queryKey: ApiQueryKey = [getApiUrl('/api-tokens/')];
+-      const result = parseQueryKey(queryKey);
+-      expect(result).toEqual({
+-        isInfinite: false,
+-        url: '/api-tokens/',
+-        options: undefined,
+-      });
+-    });
+-
+-    it('can parse a simple query key, with options', () => {
+-      const queryKey: ApiQueryKey = [getApiUrl('/api-tokens/'), {query: {filter: 'red'}}];
+-      const result = parseQueryKey(queryKey);
+-      expect(result).toEqual({
+-        isInfinite: false,
+-        url: '/api-tokens/',
+-        options: {query: {filter: 'red'}},
+-      });
+-    });
+-
+-    it('can parse an infinite query key, without options', () => {
+-      const queryKey: InfiniteApiQueryKey = ['infinite', getApiUrl('/api-tokens/')];
+-      const result = parseQueryKey(queryKey);
+-      expect(result).toEqual({
+-        isInfinite: true,
+-        url: '/api-tokens/',
+-        options: undefined,
+-      });
+-    });
+-
+-    it('can parse a infinite query key, with options', () => {
+-      const queryKey: InfiniteApiQueryKey = [
+-        'infinite',
+-        getApiUrl('/api-tokens/'),
+-        {query: {filter: 'red'}},
+-      ];
+-      const result = parseQueryKey(queryKey);
+-      expect(result).toEqual({
+-        isInfinite: true,
+-        url: '/api-tokens/',
+-        options: {query: {filter: 'red'}},
+-      });
+-    });
+-  });
+-
+   describe('useQuery', () => {
+     it('can do a simple fetch', async () => {
+       const mock = MockApiClient.addMockResponse({
+diff --git a/static/app/utils/queryClient.tsx b/static/app/utils/queryClient.tsx
+index cb1db4166e4e15..2c9cdc196d1a9f 100644
+--- a/static/app/utils/queryClient.tsx
++++ b/static/app/utils/queryClient.tsx
+@@ -9,12 +9,32 @@ import type {
+ } from '@tanstack/react-query';
+ import {useInfiniteQuery, useQueries, useQuery} from '@tanstack/react-query';
+ 
+-import type {APIRequestMethod, ApiResult, ResponseMeta} from 'sentry/api';
++import type {ApiResult, ResponseMeta} from 'sentry/api';
+ import {Client} from 'sentry/api';
+-import type getApiUrl from 'sentry/utils/api/getApiUrl';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
++import type {
++  ApiQueryKey,
++  InfiniteApiQueryKey,
++  QueryKeyEndpointOptions,
++} from 'sentry/utils/api/apiQueryKey';
+ import parseLinkHeader from 'sentry/utils/parseLinkHeader';
+ import type RequestError from 'sentry/utils/requestError/requestError';
+ 
++export type {
++  /**
++   * @deprecated Use `import type {ApiQueryKey} from 'sentry/utils/api/apiQueryKey';` directly instead.
++   */
++  ApiQueryKey,
++  /**
++   * @deprecated Use `import type {InfiniteApiQueryKey} from 'sentry/utils/api/apiQueryKey';` directlyinstead.
++   */
++  InfiniteApiQueryKey,
++  /**
++   * @deprecated Use `import type {QueryKeyEndpointOptions} from 'sentry/utils/api/apiQueryKey';` directly instead.
++   */
++  QueryKeyEndpointOptions,
++};
++
+ // Overrides to the default react-query options.
+ // See https://tanstack.com/query/v4/docs/guides/important-defaults
+ export const DEFAULT_QUERY_CLIENT_CONFIG: QueryClientConfig = {
+@@ -28,40 +48,6 @@ export const DEFAULT_QUERY_CLIENT_CONFIG: QueryClientConfig = {
+ 
+ export const QUERY_API_CLIENT = new Client();
+ 
+-export type QueryKeyEndpointOptions<
+-  Headers = Record<string, string>,
+-  Query = Record<string, any>,
+-  Data = Record<string, any>,
+-> = {
+-  data?: Data;
+-  headers?: Headers;
+-  host?: string;
+-  method?: APIRequestMethod;
+-  query?: Query;
+-};
+-
+-export type ApiQueryKey =
+-  | readonly [url: ReturnType<typeof getApiUrl>]
+-  | readonly [
+-      url: ReturnType<typeof getApiUrl>,
+-      options: QueryKeyEndpointOptions<
+-        Record<string, string>,
+-        Record<string, any>,
+-        Record<string, any>
+-      >,
+-    ];
+-export type InfiniteApiQueryKey =
+-  | readonly ['infinite', url: ReturnType<typeof getApiUrl>]
+-  | readonly [
+-      'infinite',
+-      url: ReturnType<typeof getApiUrl>,
+-      options: QueryKeyEndpointOptions<
+-        Record<string, string>,
+-        Record<string, any>,
+-        Record<string, any>
+-      >,
+-    ];
+-
+ export interface UseApiQueryOptions<TApiResponse, TError = RequestError> extends Omit<
+   UseQueryOptions<ApiResult<TApiResponse>, TError, ApiResult<TApiResponse>, ApiQueryKey>,
+   // This is an explicit option in our function
+@@ -90,27 +76,6 @@ export interface UseApiQueryOptions<TApiResponse, TError = RequestError> extends
+   staleTime: number;
+ }
+ 
+-function isInfiniteQueryKey(
+-  queryKey: ApiQueryKey | InfiniteApiQueryKey
+-): queryKey is InfiniteApiQueryKey {
+-  return queryKey[0] === 'infinite';
+-}
+-
+-export function parseQueryKey(queryKey: ApiQueryKey | InfiniteApiQueryKey) {
+-  if (isInfiniteQueryKey(queryKey)) {
+-    return {
+-      isInfinite: true,
+-      url: queryKey[1],
+-      options: queryKey[2],
+-    };
+-  }
+-  return {
+-    isInfinite: false,
+-    url: queryKey[0],
+-    options: queryKey[1],
+-  };
+-}
+-
+ export type UseApiQueryResult<TData, TError> = UseQueryResult<TData, TError> & {
+   /**
+    * Get a header value from the response
+@@ -192,15 +157,15 @@ export function useApiQueries<TResponseData, TError = RequestError>(
+ export function fetchDataQuery<TResponseData = unknown>(
+   context: QueryFunctionContext<ApiQueryKey>
+ ): Promise<ApiResult<TResponseData>> {
+-  const [url, opts] = context.queryKey;
++  const {url, options} = parseQueryKey(context.queryKey);
+ 
+   return QUERY_API_CLIENT.requestPromise(url, {
+     includeAllArgs: true,
+-    host: opts?.host,
+-    method: opts?.method ?? 'GET',
+-    data: opts?.data,
+-    query: opts?.query,
+-    headers: opts?.headers,
++    host: options?.host,
++    method: options?.method ?? 'GET',
++    data: options?.data,
++    query: options?.query,
++    headers: options?.headers,
+   });
+ }
+ 
+@@ -213,6 +178,10 @@ export function getApiQueryData<TResponseData>(
+   queryClient: QueryClient,
+   queryKey: ApiQueryKey
+ ): TResponseData | undefined {
++  const {version} = parseQueryKey(queryKey);
++  if (version !== 'v1') {
++    return undefined;
++  }
+   return queryClient.getQueryData<ApiResult<TResponseData>>(queryKey)?.[0];
+ }
+ 
+@@ -226,6 +195,10 @@ export function setApiQueryData<TResponseData>(
+   updater: Updater<TResponseData | undefined, TResponseData | undefined>,
+   options?: SetDataOptions
+ ): TResponseData | undefined {
++  const {version} = parseQueryKey(queryKey);
++  if (version !== 'v1') {
++    return undefined;
++  }
+   const updateResult = queryClient.setQueryData<ApiResult<TResponseData>>(
+     queryKey,
+     previous => {
+@@ -275,15 +248,13 @@ export function useInfiniteApiQuery<TResponseData>({
+ }) {
+   return useInfiniteQuery({
+     queryKey,
+-    queryFn: ({
+-      pageParam,
+-      queryKey: [, url, endpointOptions],
+-    }): Promise<ApiResult<TResponseData>> => {
++    queryFn: ({pageParam}): Promise<ApiResult<TResponseData>> => {
++      const {url, options} = parseQueryKey(queryKey);
+       return QUERY_API_CLIENT.requestPromise(url, {
+         includeAllArgs: true,
+-        headers: endpointOptions?.headers,
++        headers: options?.headers,
+         query: {
+-          ...endpointOptions?.query,
++          ...options?.query,
+           cursor: pageParam?.cursor,
+         },
+       });
+diff --git a/static/app/utils/useReleaseStats.tsx b/static/app/utils/useReleaseStats.tsx
+index 277024586498a5..625ba2cfc4747b 100644
+--- a/static/app/utils/useReleaseStats.tsx
++++ b/static/app/utils/useReleaseStats.tsx
+@@ -46,7 +46,7 @@ export function useReleaseStats(
+     data,
+   } = useInfiniteApiQuery<ReleaseMetaBasic[]>({
+     queryKey: [
+-      'infinite' as const,
++      {infinite: true, version: 'v1'},
+       getApiUrl('/organizations/$organizationIdOrSlug/releases/stats/', {
+         path: {organizationIdOrSlug: organization.slug},
+       }),
+diff --git a/static/app/utils/useUpdateOrganization.tsx b/static/app/utils/useUpdateOrganization.tsx
+index cd81b33e7fe880..c9221882b0c5de 100644
+--- a/static/app/utils/useUpdateOrganization.tsx
++++ b/static/app/utils/useUpdateOrganization.tsx
+@@ -1,12 +1,14 @@
+ import OrganizationStore from 'sentry/stores/organizationStore';
+ import type {Organization} from 'sentry/types/organization';
+ import {apiOptions} from 'sentry/utils/api/apiOptions';
++import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import {
+   fetchMutation,
+   getApiQueryData,
+   setApiQueryData,
+   useMutation,
+   useQueryClient,
++  type ApiQueryKey,
+ } from 'sentry/utils/queryClient';
+ 
+ interface Variables extends Partial<Organization> {}
+@@ -14,19 +16,29 @@ interface Variables extends Partial<Organization> {}
+ export function useUpdateOrganization(organization: Organization) {
+   const queryClient = useQueryClient();
+ 
+-  const organizationQueryOptions = (org: Organization) => {
+-    return apiOptions.as<Organization>()('/organizations/$organizationIdOrSlug/', {
+-      path: {organizationIdOrSlug: org.slug},
++  const v1QueryKey = [
++    getApiUrl('/organizations/$organizationIdOrSlug/', {
++      path: {organizationIdOrSlug: organization.slug},
++    }),
++  ] as ApiQueryKey;
++  const queryOptions = apiOptions.as<Organization>()(
++    '/organizations/$organizationIdOrSlug/',
++    {
++      path: {organizationIdOrSlug: organization.slug},
+       staleTime: 0,
+-    });
+-  };
+-
+-  const queryOptions = organizationQueryOptions(organization);
++    }
++  );
+ 
+   return useMutation({
+     onMutate: (data: Variables) => {
++      // Prefer to read:
++      // 1. the cached v2 response
++      // 2. falling back to the v1 response
++      // 3. then OrganizationStore
++      // 4. defaulting to the org we have in props
+       const previousOrganization =
+-        getApiQueryData(queryClient, queryOptions.queryKey) ||
++        queryClient.getQueryData(queryOptions.queryKey)?.json ||
++        getApiQueryData<Organization>(queryClient, v1QueryKey) ||
+         OrganizationStore.get().organization ||
+         organization;
+ 
+@@ -37,11 +49,24 @@ export function useUpdateOrganization(organization: Organization) {
+       const updatedOrganization = {
+         ...previousOrganization,
+         ...data,
+-      };
++      } satisfies Organization;
+ 
+       // Update caches optimistically
++      // 1. update the OrganizationStore
+       OrganizationStore.onUpdate(updatedOrganization);
+-      setApiQueryData(queryClient, queryOptions.queryKey, updatedOrganization);
++
++      // 2. update the v1 cache
++      setApiQueryData(queryClient, v1QueryKey, updatedOrganization);
++
++      // 3. update the v2 cache
++      queryClient.setQueryData(queryOptions.queryKey, prevApiResponse =>
++        prevApiResponse
++          ? {
++              ...prevApiResponse,
++              json: updatedOrganization,
++            }
++          : prevApiResponse
++      );
+ 
+       return {previousOrganization};
+     },
+@@ -54,8 +79,22 @@ export function useUpdateOrganization(organization: Organization) {
+     },
+     onError: (_error, _variables, context) => {
+       if (context?.previousOrganization) {
++        // Rollback optimistic update
++        // 1. rollback the OrganizationStore
+         OrganizationStore.onUpdate(context.previousOrganization);
+-        setApiQueryData(queryClient, queryOptions.queryKey, context.previousOrganization);
++
++        // 2. rollback the v1 cache
++        setApiQueryData(queryClient, v1QueryKey, context.previousOrganization);
++
++        // 3. rollback the v2 cache
++        queryClient.setQueryData(queryOptions.queryKey, prevApiResponse =>
++          prevApiResponse
++            ? {
++                ...prevApiResponse,
++                json: context.previousOrganization,
++              }
++            : prevApiResponse
++        );
+       }
+     },
+     onSettled: () => {
+@@ -63,6 +102,7 @@ export function useUpdateOrganization(organization: Organization) {
+       // ProjectsStore should've been updated already. It could be out of sync if
+       // there are multiple mutations in parallel.
+       queryClient.invalidateQueries({queryKey: queryOptions.queryKey});
++      queryClient.invalidateQueries({queryKey: v1QueryKey});
+     },
+   });
+ }
+diff --git a/static/app/views/detectors/datasetConfig/transactions.spec.tsx b/static/app/views/detectors/datasetConfig/transactions.spec.tsx
+index 53eab3c249d312..bfc6eb8214adaa 100644
+--- a/static/app/views/detectors/datasetConfig/transactions.spec.tsx
++++ b/static/app/views/detectors/datasetConfig/transactions.spec.tsx
+@@ -1,5 +1,6 @@
+ import {OrganizationFixture} from 'sentry-fixture/organization';
+ 
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import {DiscoverDatasets} from 'sentry/utils/discover/types';
+ import {Dataset, EventTypes} from 'sentry/views/alerts/rules/metric/types';
+ import {DetectorTransactionsConfig} from 'sentry/views/detectors/datasetConfig/transactions';
+@@ -22,8 +23,9 @@ describe('DetectorTransactionsConfig', () => {
+         comparisonDelta: undefined,
+       });
+ 
+-      expect(key[0]).toBe(`/organizations/${organization.slug}/events-stats/`);
+-      const params = key[1]!.query!;
++      const {url, options} = parseQueryKey(key);
++      expect(url).toBe(`/organizations/${organization.slug}/events-stats/`);
++      const params = options?.query!;
+       expect(params.dataset).toBe(DiscoverDatasets.METRICS_ENHANCED);
+       expect(params.query).toBe('transaction.duration:>0');
+       expect(params.interval).toBe('1m');
+@@ -49,7 +51,8 @@ describe('DetectorTransactionsConfig', () => {
+         comparisonDelta: undefined,
+       });
+ 
+-      const params = key[1]!.query!;
++      const {options} = parseQueryKey(key);
++      const params = options!.query!;
+       expect(params.dataset).toBe(DiscoverDatasets.METRICS_ENHANCED);
+       expect(params.query).toBe('transaction.duration:>0');
+       expect(params.interval).toBe('1m');
+diff --git a/static/app/views/explore/hooks/useGetTraceItemAttributeValues.tsx b/static/app/views/explore/hooks/useGetTraceItemAttributeValues.tsx
+index 19409443f756a6..185abf1beafc4c 100644
+--- a/static/app/views/explore/hooks/useGetTraceItemAttributeValues.tsx
++++ b/static/app/views/explore/hooks/useGetTraceItemAttributeValues.tsx
+@@ -5,6 +5,7 @@ import usePageFilters from 'sentry/components/pageFilters/usePageFilters';
+ import type {GetTagValues} from 'sentry/components/searchQueryBuilder';
+ import type {PageFilters} from 'sentry/types/core';
+ import {defined} from 'sentry/utils';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import {FieldKind} from 'sentry/utils/fields';
+ import type {ApiQueryKey} from 'sentry/utils/queryClient';
+@@ -110,9 +111,10 @@ export function useGetTraceItemAttributeValues({
+       });
+ 
+       try {
+-        const result = await api.requestPromise(queryKey[0], {
++        const {url, options} = parseQueryKey(queryKey);
++        const result = await api.requestPromise(url, {
+           method: 'GET',
+-          query: {...queryKey[1]?.query},
++          query: {...options?.query},
+         });
+         return result
+           .filter((item: TraceItemAttributeValue) => defined(item.value))
+diff --git a/static/app/views/insights/common/queries/useReleases.tsx b/static/app/views/insights/common/queries/useReleases.tsx
+index e9beed82f27202..e11c1617c234d1 100644
+--- a/static/app/views/insights/common/queries/useReleases.tsx
++++ b/static/app/views/insights/common/queries/useReleases.tsx
+@@ -4,6 +4,7 @@ import usePageFilters from 'sentry/components/pageFilters/usePageFilters';
+ import {ReleasesSortOption} from 'sentry/constants/releases';
+ import type {NewQuery} from 'sentry/types/organization';
+ import type {Release} from 'sentry/types/release';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import type {TableData} from 'sentry/utils/discover/discoverQuery';
+ import EventView from 'sentry/utils/discover/eventView';
+@@ -75,13 +76,15 @@ export function useReleases(
+           },
+         },
+       ] as ApiQueryKey;
++      const {url, options} = parseQueryKey(queryKey);
+       return {
+         queryKey,
+-        queryFn: () =>
+-          api.requestPromise(queryKey[0], {
++        queryFn: () => {
++          return api.requestPromise(url, {
+             method: 'GET',
+-            query: queryKey[1]?.query,
+-          }) as Promise<TableData>,
++            query: options?.query,
++          }) as Promise<TableData>;
++        },
+         staleTime: Infinity,
+         enabled: isReady && !releaseResults.isPending,
+         retry: false,
+diff --git a/static/app/views/replays/list/replayIndexTable.tsx b/static/app/views/replays/list/replayIndexTable.tsx
+index 4772ecc2322ae6..48cc6c116cfe88 100644
+--- a/static/app/views/replays/list/replayIndexTable.tsx
++++ b/static/app/views/replays/list/replayIndexTable.tsx
+@@ -13,6 +13,7 @@ import {ReplayTable} from 'sentry/components/replays/table/replayTable';
+ import useReplayTableSort from 'sentry/components/replays/table/useReplayTableSort';
+ import {usePlaylistQuery} from 'sentry/components/replays/usePlaylistQuery';
+ import {t, tct} from 'sentry/locale';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import {ListItemCheckboxProvider} from 'sentry/utils/list/useListItemCheckboxState';
+ import {useQueryClient, type ApiQueryKey} from 'sentry/utils/queryClient';
+ import {useHaveSelectedProjectsSentAnyReplayEvents} from 'sentry/utils/replays/hooks/useReplayOnboarding';
+@@ -70,8 +71,9 @@ export function ReplayIndexTable({
+   const {allMobileProj} = useAllMobileProj({});
+   const columns = useReplayIndexTableColumns({allMobileProj, tableDimensions});
+ 
++  const {options} = parseQueryKey(queryKey);
+   const needsSDKUpdateForClickSearch = useNeedsSDKUpdateForClickSearch({
+-    search: queryKey[1]?.query?.query,
++    search: options?.query?.query,
+   });
+ 
+   const showDeadRageClickCards =
+diff --git a/static/app/views/seerExplorer/hooks/useSeerExplorer.tsx b/static/app/views/seerExplorer/hooks/useSeerExplorer.tsx
+index b098fdc7db0606..63ff397f91c73a 100644
+--- a/static/app/views/seerExplorer/hooks/useSeerExplorer.tsx
++++ b/static/app/views/seerExplorer/hooks/useSeerExplorer.tsx
+@@ -2,6 +2,7 @@ import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+ 
+ import {addErrorMessage} from 'sentry/actionCreators/indicator';
+ import {trackAnalytics} from 'sentry/utils/analytics';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import {
+   setApiQueryData,
+   useApiQuery,
+@@ -244,17 +245,15 @@ export const useSeerExplorer = () => {
+       });
+ 
+       try {
+-        const response = (await api.requestPromise(
+-          makeSeerExplorerQueryKey(orgSlug, effectiveRunId)[0],
+-          {
+-            method: 'POST',
+-            data: {
+-              query,
+-              insert_index: calculatedInsertIndex,
+-              on_page_context: screenshot,
+-            },
+-          }
+-        )) as SeerExplorerChatResponse;
++        const {url} = parseQueryKey(makeSeerExplorerQueryKey(orgSlug, effectiveRunId));
++        const response = (await api.requestPromise(url, {
++          method: 'POST',
++          data: {
++            query,
++            insert_index: calculatedInsertIndex,
++            on_page_context: screenshot,
++          },
++        })) as SeerExplorerChatResponse;
+ 
+         // Set run ID if this is a new session
+         if (!effectiveRunId) {
+diff --git a/static/app/views/settings/organizationDataForwarding/util/hooks.tsx b/static/app/views/settings/organizationDataForwarding/util/hooks.tsx
+index 218720df720dd5..fc7989784117fe 100644
+--- a/static/app/views/settings/organizationDataForwarding/util/hooks.tsx
++++ b/static/app/views/settings/organizationDataForwarding/util/hooks.tsx
+@@ -1,6 +1,7 @@
+ import {addErrorMessage, addSuccessMessage} from 'sentry/actionCreators/indicator';
+ import {t, tct} from 'sentry/locale';
+ import type {AvatarProject} from 'sentry/types/project';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import {
+   useApiQuery,
+@@ -58,11 +59,15 @@ export function useMutateDataForwarder({
+   const queryClient = useQueryClient();
+   const method = dataForwarderId ? 'PUT' : 'POST';
+   const listQueryKey = makeDataForwarderQueryKey({orgSlug});
+-  const [endpoint] = dataForwarderId
++  const queryKey = dataForwarderId
+     ? makeDataForwarderMutationQueryKey({dataForwarderId, orgSlug})
+     : listQueryKey;
++
+   return useMutation<DataForwarder, RequestError, DataForwarder>({
+-    mutationFn: data => api.requestPromise(endpoint, {method, data}),
++    mutationFn: data => {
++      const {url} = parseQueryKey(queryKey);
++      return api.requestPromise(url, {method, data});
++    },
+     onSuccess: (dataForwarder: DataForwarder) => {
+       addSuccessMessage(
+         tct('[provider] data forwarder [action]', {
+@@ -70,7 +75,7 @@ export function useMutateDataForwarder({
+           action: dataForwarderId ? t('updated') : t('created'),
+         })
+       );
+-      queryClient.invalidateQueries({queryKey: [endpoint]});
++      queryClient.invalidateQueries({queryKey});
+       queryClient.invalidateQueries({queryKey: listQueryKey});
+       onSuccess?.(dataForwarder);
+     },
+@@ -90,11 +95,12 @@ export function useDeleteDataForwarder({
+   const api = useApi({persistInFlight: false});
+   const queryClient = useQueryClient();
+   return useMutation<void, RequestError, {dataForwarderId: string; orgSlug: string}>({
+-    mutationFn: ({dataForwarderId, orgSlug}) =>
+-      api.requestPromise(
+-        makeDataForwarderMutationQueryKey({dataForwarderId, orgSlug})[0],
+-        {method: 'DELETE'}
+-      ),
++    mutationFn: ({dataForwarderId, orgSlug}) => {
++      const {url} = parseQueryKey(
++        makeDataForwarderMutationQueryKey({dataForwarderId, orgSlug})
++      );
++      return api.requestPromise(url, {method: 'DELETE'});
++    },
+     onSuccess: () => {
+       addSuccessMessage(t('Data forwarder deleted'));
+       queryClient.invalidateQueries({queryKey: makeDataForwarderQueryKey(params)});
+@@ -115,20 +121,23 @@ export function useMutateDataForwarderProject({
+   const api = useApi({persistInFlight: false});
+   const queryClient = useQueryClient();
+   const listQueryKey = makeDataForwarderQueryKey({orgSlug});
+-  const [endpoint] = makeDataForwarderMutationQueryKey({dataForwarderId, orgSlug});
++  const queryKey = makeDataForwarderMutationQueryKey({dataForwarderId, orgSlug});
+   return useMutation<
+     void,
+     RequestError,
+     {is_enabled: boolean; overrides: Record<string, any>; project_id: string}
+   >({
+-    mutationFn: data => api.requestPromise(endpoint, {method: 'PUT', data}),
++    mutationFn: data => {
++      const {url} = parseQueryKey(queryKey);
++      return api.requestPromise(url, {method: 'PUT', data});
++    },
+     onSuccess: () => {
+       addSuccessMessage(
+         tct('Updated project override for [project]', {
+           project: project.slug,
+         })
+       );
+-      queryClient.invalidateQueries({queryKey: [endpoint]});
++      queryClient.invalidateQueries({queryKey});
+       queryClient.invalidateQueries({queryKey: listQueryKey});
+       onSuccess?.();
+     },
+diff --git a/static/gsAdmin/components/jsonFormModal.tsx b/static/gsAdmin/components/jsonFormModal.tsx
+index e3ae7d809f8588..6f0620564687a2 100644
+--- a/static/gsAdmin/components/jsonFormModal.tsx
++++ b/static/gsAdmin/components/jsonFormModal.tsx
+@@ -1,16 +1,15 @@
+ import {Fragment} from 'react';
+ 
+ import type {ModalRenderProps} from 'sentry/actionCreators/modal';
+-import type {APIRequestMethod} from 'sentry/api';
+ import {ApiForm} from 'sentry/components/forms/apiForm';
+ import type {FormProps} from 'sentry/components/forms/form';
+ import JsonForm from 'sentry/components/forms/jsonForm';
+ import type {FieldObject} from 'sentry/components/forms/types';
++import type {RequestMethod} from 'sentry/utils/api/apiQueryKey';
+ 
+ interface JsonFormModalProps extends ModalRenderProps, Pick<FormProps, 'onSubmitError'> {
+   apiEndpoint: string;
+-  // XXX(dcramer): as of the time of writing, apiMethod is forced to be `APIRequestMethod` which is an an allow-list of HTTP verbs.
+-  apiMethod: APIRequestMethod;
++  apiMethod: RequestMethod;
+   fields: FieldObject[];
+   onSuccess: (data: any) => void;
+   title: string;
+diff --git a/static/gsApp/components/creditCardEdit/intentForms/setupIntentForm.tsx b/static/gsApp/components/creditCardEdit/intentForms/setupIntentForm.tsx
+index d1a49a2d5727ef..03407a8e51fe96 100644
+--- a/static/gsApp/components/creditCardEdit/intentForms/setupIntentForm.tsx
++++ b/static/gsApp/components/creditCardEdit/intentForms/setupIntentForm.tsx
+@@ -9,6 +9,7 @@ import type {
+ import {addSuccessMessage} from 'sentry/actionCreators/indicator';
+ import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+ import {t} from 'sentry/locale';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import {fetchMutation, useMutation} from 'sentry/utils/queryClient';
+ 
+ import {InnerIntentForm} from 'getsentry/components/creditCardEdit/intentForms/innerIntentForm';
+@@ -26,8 +27,9 @@ export function SetupIntentForm(props: IntentFormProps) {
+   const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined);
+   const [isSubmitting, setIsSubmitting] = useState(false);
+ 
++  const {url} = parseQueryKey(props.intentDataQueryKey);
+   const {intentData, isLoading, isError, error} = useSetupIntentData({
+-    endpoint: props.intentDataQueryKey[0],
++    endpoint: url,
+   });
+ 
+   const {mutateAsync: updateSubscription} = useMutation({
+diff --git a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+index 9e48219e22e04b..3244f4e1c42e45 100644
+--- a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
++++ b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+@@ -12,9 +12,9 @@ import type {useUpdateBulkAutofixAutomationSettings} from 'sentry/components/eve
+ import {SimpleTable} from 'sentry/components/tables/simpleTable';
+ import {t, tct, tn} from 'sentry/locale';
+ import type {Project} from 'sentry/types/project';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import type {Sort} from 'sentry/utils/discover/fields';
+ import {useListItemCheckboxContext} from 'sentry/utils/list/useListItemCheckboxState';
+-import {parseQueryKey} from 'sentry/utils/queryClient';
+ import useOrganization from 'sentry/utils/useOrganization';
+ 
+ import useCanWriteSettings from 'getsentry/views/seerAutomation/components/useCanWriteSettings';
+diff --git a/static/gsApp/views/seerAutomation/components/repoTable/seerRepoTableHeader.tsx b/static/gsApp/views/seerAutomation/components/repoTable/seerRepoTableHeader.tsx
+index ad8aec775c5cff..921bc7bf5bf5eb 100644
+--- a/static/gsApp/views/seerAutomation/components/repoTable/seerRepoTableHeader.tsx
++++ b/static/gsApp/views/seerAutomation/components/repoTable/seerRepoTableHeader.tsx
+@@ -10,9 +10,9 @@ import {DropdownMenu} from 'sentry/components/dropdownMenu';
+ import {QuestionTooltip} from 'sentry/components/questionTooltip';
+ import {SimpleTable} from 'sentry/components/tables/simpleTable';
+ import {t, tct, tn} from 'sentry/locale';
++import {parseQueryKey} from 'sentry/utils/api/apiQueryKey';
+ import type {Sort} from 'sentry/utils/discover/fields';
+ import {useListItemCheckboxContext} from 'sentry/utils/list/useListItemCheckboxState';
+-import {parseQueryKey} from 'sentry/utils/queryClient';
+ 
+ import useCanWriteSettings from 'getsentry/views/seerAutomation/components/useCanWriteSettings';
+ import type {useBulkUpdateRepositorySettings} from 'getsentry/views/seerAutomation/onboarding/hooks/useBulkUpdateRepositorySettings';
+diff --git a/static/gsApp/views/spendAllocations/components/allocationForm.tsx b/static/gsApp/views/spendAllocations/components/allocationForm.tsx
+index d781e2261dfdca..0b6366010e4f54 100644
+--- a/static/gsApp/views/spendAllocations/components/allocationForm.tsx
++++ b/static/gsApp/views/spendAllocations/components/allocationForm.tsx
+@@ -10,7 +10,6 @@ import {Tooltip} from '@sentry/scraps/tooltip';
+ 
+ import {addErrorMessage} from 'sentry/actionCreators/indicator';
+ import type {ModalRenderProps} from 'sentry/actionCreators/modal';
+-import type {APIRequestMethod} from 'sentry/api';
+ import NewBooleanField from 'sentry/components/forms/fields/booleanField';
+ import SelectField from 'sentry/components/forms/fields/selectField';
+ import {PanelBody} from 'sentry/components/panels/panelBody';
+@@ -19,6 +18,7 @@ import {IconChevron} from 'sentry/icons';
+ import {t, tct} from 'sentry/locale';
+ import {DataCategory} from 'sentry/types/core';
+ import type {Organization} from 'sentry/types/organization';
++import type {RequestMethod} from 'sentry/utils/api/apiQueryKey';
+ import useApi from 'sentry/utils/useApi';
+ import {withOrganization} from 'sentry/utils/withOrganization';
+ 
+@@ -198,7 +198,7 @@ function AllocationForm({
+     const PATH = `/organizations/${organization.slug}/spend-allocations/`;
+     try {
+       await api.requestPromise(PATH, {
+-        method: METHOD as APIRequestMethod,
++        method: METHOD as RequestMethod,
+         data: {
+           billing_metric: getCategoryInfoFromPlural(selectedMetric)?.name, // TODO: we should update the endpoint to use camelCase api name
+           target_id: targetId,
+diff --git a/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py b/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py
+index 6347c3cfd5b64e..a65dba5478cbd4 100644
+--- a/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py
++++ b/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py
+@@ -3443,7 +3443,7 @@ def test_update_widget_with_field_links(self) -> None:
+                             "id": str(widget_query.id),
+                             "name": "Query with Links",
+                             "fields": ["count()", "project", "environment"],
+-                            "columns": ["project"],
++                            "columns": ["project", "environment"],
+                             "aggregates": ["count()"],
+                             "conditions": "event.type:error",
+                             "linkedDashboards": [
+@@ -3725,7 +3725,10 @@ def test_does_not_update_if_linked_dashboard_does_not_appear_in_fields(self) ->
+         }
+         response = self.do_request("put", self.url(dashboard.id), data=data)
+         assert response.status_code == 400, response.data
+-        assert b"Linked dashboard does not appear in the fields of the query" in response.content
++        assert (
++            b"Linked dashboard field does not appear in the columns of the widget query"
++            in response.content
++        )
+ 
+     def test_rejects_cross_org_linked_dashboard(self) -> None:
+         other_org = self.create_organization(name="other-org")
+diff --git a/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py b/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
+index 21617231f6b98d..90d1917468fe82 100644
+--- a/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
++++ b/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
+@@ -1127,8 +1127,7 @@ def test_delivery_time_metrics_github_event_and_action(self, mock_metrics: Magic
+         assert len(delivery_time_ms_calls) == 1
+         tags = delivery_time_ms_calls[0][1].get("tags", {})
+         assert tags.get("region_sent_to") == "us"
+-        assert tags.get("github_event_type") == "pull_request"
+-        assert tags.get("github_action") == "opened"
++        assert tags.get("github_event_and_action") == "pull_request.opened"
+ 
+     @responses.activate
+     @override_regions(region_config)
+@@ -1160,8 +1159,7 @@ def test_delivery_time_metrics_github_event_only(self, mock_metrics: MagicMock)
+         assert len(delivery_time_ms_calls) == 1
+         tags = delivery_time_ms_calls[0][1].get("tags", {})
+         assert tags.get("region_sent_to") == "us"
+-        assert tags.get("github_event_type") == "push"
+-        assert "github_action" not in tags
++        assert tags.get("github_event_and_action") == "push.unknown"
+ 
+     @responses.activate
+     @override_regions(region_config)
+@@ -1188,8 +1186,7 @@ def test_delivery_time_metrics_non_github_no_github_tags(self, mock_metrics: Mag
+         assert len(delivery_time_ms_calls) == 1
+         tags = delivery_time_ms_calls[0][1].get("tags", {})
+         assert tags.get("region_sent_to") == "us"
+-        assert "github_event_type" not in tags
+-        assert "github_action" not in tags
++        assert "github_event_and_action" not in tags
+ 
+ 
+ @control_silo_test

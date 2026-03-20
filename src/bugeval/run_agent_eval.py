@@ -30,11 +30,13 @@ from bugeval.pr_eval_models import (
     CaseToolState,
     CaseToolStatus,
     EvalConfig,
-    RunState,
     ToolDef,
+    is_case_done,
     load_eval_config,
+    parse_case_ids,
+    write_error_marker,
 )
-from bugeval.repo_setup import cleanup_repo, setup_repo_for_case
+from bugeval.repo_setup import cleanup_repo, materialize_workspace, setup_repo_for_case
 from bugeval.run_pr_eval import load_cases, make_run_id
 
 
@@ -62,9 +64,7 @@ _BASE_TOOLS = "Read,Glob,Grep,WebSearch,WebFetch"
 _DOCKER_TOOLS = f"Bash,{_BASE_TOOLS}"
 
 
-def _resolve_allowed_tools(
-    context_level: str, use_docker: bool, override: str | None
-) -> str:
+def _resolve_allowed_tools(context_level: str, use_docker: bool, override: str | None) -> str:
     """Return the tool allowlist string for the given context and runner.
 
     Resolution:
@@ -91,6 +91,7 @@ def process_case_agent(
     docker_image: str = "bugeval-agent",
     repo_cache_dir: Path | None = None,
     allowed_tools: str | None = None,
+    blind: bool = False,
 ) -> CaseToolState:
     """Run the agent state machine for one (case, tool) pair. Returns final state."""
     now = datetime.now(tz=UTC).isoformat()
@@ -105,14 +106,11 @@ def process_case_agent(
     repo_dir: Path | None = None
     try:
         patch_content = patch_path.read_text()
-        system_prompt = load_agent_prompt(language=case.language, context_level=context_level)
-        user_prompt = build_user_prompt(case, patch_content, context_level)
+        system_prompt = load_agent_prompt(
+            language=case.language, context_level=context_level, case_type=case.case_type,
+        )
 
-        # Combine system prompt with user prompt for CLI runners.
-        # API runners receive system_prompt as a separate argument.
-        cli_prompt = f"{system_prompt}\n\n{user_prompt}" if _is_cli_tool(tool.name) else user_prompt
-
-        # diff-only + CLI: no repo needed — create empty workspace only.
+        # Create workspace first.
         if context_level == "diff-only" and _is_cli_tool(tool.name):
             cli_dir = tmp_dir / "workspace"
             cli_dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +118,16 @@ def process_case_agent(
             state.status = CaseToolStatus.cloning
             repo_dir = setup_repo_for_case(case, patch_path, tmp_dir, cache_dir=repo_cache_dir)
             cli_dir = repo_dir
+
+        # Materialize workspace files (.pr/ + diff.patch) into the workspace.
+        materialize_workspace(case, patch_content, context_level, cli_dir, blind=blind)
+
+        # Build prompt from workspace files (reads .pr/ and diff.patch).
+        user_prompt = build_user_prompt(case, cli_dir, context_level)
+
+        # Combine system prompt with user prompt for CLI runners.
+        # API runners receive system_prompt as a separate argument.
+        cli_prompt = f"{system_prompt}\n\n{user_prompt}" if _is_cli_tool(tool.name) else user_prompt
 
         cli_allowed_tools = _resolve_allowed_tools(context_level, use_docker, allowed_tools)
 
@@ -197,6 +205,7 @@ def process_case_agent(
                     user_prompt,
                     max_turns=max_turns,
                     model=agent_model,
+                    context_level=context_level,
                 )
             )
         else:
@@ -206,7 +215,7 @@ def process_case_agent(
         result.context_level = context_level
 
         state.status = CaseToolStatus.collecting
-        out_dir = run_dir / "raw" / f"{case.id}-{tool.name}"
+        out_dir = run_dir / "raw" / f"{case.id}-{tool.name}-{context_level}"
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "prompt.txt").write_text(cli_prompt)
         (out_dir / "findings.json").write_text(json.dumps(result.findings, indent=2))
@@ -245,8 +254,6 @@ async def _eval_agent_tool(
     patches_dir: Path,
     run_dir: Path,
     context_level: str,
-    run_state: RunState,
-    checkpoint_path: Path,
     dry_run: bool,
     max_turns: int,
     semaphore: asyncio.Semaphore,
@@ -255,6 +262,7 @@ async def _eval_agent_tool(
     fail_after: int = 5,
     repo_cache_dir: Path | None = None,
     allowed_tools: str | None = None,
+    blind: bool = False,
 ) -> None:
     """Evaluate all cases against one agent tool, concurrently (bounded by semaphore)."""
     failure_count = 0
@@ -267,24 +275,15 @@ async def _eval_agent_tool(
         async with lock:
             if abort:
                 return
-            existing = run_state.get(case.id, tool.name)
-            if existing.status == CaseToolStatus.done:
+            if is_case_done(run_dir, case.id, tool.name, context_level):
                 click.echo(f"[skip] {case.id} x {tool.name} (already done)")
                 return
 
         patch_path = patches_dir / f"{case.id}.patch"
         if not patch_path.exists():
-            state = CaseToolState(
-                case_id=case.id,
-                tool=tool.name,
-                status=CaseToolStatus.failed,
-                error=f"patch not found: {patch_path}",
-                started_at=datetime.now(tz=UTC).isoformat(),
-                completed_at=datetime.now(tz=UTC).isoformat(),
-            )
+            error_msg = f"patch not found: {patch_path}"
             async with lock:
-                run_state.set(state)
-                run_state.save(checkpoint_path)
+                write_error_marker(run_dir, case.id, tool.name, error_msg, context_level)
                 failure_count += 1
                 click.echo(f"[failed] {case.id} x {tool.name}: patch not found")
                 if fail_after > 0 and failure_count >= fail_after:
@@ -310,13 +309,18 @@ async def _eval_agent_tool(
                 docker_image,
                 repo_cache_dir,
                 allowed_tools,
+                blind,
             )
 
         async with lock:
-            run_state.set(final_state)
-            run_state.save(checkpoint_path)
             click.echo(f"[{final_state.status}] {case.id} x {tool.name}")
             if final_state.status == CaseToolStatus.failed:
+                # Write error marker if process_case_agent didn't produce output
+                if not is_case_done(run_dir, case.id, tool.name, context_level):
+                    write_error_marker(
+                        run_dir, case.id, tool.name, final_state.error or "unknown",
+                        context_level,
+                    )
                 failure_count += 1
                 if fail_after > 0 and failure_count >= fail_after:
                     abort = True
@@ -427,6 +431,21 @@ async def _eval_agent_tool(
         "diff-only always uses no tools."
     ),
 )
+@click.option(
+    "--blind",
+    is_flag=True,
+    default=False,
+    help="Redact PR title, body, and commit messages from agent workspace.",
+)
+@click.option(
+    "--case-ids",
+    "case_ids_raw",
+    default=None,
+    help=(
+        "Filter to specific case IDs. Comma-separated: 'leo-001,leo-002'. "
+        "Or a file (one ID per line, # comments): '@pilot-step1.txt'."
+    ),
+)
 def run_agent_eval(
     config_path: str,
     cases_dir: str,
@@ -444,6 +463,8 @@ def run_agent_eval(
     max_concurrent: int | None,
     repo_cache_dir: str | None,
     allowed_tools: str | None,
+    blind: bool,
+    case_ids_raw: str | None,
 ) -> None:
     """Async orchestrator: run in-house agent evaluation across all (case × tool) pairs."""
     if not is_docker_available():
@@ -462,13 +483,17 @@ def run_agent_eval(
     resolved_run_dir = Path(run_dir) if run_dir else Path("results") / run_id
     resolved_run_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = resolved_run_dir / "checkpoint.yaml"
-    run_state = RunState.load(checkpoint_path)
-
     cases = load_cases(Path(cases_dir))
     if not cases:
         click.echo(f"No cases found in {cases_dir}")
         return
+
+    if case_ids_raw:
+        allowed_ids = set(parse_case_ids(case_ids_raw))
+        cases = [c for c in cases if c.id in allowed_ids]
+        if not cases:
+            click.echo("No cases matched --case-ids filter")
+            return
 
     if limit > 0:
         cases = cases[:limit]
@@ -494,6 +519,7 @@ def run_agent_eval(
         patches_dir=Path(patches_dir),
         config_path=config_path,
         allowed_tools=effective_tools,
+        blind=blind,
     )
 
     resolved_patches_dir = Path(patches_dir)
@@ -512,8 +538,6 @@ def run_agent_eval(
                     resolved_patches_dir,
                     resolved_run_dir,
                     context_level,
-                    run_state,
-                    checkpoint_path,
                     dry_run,
                     max_turns,
                     semaphore,
@@ -522,6 +546,7 @@ def run_agent_eval(
                     fail_after,
                     resolved_cache_dir,
                     allowed_tools,
+                    blind,
                 )
                 for tool in agent_tools
             ]

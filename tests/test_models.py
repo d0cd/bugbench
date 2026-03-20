@@ -269,3 +269,71 @@ class TestNewFields:
         case = TestCase(**make_test_case())  # type: ignore[arg-type]
         assert case.introducing_commit is None
         assert case.quality_flags == []
+
+
+class TestPRContext:
+    def test_pr_title_defaults_empty(self) -> None:
+        case = TestCase(**make_test_case())  # type: ignore[arg-type]
+        assert case.pr_title == ""
+
+    def test_pr_body_defaults_empty(self) -> None:
+        case = TestCase(**make_test_case())  # type: ignore[arg-type]
+        assert case.pr_body == ""
+
+    def test_pr_commit_messages_defaults_empty(self) -> None:
+        case = TestCase(**make_test_case())  # type: ignore[arg-type]
+        assert case.pr_commit_messages == []
+
+    def test_pr_context_can_be_set(self) -> None:
+        case = TestCase(
+            **make_test_case(  # type: ignore[arg-type]
+                pr_title="Fix race condition in pool",
+                pr_body="This PR fixes the connection pool race.",
+                pr_commit_messages=["fix: close pool before drain", "test: add race test"],
+            )
+        )
+        assert case.pr_title == "Fix race condition in pool"
+        assert case.pr_body == "This PR fixes the connection pool race."
+        assert len(case.pr_commit_messages) == 2
+
+    def test_pr_context_yaml_round_trip(self) -> None:
+        case = TestCase(
+            **make_test_case(  # type: ignore[arg-type]
+                pr_title="Fix bug",
+                pr_body="Detailed description",
+                pr_commit_messages=["commit 1", "commit 2"],
+            )
+        )
+        data = case.model_dump(mode="json")
+        yaml_str = yaml.safe_dump(data)
+        loaded = yaml.safe_load(yaml_str)
+        case2 = TestCase(**loaded)
+        assert case2.pr_title == "Fix bug"
+        assert case2.pr_body == "Detailed description"
+        assert case2.pr_commit_messages == ["commit 1", "commit 2"]
+
+    def test_backward_compat_no_pr_context_fields(self) -> None:
+        """YAML without PR context fields loads with defaults."""
+        data = make_test_case()
+        assert "pr_title" not in data
+        case = TestCase(**data)  # type: ignore[arg-type]
+        assert case.pr_title == ""
+        assert case.pr_body == ""
+        assert case.pr_commit_messages == []
+
+
+class TestLanguageValidation:
+    def test_language_is_lowercased(self) -> None:
+        """Language field should be normalized to lowercase."""
+        case = TestCase(**make_test_case(language="Rust"))  # type: ignore[arg-type]
+        assert case.language == "rust"
+
+    def test_language_mixed_case_lowercased(self) -> None:
+        """Mixed-case language should be normalized."""
+        case = TestCase(**make_test_case(language="TypeScript"))  # type: ignore[arg-type]
+        assert case.language == "typescript"
+
+    def test_language_already_lowercase(self) -> None:
+        """Already-lowercase language should pass through unchanged."""
+        case = TestCase(**make_test_case(language="python"))  # type: ignore[arg-type]
+        assert case.language == "python"

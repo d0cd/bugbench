@@ -11,6 +11,7 @@ from bugeval.pr_lifecycle import (
     make_branch_name,
     open_pr,
     poll_for_review,
+    request_review,
     scrape_review_comments,
 )
 
@@ -285,3 +286,29 @@ def test_close_pr_real_calls_gh() -> None:
     mock_gh.assert_called_once_with(
         "pr", "close", "42", "--repo", "eval-org/aleo-lang-coderabbit", "--delete-branch"
     )
+
+
+def test_request_review_calls_gh() -> None:
+    with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
+        request_review(
+            fork_repo="eval-org/aleo-lang-copilot",
+            pr_number=7,
+            reviewer="copilot",
+        )
+    mock_gh.assert_called_once_with(
+        "api",
+        "repos/eval-org/aleo-lang-copilot/pulls/7/requested_reviewers",
+        "--method", "POST",
+        "-f", "reviewers[]=copilot",
+    )
+
+
+def test_request_review_dry_run_no_call() -> None:
+    with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
+        request_review(
+            fork_repo="eval-org/aleo-lang-copilot",
+            pr_number=7,
+            reviewer="copilot",
+            dry_run=True,
+        )
+    mock_gh.assert_not_called()

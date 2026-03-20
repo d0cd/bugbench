@@ -1,287 +1,773 @@
-diff --git a/leo/cli/commands/common/query.rs b/leo/cli/commands/common/query.rs
-index 1c744fd3e9..b4e78adc82 100644
---- a/leo/cli/commands/common/query.rs
-+++ b/leo/cli/commands/common/query.rs
-@@ -88,7 +88,14 @@ pub fn handle_broadcast<N: Network>(endpoint: &str, transaction: &Transaction<N>
-         .send_json(transaction)
-         .map_err(|err| CliError::broadcast_error(err.to_string()))?;
-     match response.status() {
--        200 => Ok(response),
-+        200 => {
-+            println!(
-+                "✉️ Broadcasted transaction with:\n  - transaction ID: '{}'\n  - fee ID: '{}'",
-+                transaction.id().to_string().bold().yellow(),
-+                transaction.fee_transition().expect("Expected a fee in transactions").id().to_string().bold().yellow()
-+            );
-+            Ok(response)
-+        }
-         301 => {
-             let msg = format!(
-                 "⚠️ The endpoint `{endpoint}` has been permanently moved. Try using `https://api.explorer.provable.com/v1` in your `.env` file or via the `--endpoint` flag."
-diff --git a/leo/cli/commands/deploy.rs b/leo/cli/commands/deploy.rs
-index 13cef55ac2..d5c29486cc 100644
---- a/leo/cli/commands/deploy.rs
-+++ b/leo/cli/commands/deploy.rs
-@@ -88,13 +88,13 @@ impl Command for LeoDeploy {
-                 #[cfg(feature = "only_testnet")]
-                 panic!("Mainnet chosen with only_testnet feature");
-                 #[cfg(not(feature = "only_testnet"))]
--                return handle_deploy::<MainnetV0>(&self, context, network, input);
-+                handle_deploy::<MainnetV0>(&self, context, network, input)
+diff --git a/Cargo.lock b/Cargo.lock
+index 6ef60cb0b8..ceb4f10448 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -240,9 +240,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "clap"
+-version = "3.1.3"
++version = "3.1.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "86f8c0e2a6b902acc18214e24a6935cdaf8a8e34231913d4404dcaee659f65a1"
++checksum = "ced1892c55c910c1219e98d6fc8d71f6bddba7905866ce740066d8bfea859312"
+ dependencies = [
+  "atty",
+  "bitflags",
+@@ -250,7 +250,7 @@ dependencies = [
+  "os_str_bytes",
+  "strsim 0.10.0",
+  "termcolor",
+- "textwrap 0.14.2",
++ "textwrap 0.15.0",
+ ]
+ 
+ [[package]]
+@@ -1071,7 +1071,7 @@ version = "1.5.3"
+ dependencies = [
+  "ansi_term",
+  "assert_cmd",
+- "clap 3.1.3",
++ "clap 3.1.5",
+  "color-backtrace",
+  "colored",
+  "console",
+@@ -2220,9 +2220,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "textwrap"
+-version = "0.14.2"
++version = "0.15.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0066c8d12af8b5acd21e00547c3797fde4e8677254a7ee429176ccebbe93dd80"
++checksum = "b1141d4d61095b28419e22cb0bbf02755f5e54e0526f97f1e3d1d160e60885fb"
+ 
+ [[package]]
+ name = "thiserror"
+diff --git a/compiler/ast-passes/src/canonicalization/canonicalizer.rs b/compiler/ast-passes/src/canonicalization/canonicalizer.rs
+index 4c42d32407..592107d434 100644
+--- a/compiler/ast-passes/src/canonicalization/canonicalizer.rs
++++ b/compiler/ast-passes/src/canonicalization/canonicalizer.rs
+@@ -550,9 +550,7 @@ impl ReconstructingReducer for Canonicalizer {
+         for (index, character) in string.iter().enumerate() {
+             let col_start = span.col_start + index + 1 + col_adder; // account for open quote
+             let bytes = span.content.clone().into_bytes();
+-            let col_stop: usize;
+-
+-            if bytes[col_start - 1] == b'\\' {
++            let col_stop = if bytes[col_start - 1] == b'\\' {
+                 let mut width = 0;
+ 
+                 match bytes[col_start] {
+@@ -569,10 +567,10 @@ impl ReconstructingReducer for Canonicalizer {
+                     _ => width += 1,
+                 }
+                 col_adder += width;
+-                col_stop = col_start + 1 + width;
++                col_start + 1 + width
+             } else {
+-                col_stop = col_start + 1;
+-            }
++                col_start + 1
++            };
+ 
+             elements.push(SpreadOrExpression::Expression(Expression::Value(
+                 ValueExpression::Char(CharValue {
+diff --git a/compiler/parser/src/parser/file.rs b/compiler/parser/src/parser/file.rs
+index 295ec3b650..6318e66600 100644
+--- a/compiler/parser/src/parser/file.rs
++++ b/compiler/parser/src/parser/file.rs
+@@ -114,11 +114,9 @@ impl ParserContext<'_> {
+             let (args, _, span) = self.parse_paren_comma_list(|p| {
+                 Ok(if let Some(ident) = p.eat_identifier() {
+                     Some(ident.name)
+-                } else if let Some((int, _)) = p.eat_int() {
+-                    Some(Symbol::intern(&int.value))
+                 } else {
+                     let token = p.expect_any()?;
+-                    p.emit_err(ParserError::unexpected_str(&token.token, "ident or int", &token.span));
++                    p.emit_err(ParserError::unexpected_str(&token.token, "ident", &token.span));
+                     None
+                 })
+             })?;
+@@ -363,7 +361,7 @@ impl ParserContext<'_> {
+     ///
+     /// Returns a [`FunctionInput`] AST node if the next tokens represent a function parameter.
+     ///
+-    pub fn parse_function_parameters(&mut self) -> Result<FunctionInput> {
++    pub fn parse_function_parameters(&mut self, first: bool) -> Result<FunctionInput> {
+         let const_ = self.eat(Token::Const);
+         let mutable = self.eat(Token::Mut);
+         let reference = self.eat(Token::Ampersand);
+@@ -376,7 +374,9 @@ impl ParserContext<'_> {
+             self.expect_ident()?
+         };
+         if name.name == sym::SelfLower {
+-            if let Some(mutable) = &mutable {
++            if !first {
++                return Err(ParserError::parser_self_outside_first_argument().into());
++            } else if let Some(mutable) = &mutable {
+                 self.emit_err(ParserError::mut_self_parameter(&(&mutable.span + &name.span)));
+                 return Ok(Self::build_ref_self(name, mutable));
+             } else if let Some(reference) = &reference {
+@@ -433,7 +433,12 @@ impl ParserContext<'_> {
+         let name = self.expect_ident()?;
+ 
+         // Parse parameters.
+-        let (inputs, ..) = self.parse_paren_comma_list(|p| p.parse_function_parameters().map(Some))?;
++        let mut first = true;
++        let (inputs, ..) = self.parse_paren_comma_list(|p| {
++            let param = p.parse_function_parameters(first).map(Some);
++            first = false;
++            param
++        })?;
+ 
+         // Parse return type.
+         let output = if self.eat(Token::Arrow).is_some() {
+diff --git a/compiler/parser/src/tokenizer/lexer.rs b/compiler/parser/src/tokenizer/lexer.rs
+index be73b78d95..ce74b35547 100644
+--- a/compiler/parser/src/tokenizer/lexer.rs
++++ b/compiler/parser/src/tokenizer/lexer.rs
+@@ -66,9 +66,9 @@ impl Token {
+     ///
+     /// Returns a `char` if a character can be eaten, otherwise returns [`None`].
+     ///
+-    fn eat_char(input_tendril: StrTendril, escaped: bool, hex: bool, unicode: bool) -> Option<Char> {
++    fn eat_char(input_tendril: StrTendril, escaped: bool, hex: bool, unicode: bool) -> Result<Char> {
+         if input_tendril.is_empty() {
+-            return None;
++            return Err(ParserError::lexer_empty_input_tendril().into());
+         }
+ 
+         if escaped {
+@@ -76,22 +76,22 @@ impl Token {
+             let escaped = &string[1..string.len()];
+ 
+             if escaped.len() != 1 {
+-                return None;
++                return Err(ParserError::lexer_escaped_char_incorrect_length(escaped).into());
              }
-             NetworkName::CanaryV0 => {
-                 #[cfg(feature = "only_testnet")]
-                 panic!("Canary chosen with only_testnet feature");
-                 #[cfg(not(feature = "only_testnet"))]
--                return handle_deploy::<CanaryV0>(&self, context, network, input);
-+                handle_deploy::<CanaryV0>(&self, context, network, input)
+ 
+             if let Some(character) = escaped.chars().next() {
+                 return match character {
+-                    '0' => Some(Char::Scalar(0 as char)),
+-                    't' => Some(Char::Scalar(9 as char)),
+-                    'n' => Some(Char::Scalar(10 as char)),
+-                    'r' => Some(Char::Scalar(13 as char)),
+-                    '\"' => Some(Char::Scalar(34 as char)),
+-                    '\'' => Some(Char::Scalar(39 as char)),
+-                    '\\' => Some(Char::Scalar(92 as char)),
+-                    _ => None,
++                    '0' => Ok(Char::Scalar(0 as char)),
++                    't' => Ok(Char::Scalar(9 as char)),
++                    'n' => Ok(Char::Scalar(10 as char)),
++                    'r' => Ok(Char::Scalar(13 as char)),
++                    '\"' => Ok(Char::Scalar(34 as char)),
++                    '\'' => Ok(Char::Scalar(39 as char)),
++                    '\\' => Ok(Char::Scalar(92 as char)),
++                    _ => return Err(ParserError::lexer_expected_valid_escaped_char(character).into()),
+                 };
+             } else {
+-                return None;
++                return Err(ParserError::lexer_unclosed_escaped_char().into());
              }
          }
+ 
+@@ -100,48 +100,52 @@ impl Token {
+             let hex_string = &string[2..string.len()];
+ 
+             if hex_string.len() != 2 {
+-                return None;
++                return Err(ParserError::lexer_escaped_hex_incorrect_length(hex_string).into());
+             }
+ 
+             if let Ok(ascii_number) = u8::from_str_radix(hex_string, 16) {
+                 // According to RFC, we allow only values less than 128.
+                 if ascii_number > 127 {
+-                    return None;
++                    return Err(ParserError::lexer_expected_valid_hex_char(ascii_number).into());
+                 }
+ 
+-                return Some(Char::Scalar(ascii_number as char));
++                return Ok(Char::Scalar(ascii_number as char));
+             }
+         }
+ 
+         if unicode {
+             let string = input_tendril.to_string();
+-            if &string[string.len() - 1..] != "}" {
+-                return None;
++            if string.find('}').is_none() {
++                return Err(ParserError::lexer_unclosed_escaped_unicode_char(string).into());
+             }
+ 
+             let unicode_number = &string[3..string.len() - 1];
+             let len = unicode_number.len();
+             if !(1..=6).contains(&len) {
+-                return None;
++                return Err(ParserError::lexer_invalid_escaped_unicode_length(unicode_number).into());
+             }
+ 
+             if let Ok(hex) = u32::from_str_radix(unicode_number, 16) {
+                 if let Some(character) = std::char::from_u32(hex) {
+                     // scalar
+-                    return Some(Char::Scalar(character));
++                    return Ok(Char::Scalar(character));
+                 } else if hex <= 0x10FFFF {
+-                    return Some(Char::NonScalar(hex));
++                    return Ok(Char::NonScalar(hex));
++                } else {
++                    return Err(ParserError::lexer_invalid_character_exceeded_max_value(unicode_number).into());
+                 }
+             }
+         }
+ 
+         if input_tendril.to_string().chars().count() != 1 {
+-            return None;
++            // If char doesn't close.
++            return Err(ParserError::lexer_char_not_closed(&input_tendril[0..]).into());
+         } else if let Some(character) = input_tendril.to_string().chars().next() {
+-            return Some(Char::Scalar(character));
++            // If its a simple char.
++            return Ok(Char::Scalar(character));
+         }
+ 
+-        None
++        Err(ParserError::lexer_invalid_char(input_tendril.to_string()).into())
      }
-@@ -145,10 +145,12 @@ fn handle_deploy<N: Network>(
-     // Split the tasks into local and remote dependencies.
-     let (local, remote) = tasks.into_iter().partition::<Vec<_>, _>(|(_, _, manifest, _, _, _)| manifest.is_some());
  
--    // Split the local tasks into those that should be skipped and those that should not.
--    let (skipped, tasks): (Vec<_>, Vec<_>) = local
--        .into_iter()
--        .partition(|(program_id, _, _, _, _, _)| command.skip.iter().any(|skip| program_id.to_string().contains(skip)));
-+    // Get the skipped programs.
-+    let skipped = local
-+        .iter()
-+        .filter(|(program_id, _, _, _, _, _)| command.skip.iter().any(|skip| program_id.to_string().contains(skip)))
-+        .map(|(program_id, _, _, _, _, _)| *program_id)
-+        .collect::<Vec<_>>();
+     ///
+@@ -157,18 +161,12 @@ impl Token {
+             return Err(ParserError::lexer_eat_integer_leading_zero(String::from_utf8_lossy(input)).into());
+         }
+         let mut i = 1;
+-        let mut is_hex = false;
++
+         while i < input.len() {
+             if i == 1 && input[0] == b'0' && input[i] == b'x' {
+-                is_hex = true;
+-                i += 1;
+-                continue;
++                return Err(ParserError::lexer_hex_number_provided(&input_tendril[0..3]).into());
+             }
+-            if is_hex {
+-                if !input[i].is_ascii_hexdigit() {
+-                    break;
+-                }
+-            } else if !input[i].is_ascii_digit() {
++            if !input[i].is_ascii_digit() {
+                 break;
+             }
  
-     // Get the consensus version.
-     let consensus_version = get_consensus_version::<N>(&command.extra.consensus_version, &endpoint, network, &context)?;
-@@ -159,11 +161,12 @@ fn handle_deploy<N: Network>(
-         &address,
-         &endpoint,
-         &network,
--        &tasks,
-+        &local,
-         &skipped,
-         &remote,
--        &command.action,
-+        &check_tasks_for_warnings(&endpoint, network, &local, &command.action),
-         consensus_version,
-+        command,
-     );
+@@ -178,7 +176,7 @@ impl Token {
+     }
  
-     // Prompt the user to confirm the plan.
-@@ -178,14 +181,20 @@ fn handle_deploy<N: Network>(
-     // Initialize a new VM.
-     let vm = VM::from(ConsensusStore::<N, ConsensusMemory<N>>::open(StorageMode::Production)?)?;
+     /// Returns the number of bytes in an emoji via a bit mask.
+-    fn utf8_byte_count(byte: u8) -> u8 {
++    fn utf8_byte_count(byte: u8) -> usize {
+         let mut mask = 0x80;
+         let mut result = 0;
+         while byte & mask > 0 {
+@@ -207,7 +205,7 @@ impl Token {
+             x if x.is_ascii_whitespace() => return Ok((1, Token::WhiteSpace)),
+             b'"' => {
+                 let mut i = 1;
+-                let mut len: u8 = 1;
++                let mut len = 1;
+                 let mut start = 1;
+                 let mut in_escape = false;
+                 let mut escaped = false;
+@@ -220,7 +218,7 @@ impl Token {
+                     // If it's an emoji get the length.
+                     if input[i] & 0x80 > 0 {
+                         len = Self::utf8_byte_count(input[i]);
+-                        i += (len as usize) - 1;
++                        i += len - 1;
+                     }
  
-+    // Load the remote dependencies into the VM.
-+    for (_, program, _, _, _, _) in remote {
-+        // If the program is a remote dependency, add it to the VM.
-+        vm.process().write().add_program(&program)?;
+                     if !in_escape {
+@@ -258,26 +256,17 @@ impl Token {
+                     }
+ 
+                     if !in_escape {
+-                        match Self::eat_char(
++                        let character = Self::eat_char(
+                             input_tendril.subtendril(start as u32, len as u32),
+                             escaped,
+                             hex,
+                             unicode,
+-                        ) {
+-                            Some(character) => {
+-                                len = 1;
+-                                escaped = false;
+-                                hex = false;
+-                                unicode = false;
+-                                string.push(character.into());
+-                            }
+-                            None => {
+-                                return Err(ParserError::lexer_expected_valid_escaped_char(
+-                                    input_tendril.subtendril(start as u32, len as u32),
+-                                )
+-                                .into())
+-                            }
+-                        }
++                        )?;
++                        len = 1;
++                        escaped = false;
++                        hex = false;
++                        unicode = false;
++                        string.push(character.into());
+                     }
+ 
+                     i += 1;
+@@ -298,14 +287,27 @@ impl Token {
+                 let mut in_escape = false;
+                 let mut escaped = false;
+                 let mut hex = false;
+-                let mut unicode = false;
++                let mut escaped_unicode = false;
++                let mut unicode_char = false;
+                 let mut end = false;
+ 
+                 while i < input.len() {
+-                    if !in_escape {
++                    if input[i] & 0x80 > 0 && !unicode_char {
++                        i += Self::utf8_byte_count(input[i]);
++                        unicode_char = true;
++                        continue;
++                    } else if input[i] & 0x80 > 0 && unicode_char {
++                        i += Self::utf8_byte_count(input[i]);
++                        return Err(ParserError::lexer_invalid_char(&input_tendril[0..i]).into());
++                    } else if !in_escape || unicode_char {
+                         if input[i] == b'\'' {
+                             end = true;
+                             break;
++                        } else if unicode_char {
++                            return Err(ParserError::lexer_invalid_char(
++                                &input_tendril[0..input_tendril[1..].find('\'').unwrap_or(i + 1)],
++                            )
++                            .into());
+                         } else if input[i] == b'\\' {
+                             in_escape = true;
+                         }
+@@ -314,7 +316,7 @@ impl Token {
+                             hex = true;
+                         } else if input[i] == b'u' {
+                             if input[i + 1] == b'{' {
+-                                unicode = true;
++                                escaped_unicode = true;
+                             } else {
+                                 return Err(ParserError::lexer_expected_valid_escaped_char(input[i]).into());
+                             }
+@@ -332,10 +334,13 @@ impl Token {
+                     return Err(ParserError::lexer_char_not_closed(String::from_utf8_lossy(&input[0..i])).into());
+                 }
+ 
+-                return match Self::eat_char(input_tendril.subtendril(1, (i - 1) as u32), escaped, hex, unicode) {
+-                    Some(character) => Ok((i + 1, Token::CharLit(character))),
+-                    None => Err(ParserError::lexer_invalid_char(String::from_utf8_lossy(&input[0..i - 1])).into()),
+-                };
++                let character = Self::eat_char(
++                    input_tendril.subtendril(1, (i - 1) as u32),
++                    escaped,
++                    hex,
++                    escaped_unicode,
++                )?;
++                return Ok((i + 1, Token::CharLit(character)));
+             }
+             x if x.is_ascii_digit() => {
+                 return Self::eat_integer(&input_tendril);
+diff --git a/compiler/parser/src/tokenizer/mod.rs b/compiler/parser/src/tokenizer/mod.rs
+index f48b3222e4..81d674b0b1 100644
+--- a/compiler/parser/src/tokenizer/mod.rs
++++ b/compiler/parser/src/tokenizer/mod.rs
+@@ -56,7 +56,7 @@ pub(crate) fn tokenize(path: &str, input: StrTendril) -> Result<Vec<SpannedToken
+                             path,
+                             input.subtendril(
+                                 line_start as u32,
+-                                input[line_start..].find('\n').unwrap_or_else(|| input.len()) as u32,
++                                input[line_start..].find('\n').unwrap_or(input.len()) as u32,
+                             ),
+                         ),
+                     )
+diff --git a/leo/errors/src/parser/parser_errors.rs b/leo/errors/src/parser/parser_errors.rs
+index 15cbb19241..9ad6bf1702 100644
+--- a/leo/errors/src/parser/parser_errors.rs
++++ b/leo/errors/src/parser/parser_errors.rs
+@@ -236,23 +236,23 @@ create_errors!(
+     @backtraced
+     lexer_eat_integer_leading_zero {
+     args: (input: impl Display),
+-    msg: format!("Tried to eat integer but found a leading zero on {}.", input),
++    msg: format!("Tried to eat integer but found a leading zero on `{}`.", input),
+     help: None,
+     }
+ 
+     /// When an integer is started with a leading zero.
+     @backtraced
+-     lexer_expected_valid_escaped_char {
++    lexer_expected_valid_escaped_char {
+     args: (input: impl Display),
+-    msg: format!("Expected a valid escape character but found {}.", input),
++    msg: format!("Expected a valid escape character but found `{}`.", input),
+     help: None,
+-     }
++    }
+ 
+     /// When a string is not properly closed.
+     @backtraced
+     lexer_string_not_closed {
+     args: (input: impl Display),
+-    msg: format!("Expected a closed string but found {}.", input),
++    msg: format!("Expected a closed string but found `{}`.", input),
+     help: None,
+     }
+ 
+@@ -260,7 +260,7 @@ create_errors!(
+     @backtraced
+     lexer_char_not_closed {
+     args: (input: impl Display),
+-    msg: format!("Expected a closed char but found {}.", input),
++    msg: format!("Expected a closed char but found `{}`.", input),
+     help: None,
+     }
+ 
+@@ -268,7 +268,7 @@ create_errors!(
+     @backtraced
+     lexer_invalid_char {
+     args: (input: impl Display),
+-    msg: format!("Expected valid character but found {}.", input),
++    msg: format!("Expected valid character but found `{}`.", input),
+     help: None,
+     }
+ 
+@@ -284,7 +284,7 @@ create_errors!(
+     @backtraced
+     lexer_block_comment_does_not_close_before_eof {
+     args: (input: impl Display),
+-    msg: format!("Block comment does not close with content: {}.", input),
++    msg: format!("Block comment does not close with content: `{}`.", input),
+     help: None,
+     }
+ 
+@@ -292,7 +292,78 @@ create_errors!(
+     @backtraced
+     could_not_lex {
+     args: (input: impl Display),
+-    msg: format!("Could not lex the following content: {}.", input),
++    msg: format!("Could not lex the following content: `{}`.", input),
++    help: None,
 +    }
 +
-     // Specify the query
-     let query = SnarkVMQuery::from(&endpoint);
- 
-     // For each of the programs, generate a deployment transaction.
-     let mut transactions = Vec::new();
--    for (program_id, program, manifest, _, priority_fee, fee_record) in tasks {
--        // If the program is a local dependency, generate a deployment transaction.
--        if manifest.is_some() {
-+    for (program_id, program, manifest, _, priority_fee, fee_record) in local {
-+        // If the program is a local dependency that is not skipped, generate a deployment transaction.
-+        if manifest.is_some() && !skipped.contains(&program_id) {
-             println!("📦 Creating deployment transaction for '{}'...\n", program_id.to_string().bold());
-             // Generate the transaction.
-             let transaction = vm
-@@ -195,9 +204,8 @@ fn handle_deploy<N: Network>(
-             let deployment = transaction.deployment().expect("Expected a deployment in the transaction");
-             // Print the deployment stats.
-             print_deployment_stats(&program_id.to_string(), deployment, priority_fee)?;
--
-+            // Validate the deployment limits.
-             validate_deployment_limits(deployment, &program_id, &network)?;
--
-             // Save the transaction.
-             transactions.push((program_id, transaction));
-         }
-@@ -236,16 +244,16 @@ fn handle_deploy<N: Network>(
-     // If the `broadcast` option is set, broadcast each deployment transaction to the network.
-     if command.action.broadcast {
-         for (i, (program_id, transaction)) in transactions.iter().enumerate() {
--            println!("📡 Broadcasting deployment for {program_id}...");
-+            println!("\n📡 Broadcasting deployment for {}...", program_id.to_string().bold());
-             // Get and confirm the fee with the user.
-             let fee = transaction.fee_transition().expect("Expected a fee in the transaction");
-             if !confirm_fee(&fee, &private_key, &address, &endpoint, network, &context, command.extra.yes)? {
--                println!("❌ Deployment aborted.");
--                return Ok(());
-+                println!("⏩ Deployment skipped.");
-+                continue;
-             }
-             let fee_id = fee.id().to_string();
-             let id = transaction.id().to_string();
--            let height_before = crate::cli::check_transaction::current_height(&endpoint, network)?;
-+            let height_before = check_transaction::current_height(&endpoint, network)?;
-             // Broadcast the transaction to the network.
-             let response = handle_broadcast(
-                 &format!("{}/{}/transaction/broadcast", endpoint, network),
-@@ -253,20 +261,20 @@ fn handle_deploy<N: Network>(
-                 &program_id.to_string(),
-             )?;
- 
--            let fail = |msg| {
-+            let fail_and_prompt = |msg| {
-                 println!("❌ Failed to deploy program {program_id}: {msg}.");
-                 let count = transactions.len() - i - 1;
--                match count {
--                    0 => {}
--                    1 => println!("1 expected deployment skipped"),
--                    _ => println!("{count} expected deployments skipped"),
-+                // Check if the user wants to continue with the next deployment.
-+                if count > 0 {
-+                    confirm("Do you want to continue with the next deployment?", command.extra.yes)
-+                } else {
-+                    Ok(false)
-                 }
--                Ok(())
-             };
- 
-             match response.status() {
-                 200 => {
--                    let status = crate::cli::check_transaction::check_transaction_with_message(
-+                    let status = check_transaction::check_transaction_with_message(
-                         &id,
-                         Some(&fee_id),
-                         &endpoint,
-@@ -276,20 +284,22 @@ fn handle_deploy<N: Network>(
-                         command.extra.blocks_to_check,
-                     )?;
-                     if status == Some(TransactionStatus::Accepted) {
--                        println!(
--                            "✅ Successfully broadcast deployment with:\n  - transaction ID: '{}'\n  - fee ID: '{}'",
--                            id.bold().yellow(),
--                            fee_id.bold().yellow()
--                        );
-+                        println!("✅ Deployment confirmed!");
-+                    } else if fail_and_prompt("Transaction apparently not accepted")? {
-+                        continue;
-                     } else {
--                        return fail("Transaction apparently not accepted");
-+                        return Ok(());
-                     }
-                 }
-                 _ => {
-                     let error_message = response
-                         .into_string()
-                         .map_err(|e| CliError::custom(format!("Failed to read response: {e}")))?;
--                    return fail(&error_message);
-+                    if fail_and_prompt(&error_message)? {
-+                        continue;
-+                    } else {
-+                        return Ok(());
-+                    }
-                 }
-             }
-         }
-@@ -366,11 +376,12 @@ fn print_deployment_plan<N: Network>(
-     address: &Address<N>,
-     endpoint: &str,
-     network: &NetworkName,
--    tasks: &[DeploymentTask<N>],
--    skipped: &[DeploymentTask<N>],
-+    local: &[DeploymentTask<N>],
-+    skipped: &[ProgramID<N>],
-     remote: &[DeploymentTask<N>],
--    action: &TransactionAction,
-+    warnings: &[String],
-     consensus_version: ConsensusVersion,
-+    command: &LeoDeploy,
- ) {
-     use colored::*;
- 
-@@ -387,10 +398,10 @@ fn print_deployment_plan<N: Network>(
- 
-     // ── Deployment tasks (bullet list) ───────────────────────────────────
-     println!("\n{}", "📦 Deployment Tasks:".bold());
--    if tasks.is_empty() {
-+    if local.is_empty() {
-         println!("  (none)");
-     } else {
--        for (name, _, _, _, priority_fee, record) in tasks.iter() {
-+        for (name, _, _, _, priority_fee, record) in local.iter().filter(|(p, ..)| !skipped.contains(p)) {
-             let priority_fee_str = priority_fee.map_or("0".into(), |v| v.to_string());
-             let record_str = if record.is_some() { "yes" } else { "no (public fee)" };
-             println!(
-@@ -405,7 +416,7 @@ fn print_deployment_plan<N: Network>(
-     // ── Skipped programs ─────────────────────────────────────────────────
-     if !skipped.is_empty() {
-         println!("\n{}", "🚫 Skipped Programs:".bold().red());
--        for (symbol, _, _, _, _, _) in skipped {
-+        for symbol in skipped {
-             println!("  • {}", symbol.to_string().dimmed());
-         }
++    /// When a escaped character was given more than one char to escape.
++    @backtraced
++    lexer_escaped_char_incorrect_length {
++        args: (input: impl Display),
++        msg: format!("Could not lex the following escaped char due to being given more than one char: `{}`.", input),
++        help: None,
++    }
++
++    /// When a escape was given but no following character
++    @backtraced
++    lexer_unclosed_escaped_char {
++        args: (),
++        msg: "There was no escaped character following the escape char symbol `\\`.",
++        help: None,
++    }
++
++    /// When a escaped hex was given more than two chars to escape.
++    @backtraced
++    lexer_escaped_hex_incorrect_length {
++        args: (input: impl Display),
++        msg: format!("Could not lex the following escaped hex due to being given more than two chars: `{}`.", input),
++        help: None,
++    }
++
++    /// When a valid hex character was expected.
++    @backtraced
++    lexer_expected_valid_hex_char {
++    args: (input: impl Display),
++    msg: format!("Expected a valid hex character but found `{}`.", input),
+     help: None,
      }
-@@ -421,24 +432,23 @@ fn print_deployment_plan<N: Network>(
++
++    /// When a escaped unicode char was given but no following closing symbol.
++    @backtraced
++    lexer_unclosed_escaped_unicode_char {
++        args: (input: impl Display),
++        msg: format!("There was no closing `}}` after a escaped unicode `{}`.", input),
++        help: None,
++    }
++
++    /// When a escaped unicode char was given but it had an incorrect length.
++    @backtraced
++    lexer_invalid_escaped_unicode_length {
++        args: (input: impl Display),
++        msg: format!("The escaped unicode char `{}` is not within valid length of [1, 6].", input),
++        help: None,
++    }
++
++    /// When a escaped unicode char was given but exceeded maximum value.
++    @backtraced
++    lexer_invalid_character_exceeded_max_value {
++        args: (input: impl Display),
++        msg: format!("The escaped unicode char `{}` is greater than 0x10FFFF.", input),
++        help: None,
++    }
++    /// When a hex number is provided.
++    @backtraced
++    lexer_hex_number_provided {
++        args: (input: impl Display),
++        msg: format!("A hex number `{}..` was provided but hex is not allowed.", input),
++        help: None,
++    }
++
++    /// When a function recieved a self argument outside the first argument.
++    @backtraced
++    parser_self_outside_first_argument {
++        args: (),
++        msg: "A function received a self argument as not the first argument.",
++        help: None,
++    }
+ );
+diff --git a/tests/expectations/parser/parser/circuits/self_not_first_fail.leo.out b/tests/expectations/parser/parser/circuits/self_not_first_fail.leo.out
+new file mode 100644
+index 0000000000..5a73599380
+--- /dev/null
++++ b/tests/expectations/parser/parser/circuits/self_not_first_fail.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Parse
++expectation: Fail
++outputs:
++  - "Error [EPAR0370041]: A function received a self argument as not the first argument."
+diff --git a/tests/expectations/parser/parser/expression/literal/char_fail.leo.out b/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
+index 4642d0114d..ece3a8f208 100644
+--- a/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
++++ b/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
+@@ -2,38 +2,41 @@
+ namespace: Token
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370028]: Expected a closed char but found '\\'."
+-  - "Error [EPAR0370028]: Expected a closed char but found 'a."
+-  - "Error [EPAR0370029]: Expected valid character but found ."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\x9."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\x."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\x7."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\x."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\x8."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\xc."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\xc."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\xD."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\xC."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\xe."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\x9."
+-  - "Error [EPAR0370029]: Expected valid character but found 'abcdef."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\t\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\u{bbbbb}\\u{aaaa."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\u{2764."
+-  - "Error [EPAR0370029]: Expected valid character but found '\\u{276g."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
+-  - "Error [EPAR0370029]: Expected valid character but found '😭😂�."
++  - "Error [EPAR0370028]: Expected a closed char but found `'\\'`."
++  - "Error [EPAR0370028]: Expected a closed char but found `'a`."
++  - "Error [EPAR0370024]: Expected more characters to lex but found none."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `154`."
++  - "Error [EPAR0370035]: Could not lex the following escaped hex due to being given more than two chars: `7`."
++  - "Error [EPAR0370028]: Expected a closed char but found `\\x7g`."
++  - "Error [EPAR0370035]: Could not lex the following escaped hex due to being given more than two chars: `z`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `128`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `193`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `194`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `223`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `192`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `224`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `159`."
++  - "Error [EPAR0370028]: Expected a closed char but found `abcdefg`."
++  - "Error [EPAR0370033]: Could not lex the following escaped char due to being given more than one char: `t\\t`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `a`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `z`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `A`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `Z`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `1`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `9`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `*`."
++  - "Error [EPAR0370035]: Could not lex the following escaped hex due to being given more than two chars: ``."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `117`."
++  - "Error [EPAR0370038]: The escaped unicode char `bbbbb}\\u{aaaa` is not within valid length of [1, 6]."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `117`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `117`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `117`."
++  - "Error [EPAR0370037]: There was no closing `}` after a escaped unicode `\\u{2764z`."
++  - "Error [EPAR0370028]: Expected a closed char but found `\\u{276g}`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `117`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `117`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `117`."
++  - "Error [EPAR0370039]: The escaped unicode char `110000` is greater than 0x10FFFF."
++  - "Error [EPAR0370037]: There was no closing `}` after a escaped unicode `\\u{af🦀`."
++  - "Error [EPAR0370029]: Expected valid character but found `'🦀\\`."
++  - "Error [EPAR0370029]: Expected valid character but found `'😭😂`."
+diff --git a/tests/expectations/parser/parser/expression/literal/string_fail.leo.out b/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
+index 2b1fcd8d31..9910d77db3 100644
+--- a/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
++++ b/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
+@@ -2,10 +2,10 @@
+ namespace: Token
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370027]: Expected a closed string but found \"Hello world!."
+-  - "Error [EPAR0370027]: Expected a closed string but found \"\\\"."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found \\l."
+-  - "Error [EPAR0370027]: Expected a closed string but found \"\\uaaa\"."
+-  - "Error [EPAR0370027]: Expected a closed string but found \"\\u\"."
+-  - "Error [EPAR0370026]: Expected a valid escape character but found \\xFF."
+-  - "Error [EPAR0370027]: Expected a closed string but found \"\\x\"."
++  - "Error [EPAR0370027]: Expected a closed string but found `\"Hello world!`."
++  - "Error [EPAR0370027]: Expected a closed string but found `\"\\\"`."
++  - "Error [EPAR0370026]: Expected a valid escape character but found `l`."
++  - "Error [EPAR0370027]: Expected a closed string but found `\"\\uaaa\"`."
++  - "Error [EPAR0370027]: Expected a closed string but found `\"\\u\"`."
++  - "Error [EPAR0370036]: Expected a valid hex character but found `255`."
++  - "Error [EPAR0370027]: Expected a closed string but found `\"\\x\"`."
+diff --git a/tests/expectations/parser/parser/functions/annotated_arg_not_ident.leo.out b/tests/expectations/parser/parser/functions/annotated_arg_not_ident.leo.out
+new file mode 100644
+index 0000000000..35a7e35ca2
+--- /dev/null
++++ b/tests/expectations/parser/parser/functions/annotated_arg_not_ident.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Parse
++expectation: Fail
++outputs:
++  - "Error [EPAR0370009]: unexpected string: expected 'ident', got '?'\n    --> test:3:6\n     |\n   3 | @foo(?, bar, ?)\n     |      ^\nError [EPAR0370009]: unexpected string: expected 'ident', got '?'\n    --> test:3:14\n     |\n   3 | @foo(?, bar, ?)\n     |              ^\nError [EPAR0370009]: unexpected string: expected 'ident', got '123'\n    --> test:8:6\n     |\n   8 | @bar(123) // ints not vali\n     |      ^^^\nError [EPAR0370017]: \"@context(...)\" is deprecated. Did you mean @test annotation?\n    --> test:14:2\n     |\n  14 | @context // recovery witness\n     |  ^^^^^^^"
+diff --git a/tests/expectations/parser/parser/functions/annotated_arg_not_ident_int.leo.out b/tests/expectations/parser/parser/functions/annotated_arg_not_ident_int.leo.out
+index 34585e8f24..4c32e5ad4b 100644
+--- a/tests/expectations/parser/parser/functions/annotated_arg_not_ident_int.leo.out
++++ b/tests/expectations/parser/parser/functions/annotated_arg_not_ident_int.leo.out
+@@ -2,4 +2,4 @@
+ namespace: Parse
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370009]: unexpected string: expected 'ident or int', got '?'\n    --> test:3:6\n     |\n   3 | @foo(?, bar, ?)\n     |      ^\nError [EPAR0370009]: unexpected string: expected 'ident or int', got '?'\n    --> test:3:14\n     |\n   3 | @foo(?, bar, ?)\n     |              ^\nError [EPAR0370017]: \"@context(...)\" is deprecated. Did you mean @test annotation?\n    --> test:8:2\n     |\n   8 | @context // recovery witness\n     |  ^^^^^^^"
++  - "Error [EPAR0370009]: unexpected string: expected 'ident', got '?'\n    --> test:3:6\n     |\n   3 | @foo(?, bar, ?)\n     |      ^\nError [EPAR0370009]: unexpected string: expected 'ident', got '?'\n    --> test:3:14\n     |\n   3 | @foo(?, bar, ?)\n     |              ^\nError [EPAR0370017]: \"@context(...)\" is deprecated. Did you mean @test annotation?\n    --> test:8:2\n     |\n   8 | @context // recovery witness\n     |  ^^^^^^^"
+diff --git a/tests/expectations/parser/parser/statement/hex_int_fail.leo.out b/tests/expectations/parser/parser/statement/hex_int_fail.leo.out
+new file mode 100644
+index 0000000000..c36f660260
+--- /dev/null
++++ b/tests/expectations/parser/parser/statement/hex_int_fail.leo.out
+@@ -0,0 +1,7 @@
++---
++namespace: ParseStatement
++expectation: Fail
++outputs:
++  - "Error [EPAR0370040]: A hex number `0x4..` was provided but hex is not allowed."
++  - "Error [EPAR0370040]: A hex number `0xA..` was provided but hex is not allowed."
++  - "Error [EPAR0370040]: A hex number `0xF..` was provided but hex is not allowed."
+diff --git a/tests/parser/circuits/self_not_first_fail.leo b/tests/parser/circuits/self_not_first_fail.leo
+new file mode 100644
+index 0000000000..51ea2fc20e
+--- /dev/null
++++ b/tests/parser/circuits/self_not_first_fail.leo
+@@ -0,0 +1,10 @@
++/*
++namespace: Parse
++expectation: Fail
++*/
++
++circuit X {
++    function x(foo: u32, &self) {
++        return ();
++    }
++}
+\ No newline at end of file
+diff --git a/tests/parser/expression/literal/char_fail.leo b/tests/parser/expression/literal/char_fail.leo
+index 982cc3f801..12dfdec1f4 100644
+--- a/tests/parser/expression/literal/char_fail.leo
++++ b/tests/parser/expression/literal/char_fail.leo
+@@ -43,5 +43,8 @@ expectation: Fail
+ '\u00000000'
+ '\u01000000'
+ '\u9999999'
++'\u{110000}'
++'\u{af🦀'
++'🦀\n'
  
-     // ── Actions ──────────────────────────────────────────────────────────
-     println!("\n{}", "⚙️ Actions:".bold());
--    if action.print {
-+    if command.action.print {
-         println!("  • Transaction(s) will be printed to the console.");
-     } else {
-         println!("  • Transaction(s) will NOT be printed to the console.");
-     }
--    if let Some(path) = &action.save {
-+    if let Some(path) = &command.action.save {
-         println!("  • Transaction(s) will be saved to {}", path.bold());
-     } else {
-         println!("  • Transaction(s) will NOT be saved to a file.");
-     }
--    if action.broadcast {
-+    if command.action.broadcast {
-         println!("  • Transaction(s) will be broadcast to {}", endpoint.bold());
-     } else {
-         println!("  • Transaction(s) will NOT be broadcast to the network.");
-     }
+ '😭😂😘'
+diff --git a/tests/parser/functions/annotated_arg_not_ident_int.leo b/tests/parser/functions/annotated_arg_not_ident.leo
+similarity index 71%
+rename from tests/parser/functions/annotated_arg_not_ident_int.leo
+rename to tests/parser/functions/annotated_arg_not_ident.leo
+index 20780213f0..e927be8d5c 100644
+--- a/tests/parser/functions/annotated_arg_not_ident_int.leo
++++ b/tests/parser/functions/annotated_arg_not_ident.leo
+@@ -8,6 +8,12 @@ function x() {
+     return ();
+ }
  
-     // ── Warnings ─────────────────────────────────────────────────────────
--    let warnings = check_tasks_for_warnings(endpoint, *network, tasks, action);
-     if !warnings.is_empty() {
-         println!("\n{}", "⚠️ Warnings:".bold().red());
-         for warning in warnings {
-diff --git a/leo/cli/commands/execute.rs b/leo/cli/commands/execute.rs
-index c11ed78670..c8ec399cd0 100644
---- a/leo/cli/commands/execute.rs
-+++ b/leo/cli/commands/execute.rs
-@@ -349,7 +349,7 @@ fn handle_execute<A: Aleo>(
++@bar(123) // ints not vali
++function x() {
++    return ();
++}
++
++
+ @context // recovery witness
+ function x() {
+     return ();
+diff --git a/tests/parser/statement/hex_int_fail.leo b/tests/parser/statement/hex_int_fail.leo
+new file mode 100644
+index 0000000000..f8a4343770
+--- /dev/null
++++ b/tests/parser/statement/hex_int_fail.leo
+@@ -0,0 +1,10 @@
++/*
++namespace: ParseStatement
++expectation: Fail
++*/
++
++let x = 0x40u32;
++
++let y: u32 = 0xAAu32;
++
++let z = 0xFFu8;
+\ No newline at end of file
+diff --git a/tests/test-framework/src/fetch.rs b/tests/test-framework/src/fetch.rs
+index 68f8b145a7..862df5035b 100644
+--- a/tests/test-framework/src/fetch.rs
++++ b/tests/test-framework/src/fetch.rs
+@@ -22,7 +22,7 @@ pub fn find_tests<T: AsRef<Path>>(path: T, out: &mut Vec<(String, String)>) {
+         if entry.is_dir() {
+             find_tests(entry.as_path(), out);
+             continue;
+-        } else if entry.extension().map(|x| x.to_str()).flatten().unwrap_or_default() != "leo" {
++        } else if entry.extension().and_then(|x| x.to_str()).unwrap_or_default() != "leo" {
+             continue;
          }
-         let fee_id = fee.id().to_string();
-         let id = transaction.id().to_string();
--        let height_before = crate::cli::check_transaction::current_height(&endpoint, network)?;
-+        let height_before = check_transaction::current_height(&endpoint, network)?;
-         // Broadcast the transaction to the network.
-         let response =
-             handle_broadcast(&format!("{}/{}/transaction/broadcast", endpoint, network), &transaction, &program_name)?;
-@@ -361,7 +361,7 @@ fn handle_execute<A: Aleo>(
+         let content = fs::read_to_string(entry.as_path()).expect("failed to read test");
+diff --git a/tests/test-framework/src/runner.rs b/tests/test-framework/src/runner.rs
+index b2d49394c3..3865e2a2e3 100644
+--- a/tests/test-framework/src/runner.rs
++++ b/tests/test-framework/src/runner.rs
+@@ -147,7 +147,7 @@ pub fn run_tests<T: Runner>(runner: &T, expectation_category: &str) {
  
-         match response.status() {
-             200 => {
--                let status = crate::cli::check_transaction::check_transaction_with_message(
-+                let status = check_transaction::check_transaction_with_message(
-                     &id,
-                     Some(&fee_id),
-                     &endpoint,
-@@ -371,11 +371,7 @@ fn handle_execute<A: Aleo>(
-                     command.extra.blocks_to_check,
-                 )?;
-                 if status == Some(TransactionStatus::Accepted) {
--                    println!(
--                        "✅ Successfully broadcast execution with:\n  - transaction ID: '{}'\n  - fee ID: '{}'",
--                        id.bold().yellow(),
--                        fee_id.bold().yellow()
--                    );
-+                    println!("✅ Execution confirmed!");
-                 }
-             }
-             _ => {
+         let mut expected_output = expectations.as_ref().map(|x| x.outputs.iter());
+         for (i, test) in tests.into_iter().enumerate() {
+-            let expected_output = expected_output.as_mut().map(|x| x.next()).flatten().cloned();
++            let expected_output = expected_output.as_mut().and_then(|x| x.next()).cloned();
+             println!("running test {} @ '{}'", test_name, path.to_str().unwrap());
+             let output = namespace.run_test(Test {
+                 name: test_name.clone(),

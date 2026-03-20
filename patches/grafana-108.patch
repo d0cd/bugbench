@@ -1,0 +1,2190 @@
+diff --git a/pkg/infra/features/go.mod b/pkg/infra/features/go.mod
+index 3de49601884ac..6fcf9b18cf75f 100644
+--- a/pkg/infra/features/go.mod
++++ b/pkg/infra/features/go.mod
+@@ -18,6 +18,7 @@ require (
+ 	github.com/go-logr/stdr v1.2.2 // indirect
+ 	github.com/grafana/authlib/types v0.0.0-20260226130908-b01d89f85c4d // indirect
+ 	github.com/grafana/dskit v0.0.0-20260108123158-1a1acfb6ef2e // indirect
++	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
+ 	github.com/hashicorp/go-hclog v1.6.3 // indirect
+ 	github.com/klauspost/compress v1.18.4 // indirect
+ 	github.com/mattn/go-colorable v0.1.14 // indirect
+diff --git a/pkg/infra/features/go.sum b/pkg/infra/features/go.sum
+index b484c8b3f1b09..426a9e241b08c 100644
+--- a/pkg/infra/features/go.sum
++++ b/pkg/infra/features/go.sum
+@@ -60,8 +60,8 @@ github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus v1.1.0 h1:QGLs
+ github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus v1.1.0/go.mod h1:hM2alZsMUni80N33RBe6J0e423LB+odMj7d3EMP9l20=
+ github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.3 h1:B+8ClL/kCQkRiU82d9xajRPKYMrB7E0MbtzWVi1K4ns=
+ github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.3/go.mod h1:NbCUVmiS4foBGBHOYlCT25+YmGpJ32dZPi75pGEUpj4=
+-github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.8 h1:NpbJl/eVbvrGE0MJ6X16X9SAifesl6Fwxg/YmCvubRI=
+-github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.8/go.mod h1:mi7YA+gCzVem12exXy46ZespvGtX/lZmD/RLnQhVW7U=
++github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 h1:HWRh5R2+9EifMyIHV7ZV+MIZqgz+PMpZ14Jynv3O2Zs=
++github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0/go.mod h1:JfhWUomR1baixubs02l85lZYYOm7LV6om4ceouMv45c=
+ github.com/hashicorp/go-hclog v1.6.3 h1:Qr2kF+eVWjTiYmU7Y31tYlP1h0q/X3Nl3tPGdaB11/k=
+ github.com/hashicorp/go-hclog v1.6.3/go.mod h1:W4Qnvbt70Wk/zYJryRzDRU/4r0kIg0PVHBcfoyhpF5M=
+ github.com/hashicorp/go-plugin v1.7.0 h1:YghfQH/0QmPNc/AZMTFE3ac8fipZyZECHdDPshfk+mA=
+diff --git a/pkg/registry/apis/iam/models.go b/pkg/registry/apis/iam/models.go
+index 1b3e89850f161..bfa4a7bc204d4 100644
+--- a/pkg/registry/apis/iam/models.go
++++ b/pkg/registry/apis/iam/models.go
+@@ -103,5 +103,5 @@ type IdentityAccessManagementAPIBuilder struct {
+ 	// Toggle for enabling authz management apis
+ 	features featuremgmt.FeatureToggles
+ 
+-	tracing *tracing.TracingService
++	tracing tracing.Tracer
+ }
+diff --git a/pkg/registry/apis/iam/register.go b/pkg/registry/apis/iam/register.go
+index 686c63a584adc..4dbbe19330368 100644
+--- a/pkg/registry/apis/iam/register.go
++++ b/pkg/registry/apis/iam/register.go
+@@ -157,11 +157,15 @@ func NewAPIService(
+ 	reg prometheus.Registerer,
+ 	tokenExchanger authn.TokenExchanger,
+ 	authorizerDialConfigs map[schema.GroupResource]iamauthorizer.DialConfig,
++	tracingService tracing.Tracer,
+ ) *IdentityAccessManagementAPIBuilder {
+ 	store := legacy.NewLegacySQLStores(dbProvider)
+ 	resourcePermissionsStorage := resourcepermission.ProvideStorageBackend(dbProvider)
+ 	registerMetrics(reg)
+ 
++	//nolint:staticcheck // not yet migrated to OpenFeature
++	enableAuthnMutation := features.IsEnabledGlobally(featuremgmt.FlagKubernetesAuthnMutation)
++
+ 	coreRoleAuthorizer := iamauthorizer.NewCoreRoleAuthorizer(accessClient)
+ 	globalRoleAuthorizer := globalRoleApiInstaller.GetAuthorizer()
+ 	roleAuthorizer := roleApiInstaller.GetAuthorizer()
+@@ -175,7 +179,10 @@ func NewAPIService(
+ 
+ 	return &IdentityAccessManagementAPIBuilder{
+ 		store:                      store,
++		userLegacyStore:            user.NewLegacyStore(store, accessClient, tracingService),
++		teamBindingLegacyStore:     teambinding.NewLegacyBindingStore(store, enableAuthnMutation, tracingService),
+ 		display:                    user.NewLegacyDisplayREST(store),
++		tracing:                    tracingService,
+ 		resourcePermissionsStorage: resourcePermissionsStorage,
+ 		coreRolesStorage:           coreRoleStorage,
+ 		roleBindingsStorage:        roleBindingsStorage,
+@@ -234,6 +241,20 @@ func NewAPIService(
+ 					return resourceAuthorizer.Authorize(ctx, a)
+ 				}
+ 
++				if a.GetResource() == "teambindings" {
++					if user.GetIdentityType() != types.TypeAccessPolicy {
++						return authorizer.DecisionDeny, "only access policy identities have access for now", nil
++					}
++					return authorizer.DecisionAllow, "", nil
++				}
++
++				if a.GetResource() == "users" {
++					if user.GetIdentityType() != types.TypeAccessPolicy {
++						return authorizer.DecisionDeny, "only access policy identities have access for now", nil
++					}
++					return resourceAuthorizer.Authorize(ctx, a)
++				}
++
+ 				return authorizer.DecisionDeny, "access denied", nil
+ 			}),
+ 	}
+@@ -416,18 +437,20 @@ func (b *IdentityAccessManagementAPIBuilder) UpdateTeamsAPIGroup(opts builder.AP
+ 		storage[teamResource.StoragePath()] = dw
+ 	}
+ 
+-	legacyTeamBindingSearchClient := teambinding.NewLegacyTeamBindingSearchClient(b.store, b.tracing)
++	if b.dual != nil && b.unified != nil {
++		legacyTeamBindingSearchClient := teambinding.NewLegacyTeamBindingSearchClient(b.store, b.tracing)
+ 
+-	teamBindingSearchClient := resource.NewSearchClient(
+-		dualwrite.NewSearchAdapter(b.dual),
+-		iamv0.TeamBindingResourceInfo.GroupResource(),
+-		b.unified,
+-		legacyTeamBindingSearchClient,
+-		b.features,
+-	)
++		teamBindingSearchClient := resource.NewSearchClient(
++			dualwrite.NewSearchAdapter(b.dual),
++			iamv0.TeamBindingResourceInfo.GroupResource(),
++			b.unified,
++			legacyTeamBindingSearchClient,
++			b.features,
++		)
+ 
+-	storage[teamResource.StoragePath("members")] = team.NewTeamMembersREST(teamBindingSearchClient, b.tracing,
+-		b.features, b.accessClient)
++		storage[teamResource.StoragePath("members")] = team.NewTeamMembersREST(teamBindingSearchClient, b.tracing,
++			b.features, b.accessClient)
++	}
+ 
+ 	if enableExternalGroupMappingsApi && b.teamGroupsHandler != nil {
+ 		storage[teamResource.StoragePath("groups")] = b.teamGroupsHandler
+@@ -504,17 +527,19 @@ func (b *IdentityAccessManagementAPIBuilder) UpdateUsersAPIGroup(opts builder.AP
+ 		storage[userResource.StoragePath()] = dw
+ 	}
+ 
+-	legacyTeamBindingSearchClient := teambinding.NewLegacyTeamBindingSearchClient(b.store, b.tracing)
++	if b.dual != nil && b.unified != nil {
++		legacyTeamBindingSearchClient := teambinding.NewLegacyTeamBindingSearchClient(b.store, b.tracing)
+ 
+-	teamBindingSearchClient := resource.NewSearchClient(
+-		dualwrite.NewSearchAdapter(b.dual),
+-		iamv0.TeamBindingResourceInfo.GroupResource(),
+-		b.unified,
+-		legacyTeamBindingSearchClient,
+-		b.features,
+-	)
++		teamBindingSearchClient := resource.NewSearchClient(
++			dualwrite.NewSearchAdapter(b.dual),
++			iamv0.TeamBindingResourceInfo.GroupResource(),
++			b.unified,
++			legacyTeamBindingSearchClient,
++			b.features,
++		)
+ 
+-	storage[userResource.StoragePath("teams")] = user.NewUserTeamREST(teamBindingSearchClient, b.tracing, b.features)
++		storage[userResource.StoragePath("teams")] = user.NewUserTeamREST(teamBindingSearchClient, b.tracing, b.features)
++	}
+ 
+ 	return nil
+ }
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx
+index 53a78faf47d07..44910e78e1f31 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx
+@@ -58,12 +58,13 @@ export function DraggableList<T>({
+               const key = keyExtractor(item);
+               return (
+                 <Draggable key={key} draggableId={key} index={index}>
+-                  {(dragProvided) => (
++                  {(dragProvided, dragSnapshot) => (
+                     <div
+                       ref={dragProvided.innerRef}
+                       {...dragProvided.draggableProps}
+                       {...dragProvided.dragHandleProps}
+                       className={styles.draggableItem}
++                      data-is-dragging={dragSnapshot.isDragging || undefined}
+                     >
+                       {renderItem(item)}
+                     </div>
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx
+index 673c1b50dc506..952e4ddb56fa4 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx
+@@ -155,7 +155,7 @@ function getStyles(
+   });
+ 
+   const themeColors = getQueryEditorColors(theme);
+-  const backgroundColor = isSelected ? themeColors.card.activeBg : themeColors.card.hoverBg;
++  const hoverBackgroundColor = isSelected ? themeColors.card.activeBg : themeColors.card.hoverBg;
+   const hoverActions = css({
+     position: 'absolute',
+     right: 0,
+@@ -166,7 +166,7 @@ function getStyles(
+     paddingRight: theme.spacing(1),
+     // increasing the left padding lets the gradient become transparent before the first button rather than behind the first button
+     paddingLeft: theme.spacing(3),
+-    background: `linear-gradient(270deg, ${backgroundColor} 80%, transparent 100%)`,
++    background: `linear-gradient(270deg, ${hoverBackgroundColor} 80%, transparent 100%)`,
+     opacity: 0,
+     transform: 'translateX(8px)',
+     pointerEvents: 'none',
+@@ -243,13 +243,16 @@ function getStyles(
+         }),
+       },
+       '&:hover': {
+-        background: backgroundColor,
++        background: hoverBackgroundColor,
+       },
+       [`&:hover .${hoverActions}`]: {
+         opacity: 1,
+         transform: 'translateX(0)',
+         pointerEvents: 'auto',
+       },
++      '[data-is-dragging] &': {
++        background: hoverBackgroundColor,
++      },
+     }),
+     hoverActions,
+     hoverActionsVisible: css({
+diff --git a/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.test.tsx b/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.test.tsx
+index 0552d3f5bced4..fba226471ec0b 100644
+--- a/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.test.tsx
++++ b/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.test.tsx
+@@ -38,7 +38,6 @@ jest.mock('app/features/manage-dashboards/services/ValidationSrv', () => ({
+     validateNewFolderName: jest.fn(),
+   },
+ }));
+-
+ jest.mock('../../hooks/usePRBranch', () => ({
+   usePRBranch: jest.fn().mockReturnValue(undefined),
+ }));
+@@ -61,7 +60,6 @@ jest.mock('../../hooks/useProvisionedFolderFormData', () => ({
+ jest.mock('app/features/provisioning/hooks/usePullRequestParam', () => ({
+   usePullRequestParam: jest.fn(),
+ }));
+-
+ jest.mock('react-router-dom-v5-compat', () => {
+   const actual = jest.requireActual('react-router-dom-v5-compat');
+   return {
+@@ -251,7 +249,6 @@ describe('NewProvisionedFolderForm', () => {
+         });
+       })
+     );
+-
+     const { user } = setup(
+       {},
+       {
+diff --git a/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.tsx b/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.tsx
+index 4dfa4f8b85720..d68e363dd95e1 100644
+--- a/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.tsx
++++ b/public/app/features/provisioning/components/Folders/NewProvisionedFolderForm.tsx
+@@ -7,6 +7,7 @@ import { getAppEvents, reportInteraction } from '@grafana/runtime';
+ import { Alert, Button, Field, Input, Stack } from '@grafana/ui';
+ import { Folder } from 'app/api/clients/folder/v1beta1';
+ import { RepositoryView, useCreateRepositoryFilesWithPathMutation } from 'app/api/clients/provisioning/v0alpha1';
++import { useUrlParams } from 'app/core/navigation/hooks';
+ import { AnnoKeySourcePath, Resource } from 'app/features/apiserver/types';
+ import { usePullRequestParam } from 'app/features/provisioning/hooks/usePullRequestParam';
+ import { FolderDTO } from 'app/types/folders';
+@@ -32,6 +33,7 @@ interface Props {
+ function FormContent({ initialValues, repository, canPushToConfiguredBranch, folder, onDismiss }: FormProps) {
+   const { prURL } = usePullRequestParam();
+   const navigate = useNavigate();
++  const [, updateUrlParams] = useUrlParams();
+   const [create, request] = useCreateRepositoryFilesWithPathMutation();
+ 
+   const methods = useForm<BaseProvisionedFormData>({
+@@ -46,14 +48,18 @@ function FormContent({ initialValues, repository, canPushToConfiguredBranch, fol
+     const prUrl = urls?.newPullRequestURL;
+     // Fall back to the repository URL if no PR URL is returned, so preview banner link button stay visible
+     const paramValue = prUrl ?? repository?.url ?? '';
++    const params: Record<string, string> = {};
+ 
+-    const url = buildResourceBranchRedirectUrl({
+-      paramName: 'new_pull_request_url',
+-      paramValue,
+-      repoType: info.repoType,
+-    });
++    if (paramValue) {
++      params.new_pull_request_url = paramValue;
++    }
++    if (info.repoType) {
++      params.repo_type = info.repoType;
++    }
+ 
+-    navigate(url);
++    if (Object.keys(params).length > 0) {
++      updateUrlParams(params);
++    }
+   };
+ 
+   const onWriteSuccess = (resource: Resource<FolderDTO>) => {
+diff --git a/public/locales/cs-CZ/grafana.json b/public/locales/cs-CZ/grafana.json
+index 5278b66db5864..24135eb71f9ea 100644
+--- a/public/locales/cs-CZ/grafana.json
++++ b/public/locales/cs-CZ/grafana.json
+@@ -3290,6 +3290,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Formulář šablony",
++      "body-legacy": "",
+       "label-examples-documentation": "Příklady dokumentace",
+       "label-template-group": "Skupina šablony",
+       "label-template-group-name": "Název skupiny šablon",
+@@ -3298,6 +3299,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Pojmenujte skupinu šablony",
+       "title-error-saving-template": "Chyba při ukládání šablony",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Předloha pro tvorbu šablon"
+     },
+     "template-preview": {
+@@ -3338,6 +3340,8 @@
+       "help": {
+         "intro": "Šablony oznámení používají k vytváření oznámení jazyk šablon Go.\n\nV Grafaně může skupina šablon definovat více šablon oznámení pomocí {{ define \"<NAME>\" }}.\nTyto šablony lze poté použít v kontaktních bodech a v rámci jiných šablon oznámení použitím výzvy {{ template \"<NAME>\" }}.\nPodrobné informace o šablonách oznámení najdete v naší dokumentaci."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Nesprávně nakonfigurováno",
+       "misconfigured-warning": "Tato šablona je nesprávně nakonfigurována.",
+       "misconfigured-warning-details": "Šablony musí být definovány v oddílech <2></2> a <5></5> konfigurace správce výstrah."
+@@ -3448,7 +3452,14 @@
+         "title": "Pravidlo nebylo nalezeno"
+       },
+       "rules-with-firing-instances": "Pravidla výstrah s aktivními instancemi",
+-      "rules-with-pending-instances": "Pravidla výstrah s čekajícími instancemi"
++      "rules-with-pending-instances": "Pravidla výstrah s čekajícími instancemi",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Přidat výraz"
+@@ -4221,7 +4232,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7871,7 +7881,10 @@
+     "pro-tip": "Pro tip: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Nedaří se nám najít {{lowerCaseEntity}}. Zkuste se vrátit <4>domů</4> nebo vyhledejte pomoc na <7>komunitním webu.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -12030,8 +12043,6 @@
+       "tooltip-delete": "Odstranit"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Některé návrhy se nepodařilo načíst"
+       },
+@@ -14492,6 +14503,11 @@
+           "settings": "Nastavení"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Synchronizace externí skupiny"
+@@ -14549,6 +14565,19 @@
+       "new-team": "Nový tým",
+       "placeholder-search-teams": "Hledat týmy"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Toto je volitelné a používá se především k nastavení avatara profilu týmu (prostřednictvím služby Gravatar)",
+       "label-email": "E-mail",
+diff --git a/public/locales/de-DE/grafana.json b/public/locales/de-DE/grafana.json
+index c0e6db5e91fa3..7e0dbcf4d01a8 100644
+--- a/public/locales/de-DE/grafana.json
++++ b/public/locales/de-DE/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Vorlagenformular",
++      "body-legacy": "",
+       "label-examples-documentation": "Beispiele Dokumentation",
+       "label-template-group": "Vorlagengruppe",
+       "label-template-group-name": "Name der Vorlagengruppe",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Benennen Sie Ihre Vorlagengruppe",
+       "title-error-saving-template": "Fehler beim Speichern der Vorlage",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Vorlagen-Cheat-Sheet"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Für Benachrichtigungsvorlagen wird die Vorlagensprache Go zum Erstellen von Benachrichtigungen verwendet.\n\nIn Grafana kann eine Vorlagengruppe mehrere Benachrichtigungsvorlagen mit {{ define \"<NAME>\" }} definieren.\nDiese Vorlagen können dann in Kontaktpunkten und in anderen Benachrichtigungsvorlagen verwendet werden, indem {{ template \"<NAME>\" }} aufgerufen wird.\nAusführliche Informationen zu Benachrichtigungsvorlagen finden Sie in unserer Dokumentation."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Falsch konfiguriert",
+       "misconfigured-warning": "Diese Vorlage ist falsch konfiguriert.",
+       "misconfigured-warning-details": "Vorlagen müssen sowohl in den Abschnitten <2></2> als auch <5></5> Ihrer Alertmanager-Konfiguration definiert werden."
+@@ -3420,7 +3424,14 @@
+         "title": "Regel nicht gefunden"
+       },
+       "rules-with-firing-instances": "Warnregeln mit auslösenden Instanzen",
+-      "rules-with-pending-instances": "Warnregeln mit ausstehenden Instanzen"
++      "rules-with-pending-instances": "Warnregeln mit ausstehenden Instanzen",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Ausdruck hinzufügen"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "Profitipp: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Wir haben {{lowerCaseEntity}} gesucht, konnten es aber nicht finden. Versuchen Sie, zur <4>Startseite</4> zurückzukehren, oder suchen Sie auf der <7>Community-Website nach Hilfe.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Löschen"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Einige Vorschläge konnten nicht geladen werden"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Einstellungen"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Synchronisierung der externen Gruppe"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Neues Team",
+       "placeholder-search-teams": "Teams suchen"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Dies ist optional und wird hauptsächlich für die Festlegung eines Teamprofil-Avatars genutzt (über den Gravatar-Dienst)",
+       "label-email": "E-Mail-Adresse",
+diff --git a/public/locales/es-ES/grafana.json b/public/locales/es-ES/grafana.json
+index bc6d5fa5403f9..f463c31ac8d9a 100644
+--- a/public/locales/es-ES/grafana.json
++++ b/public/locales/es-ES/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Formulario de la plantilla",
++      "body-legacy": "",
+       "label-examples-documentation": "Documentación de ejemplos",
+       "label-template-group": "Grupo de plantillas",
+       "label-template-group-name": "Nombre del grupo de plantillas",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Ponle un nombre a tu grupo de plantillas",
+       "title-error-saving-template": "Error al guardar la plantilla",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Hoja de trucos de plantillas"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Las plantillas de notificación utilizan el lenguaje de plantillas Go para crear mensajes de notificación.\n\nEn Grafana, un grupo de plantillas puede definir varias plantillas de notificación mediante {{ define \"<NAME>\" }}.\nEstas plantillas se pueden utilizar en los puntos de contacto y dentro de otras plantillas de notificación mediante {{ template \"<NAME>\" }}.\nPara obtener información detallada sobre las plantillas de notificación, consulta nuestra documentación."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Configuración incorrecta",
+       "misconfigured-warning": "La configuración de esta plantilla es incorrecta.",
+       "misconfigured-warning-details": "Las plantillas deben definirse en las secciones <2></2> y <5></5> de la configuración de Alertmanager."
+@@ -3420,7 +3424,14 @@
+         "title": "Regla no encontrada"
+       },
+       "rules-with-firing-instances": "Reglas de alerta con instancias de activación",
+-      "rules-with-pending-instances": "Reglas de alerta con instancias pendientes"
++      "rules-with-pending-instances": "Reglas de alerta con instancias pendientes",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Añadir expresión"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "Consejo profesional: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Estamos buscando pero no encontramos esta {{lowerCaseEntity}}. Intenta volver al <4>inicio</4> o busca ayuda en el <7>sitio de la comunidad.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Eliminar"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "No se han podido cargar algunas sugerencias"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Configuración"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Sincronización de grupo externo"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Nuevo equipo",
+       "placeholder-search-teams": "Buscar equipos"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Esto es opcional y se utiliza principalmente para establecer el avatar del perfil del equipo (a través del servicio Gravatar)",
+       "label-email": "Correo electrónico",
+diff --git a/public/locales/fr-FR/grafana.json b/public/locales/fr-FR/grafana.json
+index b2eba26ee0739..80cec4be9ddb4 100644
+--- a/public/locales/fr-FR/grafana.json
++++ b/public/locales/fr-FR/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Formulaire du modèle",
++      "body-legacy": "",
+       "label-examples-documentation": "Documentation des exemples",
+       "label-template-group": "Groupe de modèles",
+       "label-template-group-name": "Nom du groupe de modèles",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Donner un nom au groupe de modèles",
+       "title-error-saving-template": "Erreur lors de l’enregistrement du modèle",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Aide-mémoire de modélisation"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Les modèles de notification utilisent le langage de modélisation Go pour créer des messages de notification.\n\nDans Grafana, un groupe de modèles peut définir plusieurs modèles de notification en utilisant {{ définir « <NAME> » }}.\nCes modèles peuvent ensuite être utilisés dans les points de contact et dans d'autres modèles de notification en appelant {{ modèle « <NAME> » }}.\nPour en savoir plus sur les modèles de notification, reportez-vous à notre documentation."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Mal configuré",
+       "misconfigured-warning": "Ce modèle est mal configuré.",
+       "misconfigured-warning-details": "Les modèles doivent être définis dans les sections <2></2> et <5></5> de la configuration de votre Alertmanager."
+@@ -3420,7 +3424,14 @@
+         "title": "Règle introuvable"
+       },
+       "rules-with-firing-instances": "Règles d’alerte avec des instances déclenchées",
+-      "rules-with-pending-instances": "Règles d’alerte avec des instances en attente"
++      "rules-with-pending-instances": "Règles d’alerte avec des instances en attente",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Ajouter une expression"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "Conseil de pro : {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Nous cherchons, mais ne trouvons pas ce {{lowerCaseEntity}}. Essayez de retourner à la <4>page d'accueil</4> ou de chercher de l'aide sur le <7>site communautaire.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Supprimer"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Certaines suggestions n’ont pas pu être chargées"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Paramètres"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Synchronisation de groupe externe"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Nouvelle équipe",
+       "placeholder-search-teams": "Rechercher les équipes"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Facultatif : principalement utilisé pour définir l’avatar du profil de l’équipe (via le service Gravatar)",
+       "label-email": "Adresse e-mail",
+diff --git a/public/locales/hu-HU/grafana.json b/public/locales/hu-HU/grafana.json
+index d462f5d5b605d..0bd5294d35cbd 100644
+--- a/public/locales/hu-HU/grafana.json
++++ b/public/locales/hu-HU/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Sablonűrlap",
++      "body-legacy": "",
+       "label-examples-documentation": "Példák dokumentációja",
+       "label-template-group": "Sabloncsoport",
+       "label-template-group-name": "Sabloncsoportnév",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Adjon nevet a sabloncsoportjának",
+       "title-error-saving-template": "Hiba a sablon mentése során",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Sablonkészítés puskalaphoz"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Az értesítési sablonok Go sablonnyelvet használnak az értesítési üzenetek létrehozásához.\n\nA Grafanában egy sabloncsoport több értesítési sablont is meghatározhat a {{ define \"<NAME>\" }} használatával.\nEzek a sablonok ezután felhasználhatók a kapcsolattartási pontokban és más értesítési sablonokban a {{ template \"<NAME>\" }} meghívásával.\nAz értesítési sablonokról részletes információt a dokumentációnkban talál."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Hibás konfiguráció",
+       "misconfigured-warning": "Ez a sablon rosszul van konfigurálva.",
+       "misconfigured-warning-details": "A sablonokat a riasztáskezelő konfigurációjának <2></2> és <5></5> szakaszában is meg kell határozni."
+@@ -3420,7 +3424,14 @@
+         "title": "A szabály nem található"
+       },
+       "rules-with-firing-instances": "Riasztási szabályok aktív példányokkal",
+-      "rules-with-pending-instances": "Riasztási szabályok függőben lévő példányokkal"
++      "rules-with-pending-instances": "Riasztási szabályok függőben lévő példányokkal",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Kifejezés hozzáadása"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "ProTip: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Keressük, de úgy tűnik, nem találjuk a következőt: {{lowerCaseEntity}}. Próbáljon visszatérni a <4>kezdőlapra</4>, vagy kérjen segítséget a <7>közösségi oldalon.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Törlés"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Néhány javaslatot nem sikerült betölteni"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Beállítások"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Külső csoport szinkronizálása"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Új csapat",
+       "placeholder-search-teams": "Csapatok keresése"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Ez nem kötelező, és elsősorban a csapatprofil avatárjának beállítására szolgál (a Gravatar szolgáltatáson keresztül)",
+       "label-email": "E-mail-cím",
+diff --git a/public/locales/id-ID/grafana.json b/public/locales/id-ID/grafana.json
+index 02c0cd7d7b182..42e7e1754ba64 100644
+--- a/public/locales/id-ID/grafana.json
++++ b/public/locales/id-ID/grafana.json
+@@ -3248,6 +3248,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Bentuk templat",
++      "body-legacy": "",
+       "label-examples-documentation": "Contoh dokumentasi",
+       "label-template-group": "Grup templat",
+       "label-template-group-name": "Nama grup templat",
+@@ -3256,6 +3257,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Beri nama grup templat Anda",
+       "title-error-saving-template": "Kesalahan saat menyimpan templat",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Cheat sheet templat"
+     },
+     "template-preview": {
+@@ -3296,6 +3298,8 @@
+       "help": {
+         "intro": "Templat pemberitahuan menggunakan bahasa Templat Go untuk membuat pesan pemberitahuan.\n\nDi Grafana, grup templat dapat menentukan beberapa templat pemberitahuan menggunakan {{ define \"<NAME>\" }}.\nTemplat ini kemudian dapat digunakan di titik kontak dan dalam templat pemberitahuan lainnya dengan memanggil {{ template \"<NAME>\" }}.\nUntuk informasi terperinci tentang templat pemberitahuan, lihat dokumentasi kami."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Salah konfigurasi",
+       "misconfigured-warning": "Templat ini salah dikonfigurasi.",
+       "misconfigured-warning-details": "Templat harus ditentukan di bagian <2></2> dan <5></5> dari konfigurasi alertmanager Anda."
+@@ -3406,7 +3410,14 @@
+         "title": "Aturan tidak ditemukan"
+       },
+       "rules-with-firing-instances": "Aturan peringatan dengan instans yang diaktifkan",
+-      "rules-with-pending-instances": "Aturan peringatan dengan instans yang tertunda"
++      "rules-with-pending-instances": "Aturan peringatan dengan instans yang tertunda",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Tambah pola"
+@@ -4164,7 +4175,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7790,7 +7800,10 @@
+     "pro-tip": "Kiat Pro: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Kami mencari, tetapi sepertinya tidak bisa menemukan {{lowerCaseEntity}} ini. Coba kembali ke <4>beranda</4> atau cari bantuan di situs komunitas <7>.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11880,8 +11893,6 @@
+       "tooltip-delete": "Hapus"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Beberapa saran tidak dapat dimuat"
+       },
+@@ -14300,6 +14311,11 @@
+           "settings": "Pengaturan"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Sinkronisasi grup eksternal"
+@@ -14357,6 +14373,19 @@
+       "new-team": "Tim Baru",
+       "placeholder-search-teams": "Cari tim"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Hal ini opsional dan secara spesifik digunakan untuk mengatur avatar profil tim (melalui layanan Gravatar)",
+       "label-email": "Email",
+diff --git a/public/locales/it-IT/grafana.json b/public/locales/it-IT/grafana.json
+index e1804fe747d16..d0db9971374d7 100644
+--- a/public/locales/it-IT/grafana.json
++++ b/public/locales/it-IT/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Modulo modelli",
++      "body-legacy": "",
+       "label-examples-documentation": "Documentazione di esempio",
+       "label-template-group": "Gruppo modelli",
+       "label-template-group-name": "Nome del gruppo di modelli",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Assegna un nome al gruppo di modelli",
+       "title-error-saving-template": "Errore durante il salvataggio del modello",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Foglio di riferimento per la creazione di modelli"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "I modelli di notifica utilizzano il linguaggio di modellazione Go per creare messaggi di notifica.\n\nIn Grafana, un gruppo di modelli può definire più modelli di notifica utilizzando {{ define \"<NAME>\" }}.\nQuesti modelli possono quindi essere utilizzati nei punti di contatto e all'interno di altri modelli di notifica richiamando {{ template \"<NAME>\" }}.\nPer informazioni dettagliate sui modelli di notifica, consulta la nostra documentazione."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Configurazione errata",
+       "misconfigured-warning": "Questo modello non è configurato correttamente.",
+       "misconfigured-warning-details": "I modelli devono essere definiti in entrambe le sezioni <2></2> e <5></5> della configurazione di Alertmanager."
+@@ -3420,7 +3424,14 @@
+         "title": "Regola non trovata"
+       },
+       "rules-with-firing-instances": "Regole di avviso con istanze attive",
+-      "rules-with-pending-instances": "Regole di avviso con istanze in sospeso"
++      "rules-with-pending-instances": "Regole di avviso con istanze in sospeso",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Aggiungi espressione"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "Suggerimento pro: {{proTip}} "
+   },
+   "entity-not-found": {
+-    "description": "Stiamo cercando ma non riusciamo a trovare {{lowerCaseEntity}}. Prova a tornare alla <4>Home</4> o a cercare aiuto sul <7>sito della community.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Elimina"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Impossibile caricare alcuni suggerimenti"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Impostazioni"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Sincronizzazione gruppo esterno"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Nuovo team",
+       "placeholder-search-teams": "Cerca team"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Questo è facoltativo e viene utilizzato principalmente per impostare l'avatar del profilo del team (tramite il servizio Gravatar)",
+       "label-email": "E-mail",
+diff --git a/public/locales/ja-JP/grafana.json b/public/locales/ja-JP/grafana.json
+index 41a55995c3286..9312d3a8181b7 100644
+--- a/public/locales/ja-JP/grafana.json
++++ b/public/locales/ja-JP/grafana.json
+@@ -3248,6 +3248,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "テンプレートフォーム",
++      "body-legacy": "",
+       "label-examples-documentation": "サンプルドキュメント",
+       "label-template-group": "テンプレートグループ",
+       "label-template-group-name": "テンプレートグループ名",
+@@ -3256,6 +3257,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "テンプレートグループに名前を付けてください",
+       "title-error-saving-template": "テンプレート保存中のエラー",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "テンプレートチートシート"
+     },
+     "template-preview": {
+@@ -3296,6 +3298,8 @@
+       "help": {
+         "intro": "通知テンプレートは、Goテンプレート言語を使用して通知メッセージを作成します。\n\nGrafanaでは、テンプレートグループは{{ define \"<NAME>\" }}を使用して複数の通知テンプレートを定義できます。\nこれらのテンプレートは、コンタクトポイントや他の通知テンプレート内で{{ template \"<NAME>\" }}を呼び出すことで使用できます。\n通知テンプレートの詳細については、ドキュメントを参照してください。"
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "誤って構成されています",
+       "misconfigured-warning": "このテンプレートは誤って構成されています。",
+       "misconfigured-warning-details": "テンプレートは、Alertmanager設定の<2></2>と<5></5>セクションの両方で定義する必要があります。"
+@@ -3406,7 +3410,14 @@
+         "title": "ルールが見つかりません"
+       },
+       "rules-with-firing-instances": "発生中のインスタンスがあるアラートルール",
+-      "rules-with-pending-instances": "保留中のインスタンスがあるアラートルール"
++      "rules-with-pending-instances": "保留中のインスタンスがあるアラートルール",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "式を追加"
+@@ -4164,7 +4175,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7790,7 +7800,10 @@
+     "pro-tip": "プロのヒント：{{proTip}} "
+   },
+   "entity-not-found": {
+-    "description": "検索していますが、{{lowerCaseEntity}}が見つかりません。<4>ホーム</4>に戻るか、<7>コミュニティサイト</7>でヘルプを求めてみてください。</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11880,8 +11893,6 @@
+       "tooltip-delete": "削除"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "一部の提案を読み込めませんでした"
+       },
+@@ -14300,6 +14311,11 @@
+           "settings": "設定"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "外部グループ同期"
+@@ -14357,6 +14373,19 @@
+       "new-team": "新しいチーム",
+       "placeholder-search-teams": "チームを検索"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "これはオプションで、主にチームプロフィールのアバター設定（Gravatarサービス経由）に使用されます",
+       "label-email": "メールアドレス",
+diff --git a/public/locales/ko-KR/grafana.json b/public/locales/ko-KR/grafana.json
+index 714b9d452f1b6..0ac4fc4b40628 100644
+--- a/public/locales/ko-KR/grafana.json
++++ b/public/locales/ko-KR/grafana.json
+@@ -3248,6 +3248,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "템플릿 양식",
++      "body-legacy": "",
+       "label-examples-documentation": "예시 문서",
+       "label-template-group": "템플릿 그룹",
+       "label-template-group-name": "템플릿 그룹 이름",
+@@ -3256,6 +3257,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "템플릿 그룹의 이름을 지정하세요",
+       "title-error-saving-template": "템플릿 저장 중에 오류 발생",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "템플릿 치트 시트"
+     },
+     "template-preview": {
+@@ -3296,6 +3298,8 @@
+       "help": {
+         "intro": "알림 템플릿은 Go 템플릿 언어를 사용하여 알림 메시지를 생성합니다.\n\nGrafana에서는 하나의 템플릿이 {{ define \"<NAME>\" }}을(를) 사용하면 여러 개의 알림 템플릿을 정의할 수 있습니다.\n{{ template \"<NAME>\" }}을(를) 호출하면 연락처 및 다른 알림 템플릿에서 이러한 템플릿을 사용할 수 있습니다.\n알림 템플릿에 대한 자세한 내용은 Grafana 문서를 참조하세요."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "잘못 구성됨",
+       "misconfigured-warning": "이 템플릿은 잘못 구성되었습니다.",
+       "misconfigured-warning-details": "템플릿은 alertmanager 구성의 <2></2> 및 <5></5> 섹션 모두에서 정의되어야 합니다."
+@@ -3406,7 +3410,14 @@
+         "title": "규칙을 찾을 수 없습니다"
+       },
+       "rules-with-firing-instances": "발동 중인 인스턴스의 알림 규칙",
+-      "rules-with-pending-instances": "대기 중인 인스턴스의 알림 규칙"
++      "rules-with-pending-instances": "대기 중인 인스턴스의 알림 규칙",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "표현식 추가"
+@@ -4164,7 +4175,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7790,7 +7800,10 @@
+     "pro-tip": "유용한 팁: {{proTip}} "
+   },
+   "entity-not-found": {
+-    "description": "{{lowerCaseEntity}}을(를) 찾아 보았지만 발견하지 못했습니다. <4>홈</4>으로 돌아가거나 <7>커뮤니티 사이트</7>에서받아 보세요."
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11880,8 +11893,6 @@
+       "tooltip-delete": "삭제"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "일부 제안을 불러올 수 없습니다"
+       },
+@@ -14300,6 +14311,11 @@
+           "settings": "설정"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "외부 그룹 동기화"
+@@ -14357,6 +14373,19 @@
+       "new-team": "새 팀",
+       "placeholder-search-teams": "팀 검색"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "이 항목은 선택 사항이며 주로 (Gravatar 서비스를 통해) 팀 프로필 아바타를 설정하는 데 사용됩니다",
+       "label-email": "이메일",
+diff --git a/public/locales/nl-NL/grafana.json b/public/locales/nl-NL/grafana.json
+index 1572cd6180536..64ed5981cbeb1 100644
+--- a/public/locales/nl-NL/grafana.json
++++ b/public/locales/nl-NL/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Sjabloonformulier",
++      "body-legacy": "",
+       "label-examples-documentation": "Voorbeelden documentatie",
+       "label-template-group": "Sjabloongroep",
+       "label-template-group-name": "Sjabloongroepnaam",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Geef je sjabloongroep een naam",
+       "title-error-saving-template": "Er is een fout opgetreden bij het opslaan van het sjabloon",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Cheatsheet maken met sjabloon"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Meldingsjablonen gebruiken Go-templatetaal om meldingsberichten te maken.\n\nIn Grafana kan een sjabloongroep meerdere meldingssjablonen definiëren met behulp van {{ define \"<NAME>\" }}.\nDeze sjablonen kunnen vervolgens worden gebruikt in contactpunten en binnen andere meldingssjablonen door {{ template \"<NAME>\" }} te gebruiken.\nRaadpleeg onze documentatie voor gedetailleerde informatie over meldingssjablonen."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Verkeerd geconfigureerd",
+       "misconfigured-warning": "Dit sjabloon is verkeerd geconfigureerd.",
+       "misconfigured-warning-details": "Sjablonen moeten worden gedefinieerd in zowel de sectie <2></2> als <5></5> van je waarschuwingsmanager-configuratie."
+@@ -3420,7 +3424,14 @@
+         "title": "Regel niet gevonden"
+       },
+       "rules-with-firing-instances": "Waarschuwingsregels met actieve instanties",
+-      "rules-with-pending-instances": "Waarschuwingsregels met wachtende instanties"
++      "rules-with-pending-instances": "Waarschuwingsregels met wachtende instanties",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Expressie toevoegen"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "ProTip: {{proTip}} "
+   },
+   "entity-not-found": {
+-    "description": "We zijn op zoek, maar kunnen deze {{lowerCaseEntity}} niet vinden. Ga terug naar <4>huis</4> of zoek hulp op de <7>communitysite.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Verwijderen"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Sommige suggesties konden niet worden geladen"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Instellingen"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Externe groepssynchronisatie"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Nieuw team",
+       "placeholder-search-teams": "Teams zoeken"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Dit is optioneel en wordt voornamelijk gebruikt voor het instellen van de teamprofielavatar (via de Gravatar-service)",
+       "label-email": "E-mailadres",
+diff --git a/public/locales/pl-PL/grafana.json b/public/locales/pl-PL/grafana.json
+index b66070697c7fe..8c7edfb2163e6 100644
+--- a/public/locales/pl-PL/grafana.json
++++ b/public/locales/pl-PL/grafana.json
+@@ -3290,6 +3290,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Formularz szablonu",
++      "body-legacy": "",
+       "label-examples-documentation": "Dokumentacja przykładów",
+       "label-template-group": "Grupa szablonów",
+       "label-template-group-name": "Nazwa grupy szablonów",
+@@ -3298,6 +3299,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Nadaj nazwę grupie szablonów",
+       "title-error-saving-template": "Błąd podczas zapisywania szablonu",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Wskazówki dotyczące szablonów"
+     },
+     "template-preview": {
+@@ -3338,6 +3340,8 @@
+       "help": {
+         "intro": "Szablony powiadomień są tworzone w języku szablonów Go.\n\nW usłudze Grafana, korzystając z polecenia {{ define \"<NAME>\" }}, można zdefiniować wiele szablonów powiadomień w obrębie grupy szablonów.\nSzablony te można następnie wykorzystać w punktach kontaktowych oraz w innych szablonach powiadomień, wywołując polecenie {{ template \"<NAME>\" }}.\nSzczegółowe informacje na temat szablonów powiadomień znajdziesz w dokumentacji."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Źle skonfigurowane",
+       "misconfigured-warning": "Ten szablon jest źle skonfigurowany.",
+       "misconfigured-warning-details": "Szablony muszą być zdefiniowane zarówno w sekcji <2></2>, jak i <5></5> konfiguracji menedżera alertów."
+@@ -3448,7 +3452,14 @@
+         "title": "Nie znaleziono reguły"
+       },
+       "rules-with-firing-instances": "Reguły alertów z instancjami w stanie uruchamiania",
+-      "rules-with-pending-instances": "Reguły alertów z oczekującymi instancjami"
++      "rules-with-pending-instances": "Reguły alertów z oczekującymi instancjami",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Dodaj wyrażenie"
+@@ -4221,7 +4232,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7871,7 +7881,10 @@
+     "pro-tip": "Wskazówka: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Nie udało się znaleźć: {{lowerCaseEntity}}. Spróbuj wrócić na <4>stronę główną</4> lub poszukaj pomocy na <7> stronie społeczności.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -12030,8 +12043,6 @@
+       "tooltip-delete": "Usuń"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Nie udało się wczytać niektórych sugestii"
+       },
+@@ -14492,6 +14503,11 @@
+           "settings": "Ustawienia"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Synchronizacja grupy zewnętrznej"
+@@ -14549,6 +14565,19 @@
+       "new-team": "Nowy zespół",
+       "placeholder-search-teams": "Szukaj zespołów"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Jest to opcjonalne i służy przede wszystkim do ustawiania awatara profilu zespołu (za pośrednictwem usługi Gravatar)",
+       "label-email": "E-mail",
+diff --git a/public/locales/pt-BR/grafana.json b/public/locales/pt-BR/grafana.json
+index 8e749d9461681..38e5ba84474bf 100644
+--- a/public/locales/pt-BR/grafana.json
++++ b/public/locales/pt-BR/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Formulário do modelo",
++      "body-legacy": "",
+       "label-examples-documentation": "Documentação de exemplos",
+       "label-template-group": "Grupo de modelos",
+       "label-template-group-name": "Nome do grupo de modelos",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Defina um nome para seu grupo de modelos",
+       "title-error-saving-template": "Erro ao salvar o modelo",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Resumo rápido de modelagem"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Os modelos de notificação usam a linguagem Go de criação de modelos para criar mensagens de notificação.\n\nNo Grafana, um grupo de modelos pode definir vários modelos de notificação usando {{ define \"<NAME>\" }}.\nEsses modelos podem ser usados em pontos de contato e em outros modelos de notificação chamando {{ template \"<NAME>\" }}.\nPara obter informações detalhadas sobre modelos de notificação, consulte nossa documentação."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Configuração incorreta",
+       "misconfigured-warning": "Este modelo está configurado incorretamente.",
+       "misconfigured-warning-details": "Os modelos devem ser definidos nas seções <2></2> e <5></5> da configuração do seu alertmanager."
+@@ -3420,7 +3424,14 @@
+         "title": "Regra não encontrada"
+       },
+       "rules-with-firing-instances": "Regras de alerta com instâncias de disparo",
+-      "rules-with-pending-instances": "Regras de alerta com instâncias pendentes"
++      "rules-with-pending-instances": "Regras de alerta com instâncias pendentes",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Adicionar expressão"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "Dica de especialistas: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Estamos procurando, mas não conseguimos encontrar {{lowerCaseEntity}}. Tente voltar para a <4>página inicial</4> ou buscar ajuda no <7>site da comunidade.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Excluir"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Não foi possível carregar algumas sugestões"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Configurações"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Sincronização de grupo externo"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Nova equipe",
+       "placeholder-search-teams": "Pesquisar equipes"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Isso é opcional e é usado principalmente para definir o avatar do perfil da equipe (através do serviço Gravatar)",
+       "label-email": "E-mail",
+diff --git a/public/locales/pt-PT/grafana.json b/public/locales/pt-PT/grafana.json
+index a5f53cc6fd3bd..f275c216b0ff4 100644
+--- a/public/locales/pt-PT/grafana.json
++++ b/public/locales/pt-PT/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Formulário de modelo",
++      "body-legacy": "",
+       "label-examples-documentation": "Documentação de exemplo",
+       "label-template-group": "Grupo de modelos",
+       "label-template-group-name": "Nome do grupo de modelos",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Dê um nome ao seu grupo de modelos",
+       "title-error-saving-template": "Erro ao guardar o modelo",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Folha de consulta de criação de modelos"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Os modelos de notificação usam a linguagem de modelagem Go para criar mensagens de notificação.\n\nNa Grafana, um grupo de modelos pode definir vários modelos de notificação utilizando {{ define \"<NAME>\" }}.\nEstes modelos podem então ser utilizados em pontos de contacto e dentro de outros modelos de notificação, chamando {{ template \"<NAME>\" }}.\nPara obter informações detalhadas sobre modelos de notificação, consulte a nossa documentação."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Mal configurado",
+       "misconfigured-warning": "Este modelo está mal configurado.",
+       "misconfigured-warning-details": "Os modelos devem ser definidos nas secções <2></2> e <5></5> da configuração do seu Alertmanager."
+@@ -3420,7 +3424,14 @@
+         "title": "Regra não encontrada"
+       },
+       "rules-with-firing-instances": "Regras de alerta com instâncias de disparo",
+-      "rules-with-pending-instances": "Regras de alerta com instâncias pendentes"
++      "rules-with-pending-instances": "Regras de alerta com instâncias pendentes",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Adicionar expressão"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "Dica Pro: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Estamos a procurar, mas não conseguimos encontrar esta {{lowerCaseEntity}}. Tente voltar à <4>página inicial</4> ou procure ajuda no <7>site da comunidade.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Eliminar"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Não foi possível carregar algumas sugestões"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Definições"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Sincronização do grupo externo"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Nova equipa",
+       "placeholder-search-teams": "Pesquisar equipas"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Isto é opcional e é utilizado principalmente para definir o avatar do perfil da equipa (através do serviço Gravatar)",
+       "label-email": "E-mail",
+diff --git a/public/locales/ru-RU/grafana.json b/public/locales/ru-RU/grafana.json
+index 43430a60c7e8f..7999899b882e7 100644
+--- a/public/locales/ru-RU/grafana.json
++++ b/public/locales/ru-RU/grafana.json
+@@ -3290,6 +3290,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Форма шаблона",
++      "body-legacy": "",
+       "label-examples-documentation": "Документация по примерам",
+       "label-template-group": "Группа шаблонов",
+       "label-template-group-name": "Название группы шаблонов",
+@@ -3298,6 +3299,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Наименуйте свою группу шаблонов",
+       "title-error-saving-template": "Ошибка при сохранении шаблона",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Памятка по созданию шаблонов"
+     },
+     "template-preview": {
+@@ -3338,6 +3340,8 @@
+       "help": {
+         "intro": "Шаблоны уведомления используют язык шаблонов Go для создания сообщений уведомления.\n\nВ Grafana группа шаблонов может задать несколько шаблонов уведомления с помощью {{ define \"<NAME>\" }}.\nЭти шаблоны можно использовать в точках контакта и других шаблонах уведомления путем вызова {{ template \"<NAME>\" }}.\nПодробную информацию о шаблонах уведомлений см. в нашей документации."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Неправильно настроенный",
+       "misconfigured-warning": "Неправильно настроенный шаблон.",
+       "misconfigured-warning-details": "Шаблоны должны задаваться в разделах <2></2> и <5></5> конфигурации вашего обработчика оповещений."
+@@ -3448,7 +3452,14 @@
+         "title": "Правило не найдено"
+       },
+       "rules-with-firing-instances": "Правила оповещения с активными экземплярами",
+-      "rules-with-pending-instances": "Правила оповещения с экземплярами в состоянии ожидания"
++      "rules-with-pending-instances": "Правила оповещения с экземплярами в состоянии ожидания",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Добавить выражение"
+@@ -4221,7 +4232,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7871,7 +7881,10 @@
+     "pro-tip": "Совет: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Мы ищем, но не можем найти {{lowerCaseEntity}}. Попробуйте вернуться на <4>главную страницу</4> или обратиться за помощью на <7>сайте сообщества.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -12030,8 +12043,6 @@
+       "tooltip-delete": "Удалить"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Не удалось загрузить некоторые рекомендации"
+       },
+@@ -14492,6 +14503,11 @@
+           "settings": "Параметры"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Синхронизация внешней группы"
+@@ -14549,6 +14565,19 @@
+       "new-team": "Новая команда",
+       "placeholder-search-teams": "Поиск команд"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Это необязательное действие, которое используется в основном для установки аватара профиля команды (с помощью сервиса Gravatar).",
+       "label-email": "Адрес электронной почты",
+diff --git a/public/locales/sv-SE/grafana.json b/public/locales/sv-SE/grafana.json
+index 0490b3b27ccf0..d083054944d7d 100644
+--- a/public/locales/sv-SE/grafana.json
++++ b/public/locales/sv-SE/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Mallformulär",
++      "body-legacy": "",
+       "label-examples-documentation": "Exempeldokumentation",
+       "label-template-group": "Mallgrupp",
+       "label-template-group-name": "Namn för mallgrupp",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Ge din mallgrupp ett namn",
+       "title-error-saving-template": "Fel vid sparande av mall",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Mall för fusklapp"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Aviseringsmallar använder Go-mallspråk för att skapa aviseringsmeddelanden.\n\nI Grafana kan en mallgrupp definiera flera aviseringsmallar med {{ define \"<NAME>\" }}.\nDessa mallar kan sedan användas i kontaktpunkter och i andra aviseringsmallar genom att anropa {{ template \"<NAME>\" }}.\nFör detaljerad information om aviseringsmallar, se vår dokumentation."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Felkonfigurerad",
+       "misconfigured-warning": "Den här mallen är felkonfigurerad.",
+       "misconfigured-warning-details": "Mallar måste definieras i både avsnitten <2></2> och <5></5> i Alertmanager-konfigurationen."
+@@ -3420,7 +3424,14 @@
+         "title": "Regeln hittades inte"
+       },
+       "rules-with-firing-instances": "Larmregler med utlösningsinstanser",
+-      "rules-with-pending-instances": "Larmregler med väntande instanser"
++      "rules-with-pending-instances": "Larmregler med väntande instanser",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "Lägg till uttryck"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "ProTip: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Vi letar men kan inte hitta det här {{lowerCaseEntity}}. Försök att återvända <4>hem</4> eller sök hjälp på <7>communitywebbplatsen.</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Ta bort"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Vissa förslag kunde inte laddas"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Inställningar"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Extern gruppsynkronisering"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Nytt team",
+       "placeholder-search-teams": "Sök team"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Detta är valfritt och används främst för att ställa in teamprofilens avatar (via Gravatartjänsten)",
+       "label-email": "E-post",
+diff --git a/public/locales/tr-TR/grafana.json b/public/locales/tr-TR/grafana.json
+index 76de17066eb78..be7eec520baad 100644
+--- a/public/locales/tr-TR/grafana.json
++++ b/public/locales/tr-TR/grafana.json
+@@ -3262,6 +3262,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "Şablon formu",
++      "body-legacy": "",
+       "label-examples-documentation": "Örnek belgeler",
+       "label-template-group": "Şablon grubu",
+       "label-template-group-name": "Şablon grubu adı",
+@@ -3270,6 +3271,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "Şablon grubunuza bir ad verin",
+       "title-error-saving-template": "Şablon kaydedilirken hata oluştu",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "Şablon hızlı başvuru kılavuzu"
+     },
+     "template-preview": {
+@@ -3310,6 +3312,8 @@
+       "help": {
+         "intro": "Bildirim şablonları, bildirim mesajları oluşturmak için Go şablon dilini kullanır.\n\nGrafana'da bir şablon grubu, {{ define \"<NAME>\" }} kullanarak birden fazla bildirim şablonu tanımlayabilir.Bu şablonlar daha sonra iletişim noktalarında ve diğer bildirim şablonları içinde {{ template \"<NAME>\" }} çağrılarak kullanılabilir.Bildirim şablonları hakkında ayrıntılı bilgi için belgelerimize bakın."
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "Yanlış yapılandırılmış",
+       "misconfigured-warning": "Bu şablon yanlış yapılandırılmış.",
+       "misconfigured-warning-details": "Şablonlar alertmanager yapılandırmanızın hem <2></2> hem de <5></5> bölümlerinde tanımlanmalıdır."
+@@ -3420,7 +3424,14 @@
+         "title": "Kural bulunamadı"
+       },
+       "rules-with-firing-instances": "Örnekleri tetiklenen uyarı kuralları",
+-      "rules-with-pending-instances": "Beklemede örnekleri olan uyarı kuralları"
++      "rules-with-pending-instances": "Beklemede örnekleri olan uyarı kuralları",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "İfade ekle"
+@@ -4183,7 +4194,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7817,7 +7827,10 @@
+     "pro-tip": "Uzman ipucu: {{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "Aramamıza rağmen bu {{lowerCaseEntity}} bulunamadı. <4>Ana sayfaya</4> dönmeyi deneyin veya <7>topluluk sitesinde</7> yardım arayın."
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11930,8 +11943,6 @@
+       "tooltip-delete": "Sil"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "Bazı öneriler yüklenemedi"
+       },
+@@ -14364,6 +14375,11 @@
+           "settings": "Ayarlar"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "Harici grup senkronizasyonu"
+@@ -14421,6 +14437,19 @@
+       "new-team": "Yeni ekip",
+       "placeholder-search-teams": "Ekip ara"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "Bu isteğe bağlıdır ve esas olarak Gravatar hizmeti üzerinden ekip profil avatarını ayarlamak için kullanılır",
+       "label-email": "E-posta",
+diff --git a/public/locales/zh-Hans/grafana.json b/public/locales/zh-Hans/grafana.json
+index c0841caacad83..3bef9740f8723 100644
+--- a/public/locales/zh-Hans/grafana.json
++++ b/public/locales/zh-Hans/grafana.json
+@@ -3248,6 +3248,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "模板表单",
++      "body-legacy": "",
+       "label-examples-documentation": "示例文档",
+       "label-template-group": "模板组",
+       "label-template-group-name": "模板组名称",
+@@ -3256,6 +3257,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "为模板组命名",
+       "title-error-saving-template": "保存模板时出错",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "模板速查表"
+     },
+     "template-preview": {
+@@ -3296,6 +3298,8 @@
+       "help": {
+         "intro": "通知模板使用 Go 模板语言来创建通知消息。\n\n在 Grafana，模板组可以使用 {{ define \"<NAME>\" }} 定义多个通知模板。\n然后，可以通过调用 {{ template \"<NAME>\" }} 在联络点和其他通知模板中使用这些模板。\n有关通知模板的详细信息，请参阅我们的文档。"
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "配置错误",
+       "misconfigured-warning": "此模板配置错误。",
+       "misconfigured-warning-details": "模板必须在 Alertmanager 配置的 <2></2> 和 <5></5> 部分中定义。"
+@@ -3406,7 +3410,14 @@
+         "title": "未找到规则"
+       },
+       "rules-with-firing-instances": "带触发实例的警报规则",
+-      "rules-with-pending-instances": "带待处理实例的警报规则"
++      "rules-with-pending-instances": "带待处理实例的警报规则",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "添加表达式"
+@@ -4164,7 +4175,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7790,7 +7800,10 @@
+     "pro-tip": "专业提示：{{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "我们正在查找，但似乎找不到这个 {{lowerCaseEntity}}。请尝试返回<4>主页</4>或在<7>社区网站</7>上寻求帮助</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11880,8 +11893,6 @@
+       "tooltip-delete": "删除"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "无法加载某些建议"
+       },
+@@ -14300,6 +14311,11 @@
+           "settings": "设置"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "外部组同步"
+@@ -14357,6 +14373,19 @@
+       "new-team": "新建团队",
+       "placeholder-search-teams": "搜索团队"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "这是可选项，主要用于设置团队资料头像（通过 Gravatar 服务）",
+       "label-email": "电子邮箱",
+diff --git a/public/locales/zh-Hant/grafana.json b/public/locales/zh-Hant/grafana.json
+index ccce066e63130..5006fbabf1f22 100644
+--- a/public/locales/zh-Hant/grafana.json
++++ b/public/locales/zh-Hant/grafana.json
+@@ -3248,6 +3248,7 @@
+     },
+     "template-form": {
+       "aria-label-template-form": "範本表單",
++      "body-legacy": "",
+       "label-examples-documentation": "範例文件",
+       "label-template-group": "範本群組",
+       "label-template-group-name": "範本群組名稱",
+@@ -3256,6 +3257,7 @@
+       },
+       "new-template-name-placeholder-give-your-template-group-a-name": "為您的範本群組命名",
+       "title-error-saving-template": "儲存範本時發生錯誤",
++      "title-legacy": "",
+       "title-templating-cheat-sheet": "範本備忘錄"
+     },
+     "template-preview": {
+@@ -3296,6 +3298,8 @@
+       "help": {
+         "intro": "通知範本使用 Go 範本語言來建立通知訊息。\n\n在 Grafana 中，範本群組可以使用 {{ define \"<NAME>\" }} 定義多個通知範本。\n然後，可以透過呼叫 {{ template \"<NAME>\" }} 在聯絡點和其他通知範本中使用這些範本。\n有關通知範本的詳細資訊，請參閱我們的文件。"
+       },
++      "legacy-badge-text": "",
++      "legacy-badge-tooltip": "",
+       "misconfigured-badge-text": "設定錯誤",
+       "misconfigured-warning": "此範本設定錯誤。",
+       "misconfigured-warning-details": "必須在警報管理設定的<2></2>和<5></5>兩個區段中定義範本。"
+@@ -3406,7 +3410,14 @@
+         "title": "找不到規則"
+       },
+       "rules-with-firing-instances": "帶有觸發執行個體的警報規則",
+-      "rules-with-pending-instances": "帶有待處理執行個體的警報規則"
++      "rules-with-pending-instances": "帶有待處理執行個體的警報規則",
++      "saved-searches": {
++        "predefined": {
++          "firing-only": "",
++          "folder-firing": "",
++          "folder-only": ""
++        }
++      }
+     },
+     "type-selector-button": {
+       "add-expression": "新增表達式"
+@@ -4164,7 +4175,6 @@
+     "quota-banner": {
+       "at-limit-body": "",
+       "at-limit-title": "",
+-      "dismiss": "",
+       "nearing-body": "",
+       "nearing-title": "",
+       "request-extension": "",
+@@ -7790,7 +7800,10 @@
+     "pro-tip": "專業提示：{{proTip}}"
+   },
+   "entity-not-found": {
+-    "description": "我們正在尋找，但似乎沒有找到{{lowerCaseEntity}}。請嘗試返回<4>首頁</4>或在<7>社群網站</7>上尋求協助。</7>"
++    "community-link": "",
++    "description": "",
++    "home-link": "",
++    "title": ""
+   },
+   "errors": {
+     "dashboard-settings": {
+@@ -11880,8 +11893,6 @@
+       "tooltip-delete": "刪除"
+     },
+     "visualization-suggestions": {
+-      "edit": "",
+-      "edit-aria-label": "",
+       "error-loading-some-suggestions": {
+         "message": "無法載入部分建議"
+       },
+@@ -14300,6 +14311,11 @@
+           "settings": "設定"
+         }
+       },
++      "team-folders": {
++        "text": {
++          "folders": ""
++        }
++      },
+       "team-group-sync": {
+         "text": {
+           "external-group-sync": "外部群組同步"
+@@ -14357,6 +14373,19 @@
+       "new-team": "新團隊",
+       "placeholder-search-teams": "搜尋團隊"
+     },
++    "team-pages": {
++      "team-folders": {
++        "empty-state-content": "",
++        "empty-state-message": "",
++        "error-loading-folders": "",
++        "loading": "",
++        "open-folder": "",
++        "table": {
++          "name": "",
++          "path": ""
++        }
++      }
++    },
+     "team-settings": {
+       "description-email": "這是可選項目，主要用於設定團隊個人資料頭像（透過 Gravatar 服務）",
+       "label-email": "電子郵件",

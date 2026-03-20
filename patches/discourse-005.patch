@@ -1,87 +1,30 @@
-diff --git a/lib/discourse_webauthn.rb b/lib/discourse_webauthn.rb
-index 15449344b5..962464aabd 100644
---- a/lib/discourse_webauthn.rb
-+++ b/lib/discourse_webauthn.rb
-@@ -4,9 +4,16 @@ module DiscourseWebauthn
-   ACCEPTABLE_REGISTRATION_TYPE = "webauthn.create"
-   ACCEPTABLE_AUTHENTICATION_TYPE = "webauthn.get"
+diff --git a/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb b/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb
+index 3b36d4d5183b4..3025e26030b36 100644
+--- a/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb
++++ b/plugins/discourse-subscriptions/app/controllers/discourse_subscriptions/hooks_controller.rb
+@@ -20,6 +20,8 @@ def create
+         sig_header = request.env["HTTP_STRIPE_SIGNATURE"]
+         webhook_secret = SiteSetting.discourse_subscriptions_webhook_secret
  
--  # -7   - ES256
--  # -257 - RS256 (Windows Hello supported alg.)
--  SUPPORTED_ALGORITHMS = COSE::Algorithm.registered_algorithm_ids.freeze
-+  SUPPORTED_ALGORITHMS = [
-+    -7, # ES256
-+    -8, # EdDSA
-+    -35, # ES384
-+    -36, # ES512
-+    -37, # PS256
-+    -38, # PS384
-+    -39, # PS512
-+    -257, # RS256 (via freedom patch)
-+  ].freeze
-   VALID_ATTESTATION_FORMATS = %w[none packed fido-u2f].freeze
-   CHALLENGE_EXPIRY = 5.minutes
- 
-diff --git a/lib/discourse_webauthn/registration_service.rb b/lib/discourse_webauthn/registration_service.rb
-index 3c84026bb7..3fb339bb83 100644
---- a/lib/discourse_webauthn/registration_service.rb
-+++ b/lib/discourse_webauthn/registration_service.rb
-@@ -1,6 +1,7 @@
- # frozen_string_literal: true
- require "cbor"
- require "cose"
-+require "stringio"
- 
- module DiscourseWebauthn
-   class RegistrationService < BaseValidationService
-@@ -117,7 +118,11 @@ module DiscourseWebauthn
-         name: @params[:name],
-         factor_type: @factor_type,
-       )
--    rescue CBOR::UnpackError, CBOR::TypeError, CBOR::MalformedFormatError, CBOR::StackError
-+    rescue CBOR::UnpackError,
-+           CBOR::TypeError,
-+           CBOR::MalformedFormatError,
-+           CBOR::StackError,
-+           COSE::MalformedKeyError
-       raise MalformedAttestationError, I18n.t("webauthn.validation.malformed_attestation_error")
-     end
- 
-@@ -154,10 +159,10 @@ module DiscourseWebauthn
-       credential_id = attested_credential_data[18..(18 + credential_id_length - 1)]
- 
-       public_key_start_position = 18 + credential_id_length
--      public_key_bytes =
--        attested_credential_data[
--          public_key_start_position..(public_key_start_position + attested_credential_data.size - 1)
--        ]
-+      public_key_and_extension_bytes = attested_credential_data[public_key_start_position..-1]
-+      unpacker = CBOR::Unpacker.new(StringIO.new(public_key_and_extension_bytes))
-+      public_key_cbor = unpacker.read
-+      public_key_bytes = CBOR.encode(public_key_cbor)
-       public_key = COSE::Key.deserialize(public_key_bytes)
- 
-       [public_key, public_key_bytes, credential_id]
-diff --git a/spec/lib/discourse_webauthn/registration_service_spec.rb b/spec/lib/discourse_webauthn/registration_service_spec.rb
-index 422dc8f826..0eb701225f 100644
---- a/spec/lib/discourse_webauthn/registration_service_spec.rb
-+++ b/spec/lib/discourse_webauthn/registration_service_spec.rb
-@@ -209,6 +209,18 @@ RSpec.describe DiscourseWebauthn::RegistrationService do
-       expect(key.factor_type).to eq(UserSecurityKey.factor_types[:first_factor])
-     end
- 
-+    context "when the authenticator includes extension data" do
-+      let(:attestation) do
-+        "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YViySZYN5YgOjGh0NBcPZHZgW4/krrmihjLHmVzzuoMdl2PFAAAAAK3OAAI1vMYKZIsLJfHwVQMAICRXq4sFZ9XpWZOzfJ8EguJmoEPMzNVyFMUWQfT5u1QzpQECAyYgASFYILjOiAHAwNrXkCk/tmyYRiE87QyV/15wUvhcXhr1JfwtIlggClQywgQvSxTsqV/FSK0cNHTTmuwfzzREqE6eLDmPxmKha2htYWMtc2VjcmV09A=="
-+      end
++        return head :forbidden if webhook_secret.blank?
 +
-+      it "registers successfully by ignoring the extension data" do
-+        key = service.register_security_key
-+        expect(key).to be_a(UserSecurityKey)
-+        expect(key.factor_type).to eq(UserSecurityKey.factor_types[:first_factor])
-+      end
-+    end
+         event = ::Stripe::Webhook.construct_event(payload, sig_header, webhook_secret)
+       rescue JSON::ParserError => e
+         return render_json_error e.message
+diff --git a/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb b/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb
+index 93b42df09608b..da21da58e4218 100644
+--- a/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb
++++ b/plugins/discourse-subscriptions/spec/requests/hooks_controller_spec.rb
+@@ -6,6 +6,12 @@
+     SiteSetting.discourse_subscriptions_enabled = true
+   end
+ 
++  it "rejects webhooks when webhook secret is blank" do
++    SiteSetting.discourse_subscriptions_webhook_secret = ""
++    post "/s/hooks.json", params: "{}", headers: { HTTP_STRIPE_SIGNATURE: "t=1,v1=abc" }
++    expect(response.status).to eq 403
++  end
 +
-     context "when the user verification flag in the key is false" do
-       it "raises a UserVerificationError" do
-         # simulate missing user verification by flipping third bit to 0
+   it "constructs a webhook event" do
+     payload = "we-want-a-shrubbery"
+     headers = { HTTP_STRIPE_SIGNATURE: "stripe-webhook-signature" }

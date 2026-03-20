@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Category(StrEnum):
@@ -85,10 +85,20 @@ class TestCase(BaseModel):
     introducing_commit: str | None = None
     """SHA of the commit that first introduced this issue. Analysis-only — never
     passed to evaluation agents. None when unknown (PR-scraped cases)."""
+    case_type: str = "fix"
+    """Type of case: 'fix' (bug-fix PR) or 'introducing' (bug-introducing commit)."""
     pr_number: int | None = None
     reviewer_notes: list[str] = []
     reviewer_findings: list[ExpectedFinding] = []
     quality_flags: list[str] = []
+    pr_title: str = ""
+    pr_body: str = ""
+    pr_commit_messages: list[str] = []
+
+    @field_validator("language")
+    @classmethod
+    def normalize_language(cls, v: str) -> str:
+        return v.lower()
 
 
 class Candidate(BaseModel):

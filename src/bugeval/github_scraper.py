@@ -166,21 +166,21 @@ def _batch_fetch_pr_reviews_graphql(
     for num in pr_numbers:
         fragments.append(f"""
   pr_{num}: pullRequest(number: {num}) {{
-    reviews(first: 50) {{
+    reviews(first: 100) {{
       nodes {{ body state author {{ login }} }}
     }}
-    reviewThreads(first: 50) {{
+    reviewThreads(first: 100) {{
       nodes {{
         path
         line
         originalLine
         isResolved
-        comments(first: 10) {{
+        comments(first: 20) {{
           nodes {{ body author {{ login }} diffHunk }}
         }}
       }}
     }}
-    comments(first: 50) {{
+    comments(first: 100) {{
       nodes {{ body author {{ login }} }}
     }}
   }}""")
@@ -212,15 +212,17 @@ def _batch_fetch_pr_reviews_graphql(
 
         for thread in (pr_data.get("reviewThreads") or {}).get("nodes") or []:
             for comment in (thread.get("comments") or {}).get("nodes") or []:
-                items.append({
-                    "body": comment.get("body") or "",
-                    "state": "",
-                    "_source": "inline",
-                    "_path": thread.get("path"),
-                    "_line": thread.get("line"),
-                    "_original_line": thread.get("originalLine"),
-                    "_diff_hunk": comment.get("diffHunk"),
-                })
+                items.append(
+                    {
+                        "body": comment.get("body") or "",
+                        "state": "",
+                        "_source": "inline",
+                        "_path": thread.get("path"),
+                        "_line": thread.get("line"),
+                        "_original_line": thread.get("originalLine"),
+                        "_diff_hunk": comment.get("diffHunk"),
+                    }
+                )
 
         for comment in (pr_data.get("comments") or {}).get("nodes") or []:
             items.append({"body": comment.get("body") or "", "state": "", "_source": "thread"})
@@ -300,6 +302,13 @@ def fetch_pr_reviews(repo: str, pr_number: int) -> list[dict[str, Any]]:
     return results
 
 
+_BOT_PATTERNS = re.compile(
+    r"cubic|coderabbit|copilot|deepsource|codeclimate|sonarqube|"
+    r"automated code review|automated review|AI code review tool|"
+    r"<!-- cubic:|<!-- coderabbit",
+    re.IGNORECASE,
+)
+
 # Keywords that suggest a reviewer explicitly identified a bug
 _REVIEWER_BUG_PATTERNS = re.compile(
     r"\b(?:bug|wrong|incorrect|should be|panic|overflow|underflow|"
@@ -326,6 +335,8 @@ def extract_reviewer_bug_signals(
     for review in reviews:
         body = str(review.get("body") or "")
         if not body.strip():
+            continue
+        if _BOT_PATTERNS.search(body):
             continue
 
         source = review.get("_source", "")
@@ -356,6 +367,8 @@ def _parse_reviewer_findings(review_items: list[dict[str, Any]]) -> list[Expecte
         if line is None:
             continue
         body = str(item.get("body") or "").strip()
+        if _BOT_PATTERNS.search(body):
+            continue
         summary = body[:120].replace("\n", " ") if body else "reviewer inline comment"
         findings.append(
             ExpectedFinding(

@@ -1,37 +1,117 @@
-diff --git a/.circleci/config.yml b/.circleci/config.yml
-index 8bc816281..620c790b9 100644
---- a/.circleci/config.yml
-+++ b/.circleci/config.yml
-@@ -10,7 +10,7 @@ commands:
-       - run: set -e
-       - setup_remote_docker
-       - run:
--          name: Prepare envrionment and install dependencies
-+          name: Prepare environment and install dependencies
-           command: |
-             export SCCACHE_CACHE_SIZE=200M
-             export WORK_DIR="$CIRCLE_WORKING_DIRECTORY/.cache/sccache"
-diff --git a/parameters/src/params.rs b/parameters/src/params.rs
-index cb4676e86..e0ebfdf18 100644
---- a/parameters/src/params.rs
-+++ b/parameters/src/params.rs
-@@ -76,13 +76,17 @@ macro_rules! impl_params_remote {
-                 file_path.push(&filename);
+diff --git a/ledger/block/src/bytes.rs b/ledger/block/src/bytes.rs
+index 1c532395d..908b553a8 100644
+--- a/ledger/block/src/bytes.rs
++++ b/ledger/block/src/bytes.rs
+@@ -36,7 +36,7 @@ impl<N: Network> FromBytes for Block<N> {
+         // Read the authority.
+         let authority = FromBytes::read_le(&mut reader)?;
  
-                 // Compute the relative path.
--                let relative_path = file_path.strip_prefix("parameters");
-+                let relative_path = if file_path.strip_prefix("parameters").is_ok() {
-+                    file_path.strip_prefix("parameters")?
-+                } else {
-+                    &file_path
-+                };
+-        // Read the number of ratifications.
++        // Read the ratifications.
+         let ratifications = Ratifications::read_le(&mut reader)?;
  
-                 // Compute the absolute path.
-                 let mut absolute_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                 absolute_path.push(&relative_path);
+         // Read the solutions.
+diff --git a/ledger/puzzle/src/solutions/bytes.rs b/ledger/puzzle/src/solutions/bytes.rs
+index c851094a3..23efdcdd1 100644
+--- a/ledger/puzzle/src/solutions/bytes.rs
++++ b/ledger/puzzle/src/solutions/bytes.rs
+@@ -20,6 +20,10 @@ impl<N: Network> FromBytes for PuzzleSolutions<N> {
+     fn read_le<R: Read>(mut reader: R) -> IoResult<Self> {
+         // Read the number of solutions.
+         let num_solutions: u8 = FromBytes::read_le(&mut reader)?;
++        // Ensure the number of solutions is within bounds.
++        if num_solutions as usize > N::MAX_SOLUTIONS {
++            return Err(error("Failed to read solutions: too many solutions"));
++        }
+         // Read the solutions.
+         let mut solutions = Vec::with_capacity(num_solutions as usize);
+         for _ in 0..num_solutions {
+diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
+index a9d9943df..d65bab3e8 100644
+--- a/synthesizer/src/vm/mod.rs
++++ b/synthesizer/src/vm/mod.rs
+@@ -114,7 +114,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+             process: &Process<N>,
+             transaction_store: &TransactionStore<N, T>,
+             transaction_id: N::TransactionID,
+-        ) -> Result<Vec<(ProgramID<N>, Deployment<N>)>> {
++            deployments: Arc<RwLock<IndexMap<ProgramID<N>, Deployment<N>>>>,
++        ) -> Result<()> {
+             // Retrieve the deployment from the transaction ID.
+             let deployment = match transaction_store.get_deployment(&transaction_id)? {
+                 Some(deployment) => deployment,
+@@ -126,17 +127,14 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+             let program_id = program.id();
  
--                let buffer = if relative_path.is_ok() && relative_path?.exists() {
-+                let buffer = if relative_path.exists() {
-                     // Attempts to load the parameter file locally with a relative path.
-                     fs::read(relative_path)?
-                 } else if absolute_path.exists() {
+             // Return early if the program is already loaded.
+-            if process.contains_program(program_id) {
+-                return Ok(vec![]);
++            if process.contains_program(program_id) || deployments.read().contains_key(program_id) {
++                return Ok(());
+             }
+ 
+-            // Prepare a vector for the deployments.
+-            let mut deployments = vec![];
+-
+             // Iterate through the program imports.
+             for import_program_id in program.imports().keys() {
+                 // Add the imports to the process if does not exist yet.
+-                if !process.contains_program(import_program_id) {
++                if !process.contains_program(import_program_id) && !deployments.read().contains_key(program_id) {
+                     // Fetch the deployment transaction ID.
+                     let Some(transaction_id) =
+                         transaction_store.deployment_store().find_transaction_id_from_program_id(import_program_id)?
+@@ -145,24 +143,25 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                     };
+ 
+                     // Add the deployment and its imports found recursively.
+-                    deployments.extend_from_slice(&load_deployment_and_imports(
+-                        process,
+-                        transaction_store,
+-                        transaction_id,
+-                    )?);
++                    load_deployment_and_imports(process, transaction_store, transaction_id, deployments.clone())?;
+                 }
+             }
+ 
+             // Once all the imports have been included, add the parent deployment.
+-            deployments.push((*program_id, deployment));
++            if !deployments.read().contains_key(program_id) {
++                // Note: There may be re-insertions due to parallelism, but it is safe to
++                //  reinsert into the IndexMap because it should be the same object.
++                deployments.write().entry(*program_id).or_insert(deployment);
++            }
+ 
+-            Ok(deployments)
++            Ok(())
+         }
+ 
+         // Retrieve the transaction store.
+         let transaction_store = store.transaction_store();
+         // Retrieve the list of deployment transaction IDs.
+         let deployment_ids = transaction_store.deployment_transaction_ids().collect::<Vec<_>>();
++        // TODO (raychu86): Investigate loading them in order to limit recursion.
+         // Load the deployments from the store.
+         for (i, chunk) in deployment_ids.chunks(256).enumerate() {
+             debug!(
+@@ -171,14 +170,16 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                 ((i + 1) * 256).min(deployment_ids.len()),
+                 deployment_ids.len()
+             );
+-            let deployments = cfg_iter!(chunk)
++            // Prepare a tracker for the deployments.
++            let deployments = Arc::new(RwLock::new(IndexMap::new()));
++            cfg_iter!(chunk)
+                 .map(|transaction_id| {
+                     // Load the deployment and its imports.
+-                    load_deployment_and_imports(&process, transaction_store, **transaction_id)
++                    load_deployment_and_imports(&process, transaction_store, **transaction_id, deployments.clone())
+                 })
+-                .collect::<Result<Vec<_>>>()?;
++                .collect::<Result<()>>()?;
+ 
+-            for (program_id, deployment) in deployments.iter().flatten() {
++            for (program_id, deployment) in deployments.read().iter() {
+                 // Load the deployment if it does not exist in the process yet.
+                 if !process.contains_program(program_id) {
+                     process.load_deployment(deployment)?;

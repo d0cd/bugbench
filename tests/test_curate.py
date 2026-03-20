@@ -126,6 +126,13 @@ class TestParseLlmResponse:
         case = parse_llm_response(data, case_id="bar-002", candidate=candidate)
         assert case.head_commit == "deadbeef" * 5
 
+    def test_pr_context_carried_through(self) -> None:
+        candidate = make_candidate()
+        data = make_llm_response_data()
+        case = parse_llm_response(data, case_id="bar-001", candidate=candidate)
+        assert case.pr_title == candidate.title
+        assert case.pr_body == candidate.body
+
     def test_empty_findings(self) -> None:
         candidate = make_candidate()
         data = {**make_llm_response_data(), "expected_findings": []}
@@ -488,9 +495,7 @@ class TestParseLlmResponsePreservesReviewerContext:
 
     def test_preserves_reviewer_notes(self) -> None:
         candidate = make_candidate()
-        candidate = candidate.model_copy(
-            update={"reviewer_notes": ["reviewer said X"]}
-        )
+        candidate = candidate.model_copy(update={"reviewer_notes": ["reviewer said X"]})
         data = make_llm_response_data()
         case = parse_llm_response(data, case_id="bar-011", candidate=candidate)
         assert case.reviewer_notes == ["reviewer said X"]
@@ -540,6 +545,7 @@ class TestCurateCandidateBackend:
         candidate = make_candidate(1)
         mock_sub = make_mock_subprocess(make_llm_response_data())
         captured: list[list[str]] = []
+
         def _capture(cmd: list[str], **_kw: object) -> object:
             captured.append(cmd)
             return mock_sub

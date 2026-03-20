@@ -7,21 +7,35 @@ import yaml
 from click.testing import CliRunner
 
 from bugeval.models import Category, Difficulty, PRSize, Severity, TestCase
-from bugeval.pr_eval_models import CaseToolStatus, RunState
+from bugeval.pr_eval_models import CaseToolStatus
 from bugeval.run_pr_eval import load_cases, make_run_id, process_case_tool, run_pr_eval
 
 
-def _make_config_file(tmp_path: Path, eval_org: str = "provable-eval") -> Path:
+def _make_config_file(
+    tmp_path: Path, eval_org: str = "provable-eval", fresh_repo: bool = False
+) -> Path:
+    tools: list[dict] = [
+        {
+            "name": "coderabbit",
+            "type": "pr",
+            "github_app": "coderabbit-ai",
+            "cooldown_seconds": 0,
+        },
+    ]
+    if fresh_repo:
+        tools.append(
+            {
+                "name": "github-copilot",
+                "type": "pr",
+                "github_app": "copilot",
+                "reviewer": "copilot",
+                "fresh_repo": True,
+                "cooldown_seconds": 0,
+            }
+        )
     data = {
         "github": {"eval_org": eval_org},
-        "tools": [
-            {
-                "name": "coderabbit",
-                "type": "pr",
-                "github_app": "coderabbit-ai",
-                "cooldown_seconds": 0,
-            },
-        ],
+        "tools": tools,
         "repos": {"aleo-lang": "provable-org/aleo-lang"},
     }
     config_path = tmp_path / "config.yaml"
@@ -43,7 +57,7 @@ def _make_case_file(cases_dir: Path, case_id: str = "case-001") -> Path:
         "language": "rust",
         "pr_size": "small",
         "description": "A test bug case",
-        "expected_findings": [],
+        "expected_findings": [{"file": "src/lib.rs", "line": 10, "summary": "test bug"}],
     }
     path = cases_dir / f"{case_id}.yaml"
     path.write_text(yaml.dump(data))
@@ -86,6 +100,53 @@ def test_load_cases_empty_dir(tmp_path: Path) -> None:
     assert cases == []
 
 
+def test_load_cases_excludes_invalid_for_code_review(tmp_path: Path) -> None:
+    """Cases with valid_for_code_review: false must be excluded."""
+    valid = {
+        "id": "test-001",
+        "repo": "org/repo",
+        "base_commit": "aaa",
+        "head_commit": "bbb",
+        "fix_commit": "bbb",
+        "category": "logic",
+        "difficulty": "easy",
+        "severity": "low",
+        "language": "rust",
+        "pr_size": "small",
+        "description": "Valid case",
+        "expected_findings": [{"file": "f.rs", "line": 1, "summary": "bug"}],
+        "valid_for_code_review": True,
+    }
+    invalid = {**valid, "id": "test-002", "valid_for_code_review": False}
+    (tmp_path / "test-001.yaml").write_text(yaml.safe_dump(valid, sort_keys=False))
+    (tmp_path / "test-002.yaml").write_text(yaml.safe_dump(invalid, sort_keys=False))
+    cases = load_cases(tmp_path)
+    assert len(cases) == 1
+    assert cases[0].id == "test-001"
+
+
+def test_load_cases_excludes_empty_findings(tmp_path: Path) -> None:
+    """Cases with no expected_findings cannot be scored — must be excluded."""
+    case = {
+        "id": "test-003",
+        "repo": "org/repo",
+        "base_commit": "aaa",
+        "head_commit": "bbb",
+        "fix_commit": "bbb",
+        "category": "logic",
+        "difficulty": "easy",
+        "severity": "low",
+        "language": "rust",
+        "pr_size": "small",
+        "description": "No findings",
+        "expected_findings": [],
+        "valid_for_code_review": True,
+    }
+    (tmp_path / "test-003.yaml").write_text(yaml.safe_dump(case, sort_keys=False))
+    cases = load_cases(tmp_path)
+    assert len(cases) == 0
+
+
 def test_run_pr_eval_help() -> None:
     runner = CliRunner()
     result = runner.invoke(run_pr_eval, ["--help"])
@@ -120,7 +181,7 @@ def test_run_pr_eval_no_cases(tmp_path: Path) -> None:
     assert "No cases" in result.output
 
 
-def test_checkpoint_created_on_dry_run(tmp_path: Path) -> None:
+def test_dry_run_completes(tmp_path: Path) -> None:
     config_path = _make_config_file(tmp_path)
     cases_dir = tmp_path / "cases"
     _make_case_file(cases_dir)
@@ -145,12 +206,7 @@ def test_checkpoint_created_on_dry_run(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    checkpoint = run_dir / "checkpoint.yaml"
-    assert checkpoint.exists()
-    # Verify checkpoint records the case-tool pair as done
-    state = RunState.load(checkpoint)
-    pair = state.get("case-001", "coderabbit")
-    assert pair.status == CaseToolStatus.done
+    assert "done" in result.output
 
 
 def test_process_case_tool_dry_run_no_gh_calls(tmp_path: Path) -> None:
@@ -282,7 +338,9 @@ def test_scrape_always_called_even_when_poll_times_out(tmp_path: Path) -> None:
     assert state.status == CaseToolStatus.done
 
 
-def test_checkpoint_resume_skips_done(tmp_path: Path) -> None:
+def test_resume_skips_done(tmp_path: Path) -> None:
+    import json
+
     config_path = _make_config_file(tmp_path)
     cases_dir = tmp_path / "cases"
     _make_case_file(cases_dir)
@@ -292,12 +350,10 @@ def test_checkpoint_resume_skips_done(tmp_path: Path) -> None:
     run_dir = tmp_path / "results"
     run_dir.mkdir()
 
-    # Pre-populate checkpoint with done state
-    rs = RunState()
-    from bugeval.pr_eval_models import CaseToolState
-
-    rs.set(CaseToolState(case_id="case-001", tool="coderabbit", status=CaseToolStatus.done))
-    rs.save(run_dir / "checkpoint.yaml")
+    # Pre-populate raw dir with comments.json to simulate completed PR case
+    raw_dir = run_dir / "raw" / "case-001-coderabbit"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "comments.json").write_text(json.dumps([]))
 
     runner = CliRunner()
     with patch("bugeval.run_pr_eval.process_case_tool") as mock_process:
@@ -316,7 +372,7 @@ def test_checkpoint_resume_skips_done(tmp_path: Path) -> None:
             ],
         )
 
-    # process_case_tool should NOT be called since status=done
+    # process_case_tool should NOT be called since already done
     mock_process.assert_not_called()
     assert result.exit_code == 0
 
@@ -351,9 +407,7 @@ def test_run_pr_eval_limit_slices_cases(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    checkpoint = run_dir / "checkpoint.yaml"
-    rs = RunState.load(checkpoint)
-    assert len(rs.states()) == 2
+    assert result.output.count("[done]") == 2
 
 
 def test_run_pr_eval_fail_after_aborts(tmp_path: Path) -> None:
@@ -384,7 +438,89 @@ def test_run_pr_eval_fail_after_aborts(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    checkpoint = run_dir / "checkpoint.yaml"
-    rs = RunState.load(checkpoint)
-    failed = [s for s in rs.states() if s.status == CaseToolStatus.failed]
-    assert len(failed) == 2
+    assert "abort" in result.output
+
+
+def test_process_case_tool_fresh_repo_dry_run(tmp_path: Path) -> None:
+    """Fresh repo tools should complete in dry-run without calling git or gh."""
+    from bugeval.pr_eval_models import load_eval_config
+
+    config_path = _make_config_file(tmp_path, fresh_repo=True)
+    config = load_eval_config(config_path)
+    tool = next(t for t in config.pr_tools if t.fresh_repo)
+
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (patches_dir / "case-001.patch").write_text("--- a\n+++ b\n")
+    run_dir = tmp_path / "results"
+
+    case = _make_case()
+
+    with patch("bugeval.pr_lifecycle.run_gh") as mock_gh:
+        state = process_case_tool(
+            case, tool, config, patches_dir, run_dir, None, dry_run=True
+        )
+
+    mock_gh.assert_not_called()
+    assert state.status == CaseToolStatus.done
+
+
+def test_process_case_tool_fresh_repo_uses_push_case_branches(tmp_path: Path) -> None:
+    """Fresh repo tools should call push_case_branches when not dry-run."""
+    from bugeval.pr_eval_models import load_eval_config
+
+    config_path = _make_config_file(tmp_path, fresh_repo=True)
+    config = load_eval_config(config_path)
+    tool = next(t for t in config.pr_tools if t.fresh_repo)
+
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (patches_dir / "case-001.patch").write_text("--- a\n+++ b\n")
+    run_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    case = _make_case()
+
+    with (
+        patch("bugeval.run_pr_eval.get_or_create_cached_repo", return_value=cache_dir),
+        patch(
+            "bugeval.run_pr_eval.push_case_branches",
+            return_value=("bugeval-base/case-001", "bugeval/case-001-github-copilot"),
+        ) as mock_push,
+        patch("bugeval.run_pr_eval.open_pr", return_value=7),
+        patch("bugeval.run_pr_eval.request_review"),
+        patch("bugeval.run_pr_eval.poll_for_review", return_value=True),
+        patch("bugeval.run_pr_eval.scrape_review_comments", return_value=[]),
+        patch("bugeval.run_pr_eval.close_pr_delete_branch"),
+    ):
+        state = process_case_tool(
+            case, tool, config, patches_dir, run_dir, None, dry_run=False,
+            cache_dir=cache_dir,
+        )
+
+    mock_push.assert_called_once()
+    assert state.status == CaseToolStatus.done
+
+
+def test_process_case_tool_fresh_repo_no_cache_dir_fails(tmp_path: Path) -> None:
+    """Fresh repo tools should fail if cache_dir is not provided."""
+    from bugeval.pr_eval_models import load_eval_config
+
+    config_path = _make_config_file(tmp_path, fresh_repo=True)
+    config = load_eval_config(config_path)
+    tool = next(t for t in config.pr_tools if t.fresh_repo)
+
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (patches_dir / "case-001.patch").write_text("--- a\n+++ b\n")
+    run_dir = tmp_path / "results"
+
+    case = _make_case()
+
+    state = process_case_tool(
+        case, tool, config, patches_dir, run_dir, None, dry_run=False, cache_dir=None,
+    )
+
+    assert state.status == CaseToolStatus.failed
+    assert "cache-dir" in (state.error or "")

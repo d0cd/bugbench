@@ -6,8 +6,10 @@ import shutil
 import threading
 from pathlib import Path
 
-from bugeval.git_utils import clone_repo, clone_repo_local, is_repo, run_git
+from bugeval.git_utils import clone_repo, clone_repo_local, is_repo, run_git, sanitize_patch
 from bugeval.models import TestCase
+
+_PR_BODY_MAX = 3000
 
 # Per-repo locks prevent concurrent threads from racing to create the same cache
 # entry. asyncio.to_thread runs setup_repo_for_case in a thread pool, so we need
@@ -65,6 +67,58 @@ def setup_repo_for_case(
     if apply_patch:
         run_git("apply", str(patch_path.resolve()), cwd=repo_dir)
     return repo_dir
+
+
+def materialize_workspace(
+    case: TestCase,
+    patch_content: str,
+    context_level: str,
+    workspace_dir: Path,
+    blind: bool = False,
+) -> None:
+    """Write PR context files and sanitized diff into a workspace directory."""
+    pr_dir = workspace_dir / ".pr"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+
+    # description.md
+    sections: list[str] = []
+    if blind:
+        sections.append("# Pull Request\n\n(description redacted)")
+    else:
+        if case.pr_title:
+            sections.append(f"# {case.pr_title}")
+        body = case.pr_body[:_PR_BODY_MAX] if case.pr_body else ""
+        if body:
+            sections.append(body)
+    if case.stats is not None:
+        stats_text = (
+            f"Files changed: {case.stats.files_changed}\n"
+            f"Lines added: {case.stats.lines_added}\n"
+            f"Lines deleted: {case.stats.lines_deleted}"
+        )
+        sections.append(stats_text)
+    (pr_dir / "description.md").write_text("\n\n".join(sections))
+
+    # commits.txt
+    if blind:
+        (pr_dir / "commits.txt").write_text("")
+    elif case.pr_commit_messages:
+        (pr_dir / "commits.txt").write_text("\n".join(case.pr_commit_messages) + "\n")
+    else:
+        (pr_dir / "commits.txt").write_text("")
+
+    # domain.md (only for diff+repo+domain)
+    if context_level == "diff+repo+domain":
+        domain_text = (
+            f"Category: {case.category}\n"
+            f"Severity: {case.severity}\n"
+            f"Language: {case.language}\n"
+            f"Description: {case.description}"
+        )
+        (pr_dir / "domain.md").write_text(domain_text)
+
+    # diff.patch (sanitized)
+    (workspace_dir / "diff.patch").write_text(sanitize_patch(patch_content))
 
 
 def cleanup_repo(repo_dir: Path) -> None:

@@ -1,8 +1,27 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8654a6b7d..96cd84bb4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2764,6 +2764,7 @@ dependencies = [
+  "futures 0.3.17",
+  "hash_hasher",
+  "hex",
++ "indexmap",
+  "itertools",
+  "log",
+  "metrics",
 diff --git a/benchmarks/network/block_cache.rs b/benchmarks/network/block_cache.rs
-index bb7f47481..6f83e6a74 100644
+index 2b53dc382..6f83e6a74 100644
 --- a/benchmarks/network/block_cache.rs
 +++ b/benchmarks/network/block_cache.rs
-@@ -24,7 +24,7 @@ fn block_cache_perf(c: &mut Criterion) {
+@@ -18,13 +18,13 @@ use criterion::*;
+ use rand::{thread_rng, Rng, SeedableRng};
+ use rand_xorshift::XorShiftRng;
+ 
+-use snarkos_network::Cache;
++use snarkos_network::BlockCache;
+ 
+ fn block_cache_perf(c: &mut Criterion) {
      const MIN_BLOCK_SIZE: usize = 1024; // 1KiB
      const MAX_BLOCK_SIZE: usize = 1024 * 1024; // 1MiB
  
@@ -11,3 +30,1330 @@ index bb7f47481..6f83e6a74 100644
  
      let seed: u64 = thread_rng().gen();
      let mut rng = XorShiftRng::seed_from_u64(seed);
+diff --git a/benchmarks/network/syncing.rs b/benchmarks/network/syncing.rs
+index ef6d893a5..f86db7fb3 100644
+--- a/benchmarks/network/syncing.rs
++++ b/benchmarks/network/syncing.rs
+@@ -39,7 +39,7 @@ fn providing_sync_blocks(c: &mut Criterion) {
+         assert!(rt.block_on(provider.expect_sync().consensus.receive_block(block.clone())));
+     }
+ 
+-    let canon = rt.block_on(provider.expect_storage().canon()).unwrap();
++    let canon = rt.block_on(provider.storage.canon()).unwrap();
+ 
+     assert_eq!(canon.block_height, NUM_BLOCKS);
+ 
+diff --git a/bin/crawler.rs b/bin/crawler.rs
+index e3181dc54..de33b3d65 100644
+--- a/bin/crawler.rs
++++ b/bin/crawler.rs
+@@ -25,8 +25,9 @@ use snarkos::{
+ };
+ use snarkos_network::{config::Config as NodeConfig, Node};
+ use snarkos_rpc::start_rpc_server;
++use snarkos_storage::{AsyncStorage, SqliteStorage};
+ 
+-use std::{net::SocketAddr, time::Duration};
++use std::{net::SocketAddr, sync::Arc, time::Duration};
+ 
+ use tokio::runtime;
+ 
+@@ -59,7 +60,10 @@ async fn start_server(config: Config) -> anyhow::Result<()> {
+     // Construct the node instance. Note this does not start the network services.
+     // This is done early on, so that the local address can be discovered
+     // before any other object (RPC) needs to use it.
+-    let node = Node::new(node_config, None).await?;
++
++    let storage = Arc::new(AsyncStorage::new(SqliteStorage::new_ephemeral().unwrap()));
++
++    let node = Node::new(node_config, storage.clone()).await?;
+ 
+     // Initialize metrics framework.
+     node.initialize_metrics().await?;
+@@ -72,7 +76,7 @@ async fn start_server(config: Config) -> anyhow::Result<()> {
+ 
+         let rpc_handle = start_rpc_server(
+             rpc_address,
+-            None,
++            storage,
+             node.clone(),
+             config.rpc.username,
+             config.rpc.password,
+diff --git a/bin/snarkos.rs b/bin/snarkos.rs
+index 4eeacd0e7..055f450de 100644
+--- a/bin/snarkos.rs
++++ b/bin/snarkos.rs
+@@ -139,7 +139,7 @@ async fn start_server(config: Config) -> anyhow::Result<()> {
+     // Construct the node instance. Note this does not start the network services.
+     // This is done early on, so that the local address can be discovered
+     // before any other object (miner, RPC) needs to use it.
+-    let mut node = Node::new(node_config, Some(storage.clone())).await?;
++    let mut node = Node::new(node_config, storage.clone()).await?;
+ 
+     if let Some(limit) = config.storage.export {
+         let mut export_path = path.clone();
+@@ -276,7 +276,7 @@ async fn start_server(config: Config) -> anyhow::Result<()> {
+ 
+         let rpc_handle = start_rpc_server(
+             rpc_address,
+-            Some(storage),
++            storage,
+             node.clone(),
+             config.rpc.username,
+             config.rpc.password,
+diff --git a/consensus/src/consensus/inner/agent.rs b/consensus/src/consensus/inner/agent.rs
+index d3f0fa5ad..5b3ea812e 100644
+--- a/consensus/src/consensus/inner/agent.rs
++++ b/consensus/src/consensus/inner/agent.rs
+@@ -92,6 +92,9 @@ impl ConsensusInner {
+                     }
+                     Err(e) => {
+                         match e {
++                            ConsensusError::PreExistingBlock => {
++                                trace!("failed receiving block: {:?}", e);
++                            }
+                             ConsensusError::InvalidBlock(e) => {
+                                 debug!("failed receiving block: {:?}", e);
+                             }
+diff --git a/consensus/src/consensus/inner/commit.rs b/consensus/src/consensus/inner/commit.rs
+index 20d1784b1..ca01057d2 100644
+--- a/consensus/src/consensus/inner/commit.rs
++++ b/consensus/src/consensus/inner/commit.rs
+@@ -28,7 +28,6 @@ impl ConsensusInner {
+         match self.storage.get_block_state(&hash).await? {
+             BlockStatus::Unknown => (),
+             BlockStatus::Committed(_) | BlockStatus::Uncommitted => {
+-                debug!("Received a pre-existing block");
+                 metrics::increment_counter!(DUPLICATE_BLOCKS);
+                 return Err(ConsensusError::PreExistingBlock);
+             }
+diff --git a/network/Cargo.toml b/network/Cargo.toml
+index 0d433167e..4de0e5a84 100644
+--- a/network/Cargo.toml
++++ b/network/Cargo.toml
+@@ -41,6 +41,9 @@ version = "1.3.14"
+ path = "../storage"
+ version = "1.3.14"
+ 
++[dependencies.indexmap]
++version = "1.6"
++
+ [dependencies.futures]
+ version = "0.3"
+ 
+diff --git a/network/src/inbound/cache.rs b/network/src/inbound/cache.rs
+index 3d3d9b06b..6b63952aa 100644
+--- a/network/src/inbound/cache.rs
++++ b/network/src/inbound/cache.rs
+@@ -14,17 +14,20 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use snarkvm_dpc::block::BlockHeader;
+-
+ use circular_queue::CircularQueue;
++use snarkvm_dpc::BlockHeader;
+ use twox_hash::xxh3::hash64;
+ 
+ #[derive(Debug, Clone)]
+-pub struct Cache<const N: usize> {
++pub struct Cache<const N: usize, const S: usize> {
+     queue: CircularQueue<u64>,
+ }
+ 
+-impl<const N: usize> Default for Cache<N> {
++const BLOCK_HEADER_SIZE: usize = BlockHeader::size();
++
++pub type BlockCache<const N: usize> = Cache<N, BLOCK_HEADER_SIZE>;
++
++impl<const N: usize, const S: usize> Default for Cache<N, S> {
+     fn default() -> Self {
+         Self {
+             queue: CircularQueue::with_capacity(N),
+@@ -32,9 +35,9 @@ impl<const N: usize> Default for Cache<N> {
+     }
+ }
+ 
+-impl<const N: usize> Cache<N> {
++impl<const N: usize, const S: usize> Cache<N, S> {
+     fn hash_block(payload: &[u8]) -> u64 {
+-        hash64(&payload[..BlockHeader::size()])
++        hash64(&payload[..S.min(payload.len())])
+     }
+ 
+     pub fn contains(&self, payload: &[u8]) -> bool {
+diff --git a/network/src/node.rs b/network/src/node.rs
+index 30004bfc2..af6745c31 100644
+--- a/network/src/node.rs
++++ b/network/src/node.rs
+@@ -14,7 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use crate::{master::SyncInbound, sync::master::SyncMaster, *};
++use crate::*;
+ use snarkos_metrics::{self as metrics, misc};
+ 
+ use anyhow::*;
+@@ -61,7 +61,7 @@ pub struct InnerNode {
+     /// The pre-configured parameters of this node.
+     pub config: Config,
+     /// The cache of node's inbound messages.
+-    pub inbound_cache: Mutex<Cache<{ crate::BLOCK_CACHE_SIZE }>>,
++    pub inbound_cache: Mutex<BlockCache<{ crate::BLOCK_CACHE_SIZE }>>,
+     /// The list of connected and disconnected peers of this node.
+     pub peer_book: PeerBook,
+     /// Tracks the known network crawled by this node.
+@@ -69,7 +69,7 @@ pub struct InnerNode {
+     /// The sync handler of this node.
+     pub sync: OnceCell<Arc<Sync>>,
+     /// The node's storage.
+-    pub storage: Option<DynStorage>,
++    pub storage: DynStorage,
+     /// The node's start-up timestamp.
+     pub launched: DateTime<Utc>,
+     /// The tasks spawned by the node.
+@@ -118,7 +118,7 @@ impl Node {
+ 
+ impl Node {
+     /// Creates a new instance of `Node`.
+-    pub async fn new(config: Config, storage: Option<DynStorage>) -> Result<Self, NetworkError> {
++    pub async fn new(config: Config, storage: DynStorage) -> Result<Self, NetworkError> {
+         let node = Self(Arc::new(InnerNode {
+             id: config.node_id.unwrap_or_else(|| thread_rng().gen()),
+             state: Default::default(),
+@@ -148,10 +148,6 @@ impl Node {
+         Ok(node)
+     }
+ 
+-    pub fn expect_storage(&self) -> &DynStorage {
+-        self.storage.as_ref().expect("no storage!")
+-    }
+-
+     pub fn set_sync(&mut self, sync: Sync) {
+         if self.sync.set(Arc::new(sync)).is_err() {
+             panic!("sync was set more than once!");
+@@ -346,10 +342,7 @@ impl Node {
+ 
+         // The node can already be at some non-zero height.
+         if self.sync().is_some() {
+-            metrics::gauge!(
+-                misc::BLOCK_HEIGHT,
+-                self.expect_storage().canon().await?.block_height as f64
+-            );
++            metrics::gauge!(misc::BLOCK_HEIGHT, self.storage.canon().await?.block_height as f64);
+         }
+ 
+         Ok(())
+@@ -360,7 +353,7 @@ impl Node {
+     }
+ 
+     pub async fn run_sync(&self) -> Result<()> {
+-        let (master, sender) = SyncMaster::new(self.clone());
++        let (master, sender) = SyncAggro::new(self.clone());
+         *self.master_dispatch.write().await = Some(sender);
+         master.run().await
+     }
+diff --git a/network/src/peers/peer/outbound_handler.rs b/network/src/peers/peer/outbound_handler.rs
+index f0c11c5f6..8415c383a 100644
+--- a/network/src/peers/peer/outbound_handler.rs
++++ b/network/src/peers/peer/outbound_handler.rs
+@@ -208,13 +208,13 @@ impl Peer {
+                 if self.quality.remaining_sync_blocks > 0 {
+                     self.quality.remaining_sync_blocks -= 1;
+                 } else {
+-                    warn!("received unexpected or late sync block from {}", self.address);
++                    trace!("received unexpected or late sync block from {}", self.address);
+                 }
+                 Ok(PeerResponse::None)
+             }
+             PeerAction::ExpectingSyncBlocks(amount) => {
+-                self.quality.remaining_sync_blocks = amount;
+-                self.quality.total_sync_blocks = amount;
++                self.quality.remaining_sync_blocks += amount;
++                self.quality.total_sync_blocks += amount;
+                 Ok(PeerResponse::None)
+             }
+             PeerAction::SoftFail => {
+diff --git a/network/src/peers/peer/peer.rs b/network/src/peers/peer/peer.rs
+index 7045cf4f5..d995f1b2f 100644
+--- a/network/src/peers/peer/peer.rs
++++ b/network/src/peers/peer/peer.rs
+@@ -29,7 +29,7 @@ use std::{
+ use tokio::sync::mpsc;
+ 
+ use super::PeerQuality;
+-use crate::{message::Payload, Cache, NetworkError, Node};
++use crate::{message::Payload, BlockCache, NetworkError, Node};
+ 
+ use super::{network::*, outbound_handler::*};
+ 
+@@ -64,7 +64,7 @@ pub struct Peer {
+     pub is_routable: Option<bool>,
+ 
+     #[serde(skip)]
+-    pub block_received_cache: Cache<{ crate::PEER_BLOCK_CACHE_SIZE }>,
++    pub block_received_cache: BlockCache<{ crate::PEER_BLOCK_CACHE_SIZE }>,
+ }
+ 
+ const FAILURE_EXPIRY_TIME: Duration = Duration::from_secs(15 * 60);
+@@ -83,7 +83,7 @@ impl Peer {
+             // Set to `None` since peer creation only ever happens before a connection to the peer,
+             // therefore we don't know if its listener is routable or not.
+             is_routable: None,
+-            block_received_cache: Cache::default(),
++            block_received_cache: BlockCache::default(),
+         }
+     }
+ 
+diff --git a/network/src/peers/peers.rs b/network/src/peers/peers.rs
+index 9ede8b06f..db8ddfd25 100644
+--- a/network/src/peers/peers.rs
++++ b/network/src/peers/peers.rs
+@@ -287,7 +287,7 @@ impl Node {
+ 
+         // Consider peering tests that don't use the sync layer.
+         let current_block_height = if self.sync().is_some() {
+-            self.expect_storage().canon().await?.block_height as u32
++            self.storage.canon().await?.block_height as u32
+         } else {
+             0
+         };
+diff --git a/network/src/sync/blocks/aggro.rs b/network/src/sync/blocks/aggro.rs
+new file mode 100644
+index 000000000..1d6c59188
+--- /dev/null
++++ b/network/src/sync/blocks/aggro.rs
+@@ -0,0 +1,202 @@
++// Copyright (C) 2019-2021 Aleo Systems Inc.
++// This file is part of the snarkOS library.
++
++// The snarkOS library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkOS library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
++
++use std::{sync::Arc, time::Duration};
++
++use crate::{Cache, Node, Payload, Peer, SyncBase, SyncInbound};
++use anyhow::*;
++use indexmap::IndexSet;
++use snarkos_storage::Digest;
++use snarkvm_dpc::BlockHeaderHash;
++use tokio::{
++    sync::{mpsc, RwLock},
++    time::Instant,
++};
++
++/// Aggressive, continuous sync process that pulls peers entire canon trees.
++pub struct SyncAggro {
++    base: SyncBase,
++}
++
++struct BlockLocatorHashes {
++    hashes: Vec<BlockHeaderHash>,
++    last_update: Instant,
++}
++
++impl SyncAggro {
++    pub fn new(node: Node) -> (Self, mpsc::Sender<SyncInbound>) {
++        let (base, sender) = SyncBase::new(node);
++        let new = Self { base };
++        (new, sender)
++    }
++
++    async fn send_sync_messages(&mut self, nodes: Vec<(Peer, Vec<BlockHeaderHash>)>) -> Result<usize> {
++        info!("requested block information from {} peers", nodes.len());
++        let mut future_set = vec![];
++
++        for (peer, hashes) in nodes {
++            if let Some(handle) = self.base.node.peer_book.get_peer_handle(peer.address) {
++                future_set.push(async move {
++                    handle.send_payload(Payload::GetSync(hashes), None).await;
++                });
++            }
++        }
++        let sent = future_set.len();
++        futures::future::join_all(future_set).await;
++        Ok(sent)
++    }
++
++    pub async fn run(mut self) -> Result<()> {
++        let sync_nodes = self.base.find_sync_nodes().await?;
++
++        if sync_nodes.is_empty() {
++            return Ok(());
++        }
++
++        self.base.node.register_block_sync_attempt();
++
++        let block_locator_hashes = Arc::new(RwLock::new(BlockLocatorHashes {
++            hashes: SyncBase::block_locator_hashes(&self.base.node).await?,
++            last_update: Instant::now(),
++        }));
++
++        let peer_syncs = {
++            let block_locator_hashes = block_locator_hashes.read().await;
++            sync_nodes
++                .iter()
++                .map(|peer| (peer.clone(), block_locator_hashes.hashes.clone()))
++                .collect()
++        };
++
++        let hash_requests_sent = self.send_sync_messages(peer_syncs).await?;
++
++        if hash_requests_sent == 0 {
++            return Ok(());
++        }
++
++        let received_hashes = Arc::new(RwLock::new(Cache::<1024, 32>::default()));
++
++        let node = self.base.node.clone();
++        self.base
++            .receive_messages(15, 3, |msg| {
++                metrics::decrement_gauge!(snarkos_metrics::queues::SYNC_ITEMS, 1.0);
++                match msg {
++                    SyncInbound::BlockHashes(peer, hashes) => {
++                        debug!("received {} sync hashes from {}", hashes.len(), peer);
++                        let hashes: Vec<Digest> = hashes.into_iter().map(|x| x.0.into()).collect::<Vec<_>>();
++                        if hashes.is_empty() {
++                            return false;
++                        }
++                        let last_hash = hashes.last().unwrap().clone();
++
++                        let node = node.clone();
++                        let block_locator_hashes = block_locator_hashes.clone();
++                        let received_hashes = received_hashes.clone();
++                        tokio::spawn(async move {
++                            if block_locator_hashes.read().await.last_update.elapsed() > Duration::from_secs(10) {
++                                match SyncBase::block_locator_hashes(&node).await {
++                                    Ok(hashes) => {
++                                        let mut target = block_locator_hashes.write().await;
++                                        target.hashes = hashes;
++                                        target.last_update = Instant::now();
++                                    }
++                                    Err(e) => warn!("sync failed to fetch block locator hashes: {:?}", e),
++                                }
++                            }
++
++                            let mut hashes_trimmed = Vec::with_capacity(hashes.len());
++                            {
++                                let received_hashes = received_hashes.read().await;
++                                for hash in hashes {
++                                    if !received_hashes.contains(&hash[..]) {
++                                        hashes_trimmed.push(hash);
++                                    }
++                                }
++                            }
++
++                            let early_block_states = match node.storage.get_block_states(&hashes_trimmed[..]).await {
++                                Ok(x) => x,
++                                Err(e) => {
++                                    warn!("failed to get block states: {:?}", e);
++                                    return;
++                                }
++                            };
++
++                            let blocks: IndexSet<_> = {
++                                let received_hashes = received_hashes.read().await;
++                                let hashes = block_locator_hashes.read().await;
++                                hashes
++                                    .hashes
++                                    .iter()
++                                    .filter(|x| !received_hashes.contains(&x.0[..]))
++                                    .cloned()
++                                    .chain(
++                                        hashes_trimmed
++                                            .into_iter()
++                                            .zip(early_block_states.iter())
++                                            .filter(|(_, status)| {
++                                                matches!(status, snarkos_storage::BlockStatus::Unknown)
++                                            })
++                                            .map(|(hash, _)| BlockHeaderHash(hash.bytes().unwrap())),
++                                    )
++                                    .collect()
++                            };
++                            if blocks.is_empty() {
++                                return;
++                            }
++                            debug!("requesting {} sync blocks from {}", blocks.len(), peer);
++
++                            if let Some(peer) = node.peer_book.get_peer_handle(peer) {
++                                let request: Vec<BlockHeaderHash> = blocks.into_iter().collect();
++                                peer.expecting_sync_blocks(request.len() as u32).await;
++                                peer.send_payload(Payload::GetBlocks(request), None).await;
++                                peer.send_payload(
++                                    Payload::GetSync(vec![BlockHeaderHash(last_hash.bytes().unwrap())]),
++                                    None,
++                                )
++                                .await;
++                            }
++                        });
++                    }
++                    SyncInbound::Block(peer, block, peer_height) => {
++                        let node = node.clone();
++                        let received_hashes = received_hashes.clone();
++                        tokio::spawn(async move {
++                            received_hashes.write().await.push(&block[..]);
++                            match node.process_received_block(peer, block, peer_height, false).await {
++                                Err(e) => warn!("failed to process received block from {}: {:?}", peer, e),
++                                Ok(()) => (),
++                            }
++                        });
++                    }
++                }
++                false
++            })
++            .await;
++
++        let sync_addresses = sync_nodes.iter().map(|x| x.address).collect::<Vec<_>>();
++
++        self.base.cancel_outstanding_syncs(&sync_addresses[..]).await;
++
++        Ok(())
++    }
++}
++
++impl Drop for SyncAggro {
++    fn drop(&mut self) {
++        metrics::gauge!(snarkos_metrics::queues::SYNC_ITEMS, 0.0);
++    }
++}
+diff --git a/network/src/sync/blocks/base.rs b/network/src/sync/blocks/base.rs
+new file mode 100644
+index 000000000..26c751ae3
+--- /dev/null
++++ b/network/src/sync/blocks/base.rs
+@@ -0,0 +1,148 @@
++// Copyright (C) 2019-2021 Aleo Systems Inc.
++// This file is part of the snarkOS library.
++
++// The snarkOS library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkOS library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
++
++use std::{net::SocketAddr, time::Duration};
++
++use futures::{pin_mut, select, FutureExt};
++use snarkos_storage::Digest;
++use snarkvm_dpc::BlockHeaderHash;
++use tokio::{sync::mpsc, time::Instant};
++
++use crate::{Node, Peer, SyncInbound};
++use anyhow::*;
++
++/// Base sync helpers
++pub struct SyncBase {
++    pub node: Node,
++    pub incoming: mpsc::Receiver<SyncInbound>,
++}
++
++impl SyncBase {
++    pub fn new(node: Node) -> (Self, mpsc::Sender<SyncInbound>) {
++        let (sender, receiver) = mpsc::channel(256);
++        let new = Self {
++            node,
++            incoming: receiver,
++        };
++        (new, sender)
++    }
++
++    pub async fn find_sync_nodes(&self) -> Result<Vec<Peer>> {
++        let our_block_height = self.node.storage.canon().await?.block_height;
++        let mut interesting_peers = vec![];
++        for mut node in self.node.peer_book.connected_peers_snapshot().await {
++            let judge_bad = node.judge_bad();
++            if !judge_bad && node.quality.block_height as usize > our_block_height + 1 {
++                interesting_peers.push(node);
++            }
++        }
++        interesting_peers.sort_by(|x, y| y.quality.block_height.cmp(&x.quality.block_height));
++
++        // trim nodes close to us if any are > 10 blocks ahead
++        if let Some(i) = interesting_peers
++            .iter()
++            .position(|x| x.quality.block_height as usize <= our_block_height + 10)
++        {
++            interesting_peers.truncate(i + 1);
++        }
++
++        if !interesting_peers.is_empty() {
++            info!("found {} interesting peers for sync", interesting_peers.len());
++            trace!("sync interesting peers = {:?}", interesting_peers);
++        }
++
++        Ok(interesting_peers)
++    }
++
++    pub async fn block_locator_hashes(node: &Node) -> Result<Vec<BlockHeaderHash>> {
++        let forks_of_interest = node.expect_sync().consensus.scan_forks().await?;
++        trace!("sync found {} forks", forks_of_interest.len());
++        let blocks_of_interest: Vec<Digest> = forks_of_interest.into_iter().map(|(_canon, fork)| fork).collect();
++        let mut tips_of_blocks_of_interest: Vec<Digest> = Vec::with_capacity(blocks_of_interest.len());
++        for block in blocks_of_interest {
++            if tips_of_blocks_of_interest.len() > crate::MAX_BLOCK_SYNC_COUNT as usize {
++                debug!("reached limit of blocks of interest in sync block locator hashes");
++                break;
++            }
++            let mut fork_path = node.storage.longest_child_path(&block).await?;
++            if fork_path.len() < 2 {
++                // a minor fork, we probably don't care
++                continue;
++            }
++            tips_of_blocks_of_interest.push(fork_path.pop().unwrap());
++        }
++        let hashes = match node
++            .storage
++            .get_block_locator_hashes(tips_of_blocks_of_interest, snarkos_consensus::OLDEST_FORK_THRESHOLD)
++            .await
++        {
++            Ok(block_locator_hashes) => Ok(block_locator_hashes),
++            Err(e) => {
++                error!("Unable to get block locator hashes from storage: {:?}", e);
++                Err(e)
++            }
++        }?;
++
++        Ok(hashes
++            .into_iter()
++            .map(|x| BlockHeaderHash(x.bytes().unwrap()))
++            .collect::<Vec<_>>())
++    }
++
++    /// receives an arbitrary amount of inbound sync messages with a given timeout.
++    /// if the passed `handler` callback returns `true`, then the loop is terminated early.
++    /// if the sync stream closes, the loop is also terminated early.
++    pub async fn receive_messages<F: FnMut(SyncInbound) -> bool>(
++        &mut self,
++        timeout_sec: u64,
++        moving_timeout_sec: u64,
++        mut handler: F,
++    ) {
++        let end = Instant::now() + Duration::from_secs(timeout_sec);
++        let mut moving_end = Instant::now() + Duration::from_secs(moving_timeout_sec);
++        loop {
++            let timeout = tokio::time::sleep_until(end.min(moving_end)).fuse();
++            pin_mut!(timeout);
++            select! {
++                msg = self.incoming.recv().fuse() => {
++                    if msg.is_none() {
++                        break;
++                    }
++                    metrics::decrement_gauge!(snarkos_metrics::queues::SYNC_ITEMS, 1.0);
++                    if handler(msg.unwrap()) {
++                        break;
++                    }
++                    moving_end += Duration::from_secs(moving_timeout_sec);
++                },
++                _ = timeout => {
++                    break;
++                }
++            }
++        }
++    }
++
++    pub async fn cancel_outstanding_syncs(&self, addresses: &[SocketAddr]) {
++        let mut future_set = vec![];
++        for addr in addresses {
++            if let Some(peer) = self.node.peer_book.get_peer_handle(*addr) {
++                future_set.push(async move {
++                    peer.cancel_sync().await;
++                });
++            }
++        }
++        futures::future::join_all(future_set).await;
++    }
++}
+diff --git a/network/src/sync/master.rs b/network/src/sync/blocks/batched.rs
+similarity index 57%
+rename from network/src/sync/master.rs
+rename to network/src/sync/blocks/batched.rs
+index df191b418..c62bf750c 100644
+--- a/network/src/sync/master.rs
++++ b/network/src/sync/blocks/batched.rs
+@@ -14,26 +14,20 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+-use std::{collections::HashMap, net::SocketAddr, time::Duration};
++use std::{collections::HashMap, net::SocketAddr};
+ 
+-use crate::{Node, Payload, Peer};
++use crate::{Node, Payload, Peer, SyncBase, SyncInbound};
+ use anyhow::*;
+-use futures::{pin_mut, select, FutureExt};
+ use hash_hasher::{HashBuildHasher, HashedMap, HashedSet};
+ use rand::{prelude::SliceRandom, rngs::SmallRng, SeedableRng};
+ use snarkos_storage::Digest;
+ use snarkvm_algorithms::crh::double_sha256;
+ use snarkvm_dpc::{BlockHeader, BlockHeaderHash};
+-use tokio::{sync::mpsc, time::Instant};
++use tokio::sync::mpsc;
+ 
+-pub enum SyncInbound {
+-    BlockHashes(SocketAddr, Vec<BlockHeaderHash>),
+-    Block(SocketAddr, Vec<u8>, Option<u32>),
+-}
+-
+-pub struct SyncMaster {
+-    node: Node,
+-    incoming: mpsc::Receiver<SyncInbound>,
++/// Efficient but slow and fork-prone sync method that operates in distributed batches.
++pub struct SyncBatched {
++    base: SyncBase,
+ }
+ 
+ struct SyncBlock {
+@@ -42,86 +36,20 @@ struct SyncBlock {
+     height: Option<u32>,
+ }
+ 
+-impl SyncMaster {
++impl SyncBatched {
+     pub fn new(node: Node) -> (Self, mpsc::Sender<SyncInbound>) {
+-        let (sender, receiver) = mpsc::channel(256);
+-        let new = Self {
+-            node,
+-            incoming: receiver,
+-        };
++        let (base, sender) = SyncBase::new(node);
++        let new = Self { base };
+         (new, sender)
+     }
+ 
+-    async fn find_sync_nodes(&mut self) -> Result<Vec<Peer>> {
+-        let our_block_height = self.node.expect_storage().canon().await?.block_height;
+-        let mut interesting_peers = vec![];
+-        for mut node in self.node.peer_book.connected_peers_snapshot().await {
+-            let judge_bad = node.judge_bad();
+-            if !judge_bad && node.quality.block_height as usize > our_block_height + 1 {
+-                interesting_peers.push(node);
+-            }
+-        }
+-        interesting_peers.sort_by(|x, y| y.quality.block_height.cmp(&x.quality.block_height));
+-
+-        // trim nodes close to us if any are > 10 blocks ahead
+-        if let Some(i) = interesting_peers
+-            .iter()
+-            .position(|x| x.quality.block_height as usize <= our_block_height + 10)
+-        {
+-            interesting_peers.truncate(i + 1);
+-        }
+-
+-        if !interesting_peers.is_empty() {
+-            info!("found {} interesting peers for sync", interesting_peers.len());
+-            trace!("sync interesting peers = {:?}", interesting_peers);
+-        }
+-
+-        Ok(interesting_peers)
+-    }
+-
+-    async fn block_locator_hashes(&mut self) -> Result<Vec<Digest>> {
+-        let forks_of_interest = self.node.expect_sync().consensus.scan_forks().await?;
+-        trace!("sync found {} forks", forks_of_interest.len());
+-        let blocks_of_interest: Vec<Digest> = forks_of_interest.into_iter().map(|(_canon, fork)| fork).collect();
+-        let mut tips_of_blocks_of_interest: Vec<Digest> = Vec::with_capacity(blocks_of_interest.len());
+-        for block in blocks_of_interest {
+-            if tips_of_blocks_of_interest.len() > crate::MAX_BLOCK_SYNC_COUNT as usize {
+-                debug!("reached limit of blocks of interest in sync block locator hashes");
+-                break;
+-            }
+-            let mut fork_path = self.node.expect_storage().longest_child_path(&block).await?;
+-            if fork_path.len() < 2 {
+-                // a minor fork, we probably don't care
+-                continue;
+-            }
+-            tips_of_blocks_of_interest.push(fork_path.pop().unwrap());
+-        }
+-        match self
+-            .node
+-            .expect_storage()
+-            .get_block_locator_hashes(tips_of_blocks_of_interest, snarkos_consensus::OLDEST_FORK_THRESHOLD)
+-            .await
+-        {
+-            Ok(block_locator_hashes) => Ok(block_locator_hashes),
+-            Err(e) => {
+-                error!("Unable to get block locator hashes from storage: {:?}", e);
+-                Err(e)
+-            }
+-        }
+-    }
+-
+     async fn send_sync_messages(&mut self, sync_nodes: Vec<Peer>) -> Result<usize> {
+         info!("requested block information from {} peers", sync_nodes.len());
+-        let block_locator_hashes = self
+-            .block_locator_hashes()
+-            .await?
+-            .into_iter()
+-            .map(|x| BlockHeaderHash(x.bytes::<32>().unwrap()))
+-            .collect::<Vec<_>>();
++        let block_locator_hashes = SyncBase::block_locator_hashes(&self.base.node).await?;
+         let mut future_set = vec![];
+ 
+         for peer in sync_nodes.iter() {
+-            if let Some(handle) = self.node.peer_book.get_peer_handle(peer.address) {
++            if let Some(handle) = self.base.node.peer_book.get_peer_handle(peer.address) {
+                 let locator_hashes = block_locator_hashes.clone();
+                 future_set.push(async move {
+                     handle.send_payload(Payload::GetSync(locator_hashes), None).await;
+@@ -133,55 +61,25 @@ impl SyncMaster {
+         Ok(sent)
+     }
+ 
+-    /// receives an arbitrary amount of inbound sync messages with a given timeout.
+-    /// if the passed `handler` callback returns `true`, then the loop is terminated early.
+-    /// if the sync stream closes, the loop is also terminated early.
+-    async fn receive_messages<F: FnMut(SyncInbound) -> bool>(
+-        &mut self,
+-        timeout_sec: u64,
+-        moving_timeout_sec: u64,
+-        mut handler: F,
+-    ) {
+-        let end = Instant::now() + Duration::from_secs(timeout_sec);
+-        let mut moving_end = Instant::now() + Duration::from_secs(moving_timeout_sec);
+-        loop {
+-            let timeout = tokio::time::sleep_until(end.min(moving_end)).fuse();
+-            pin_mut!(timeout);
+-            select! {
+-                msg = self.incoming.recv().fuse() => {
+-                    if msg.is_none() {
+-                        break;
+-                    }
+-                    metrics::decrement_gauge!(snarkos_metrics::queues::SYNC_ITEMS, 1.0);
+-                    if handler(msg.unwrap()) {
+-                        break;
+-                    }
+-                    moving_end += Duration::from_secs(moving_timeout_sec);
+-                },
+-                _ = timeout => {
+-                    break;
+-                }
+-            }
+-        }
+-    }
+-
+     async fn receive_sync_hashes(&mut self, max_message_count: usize) -> HashMap<SocketAddr, Vec<Digest>> {
+         const TIMEOUT: u64 = 5;
+         let mut received_block_hashes = HashMap::new();
+ 
+-        self.receive_messages(TIMEOUT, TIMEOUT, |msg| {
+-            match msg {
+-                SyncInbound::BlockHashes(addr, hashes) => {
+-                    received_block_hashes.insert(addr, hashes.into_iter().map(|x| -> Digest { x.0.into() }).collect());
+-                }
+-                SyncInbound::Block(..) => {
+-                    warn!("received sync block prematurely");
++        self.base
++            .receive_messages(TIMEOUT, TIMEOUT, |msg| {
++                match msg {
++                    SyncInbound::BlockHashes(addr, hashes) => {
++                        received_block_hashes
++                            .insert(addr, hashes.into_iter().map(|x| -> Digest { x.0.into() }).collect());
++                    }
++                    SyncInbound::Block(..) => {
++                        warn!("received sync block prematurely");
++                    }
+                 }
+-            }
+-            //todo: fail if peer sends > 1 block hash packet
+-            received_block_hashes.len() >= max_message_count
+-        })
+-        .await;
++                //todo: fail if peer sends > 1 block hash packet
++                received_block_hashes.len() >= max_message_count
++            })
++            .await;
+ 
+         info!(
+             "received {} hashes from {} peers in {} seconds",
+@@ -200,18 +98,19 @@ impl SyncMaster {
+         const TIMEOUT: u64 = 30;
+         let mut blocks = vec![];
+ 
+-        self.receive_messages(TIMEOUT, 4, |msg| {
+-            match msg {
+-                SyncInbound::BlockHashes(_, _) => {
+-                    // late, ignored
+-                }
+-                SyncInbound::Block(address, block, height) => {
+-                    blocks.push(SyncBlock { address, block, height });
++        self.base
++            .receive_messages(TIMEOUT, 4, |msg| {
++                match msg {
++                    SyncInbound::BlockHashes(_, _) => {
++                        // late, ignored
++                    }
++                    SyncInbound::Block(address, block, height) => {
++                        blocks.push(SyncBlock { address, block, height });
++                    }
+                 }
+-            }
+-            blocks.len() >= block_count
+-        })
+-        .await;
++                blocks.len() >= block_count
++            })
++            .await;
+ 
+         info!("received {} blocks in {} seconds", blocks.len(), TIMEOUT);
+ 
+@@ -288,7 +187,7 @@ impl SyncMaster {
+ 
+         let mut future_set = vec![];
+         for (addr, request) in peer_block_requests {
+-            if let Some(peer) = self.node.peer_book.get_peer_handle(addr) {
++            if let Some(peer) = self.base.node.peer_book.get_peer_handle(addr) {
+                 sent += request.len();
+                 let request: Vec<BlockHeaderHash> = request
+                     .into_iter()
+@@ -304,26 +203,14 @@ impl SyncMaster {
+         sent
+     }
+ 
+-    async fn cancel_outstanding_syncs(&mut self, addresses: &[SocketAddr]) {
+-        let mut future_set = vec![];
+-        for addr in addresses {
+-            if let Some(peer) = self.node.peer_book.get_peer_handle(*addr) {
+-                future_set.push(async move {
+-                    peer.cancel_sync().await;
+-                });
+-            }
+-        }
+-        futures::future::join_all(future_set).await;
+-    }
+-
+     pub async fn run(mut self) -> Result<()> {
+-        let sync_nodes = self.find_sync_nodes().await?;
++        let sync_nodes = self.base.find_sync_nodes().await?;
+ 
+         if sync_nodes.is_empty() {
+             return Ok(());
+         }
+ 
+-        self.node.register_block_sync_attempt();
++        self.base.node.register_block_sync_attempt();
+ 
+         let hash_requests_sent = self.send_sync_messages(sync_nodes).await?;
+ 
+@@ -342,7 +229,7 @@ impl SyncMaster {
+         let early_blocks = Self::order_block_hashes(&blocks[..]);
+         let early_blocks_count = early_blocks.len();
+ 
+-        let early_block_states = self.node.expect_storage().get_block_states(&early_blocks[..]).await?;
++        let early_block_states = self.base.node.storage.get_block_states(&early_blocks[..]).await?;
+         let block_order: Vec<_> = early_blocks
+             .into_iter()
+             .zip(early_block_states.iter())
+@@ -374,7 +261,7 @@ impl SyncMaster {
+             sent_block_requests
+         );
+ 
+-        self.cancel_outstanding_syncs(&peer_addresses[..]).await;
++        self.base.cancel_outstanding_syncs(&peer_addresses[..]).await;
+ 
+         let mut blocks_by_hash: HashedMap<Digest, _> =
+             HashedMap::with_capacity_and_hasher(received_blocks.len(), HashBuildHasher::default());
+@@ -387,7 +274,8 @@ impl SyncMaster {
+ 
+         for (i, hash) in block_order.iter().enumerate() {
+             if let Some(block) = blocks_by_hash.remove(hash) {
+-                self.node
++                self.base
++                    .node
+                     .process_received_block(block.address, block.block, block.height, false)
+                     .await?;
+             } else {
+@@ -405,7 +293,7 @@ impl SyncMaster {
+     }
+ }
+ 
+-impl Drop for SyncMaster {
++impl Drop for SyncBatched {
+     fn drop(&mut self) {
+         metrics::gauge!(snarkos_metrics::queues::SYNC_ITEMS, 0.0);
+     }
+diff --git a/network/src/sync/blocks.rs b/network/src/sync/blocks/interface.rs
+similarity index 96%
+rename from network/src/sync/blocks.rs
+rename to network/src/sync/blocks/interface.rs
+index ef75a5167..a0009a28f 100644
+--- a/network/src/sync/blocks.rs
++++ b/network/src/sync/blocks/interface.rs
+@@ -30,7 +30,7 @@ use snarkvm_dpc::{
+ use snarkos_consensus::error::ConsensusError;
+ use snarkos_metrics as metrics;
+ 
+-use crate::{master::SyncInbound, message::*, NetworkError, Node, State};
++use crate::{message::*, NetworkError, Node, State, SyncInbound};
+ use anyhow::*;
+ use tokio::task;
+ 
+@@ -131,7 +131,7 @@ impl Node {
+         .map_err(|e| NetworkError::Other(e.into()))??;
+         let previous_block_hash = block_struct.header.previous_block_hash.clone();
+ 
+-        let canon = self.expect_storage().canon().await?;
++        let canon = self.storage.canon().await?;
+ 
+         info!(
+             "Got a block from {} ({}) with hash {}... (current head {})",
+@@ -175,8 +175,8 @@ impl Node {
+             .map(|x| -> Digest { x.0.into() })
+             .enumerate()
+         {
+-            let block = self.expect_storage().get_block(&hash).await?;
+-            let height = match self.expect_storage().get_block_state(&block.header.hash()).await? {
++            let block = self.storage.get_block(&hash).await?;
++            let height = match self.storage.get_block_state(&block.header.hash()).await? {
+                 BlockStatus::Committed(h) => Some(h as u32),
+                 _ => None,
+             };
+@@ -211,7 +211,7 @@ impl Node {
+         let block_locator_hashes = block_locator_hashes.into_iter().map(|x| x.0.into()).collect::<Vec<_>>();
+ 
+         let sync_hashes = self
+-            .expect_storage()
++            .storage
+             .find_sync_blocks(&block_locator_hashes[..], crate::MAX_BLOCK_SYNC_COUNT as usize)
+             .await?
+             .into_iter()
+diff --git a/network/src/sync/blocks/mod.rs b/network/src/sync/blocks/mod.rs
+new file mode 100644
+index 000000000..5ec690eef
+--- /dev/null
++++ b/network/src/sync/blocks/mod.rs
+@@ -0,0 +1,32 @@
++// Copyright (C) 2019-2021 Aleo Systems Inc.
++// This file is part of the snarkOS library.
++
++// The snarkOS library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkOS library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
++
++mod batched;
++pub use batched::*;
++mod interface;
++pub use interface::*;
++mod base;
++pub use base::*;
++mod aggro;
++pub use aggro::*;
++
++use snarkvm_dpc::BlockHeaderHash;
++use std::net::SocketAddr;
++
++pub enum SyncInbound {
++    BlockHashes(SocketAddr, Vec<BlockHeaderHash>),
++    Block(SocketAddr, Vec<u8>, Option<u32>),
++}
+diff --git a/network/src/sync/miner.rs b/network/src/sync/miner.rs
+index d6e5821ef..d0914a2f6 100644
+--- a/network/src/sync/miner.rs
++++ b/network/src/sync/miner.rs
+@@ -124,12 +124,7 @@ impl MinerInstance {
+ 
+                 let serialized_block = block.serialize();
+                 let node_clone = self.node.clone();
+-                let new_height = node_clone
+-                    .expect_storage()
+-                    .canon()
+-                    .await
+-                    .map(|c| c.block_height as u32)
+-                    .ok();
++                let new_height = node_clone.storage.canon().await.map(|c| c.block_height as u32).ok();
+ 
+                 self.node.propagate_block(serialized_block, new_height, local_addr);
+             }
+diff --git a/network/src/sync/mod.rs b/network/src/sync/mod.rs
+index e71ca88d6..585038afe 100644
+--- a/network/src/sync/mod.rs
++++ b/network/src/sync/mod.rs
+@@ -26,5 +26,3 @@ pub use miner::*;
+ 
+ pub mod sync;
+ pub use sync::*;
+-
+-pub mod master;
+diff --git a/rpc/src/custom_rpc_server.rs b/rpc/src/custom_rpc_server.rs
+index 1e57d4b32..afd21cea0 100644
+--- a/rpc/src/custom_rpc_server.rs
++++ b/rpc/src/custom_rpc_server.rs
+@@ -60,7 +60,7 @@ const METHODS_EXPECTING_PARAMS: [&str; 15] = [
+ #[allow(clippy::too_many_arguments)]
+ pub fn start_rpc_server(
+     rpc_addr: SocketAddr,
+-    storage: Option<DynStorage>,
++    storage: DynStorage,
+     node_server: Node,
+     username: Option<String>,
+     password: Option<String>,
+diff --git a/rpc/src/rpc_impl.rs b/rpc/src/rpc_impl.rs
+index fca1d31ec..64a6acc48 100644
+--- a/rpc/src/rpc_impl.rs
++++ b/rpc/src/rpc_impl.rs
+@@ -57,7 +57,7 @@ impl Deref for RpcImpl {
+ 
+ pub struct RpcInner {
+     /// Blockchain database storage.
+-    pub(crate) storage: Option<DynStorage>,
++    pub(crate) storage: DynStorage,
+ 
+     /// RPC credentials for accessing guarded endpoints
+     pub(crate) credentials: Option<RpcCredentials>,
+@@ -68,7 +68,7 @@ pub struct RpcInner {
+ 
+ impl RpcImpl {
+     /// Creates a new struct for calling public and private RPC endpoints.
+-    pub fn new(storage: Option<DynStorage>, credentials: Option<RpcCredentials>, node: Node) -> Self {
++    pub fn new(storage: DynStorage, credentials: Option<RpcCredentials>, node: Node) -> Self {
+         Self(Arc::new(RpcInner {
+             storage,
+             credentials,
+@@ -76,10 +76,6 @@ impl RpcImpl {
+         }))
+     }
+ 
+-    pub fn storage(&self) -> Result<&DynStorage, RpcError> {
+-        self.storage.as_ref().ok_or(RpcError::NoStorage)
+-    }
+-
+     pub fn sync_handler(&self) -> Result<&Arc<Sync>, RpcError> {
+         self.node.sync().ok_or(RpcError::NoConsensus)
+     }
+@@ -226,20 +222,20 @@ impl RpcFunctions for RpcImpl {
+         }
+ 
+         let block_header_hash: Digest = block_hash[..].into();
+-        let height = match self.storage()?.get_block_state(&block_header_hash).await? {
++        let height = match self.storage.get_block_state(&block_header_hash).await? {
+             BlockStatus::Committed(block_num) => Some(block_num),
+             BlockStatus::Uncommitted => None,
+             BlockStatus::Unknown => return Err(RpcError::InvalidBlockHash(block_hash_string)),
+         };
+ 
+-        let canon = self.storage()?.canon().await?;
++        let canon = self.storage.canon().await?;
+ 
+         let confirmations = match height {
+             Some(block_height) => canon.block_height - block_height,
+             None => 0,
+         };
+ 
+-        let block = self.storage()?.get_block(&block_header_hash).await?;
++        let block = self.storage.get_block(&block_header_hash).await?;
+         let mut transactions = Vec::with_capacity(block.transactions.len());
+ 
+         for transaction in block.transactions.iter() {
+@@ -264,20 +260,20 @@ impl RpcFunctions for RpcImpl {
+ 
+     /// Returns the number of blocks in the canonical chain, including the genesis.
+     async fn get_block_count(&self) -> Result<u32, RpcError> {
+-        let canon = self.storage()?.canon().await?;
++        let canon = self.storage.canon().await?;
+         Ok(canon.block_height as u32 + 1)
+     }
+ 
+     /// Returns the block hash of the head of the canonical chain.
+     async fn get_best_block_hash(&self) -> Result<String, RpcError> {
+-        let canon = self.storage()?.canon().await?;
++        let canon = self.storage.canon().await?;
+ 
+         Ok(hex::encode(&canon.hash.0))
+     }
+ 
+     /// Returns the block hash of the index specified if it exists in the canonical chain.
+     async fn get_block_hash(&self, block_height: u32) -> Result<String, RpcError> {
+-        let block_hash = self.storage()?.get_block_hash(block_height).await?;
++        let block_hash = self.storage.get_block_hash(block_height).await?;
+ 
+         Ok(block_hash
+             .map(|x| hex::encode(&x))
+@@ -287,7 +283,7 @@ impl RpcFunctions for RpcImpl {
+     /// Returns the hex encoded bytes of a transaction from its transaction id.
+     async fn get_raw_transaction(&self, transaction_id: String) -> Result<String, RpcError> {
+         let transaction_id = hex::decode(transaction_id)?;
+-        let transaction = self.storage()?.get_transaction(transaction_id[..].into()).await?;
++        let transaction = self.storage.get_transaction(transaction_id[..].into()).await?;
+ 
+         Ok(hex::encode(&to_bytes_le![&transaction]?))
+     }
+@@ -332,8 +328,8 @@ impl RpcFunctions for RpcImpl {
+ 
+         let transaction_id = transaction.transaction_id()?;
+ 
+-        let block_number = match self.storage()?.get_transaction_location(transaction_id.into()).await? {
+-            Some(block_location) => match self.storage()?.get_block_state(&block_location.block_hash).await? {
++        let block_number = match self.storage.get_transaction_location(transaction_id.into()).await? {
++            Some(block_location) => match self.storage.get_block_state(&block_location.block_hash).await? {
+                 BlockStatus::Committed(n) => Some(n as u32),
+                 _ => None,
+             },
+@@ -431,9 +427,9 @@ impl RpcFunctions for RpcImpl {
+ 
+     /// Returns the current mempool and sync information known by this node.
+     async fn get_block_template(&self) -> Result<BlockTemplate, RpcError> {
+-        let canon = self.storage()?.canon().await?;
++        let canon = self.storage.canon().await?;
+ 
+-        let block = self.storage()?.get_block_header(&canon.hash).await?;
++        let block = self.storage.get_block_header(&canon.hash).await?;
+ 
+         let time = Utc::now().timestamp();
+ 
+diff --git a/rpc/src/rpc_impl_protected.rs b/rpc/src/rpc_impl_protected.rs
+index af5f24812..df3521e77 100644
+--- a/rpc/src/rpc_impl_protected.rs
++++ b/rpc/src/rpc_impl_protected.rs
+@@ -621,7 +621,7 @@ impl ProtectedRpcFunctions for RpcImpl {
+ 
+     /// Returns the number of record commitments that are stored on the full node.
+     async fn get_record_commitment_count(&self) -> Result<usize, RpcError> {
+-        let storage = &self.storage()?;
++        let storage = &self.storage;
+         let record_commitments = storage.get_record_commitments(None).await?;
+ 
+         Ok(record_commitments.len())
+@@ -629,7 +629,7 @@ impl ProtectedRpcFunctions for RpcImpl {
+ 
+     /// Returns a list of record commitments that are stored on the full node.
+     async fn get_record_commitments(&self) -> Result<Vec<String>, RpcError> {
+-        let record_commitments = self.storage()?.get_record_commitments(Some(100)).await?;
++        let record_commitments = self.storage.get_record_commitments(Some(100)).await?;
+         let record_commitment_strings: Vec<String> = record_commitments.iter().map(hex::encode).collect();
+ 
+         Ok(record_commitment_strings)
+@@ -638,7 +638,7 @@ impl ProtectedRpcFunctions for RpcImpl {
+     /// Returns the hex encoded bytes of a record from its record commitment
+     async fn get_raw_record(&self, record_commitment: String) -> Result<String, RpcError> {
+         let decoded = hex::decode(record_commitment)?;
+-        match self.storage()?.get_record(decoded[..].into()).await? {
++        match self.storage.get_record(decoded[..].into()).await? {
+             Some(record) => Ok(hex::encode(to_bytes_le![record]?)),
+             None => Ok("Record not found".to_string()),
+         }
+diff --git a/rpc/tests/protected_rpc_tests.rs b/rpc/tests/protected_rpc_tests.rs
+index 80031cb62..ea8db140a 100644
+--- a/rpc/tests/protected_rpc_tests.rs
++++ b/rpc/tests/protected_rpc_tests.rs
+@@ -80,7 +80,7 @@ mod protected_rpc_tests {
+         };
+ 
+         let environment = test_config(node_setup.unwrap_or_default());
+-        let mut node = Node::new(environment, Some(consensus.storage.clone())).await.unwrap();
++        let mut node = Node::new(environment, consensus.storage.clone()).await.unwrap();
+         let consensus_setup = ConsensusSetup::default();
+ 
+         let node_consensus = snarkos_network::Sync::new(
+@@ -92,7 +92,7 @@ mod protected_rpc_tests {
+ 
+         node.set_sync(node_consensus);
+ 
+-        let rpc_impl = RpcImpl::new(Some(consensus.storage.clone()), Some(credentials), node.clone());
++        let rpc_impl = RpcImpl::new(consensus.storage.clone(), Some(credentials), node.clone());
+         let mut io = jsonrpc_core::MetaIoHandler::default();
+ 
+         rpc_impl.add_protected(&mut io);
+diff --git a/rpc/tests/rpc_tests.rs b/rpc/tests/rpc_tests.rs
+index 054a3aa11..ffad5c339 100644
+--- a/rpc/tests/rpc_tests.rs
++++ b/rpc/tests/rpc_tests.rs
+@@ -39,7 +39,7 @@ mod rpc_tests {
+     async fn initialize_test_rpc(consensus: &Arc<Consensus>, node_setup: Option<TestSetup>) -> (Rpc, Node) {
+         let environment = test_config(node_setup.unwrap_or_default());
+ 
+-        let mut node = Node::new(environment, Some(consensus.storage.clone())).await.unwrap();
++        let mut node = Node::new(environment, consensus.storage.clone()).await.unwrap();
+         let consensus_setup = ConsensusSetup::default();
+ 
+         let node_consensus = snarkos_network::Sync::new(
+diff --git a/testing/src/network/mod.rs b/testing/src/network/mod.rs
+index 1225c6c97..311f4152e 100644
+--- a/testing/src/network/mod.rs
++++ b/testing/src/network/mod.rs
+@@ -187,15 +187,13 @@ pub async fn test_node(setup: TestSetup) -> Node {
+     let node = match setup.consensus_setup {
+         None => Node::new(
+             config,
+-            Some(Arc::new(AsyncStorage::new(SqliteStorage::new_ephemeral().unwrap()))),
++            Arc::new(AsyncStorage::new(SqliteStorage::new_ephemeral().unwrap())),
+         )
+         .await
+         .unwrap(),
+         Some(consensus_setup) => {
+             let consensus = test_consensus(consensus_setup).await;
+-            let mut node = Node::new(config, Some(consensus.consensus.storage.clone()))
+-                .await
+-                .unwrap();
++            let mut node = Node::new(config, consensus.consensus.storage.clone()).await.unwrap();
+ 
+             node.set_sync(consensus);
+             node
+diff --git a/testing/src/network/sync.rs b/testing/src/network/sync.rs
+index c64312661..a0cbc8725 100644
+--- a/testing/src/network/sync.rs
++++ b/testing/src/network/sync.rs
+@@ -104,7 +104,7 @@ async fn block_initiator_side() {
+     wait_until!(
+         5,
+         matches!(
+-            node.expect_storage()
++            node.storage
+                 .get_block_state(&block_1_header_hash.0.into())
+                 .await
+                 .unwrap(),
+@@ -114,7 +114,7 @@ async fn block_initiator_side() {
+     wait_until!(
+         1,
+         matches!(
+-            node.expect_storage()
++            node.storage
+                 .get_block_state(&block_2_header_hash.0.into())
+                 .await
+                 .unwrap(),
+@@ -181,7 +181,7 @@ async fn block_propagation() {
+     let payload = Payload::Block(block_1.clone(), Some(1));
+     peer.write_message(&payload).await;
+ 
+-    wait_until!(5, node.expect_storage().canon().await.unwrap().block_height == 1);
++    wait_until!(5, node.storage.canon().await.unwrap().block_height == 1);
+ 
+     node.peer_book.broadcast(Payload::Ping(1)).await;
+ 
+@@ -227,10 +227,7 @@ async fn block_two_node() {
+     let node_bob = test_node(setup).await;
+ 
+     // check blocks present in alice's chain were synced to bob's
+-    wait_until!(
+-        30,
+-        node_bob.expect_storage().canon().await.unwrap().block_height == NUM_BLOCKS
+-    );
++    wait_until!(30, node_bob.storage.canon().await.unwrap().block_height == NUM_BLOCKS);
+ }
+ 
+ #[tokio::test]

@@ -1,54 +1,243 @@
-diff --git a/src/sentry/users/api/serializers/user.py b/src/sentry/users/api/serializers/user.py
-index 7ed86267bca..caff0ddfb4c 100644
---- a/src/sentry/users/api/serializers/user.py
-+++ b/src/sentry/users/api/serializers/user.py
-@@ -183,11 +183,13 @@ class UserSerializer(Serializer):
-             "experiments": {},
-         }
+diff --git a/static/app/views/performance/newTraceDetails/traceModels/traceTree.measurements.tsx b/static/app/views/performance/newTraceDetails/traceModels/traceTree.measurements.tsx
+index da39930b452575..238d3265c282c7 100644
+--- a/static/app/views/performance/newTraceDetails/traceModels/traceTree.measurements.tsx
++++ b/static/app/views/performance/newTraceDetails/traceModels/traceTree.measurements.tsx
+@@ -135,22 +135,28 @@ export function collectTraceMeasurements(
+       score,
+     });
  
--        if self._user_is_requester(obj, user):
-+        if self._user_is_requester(obj, user) or user.is_superuser:
-             d["emails"] = [
-                 {"id": str(e.id), "email": e.email, "is_verified": e.is_verified}
-                 for e in attrs["emails"]
-             ]
+-    const hasSeenMeasurement = tree.indicators.some(
++    if (!RENDERABLE_MEASUREMENTS[collectableMeasurement]) {
++      continue;
++    }
 +
-+        if self._user_is_requester(obj, user):
-             d = cast(UserSerializerResponseSelf, d)
-             options = {
-                 o.key: o.value
-diff --git a/tests/sentry/users/api/serializers/test_user.py b/tests/sentry/users/api/serializers/test_user.py
-index 8236160f3bd..bc558dd5acd 100644
---- a/tests/sentry/users/api/serializers/test_user.py
-+++ b/tests/sentry/users/api/serializers/test_user.py
-@@ -49,6 +49,30 @@ class UserSerializerTest(TestCase):
-         result = serialize(user)
-         assert result["isSuperuser"] is True
++    const isStandalone = isStandaloneSpanMeasurementNode(node);
++    const existingIndicatorIndex = tree.indicators.findIndex(
+       indicator => indicator.type === collectableMeasurement
+     );
+-    if (!RENDERABLE_MEASUREMENTS[collectableMeasurement] || hasSeenMeasurement) {
++
++    if (existingIndicatorIndex !== -1 && !isStandalone) {
+       continue;
+     }
  
-+    def test_superuser_can_see_other_user_emails(self) -> None:
-+        superuser = self.create_user(is_superuser=True)
-+        other_user = self.create_user()
-+
-+        result = serialize(other_user, superuser)
-+        assert len(result["emails"]) == 1
-+        assert result["emails"][0]["email"] == other_user.email
-+        assert result["emails"][0]["is_verified"]
-+
-+    def test_non_requester_cannot_see_emails(self) -> None:
-+        viewer = self.create_user()
-+        other_user = self.create_user()
-+
-+        result = serialize(other_user, viewer)
-+        assert result["emails"] == []
-+
-+    def test_superuser_does_not_get_self_fields_for_other_user(self) -> None:
-+        superuser = self.create_user(is_superuser=True)
-+        other_user = self.create_user()
-+
-+        result = serialize(other_user, superuser)
-+        assert "options" not in result
-+        assert "flags" not in result
-+
+-    // Standalone span measurements occur at the exact start timestamp of the span.
+-    // We pass in 0 as the measurement value to prevent applying any unnecessary offset.
++    // Standalone spans should win over transaction-level measurements, but the
++    // measurement value is still applied relative to the provided timeline origin.
+     const timestamp = traceMeasurementToTimestamp(
+       start_timestamp,
+-      isStandaloneSpanMeasurementNode(node) ? 0 : measurement.value,
++      measurement.value,
+       measurement.unit ?? 'millisecond'
+     );
  
- @control_silo_test
- class DetailedUserSerializerTest(TestCase):
+-    indicators.push({
++    const indicator: TraceTree.Indicator = {
+       start: timestamp,
+       duration: 0,
+       measurement,
+@@ -162,7 +168,13 @@ export function collectTraceMeasurements(
+         MEASUREMENT_ACRONYM_MAPPING[collectableMeasurement] ?? collectableMeasurement
+       ).toUpperCase(),
+       score,
+-    });
++    };
++
++    if (existingIndicatorIndex === -1) {
++      indicators.push(indicator);
++    } else {
++      tree.indicators[existingIndicatorIndex] = indicator;
++    }
+   }
+ 
+   return indicators;
+diff --git a/static/app/views/performance/newTraceDetails/traceModels/traceTree.spec.tsx b/static/app/views/performance/newTraceDetails/traceModels/traceTree.spec.tsx
+index 8e19194e040b18..7558ce83ed437f 100644
+--- a/static/app/views/performance/newTraceDetails/traceModels/traceTree.spec.tsx
++++ b/static/app/views/performance/newTraceDetails/traceModels/traceTree.spec.tsx
+@@ -820,6 +820,78 @@ describe('TraceTree', () => {
+       );
+     });
+ 
++    it('standalone LCP span indicator takes priority over pageload LCP indicator', () => {
++      const standaloneStart = start + 1.5;
++      const tree = TraceTree.FromTrace(
++        makeEAPTrace([
++          makeEAPSpan({
++            event_id: 'pageload-span',
++            op: 'pageload',
++            start_timestamp: start,
++            end_timestamp: start + 2,
++            is_transaction: true,
++            measurements: {
++              'measurements.lcp': 500,
++            },
++            children: [],
++          }),
++          makeEAPSpan({
++            event_id: 'standalone-lcp-span',
++            op: 'ui.webvital.lcp',
++            start_timestamp: standaloneStart,
++            end_timestamp: standaloneStart + 0.1,
++            is_transaction: false,
++            measurements: {
++              'measurements.lcp': 500,
++            },
++            children: [],
++          }),
++        ]),
++        {meta: null, replay: null, organization}
++      );
++
++      const lcpIndicators = tree.indicators.filter(i => i.type === 'lcp');
++      expect(lcpIndicators).toHaveLength(1);
++      expect(lcpIndicators[0]!.start).toBe(standaloneStart * 1e3 + 500);
++    });
++
++    it('applies standalone LCP measurement offset from trace origin when present', () => {
++      const tree = TraceTree.FromTrace(
++        makeEAPTrace([
++          makeEAPSpan({
++            event_id: 'pageload-span',
++            op: 'pageload',
++            start_timestamp: start,
++            end_timestamp: start + 2,
++            is_transaction: true,
++            additional_attributes: {
++              'tags[performance.timeOrigin,number]': start,
++            },
++            measurements: {
++              'measurements.lcp': 500,
++            },
++            children: [],
++          }),
++          makeEAPSpan({
++            event_id: 'standalone-lcp-span',
++            op: 'ui.webvital.lcp',
++            start_timestamp: start + 1.5,
++            end_timestamp: start + 1.6,
++            is_transaction: false,
++            measurements: {
++              'measurements.lcp': 1240,
++            },
++            children: [],
++          }),
++        ]),
++        {meta: null, replay: null, organization}
++      );
++
++      const lcpIndicators = tree.indicators.filter(i => i.type === 'lcp');
++      expect(lcpIndicators).toHaveLength(1);
++      expect(lcpIndicators[0]!.start).toBe(start * 1e3 + 1240);
++    });
++
+     it('handles cycles in EAP trace structure without infinite loop', () => {
+       const cyclicSpan = makeEAPSpan({
+         event_id: 'cyclic-span',
+diff --git a/static/app/views/performance/newTraceDetails/traceModels/traceTree.tsx b/static/app/views/performance/newTraceDetails/traceModels/traceTree.tsx
+index e539acabed670e..a588968e6ae172 100644
+--- a/static/app/views/performance/newTraceDetails/traceModels/traceTree.tsx
++++ b/static/app/views/performance/newTraceDetails/traceModels/traceTree.tsx
+@@ -437,7 +437,7 @@ export class TraceTree extends TraceTreeEventDispatcher {
+     });
+ 
+     // Track visited event_ids to prevent cycles during tree construction.
+-    // Cyclic nodes are skipped and logged to Sentry for monitoring.
++    // Cyclic nodes are skipped and logged for debugging.
+     const visitedIds = new Set<string>();
+ 
+     function visit(
+@@ -451,10 +451,7 @@ export class TraceTree extends TraceTreeEventDispatcher {
+     ) {
+       const nodeId = 'event_id' in value ? value.event_id : undefined;
+       if (nodeId && visitedIds.has(nodeId)) {
+-        Sentry.withScope(scope => {
+-          scope.setFingerprint(['trace-tree-cycle-detected']);
+-          Sentry.captureMessage('Cycle detected in trace tree structure');
+-        });
++        Sentry.logger.warn('Cycle detected in trace tree structure', {nodeId});
+         return;
+       }
+       if (nodeId) {
+diff --git a/static/app/views/projectDetail/missingFeatureButtons/missingAlertsButtons.tsx b/static/app/views/projectDetail/missingFeatureButtons/missingAlertsButtons.tsx
+index c8ee723ca38fc2..1984d6a4957471 100644
+--- a/static/app/views/projectDetail/missingFeatureButtons/missingAlertsButtons.tsx
++++ b/static/app/views/projectDetail/missingFeatureButtons/missingAlertsButtons.tsx
+@@ -23,10 +23,18 @@ function MissingAlertsButtons({organization, projectSlug}: Props) {
+         referrer="project_detail"
+         projectSlug={projectSlug}
+         hideIcon
++        analyticsEventKey="project_detail.alerts_create_alert_clicked"
++        analyticsEventName="Project Detail: Alerts Create Alert Clicked"
+       >
+         {t('Create Alert')}
+       </CreateAlertButton>
+-      <LinkButton size="sm" external href={DOCS_URL}>
++      <LinkButton
++        size="sm"
++        external
++        href={DOCS_URL}
++        analyticsEventKey="project_detail.alerts_learn_more_clicked"
++        analyticsEventName="Project Detail: Alerts Learn More Clicked"
++      >
+         {t('Learn More')}
+       </LinkButton>
+     </Grid>
+diff --git a/static/app/views/projectDetail/missingFeatureButtons/missingPerformanceButtons.tsx b/static/app/views/projectDetail/missingFeatureButtons/missingPerformanceButtons.tsx
+index 9cc19457105fa5..43f96e1ccb5a94 100644
+--- a/static/app/views/projectDetail/missingFeatureButtons/missingPerformanceButtons.tsx
++++ b/static/app/views/projectDetail/missingFeatureButtons/missingPerformanceButtons.tsx
+@@ -56,9 +56,10 @@ function MissingPerformanceButtons({organization}: Props) {
+         <Button
+           size="sm"
+           priority="primary"
++          analyticsEventKey="project_detail.performance_setup_clicked"
++          analyticsEventName="Project Detail: Performance Start Setup Clicked"
+           onClick={event => {
+             event.preventDefault();
+-            // TODO: add analytics here for this specific action.
+             navigateTo(
+               `${getPerformanceBaseUrl(organization.slug, domainView)}/?project=:project#performance-sidequest`,
+               router
+@@ -76,7 +77,12 @@ function MissingPerformanceButtons({organization}: Props) {
+           doneUrl={DOCS_URL}
+         >
+           {({showModal}) => (
+-            <Button size="sm" onClick={showModal}>
++            <Button
++              size="sm"
++              onClick={showModal}
++              analyticsEventKey="project_detail.performance_tour_clicked"
++              analyticsEventName="Project Detail: Performance Get Tour Clicked"
++            >
+               {t('Get Tour')}
+             </Button>
+           )}
+diff --git a/static/app/views/projectDetail/missingFeatureButtons/missingReleasesButtons.tsx b/static/app/views/projectDetail/missingFeatureButtons/missingReleasesButtons.tsx
+index 497acbdb31110f..02cd2bcd0dffad 100644
+--- a/static/app/views/projectDetail/missingFeatureButtons/missingReleasesButtons.tsx
++++ b/static/app/views/projectDetail/missingFeatureButtons/missingReleasesButtons.tsx
+@@ -55,6 +55,8 @@ function MissingReleasesButtons({organization, health, projectId, platform}: Pro
+         href={health ? DOCS_HEALTH_URL : DOCS_URL}
+         disabled={setupDisabled}
+         tooltipProps={{title: setupDisabled ? setupDisabledTooltip : undefined}}
++        analyticsEventKey="project_detail.releases_setup_clicked"
++        analyticsEventName="Project Detail: Releases Start Setup Clicked"
+       >
+         {t('Start Setup')}
+       </LinkButton>
+@@ -67,7 +69,12 @@ function MissingReleasesButtons({organization, health, projectId, platform}: Pro
+           doneUrl={health ? DOCS_HEALTH_URL : DOCS_URL}
+         >
+           {({showModal}) => (
+-            <Button size="sm" onClick={showModal}>
++            <Button
++              size="sm"
++              onClick={showModal}
++              analyticsEventKey="project_detail.releases_tour_clicked"
++              analyticsEventName="Project Detail: Releases Get Tour Clicked"
++            >
+               {t('Get Tour')}
+             </Button>
+           )}

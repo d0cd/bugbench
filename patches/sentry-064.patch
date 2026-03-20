@@ -1,0 +1,307 @@
+diff --git a/src/sentry/preprod/build_distribution_utils.py b/src/sentry/preprod/build_distribution_utils.py
+index a9e116b1a1d5b4..6db66ad394a7f2 100644
+--- a/src/sentry/preprod/build_distribution_utils.py
++++ b/src/sentry/preprod/build_distribution_utils.py
+@@ -84,6 +84,8 @@ def is_installable_artifact(artifact: PreprodArtifact) -> bool:
+         extras = artifact.extras or {}
+         if extras.get("is_code_signature_valid") is not True:
+             return False
++        if extras.get("codesigning_type") == "app-store":
++            return False
+     return True
+ 
+ 
+diff --git a/src/sentry/search/eap/spans/formulas.py b/src/sentry/search/eap/spans/formulas.py
+index 82daa59cc88975..b90fef5d198030 100644
+--- a/src/sentry/search/eap/spans/formulas.py
++++ b/src/sentry/search/eap/spans/formulas.py
+@@ -228,28 +228,35 @@ def failure_rate(_: ResolvedArguments, settings: ResolverSettings) -> Column.Bin
+ 
+     return Column.BinaryFormula(
+         left=Column(
+-            conditional_aggregation=AttributeConditionalAggregation(
+-                aggregate=Function.FUNCTION_COUNT,
+-                key=AttributeKey(
+-                    name="sentry.status",
+-                    type=AttributeKey.TYPE_STRING,
+-                ),
+-                filter=TraceItemFilter(
+-                    comparison_filter=ComparisonFilter(
++            formula=Column.BinaryFormula(
++                default_value_double=0.0,
++                left=Column(
++                    conditional_aggregation=AttributeConditionalAggregation(
++                        aggregate=Function.FUNCTION_COUNT,
+                         key=AttributeKey(
+                             name="sentry.status",
+                             type=AttributeKey.TYPE_STRING,
+                         ),
+-                        op=ComparisonFilter.OP_NOT_IN,
+-                        value=AttributeValue(
+-                            val_str_array=StrArray(
+-                                values=["ok", "cancelled", "unknown"],
+-                            ),
++                        filter=TraceItemFilter(
++                            comparison_filter=ComparisonFilter(
++                                key=AttributeKey(
++                                    name="sentry.status",
++                                    type=AttributeKey.TYPE_STRING,
++                                ),
++                                op=ComparisonFilter.OP_NOT_IN,
++                                value=AttributeValue(
++                                    val_str_array=StrArray(
++                                        values=["ok", "cancelled", "unknown"],
++                                    ),
++                                ),
++                            )
+                         ),
+-                    )
++                        extrapolation_mode=extrapolation_mode,
++                    ),
+                 ),
+-                extrapolation_mode=extrapolation_mode,
+-            ),
++                op=Column.BinaryFormula.OP_MULTIPLY,
++                right=Column(literal=LiteralValue(val_double=1.0)),
++            )
+         ),
+         op=Column.BinaryFormula.OP_DIVIDE,
+         right=get_total_span_count(settings),
+@@ -755,6 +762,7 @@ def failure_count(_: ResolvedArguments, settings: ResolverSettings) -> Column.Bi
+     extrapolation_mode = settings["extrapolation_mode"]
+ 
+     return Column.BinaryFormula(
++        default_value_double=0.0,
+         left=Column(
+             conditional_aggregation=AttributeConditionalAggregation(
+                 aggregate=Function.FUNCTION_COUNT,
+diff --git a/src/sentry/tasks/autofix.py b/src/sentry/tasks/autofix.py
+index 2c77d415cdfbae..5cce4bd27be850 100644
+--- a/src/sentry/tasks/autofix.py
++++ b/src/sentry/tasks/autofix.py
+@@ -32,6 +32,15 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _get_group_or_log(group_id: int, task_name: str) -> Group | None:
++    """Fetch a Group by ID, returning None and logging a warning if it no longer exists."""
++    try:
++        return Group.objects.get(id=group_id)
++    except Group.DoesNotExist:
++        logger.warning("%s.group_not_found", task_name, extra={"group_id": group_id})
++        return None
++
++
+ @instrumented_task(
+     name="sentry.tasks.autofix.check_autofix_status",
+     namespace=issues_tasks,
+@@ -63,7 +72,9 @@ def generate_summary_and_run_automation(group_id: int, **kwargs) -> None:
+     trigger_path = kwargs.get("trigger_path", "unknown")
+     sentry_sdk.set_tag("trigger_path", trigger_path)
+ 
+-    group = Group.objects.get(id=group_id)
++    group = _get_group_or_log(group_id, "generate_summary_and_run_automation")
++    if group is None:
++        return
+     organization = group.project.organization
+ 
+     task_state = current_task()
+@@ -99,7 +110,9 @@ def generate_issue_summary_only(group_id: int) -> None:
+         get_issue_summary,
+     )
+ 
+-    group = Group.objects.get(id=group_id)
++    group = _get_group_or_log(group_id, "generate_issue_summary_only")
++    if group is None:
++        return
+     organization = group.project.organization
+ 
+     task_state = current_task()
+@@ -139,7 +152,9 @@ def run_automation_only_task(group_id: int) -> None:
+ 
+     from sentry.seer.autofix.issue_summary import run_automation
+ 
+-    group = Group.objects.get(id=group_id)
++    group = _get_group_or_log(group_id, "run_automation_only_task")
++    if group is None:
++        return
+     organization = group.project.organization
+ 
+     task_state = current_task()
+diff --git a/tests/sentry/discover/test_compare_tables.py b/tests/sentry/discover/test_compare_tables.py
+index 7e97c70e07ae17..a4d85db853ab62 100644
+--- a/tests/sentry/discover/test_compare_tables.py
++++ b/tests/sentry/discover/test_compare_tables.py
+@@ -88,16 +88,6 @@ def setUp(self) -> None:
+             widget_type=DashboardWidgetTypes.TRANSACTION_LIKE,
+         )
+ 
+-        self.empty_field_widget_query = DashboardWidgetQuery.objects.create(
+-            widget=self.empty_field_widget,
+-            name="Test Empty Field Widget Query",
+-            order=2,
+-            conditions="",
+-            aggregates=["failure_rate()", "count()"],
+-            columns=["failure_rate()", "count()", "http.status_code"],
+-            fields=["failure_rate()", "count()", "http.status_code"],
+-        )
+-
+         self.non_existent_field_widget = DashboardWidget.objects.create(
+             dashboard=self.dashboard,
+             title="Test Non Existent Field Widget",
+@@ -282,18 +272,6 @@ def test_compare_successful_tables(self) -> None:
+         assert comparison_result["passed"]
+         assert comparison_result["mismatches"] == []
+ 
+-    def test_compare_empty_field_tables(self) -> None:
+-        # testing with failure_rate() field, which is not supported in EAP
+-        comparison_result = compare_tables_for_dashboard_widget_queries(
+-            self.empty_field_widget_query
+-        )
+-        assert comparison_result["passed"] is False
+-        assert comparison_result["reason"] == CompareTableResult.FIELD_NOT_FOUND
+-        assert (
+-            comparison_result["mismatches"] is not None
+-            and "failure_rate()" in comparison_result["mismatches"]
+-        )
+-
+     def test_compare_non_existent_field_tables(self) -> None:
+         comparison_result = compare_tables_for_dashboard_widget_queries(
+             self.non_existent_field_widget_query
+diff --git a/tests/sentry/preprod/test_build_distribution_utils.py b/tests/sentry/preprod/test_build_distribution_utils.py
+new file mode 100644
+index 00000000000000..bdaa6bf5bddb06
+--- /dev/null
++++ b/tests/sentry/preprod/test_build_distribution_utils.py
+@@ -0,0 +1,65 @@
++from sentry.preprod.build_distribution_utils import is_installable_artifact
++from sentry.preprod.models import (
++    PreprodArtifact,
++    PreprodArtifactMobileAppInfo,
++    PreprodBuildConfiguration,
++)
++from sentry.testutils.cases import TestCase
++from sentry.testutils.silo import region_silo_test
++
++
++@region_silo_test
++class IsInstallableArtifactTest(TestCase):
++    def _create_artifact(
++        self,
++        artifact_type=PreprodArtifact.ArtifactType.XCARCHIVE,
++        installable_app_file_id=1,
++        build_number="456",
++        extras=None,
++    ) -> PreprodArtifact:
++        build_config = PreprodBuildConfiguration.objects.create(
++            project=self.project, name="Release"
++        )
++        artifact = PreprodArtifact.objects.create(
++            project=self.project,
++            state=PreprodArtifact.ArtifactState.PROCESSED,
++            artifact_type=artifact_type,
++            app_id="com.example.app",
++            build_configuration=build_config,
++            installable_app_file_id=installable_app_file_id,
++            extras=extras,
++        )
++        PreprodArtifactMobileAppInfo.objects.create(
++            preprod_artifact=artifact,
++            app_name="TestApp",
++            build_version="1.0.0",
++            build_number=build_number,
++        )
++        return PreprodArtifact.objects.select_related("mobile_app_info").get(id=artifact.id)
++
++    def test_xcarchive_with_valid_signature_is_installable(self):
++        artifact = self._create_artifact(extras={"is_code_signature_valid": True})
++        assert is_installable_artifact(artifact) is True
++
++    def test_xcarchive_without_valid_signature_is_not_installable(self):
++        artifact = self._create_artifact(extras={"is_code_signature_valid": False})
++        assert is_installable_artifact(artifact) is False
++
++    def test_xcarchive_with_app_store_codesigning_is_not_installable(self):
++        artifact = self._create_artifact(
++            extras={"is_code_signature_valid": True, "codesigning_type": "app-store"}
++        )
++        assert is_installable_artifact(artifact) is False
++
++    def test_xcarchive_without_installable_app_file_is_not_installable(self):
++        artifact = self._create_artifact(
++            installable_app_file_id=None, extras={"is_code_signature_valid": True}
++        )
++        assert is_installable_artifact(artifact) is False
++
++    def test_aab_is_installable(self):
++        artifact = self._create_artifact(
++            artifact_type=PreprodArtifact.ArtifactType.AAB,
++            extras=None,
++        )
++        assert is_installable_artifact(artifact) is True
+diff --git a/tests/sentry/preprod/vcs/pr_comments/test_tasks.py b/tests/sentry/preprod/vcs/pr_comments/test_tasks.py
+index 17777a3fcaeeff..20cacb555b6955 100644
+--- a/tests/sentry/preprod/vcs/pr_comments/test_tasks.py
++++ b/tests/sentry/preprod/vcs/pr_comments/test_tasks.py
+@@ -536,3 +536,17 @@ def test_skips_xcarchive_without_valid_code_signature(self):
+             create_preprod_pr_comment_task(artifact.id)
+ 
+         # No comment posted — task returns early because artifact is not installable
++
++    @patch("sentry.preprod.vcs.pr_comments.tasks.get_commit_context_client")
++    def test_skips_xcarchive_with_app_store_codesigning(self, mock_get_client):
++        mock_client = Mock()
++        mock_get_client.return_value = mock_client
++        artifact = self._create_artifact(
++            extras={"is_code_signature_valid": True, "codesigning_type": "app-store"}
++        )
++
++        with self.feature(self._pr_comment_feature):
++            create_preprod_pr_comment_task(artifact.id)
++
++        mock_client.create_comment.assert_not_called()
++        mock_client.update_comment.assert_not_called()
+diff --git a/tests/snuba/api/endpoints/test_organization_events_span_indexed.py b/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
+index 97c8cf9561eb11..72c0f0ef85369f 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
++++ b/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
+@@ -7286,3 +7286,39 @@ def test_has_in_filter(self) -> None:
+         assert app_start_row["os.name"] == "iOS"
+ 
+         assert meta["dataset"] == "spans"
++
++    def test_failure_count_and_rate_none(self):
++        response = self.do_request(
++            {
++                "field": ["failure_rate()", "failure_count()", "count()"],
++                "project": self.project.id,
++                "dataset": "spans",
++            }
++        )
++        assert response.status_code == 200, response.content
++        assert response.data["data"] == [
++            {
++                "failure_rate()": None,
++                "failure_count()": 0,
++                "count()": 0,
++            }
++        ]
++
++    def test_failure_count_and_rate_zero(self):
++        self.store_spans([self.create_span({"description": "foo"}, start_ts=self.ten_mins_ago)])
++
++        response = self.do_request(
++            {
++                "field": ["failure_rate()", "failure_count()", "count()"],
++                "project": self.project.id,
++                "dataset": "spans",
++            }
++        )
++        assert response.status_code == 200, response.content
++        assert response.data["data"] == [
++            {
++                "failure_rate()": 0,
++                "failure_count()": 0,
++                "count()": 1,
++            }
++        ]

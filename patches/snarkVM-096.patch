@@ -1,803 +1,1048 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index c777d0dfe..01a7d51db 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -3132,6 +3132,7 @@ dependencies = [
-  "snarkvm-ledger-authority",
-  "snarkvm-ledger-committee",
-  "snarkvm-ledger-narwhal-batch-header",
-+ "snarkvm-ledger-narwhal-data",
-  "snarkvm-ledger-narwhal-subdag",
-  "snarkvm-ledger-narwhal-transmission-id",
-  "snarkvm-ledger-puzzle",
-@@ -3416,6 +3417,7 @@ dependencies = [
-  "snarkvm-ledger-block",
-  "snarkvm-ledger-committee",
-  "snarkvm-ledger-narwhal-batch-header",
-+ "snarkvm-ledger-narwhal-data",
-  "snarkvm-ledger-puzzle",
-  "snarkvm-ledger-puzzle-epoch",
-  "snarkvm-ledger-query",
-diff --git a/console/network/src/canary_v0.rs b/console/network/src/canary_v0.rs
-index 1fb44dbb4..e4b2cde26 100644
---- a/console/network/src/canary_v0.rs
-+++ b/console/network/src/canary_v0.rs
-@@ -129,6 +129,8 @@ impl Network for CanaryV0 {
-     type TransactionID = AleoID<Field<Self>, { hrp2!(TRANSACTION_PREFIX) }>;
-     /// The transition ID type.
-     type TransitionID = AleoID<Field<Self>, { hrp2!("au") }>;
-+    /// The transmission checksum type.
-+    type TransmissionChecksum = u128;
+diff --git a/synthesizer/src/block/bytes.rs b/synthesizer/src/block/bytes.rs
+index 4d50cd567..1f1af658d 100644
+--- a/synthesizer/src/block/bytes.rs
++++ b/synthesizer/src/block/bytes.rs
+@@ -33,20 +33,20 @@ impl<N: Network> FromBytes for Block<N> {
+         let header = FromBytes::read_le(&mut reader)?;
+         let transactions = FromBytes::read_le(&mut reader)?;
  
-     /// The network edition.
-     const EDITION: u16 = 0;
-diff --git a/console/network/src/lib.rs b/console/network/src/lib.rs
-index 80c392e09..b2661a6db 100644
---- a/console/network/src/lib.rs
-+++ b/console/network/src/lib.rs
-@@ -215,6 +215,8 @@ pub trait Network:
-     type TransactionID: Bech32ID<Field<Self>>;
-     /// The transition ID type.
-     type TransitionID: Bech32ID<Field<Self>>;
-+    /// The transmission checksum type.
-+    type TransmissionChecksum: IntegerType;
+-        // Write the coinbase proof.
++        // Write the coinbase.
+         let coinbase_variant = u8::read_le(&mut reader)?;
+-        let coinbase_proof = match coinbase_variant {
++        let coinbase = match coinbase_variant {
+             0 => None,
+             1 => Some(FromBytes::read_le(&mut reader)?),
+-            _ => return Err(error("Invalid coinbase proof variant")),
++            _ => return Err(error("Invalid coinbase variant")),
+         };
  
-     /// Returns the genesis block bytes.
-     fn genesis_bytes() -> &'static [u8];
-diff --git a/console/network/src/mainnet_v0.rs b/console/network/src/mainnet_v0.rs
-index 16640a0d4..9ca0addd7 100644
---- a/console/network/src/mainnet_v0.rs
-+++ b/console/network/src/mainnet_v0.rs
-@@ -130,6 +130,8 @@ impl Network for MainnetV0 {
-     type TransactionID = AleoID<Field<Self>, { hrp2!(TRANSACTION_PREFIX) }>;
-     /// The transition ID type.
-     type TransitionID = AleoID<Field<Self>, { hrp2!("au") }>;
-+    /// The transmission checksum type.
-+    type TransmissionChecksum = u128;
+         // Write the signature.
+         let signature = FromBytes::read_le(&mut reader)?;
  
-     /// The network edition.
-     const EDITION: u16 = 0;
-diff --git a/console/network/src/testnet_v0.rs b/console/network/src/testnet_v0.rs
-index a33c96f0a..0f52a1510 100644
---- a/console/network/src/testnet_v0.rs
-+++ b/console/network/src/testnet_v0.rs
-@@ -129,6 +129,8 @@ impl Network for TestnetV0 {
-     type TransactionID = AleoID<Field<Self>, { hrp2!(TRANSACTION_PREFIX) }>;
-     /// The transition ID type.
-     type TransitionID = AleoID<Field<Self>, { hrp2!("au") }>;
-+    /// The transmission checksum type.
-+    type TransmissionChecksum = u128;
+         // Construct the block.
+-        let block = Self::from(previous_hash, header, transactions, coinbase_proof, signature)
+-            .map_err(|e| error(e.to_string()))?;
++        let block =
++            Self::from(previous_hash, header, transactions, coinbase, signature).map_err(|e| error(e.to_string()))?;
  
-     /// The network edition.
-     const EDITION: u16 = 0;
-diff --git a/ledger/block/Cargo.toml b/ledger/block/Cargo.toml
-index de289f8bd..994a86894 100644
---- a/ledger/block/Cargo.toml
-+++ b/ledger/block/Cargo.toml
-@@ -56,6 +56,11 @@ package = "snarkvm-ledger-narwhal-batch-header"
- path = "../narwhal/batch-header"
- version = "=0.16.19"
+         // Ensure the block hash matches.
+         match block_hash == block.hash() {
+@@ -69,12 +69,12 @@ impl<N: Network> ToBytes for Block<N> {
+         self.header.write_le(&mut writer)?;
+         self.transactions.write_le(&mut writer)?;
  
-+[dependencies.ledger-narwhal-data]
-+package = "snarkvm-ledger-narwhal-data"
-+path = "../narwhal/data"
-+version = "=0.16.19"
-+
- [dependencies.ledger-narwhal-subdag]
- package = "snarkvm-ledger-narwhal-subdag"
- path = "../narwhal/subdag"
-diff --git a/ledger/block/src/lib.rs b/ledger/block/src/lib.rs
-index e8b86bb42..1267bbd50 100644
---- a/ledger/block/src/lib.rs
-+++ b/ledger/block/src/lib.rs
-@@ -55,6 +55,7 @@ use console::{
- };
- use ledger_authority::Authority;
- use ledger_committee::Committee;
-+use ledger_narwhal_data::Data;
- use ledger_narwhal_subdag::Subdag;
- use ledger_narwhal_transmission_id::TransmissionID;
- use ledger_puzzle::{PuzzleSolutions, Solution, SolutionID};
-diff --git a/ledger/block/src/verify.rs b/ledger/block/src/verify.rs
-index 6a7b49d28..a1aca1fd0 100644
---- a/ledger/block/src/verify.rs
-+++ b/ledger/block/src/verify.rs
-@@ -539,14 +539,15 @@ impl<N: Network> Block<N> {
-     ) -> Result<(Vec<SolutionID<N>>, Vec<N::TransactionID>)> {
-         // Prepare an iterator over the solution IDs.
-         let mut solutions = solutions.as_ref().map(|s| s.deref()).into_iter().flatten().peekable();
--        // Prepare an iterator over the unconfirmed transaction IDs.
--        let unconfirmed_transaction_ids = cfg_iter!(transactions)
--            .map(|confirmed| confirmed.to_unconfirmed_transaction_id())
-+        // Prepare an iterator over the unconfirmed transactions.
-+        let unconfirmed_transactions = cfg_iter!(transactions)
-+            .map(|confirmed| confirmed.to_unconfirmed_transaction())
-             .collect::<Result<Vec<_>>>()?;
--        let mut unconfirmed_transaction_ids = unconfirmed_transaction_ids.iter().peekable();
-+        let mut unconfirmed_transactions = unconfirmed_transactions.iter().peekable();
- 
--        // Initialize a set of already seen transmission IDs.
--        let mut seen_transmission_ids = HashSet::new();
-+        // Initialize a set of already seen transaction and solution IDs.
-+        let mut seen_transaction_ids = HashSet::new();
-+        let mut seen_solution_ids = HashSet::new();
- 
-         // Initialize a set of aborted or already-existing solution IDs.
-         let mut aborted_or_existing_solution_ids = HashSet::new();
-@@ -555,18 +556,36 @@ impl<N: Network> Block<N> {
- 
-         // Iterate over the transmission IDs.
-         for transmission_id in subdag.transmission_ids() {
--            // If the transmission ID has already been seen, then continue.
--            if !seen_transmission_ids.insert(transmission_id) {
--                continue;
-+            // If the transaction or solution ID has already been seen, then continue.
-+            // Note: This is done instead of checking `TransmissionID` directly, because we need to
-+            // ensure that each transaction or solution ID is unique. The `TransmissionID` is guaranteed
-+            // to be unique, however the transaction/solution ID may not be due to malleability concerns.
-+            match transmission_id {
-+                TransmissionID::Ratification => {}
-+                TransmissionID::Solution(solution_id, _) => {
-+                    if !seen_solution_ids.insert(solution_id) {
-+                        continue;
-+                    }
-+                }
-+                TransmissionID::Transaction(transaction_id, _) => {
-+                    if !seen_transaction_ids.insert(transaction_id) {
-+                        continue;
-+                    }
-+                }
-             }
- 
-             // Process the transmission ID.
-             match transmission_id {
-                 TransmissionID::Ratification => {}
--                TransmissionID::Solution(solution_id) => {
-+                TransmissionID::Solution(solution_id, checksum) => {
-                     match solutions.peek() {
-                         // Check the next solution matches the expected solution ID.
--                        Some((_, solution)) if solution.id() == *solution_id => {
-+                        Some((_, solution))
-+                            if solution.id() == *solution_id
-+                                && Data::<Solution<N>>::Buffer(solution.to_bytes_le()?.into())
-+                                    .to_checksum::<N>()?
-+                                    == *checksum =>
-+                        {
-                             // Increment the solution iterator.
-                             solutions.next();
-                         }
-@@ -578,12 +597,17 @@ impl<N: Network> Block<N> {
-                         }
-                     }
-                 }
--                TransmissionID::Transaction(transaction_id) => {
--                    match unconfirmed_transaction_ids.peek() {
-+                TransmissionID::Transaction(transaction_id, checksum) => {
-+                    match unconfirmed_transactions.peek() {
-                         // Check the next transaction matches the expected transaction.
--                        Some(expected_id) if transaction_id == *expected_id => {
--                            // Increment the unconfirmed transaction ID iterator.
--                            unconfirmed_transaction_ids.next();
-+                        Some(transaction)
-+                            if transaction.id() == *transaction_id
-+                                && Data::<Transaction<N>>::Buffer(transaction.to_bytes_le()?.into())
-+                                    .to_checksum::<N>()?
-+                                    == *checksum =>
-+                        {
-+                            // Increment the unconfirmed transaction iterator.
-+                            unconfirmed_transactions.next();
-                         }
-                         // Otherwise, add the transaction ID to the aborted or existing list.
-                         _ => {
-@@ -599,7 +623,7 @@ impl<N: Network> Block<N> {
-         // Ensure there are no more solutions in the block.
-         ensure!(solutions.next().is_none(), "There exists more solutions than expected.");
-         // Ensure there are no more transactions in the block.
--        ensure!(unconfirmed_transaction_ids.next().is_none(), "There exists more transactions than expected.");
-+        ensure!(unconfirmed_transactions.next().is_none(), "There exists more transactions than expected.");
- 
-         // Ensure the aborted solution IDs match.
-         for aborted_solution_id in aborted_solution_ids {
-diff --git a/ledger/narwhal/data/src/lib.rs b/ledger/narwhal/data/src/lib.rs
-index 18997c95a..6da590015 100644
---- a/ledger/narwhal/data/src/lib.rs
-+++ b/ledger/narwhal/data/src/lib.rs
-@@ -35,6 +35,20 @@ pub enum Data<T: FromBytes + ToBytes + Send + 'static> {
- }
- 
- impl<T: FromBytes + ToBytes + Send + 'static> Data<T> {
-+    pub fn to_checksum<N: Network>(&self) -> Result<N::TransmissionChecksum> {
-+        // Convert to bits.
-+        let preimage = match self {
-+            Self::Object(object) => object.to_bytes_le()?.to_bits_le(),
-+            Self::Buffer(bytes) => bytes.deref().to_bits_le(),
-+        };
-+        // Hash the preimage bits.
-+        let hash = N::hash_sha3_256(&preimage)?;
-+        // Select the number of bits needed to parse the checksum.
-+        let num_bits = usize::try_from(N::TransmissionChecksum::BITS).map_err(error)?;
-+        // Return the checksum.
-+        N::TransmissionChecksum::from_bits_le(&hash[0..num_bits])
-+    }
-+
-     pub fn into<T2: From<Data<T>> + From<T> + FromBytes + ToBytes + Send + 'static>(self) -> Data<T2> {
-         match self {
-             Self::Object(x) => Data::Object(x.into()),
-diff --git a/ledger/narwhal/transmission-id/src/bytes.rs b/ledger/narwhal/transmission-id/src/bytes.rs
-index a8a49a3d7..667ceed52 100644
---- a/ledger/narwhal/transmission-id/src/bytes.rs
-+++ b/ledger/narwhal/transmission-id/src/bytes.rs
-@@ -22,8 +22,8 @@ impl<N: Network> FromBytes for TransmissionID<N> {
-         // Match the variant.
-         match variant {
-             0 => Ok(Self::Ratification),
--            1 => Ok(Self::Solution(FromBytes::read_le(&mut reader)?)),
--            2 => Ok(Self::Transaction(FromBytes::read_le(&mut reader)?)),
-+            1 => Ok(Self::Solution(FromBytes::read_le(&mut reader)?, FromBytes::read_le(&mut reader)?)),
-+            2 => Ok(Self::Transaction(FromBytes::read_le(&mut reader)?, FromBytes::read_le(&mut reader)?)),
-             3.. => Err(error("Invalid worker transmission ID variant")),
-         }
-     }
-@@ -35,13 +35,15 @@ impl<N: Network> ToBytes for TransmissionID<N> {
-         // Write the transmission.
-         match self {
-             Self::Ratification => 0u8.write_le(&mut writer),
--            Self::Solution(id) => {
-+            Self::Solution(id, checksum) => {
+-        // Write the coinbase proof.
+-        match self.coinbase_proof {
++        // Write the coinbase solution.
++        match self.coinbase {
+             None => 0u8.write_le(&mut writer)?,
+-            Some(ref coinbase_proof) => {
++            Some(ref coinbase) => {
                  1u8.write_le(&mut writer)?;
--                id.write_le(&mut writer)
-+                id.write_le(&mut writer)?;
-+                checksum.write_le(&mut writer)
-             }
--            Self::Transaction(id) => {
-+            Self::Transaction(id, checksum) => {
-                 2u8.write_le(&mut writer)?;
--                id.write_le(&mut writer)
-+                id.write_le(&mut writer)?;
-+                checksum.write_le(&mut writer)
+-                coinbase_proof.write_le(&mut writer)?;
++                coinbase.write_le(&mut writer)?;
              }
          }
-     }
-diff --git a/ledger/narwhal/transmission-id/src/lib.rs b/ledger/narwhal/transmission-id/src/lib.rs
-index 7ba75ba2a..89778c1c1 100644
---- a/ledger/narwhal/transmission-id/src/lib.rs
-+++ b/ledger/narwhal/transmission-id/src/lib.rs
-@@ -27,22 +27,22 @@ pub enum TransmissionID<N: Network> {
-     /// A ratification.
-     Ratification,
-     /// A solution.
--    Solution(SolutionID<N>),
-+    Solution(SolutionID<N>, N::TransmissionChecksum),
-     /// A transaction.
--    Transaction(N::TransactionID),
-+    Transaction(N::TransactionID, N::TransmissionChecksum),
- }
  
--impl<N: Network> From<SolutionID<N>> for TransmissionID<N> {
--    /// Converts the solution ID into a transmission ID.
--    fn from(solution_id: SolutionID<N>) -> Self {
--        Self::Solution(solution_id)
-+impl<N: Network> From<(SolutionID<N>, N::TransmissionChecksum)> for TransmissionID<N> {
-+    /// Converts the solution ID and checksum into a transmission ID.
-+    fn from((solution_id, checksum): (SolutionID<N>, N::TransmissionChecksum)) -> Self {
-+        Self::Solution(solution_id, checksum)
-     }
- }
+diff --git a/synthesizer/src/block/genesis.rs b/synthesizer/src/block/genesis.rs
+index a2b3e5c4e..0e93ac422 100644
+--- a/synthesizer/src/block/genesis.rs
++++ b/synthesizer/src/block/genesis.rs
+@@ -44,11 +44,11 @@ impl<N: Network> Block<N> {
+         // Prepare the previous block hash.
+         let previous_hash = N::BlockHash::default();
  
--impl<N: Network> From<&N::TransactionID> for TransmissionID<N> {
--    /// Converts the transaction ID into a transmission ID.
--    fn from(transaction_id: &N::TransactionID) -> Self {
--        Self::Transaction(*transaction_id)
-+impl<N: Network> From<(&N::TransactionID, &N::TransmissionChecksum)> for TransmissionID<N> {
-+    /// Converts the transaction ID and checksum into a transmission ID.
-+    fn from((transaction_id, checksum): (&N::TransactionID, &N::TransmissionChecksum)) -> Self {
-+        Self::Transaction(*transaction_id, *checksum)
+-        // Prepare the coinbase proof.
+-        let coinbase_proof = None; // The genesis block does not require a coinbase proof.
++        // Prepare the coinbase solution.
++        let coinbase_solution = None; // The genesis block does not require a coinbase solution.
+ 
+         // Construct the block.
+-        let block = Self::new(private_key, previous_hash, header, transactions, coinbase_proof, rng)?;
++        let block = Self::new(private_key, previous_hash, header, transactions, coinbase_solution, rng)?;
+         // Ensure the block is valid genesis block.
+         match block.is_genesis() {
+             true => Ok(block),
+@@ -64,8 +64,8 @@ impl<N: Network> Block<N> {
+             && self.header.is_genesis()
+             // Ensure there is 1 transaction in the genesis block.
+             && self.transactions.len() == 1
+-            // Ensure the coinbase proof does not exist.
+-            && self.coinbase_proof.is_none()
++            // Ensure the coinbase solution does not exist.
++            && self.coinbase.is_none()
      }
  }
  
-@@ -50,7 +50,7 @@ impl<N: Network> TransmissionID<N> {
-     /// Returns the solution ID if the transmission is a solution.
-     pub fn solution(&self) -> Option<SolutionID<N>> {
-         match self {
--            Self::Solution(solution_id) => Some(*solution_id),
-+            Self::Solution(solution_id, _) => Some(*solution_id),
-             _ => None,
-         }
+diff --git a/synthesizer/src/block/mod.rs b/synthesizer/src/block/mod.rs
+index 3220321a5..c9cd13af5 100644
+--- a/synthesizer/src/block/mod.rs
++++ b/synthesizer/src/block/mod.rs
+@@ -62,20 +62,20 @@ pub struct Block<N: Network> {
+     header: Header<N>,
+     /// The transactions in this block.
+     transactions: Transactions<N>,
+-    /// The coinbase proof.
+-    coinbase_proof: Option<CoinbaseSolution<N>>,
++    /// The coinbase solution.
++    coinbase: Option<CoinbaseSolution<N>>,
+     /// The signature for this block.
+     signature: Signature<N>,
+ }
+ 
+ impl<N: Network> Block<N> {
+-    /// Initializes a new block from a given previous hash, header, and transactions list.
++    /// Initializes a new block from a given previous hash, header, transactions, coinbase, and signature.
+     pub fn new<R: Rng + CryptoRng>(
+         private_key: &PrivateKey<N>,
+         previous_hash: N::BlockHash,
+         header: Header<N>,
+         transactions: Transactions<N>,
+-        coinbase_proof: Option<CoinbaseSolution<N>>,
++        coinbase: Option<CoinbaseSolution<N>>,
+         rng: &mut R,
+     ) -> Result<Self> {
+         // Ensure the block is not empty.
+@@ -85,15 +85,15 @@ impl<N: Network> Block<N> {
+         // Sign the block hash.
+         let signature = private_key.sign(&[block_hash], rng)?;
+         // Construct the block.
+-        Self::from(previous_hash, header, transactions, coinbase_proof, signature)
++        Self::from(previous_hash, header, transactions, coinbase, signature)
      }
-@@ -58,10 +58,19 @@ impl<N: Network> TransmissionID<N> {
-     /// Returns the transaction ID if the transmission is a transaction.
-     pub fn transaction(&self) -> Option<N::TransactionID> {
-         match self {
--            Self::Transaction(transaction_id) => Some(*transaction_id),
-+            Self::Transaction(transaction_id, _) => Some(*transaction_id),
-             _ => None,
-         }
+ 
+-    /// Initializes a new block from a given previous hash, header, and transactions list.
++    /// Initializes a new block from a given previous hash, header, transactions, coinbase, and signature.
+     pub fn from(
+         previous_hash: N::BlockHash,
+         header: Header<N>,
+         transactions: Transactions<N>,
+-        coinbase_proof: Option<CoinbaseSolution<N>>,
++        coinbase: Option<CoinbaseSolution<N>>,
+         signature: Signature<N>,
+     ) -> Result<Self> {
+         // Ensure the block is not empty.
+@@ -105,18 +105,18 @@ impl<N: Network> Block<N> {
+         // Ensure the signature is valid.
+         ensure!(signature.verify(&address, &[block_hash]), "Invalid signature for block {}", header.height());
+ 
+-        // Ensure that coinbase accumulator matches the coinbase proof.
+-        let expected_accumulator_point = match &coinbase_proof {
+-            Some(coinbase_proof) => coinbase_proof.to_accumulator_point()?,
++        // Ensure that coinbase accumulator matches the coinbase solution.
++        let expected_accumulator_point = match &coinbase {
++            Some(coinbase_solution) => coinbase_solution.to_accumulator_point()?,
+             None => Field::<N>::zero(),
+         };
+         ensure!(
+             header.coinbase_accumulator_point() == expected_accumulator_point,
+-            "The coinbase accumulator point in the block header does not correspond to the given coinbase proof"
++            "The coinbase accumulator point in the block header does not correspond to the given coinbase solution"
+         );
+ 
+         // Construct the block.
+-        Ok(Self { block_hash: block_hash.into(), previous_hash, header, transactions, coinbase_proof, signature })
++        Ok(Self { block_hash: block_hash.into(), previous_hash, header, transactions, coinbase, signature })
      }
+ }
+ 
+@@ -131,9 +131,9 @@ impl<N: Network> Block<N> {
+         self.previous_hash
+     }
+ 
+-    /// Returns the coinbase proof.
+-    pub const fn coinbase_proof(&self) -> Option<&CoinbaseSolution<N>> {
+-        self.coinbase_proof.as_ref()
++    /// Returns the coinbase solution.
++    pub const fn coinbase(&self) -> Option<&CoinbaseSolution<N>> {
++        self.coinbase.as_ref()
+     }
+ 
+     /// Returns the signature.
+diff --git a/synthesizer/src/block/serialize.rs b/synthesizer/src/block/serialize.rs
+index 9bfd6ae19..feeb18db3 100644
+--- a/synthesizer/src/block/serialize.rs
++++ b/synthesizer/src/block/serialize.rs
+@@ -27,8 +27,8 @@ impl<N: Network> Serialize for Block<N> {
+                 block.serialize_field("header", &self.header)?;
+                 block.serialize_field("transactions", &self.transactions)?;
+ 
+-                if let Some(coinbase_proof) = self.coinbase_proof() {
+-                    block.serialize_field("coinbase_proof", coinbase_proof)?;
++                if let Some(coinbase) = &self.coinbase {
++                    block.serialize_field("coinbase", coinbase)?;
+                 }
+ 
+                 block.serialize_field("signature", &self.signature)?;
+@@ -53,8 +53,8 @@ impl<'de, N: Network> Deserialize<'de> for Block<N> {
+                     serde_json::from_value(block["previous_hash"].take()).map_err(de::Error::custom)?,
+                     serde_json::from_value(block["header"].take()).map_err(de::Error::custom)?,
+                     serde_json::from_value(block["transactions"].take()).map_err(de::Error::custom)?,
+-                    match block["coinbase_proof"].as_str() {
+-                        Some(coinbase_proof) => Some(serde_json::from_str(coinbase_proof).map_err(de::Error::custom)?),
++                    match block["coinbase"].as_str() {
++                        Some(coinbase) => Some(serde_json::from_str(coinbase).map_err(de::Error::custom)?),
+                         None => None,
+                     },
+                     serde_json::from_value(block["signature"].take()).map_err(de::Error::custom)?,
+diff --git a/synthesizer/src/coinbase_puzzle/hash.rs b/synthesizer/src/coinbase_puzzle/hash.rs
+index b963f0dee..b6b93807a 100644
+--- a/synthesizer/src/coinbase_puzzle/hash.rs
++++ b/synthesizer/src/coinbase_puzzle/hash.rs
+@@ -46,7 +46,7 @@ pub fn hash_to_polynomial<F: PrimeField>(input: &[u8], degree: u32) -> DensePoly
+     DensePolynomial::from_coefficients_vec(coefficients)
+ }
+ 
+-pub fn hash_commitment<E: PairingEngine>(commitment: KZGCommitment<E>) -> Result<E::Fr> {
++pub fn hash_commitment<E: PairingEngine>(commitment: &KZGCommitment<E>) -> Result<E::Fr> {
+     // Convert the commitment into bytes.
+     let mut bytes = Vec::with_capacity(96);
+     commitment.serialize_uncompressed(&mut bytes)?;
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/bytes.rs b/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/bytes.rs
+index 1b8499572..6cfc453ae 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/bytes.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/bytes.rs
+@@ -29,7 +29,7 @@ impl<N: Network> FromBytes for CoinbaseSolution<N> {
+ 
+         let proof = KZGProof::read_le(&mut reader)?;
+ 
+-        Ok(Self { partial_solutions, proof })
++        Ok(Self::new(partial_solutions, proof))
+     }
+ }
+ 
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/mod.rs b/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/mod.rs
+index f41b52652..f7f451bb8 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/mod.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/coinbase_solution/mod.rs
+@@ -56,7 +56,7 @@ impl<N: Network> CoinbaseSolution<N> {
+     }
+ 
+     /// Returns the cumulative sum of the prover solutions.
+-    pub fn to_cumulative_target(&self) -> Result<u128> {
++    pub fn to_cumulative_proof_target(&self) -> Result<u128> {
+         // Compute the cumulative target as a u128.
+         self.partial_solutions.iter().try_fold(0u128, |cumulative, solution| {
+             cumulative.checked_add(solution.to_target()? as u128).ok_or_else(|| anyhow!("Cumulative target overflowed"))
+@@ -66,7 +66,7 @@ impl<N: Network> CoinbaseSolution<N> {
+     /// Returns the accumulator challenge point.
+     pub fn to_accumulator_point(&self) -> Result<Field<N>> {
+         let mut challenge_points =
+-            hash_commitments(self.partial_solutions.iter().map(|solution| solution.commitment()))?;
++            hash_commitments(self.partial_solutions.iter().map(|solution| *solution.commitment()))?;
+         ensure!(challenge_points.len() == self.partial_solutions.len() + 1, "Invalid number of challenge points");
+ 
+         // Pop the last challenge point as the accumulator challenge point.
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/mod.rs b/synthesizer/src/coinbase_puzzle/helpers/mod.rs
+index 383eb50f1..4c3218b51 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/mod.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/mod.rs
+@@ -26,6 +26,9 @@ pub use partial_solution::*;
+ mod prover_solution;
+ pub use prover_solution::*;
+ 
++mod puzzle_commitment;
++pub use puzzle_commitment::*;
 +
-+    /// Returns the checksum if the transmission is a solution or a transaction.
-+    pub fn checksum(&self) -> Option<N::TransmissionChecksum> {
-+        match self {
-+            Self::Ratification => None,
-+            Self::Solution(_, checksum) => Some(*checksum),
-+            Self::Transaction(_, checksum) => Some(*checksum),
-+        }
+ use crate::coinbase_puzzle::{hash_commitment, hash_commitments, CoinbasePuzzle};
+ use console::{account::Address, prelude::*, types::Field};
+ use snarkvm_algorithms::{
+@@ -41,8 +44,6 @@ use std::{
+     io::{Read, Result as IoResult, Write},
+ };
+ 
+-/// The commitment to the polynomial.
+-pub type PuzzleCommitment<N> = KZGCommitment<<N as Environment>::PairingCurve>;
+ /// The proof of opening the polynomial, for the solution.
+ pub type PuzzleProof<N> = KZGProof<<N as Environment>::PairingCurve>;
+ 
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/partial_solution/bytes.rs b/synthesizer/src/coinbase_puzzle/helpers/partial_solution/bytes.rs
+index f84f5b343..1df4b0127 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/partial_solution/bytes.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/partial_solution/bytes.rs
+@@ -23,7 +23,7 @@ impl<N: Network> FromBytes for PartialSolution<N> {
+         let nonce = u64::read_le(&mut reader)?;
+         let commitment = KZGCommitment::read_le(&mut reader)?;
+ 
+-        Ok(Self { address, nonce, commitment })
++        Ok(Self::new(address, nonce, commitment))
+     }
+ }
+ 
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/partial_solution/mod.rs b/synthesizer/src/coinbase_puzzle/helpers/partial_solution/mod.rs
+index 393aa3a26..effcad908 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/partial_solution/mod.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/partial_solution/mod.rs
+@@ -34,8 +34,8 @@ pub struct PartialSolution<N: Network> {
+ 
+ impl<N: Network> PartialSolution<N> {
+     /// Initializes a new instance of the partial solution.
+-    pub const fn new(address: Address<N>, nonce: u64, commitment: PuzzleCommitment<N>) -> Self {
+-        Self { address, nonce, commitment }
++    pub fn new<C: Into<PuzzleCommitment<N>>>(address: Address<N>, nonce: u64, commitment: C) -> Self {
++        Self { address, nonce, commitment: commitment.into() }
+     }
+ 
+     /// Returns the address of the prover.
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/partial_solution/serialize.rs b/synthesizer/src/coinbase_puzzle/helpers/partial_solution/serialize.rs
+index f10eb24e5..39e372d34 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/partial_solution/serialize.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/partial_solution/serialize.rs
+@@ -24,7 +24,7 @@ impl<N: Network> Serialize for PartialSolution<N> {
+                 let mut partial_prover_solution = serializer.serialize_struct("PartialSolution", 3)?;
+                 partial_prover_solution.serialize_field("address", &self.address)?;
+                 partial_prover_solution.serialize_field("nonce", &self.nonce)?;
+-                partial_prover_solution.serialize_field("commitment", &self.commitment.0)?;
++                partial_prover_solution.serialize_field("commitment", &self.commitment)?;
+                 partial_prover_solution.end()
+             }
+             false => ToBytesSerializer::serialize_with_size_encoding(self, serializer),
+@@ -41,10 +41,8 @@ impl<'de, N: Network> Deserialize<'de> for PartialSolution<N> {
+                 Ok(Self::new(
+                     serde_json::from_value(partial_prover_solution["address"].clone()).map_err(de::Error::custom)?,
+                     serde_json::from_value(partial_prover_solution["nonce"].clone()).map_err(de::Error::custom)?,
+-                    KZGCommitment(
+-                        serde_json::from_value(partial_prover_solution["commitment"].clone())
+-                            .map_err(de::Error::custom)?,
+-                    ),
++                    serde_json::from_value::<PuzzleCommitment<N>>(partial_prover_solution["commitment"].clone())
++                        .map_err(de::Error::custom)?,
+                 ))
+             }
+             false => FromBytesDeserializer::<Self>::deserialize_with_size_encoding(deserializer, "partial solution"),
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/prover_solution/bytes.rs b/synthesizer/src/coinbase_puzzle/helpers/prover_solution/bytes.rs
+index ff3c57a06..b4734e6c3 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/prover_solution/bytes.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/prover_solution/bytes.rs
+@@ -22,7 +22,7 @@ impl<N: Network> FromBytes for ProverSolution<N> {
+         let partial_solution: PartialSolution<N> = FromBytes::read_le(&mut reader)?;
+         let proof = KZGProof::read_le(&mut reader)?;
+ 
+-        Ok(Self { partial_solution, proof })
++        Ok(Self::new(partial_solution, proof))
+     }
+ }
+ 
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/prover_solution/mod.rs b/synthesizer/src/coinbase_puzzle/helpers/prover_solution/mod.rs
+index d123588e9..9b0c78f5d 100644
+--- a/synthesizer/src/coinbase_puzzle/helpers/prover_solution/mod.rs
++++ b/synthesizer/src/coinbase_puzzle/helpers/prover_solution/mod.rs
+@@ -56,7 +56,7 @@ impl<N: Network> ProverSolution<N> {
+         let prover_polynomial = self.partial_solution.to_prover_polynomial(epoch_challenge)?;
+ 
+         // Compute the challenge point.
+-        let challenge_point = hash_commitment(self.commitment())?;
++        let challenge_point = hash_commitment(&self.commitment())?;
+ 
+         // Evaluate the epoch and prover polynomials at the challenge point.
+         let epoch_evaluation = epoch_challenge.epoch_polynomial().evaluate(challenge_point);
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/bytes.rs b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/bytes.rs
+new file mode 100644
+index 000000000..998a0575c
+--- /dev/null
++++ b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/bytes.rs
+@@ -0,0 +1,56 @@
++// Copyright (C) 2019-2022 Aleo Systems Inc.
++// This file is part of the snarkVM library.
++
++// The snarkVM library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkVM library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
++
++use super::*;
++
++impl<N: Network> FromBytes for PuzzleCommitment<N> {
++    /// Reads the puzzle commitment from the buffer.
++    fn read_le<R: Read>(mut reader: R) -> IoResult<Self> {
++        let commitment = KZGCommitment::read_le(&mut reader)?;
++
++        Ok(Self::new(commitment))
 +    }
- }
- 
- #[cfg(any(test, feature = "test-helpers"))]
-@@ -81,11 +90,17 @@ pub mod test_helpers {
-         let mut sample = Vec::with_capacity(10);
-         // Append sample solution IDs.
-         for _ in 0..5 {
--            sample.push(TransmissionID::Solution(SolutionID::from(rng.gen::<u64>())));
-+            sample.push(TransmissionID::Solution(
-+                SolutionID::from(rng.gen::<u64>()),
-+                <CurrentNetwork as Network>::TransmissionChecksum::from(rng.gen::<u128>()),
-+            ));
-         }
-         // Append sample transaction IDs.
-         for _ in 0..5 {
--            let id = TransmissionID::Transaction(<CurrentNetwork as Network>::TransactionID::from(Field::rand(rng)));
-+            let id = TransmissionID::Transaction(
-+                <CurrentNetwork as Network>::TransactionID::from(Field::rand(rng)),
-+                <CurrentNetwork as Network>::TransmissionChecksum::from(rng.gen::<u128>()),
-+            );
-             sample.push(id);
-         }
-         // Return the sample vector.
-diff --git a/ledger/narwhal/transmission-id/src/string.rs b/ledger/narwhal/transmission-id/src/string.rs
-index 817c87823..febe35e80 100644
---- a/ledger/narwhal/transmission-id/src/string.rs
-+++ b/ledger/narwhal/transmission-id/src/string.rs
-@@ -19,11 +19,20 @@ impl<N: Network> FromStr for TransmissionID<N> {
- 
-     /// Initializes the transmission ID from a string.
-     fn from_str(input: &str) -> Result<Self, Self::Err> {
--        if input.starts_with(SOLUTION_ID_PREFIX) {
--            Ok(Self::Solution(SolutionID::from_str(input)?))
--        } else if input.starts_with(TRANSACTION_PREFIX) {
-+        // Split the id and checksum.
-+        let (id, checksum) = input.split_once('.').ok_or_else(|| anyhow!("Invalid transmission ID: {input}"))?;
-+        // Parse the string.
-+        if id.starts_with(SOLUTION_ID_PREFIX) {
-+            Ok(Self::Solution(
-+                SolutionID::from_str(id)?,
-+                N::TransmissionChecksum::from_str(checksum)
-+                    .map_err(|_| anyhow!("Failed to parse checksum: {checksum}"))?,
-+            ))
-+        } else if id.starts_with(TRANSACTION_PREFIX) {
-             Ok(Self::Transaction(
--                N::TransactionID::from_str(input).map_err(|_| anyhow!("Failed to parse transaction ID: {input}"))?,
-+                N::TransactionID::from_str(id).map_err(|_| anyhow!("Failed to parse transaction ID: {id}"))?,
-+                N::TransmissionChecksum::from_str(checksum)
-+                    .map_err(|_| anyhow!("Failed to parse checksum: {checksum}"))?,
-             ))
-         } else {
-             bail!("Invalid transmission ID: {input}")
-@@ -43,8 +52,8 @@ impl<N: Network> Display for TransmissionID<N> {
-     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-         match self {
-             Self::Ratification => write!(f, "ratification"),
--            Self::Solution(id) => write!(f, "{}", id),
--            Self::Transaction(id) => write!(f, "{}", id),
-+            Self::Solution(id, checksum) => write!(f, "{}.{}", id, checksum),
-+            Self::Transaction(id, checksum) => write!(f, "{}.{}", id, checksum),
-         }
-     }
- }
-diff --git a/ledger/narwhal/transmission/src/lib.rs b/ledger/narwhal/transmission/src/lib.rs
-index 44d2eb83c..7bb3d90fb 100644
---- a/ledger/narwhal/transmission/src/lib.rs
-+++ b/ledger/narwhal/transmission/src/lib.rs
-@@ -64,6 +64,17 @@ impl<N: Network> From<Data<Transaction<N>>> for Transmission<N> {
-     }
- }
- 
-+impl<N: Network> Transmission<N> {
-+    /// Returns the checksum of the transmission.
-+    pub fn to_checksum(&self) -> Result<Option<N::TransmissionChecksum>> {
-+        match self {
-+            Self::Ratification => Ok(None),
-+            Self::Solution(solution) => solution.to_checksum::<N>().map(Some),
-+            Self::Transaction(transaction) => transaction.to_checksum::<N>().map(Some),
++}
++
++impl<N: Network> ToBytes for PuzzleCommitment<N> {
++    /// Writes the puzzle commitment to the buffer.
++    fn write_le<W: Write>(&self, mut writer: W) -> IoResult<()> {
++        self.commitment.write_le(&mut writer)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use console::network::Testnet3;
++
++    type CurrentNetwork = Testnet3;
++
++    #[test]
++    fn test_bytes() -> Result<()> {
++        let mut rng = TestRng::default();
++        // Sample a new puzzle commitment.
++        let expected = PuzzleCommitment::<CurrentNetwork>::new(KZGCommitment(rng.gen()));
++
++        // Check the byte representation.
++        let expected_bytes = expected.to_bytes_le()?;
++        assert_eq!(expected_bytes.len(), 48);
++        assert_eq!(expected, PuzzleCommitment::read_le(&expected_bytes[..])?);
++        assert!(PuzzleCommitment::<CurrentNetwork>::read_le(&expected_bytes[1..]).is_err());
++
++        Ok(())
++    }
++}
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/mod.rs b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/mod.rs
+new file mode 100644
+index 000000000..fc61392bc
+--- /dev/null
++++ b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/mod.rs
+@@ -0,0 +1,50 @@
++// Copyright (C) 2019-2022 Aleo Systems Inc.
++// This file is part of the snarkVM library.
++
++// The snarkVM library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkVM library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
++
++mod bytes;
++mod serialize;
++mod string;
++
++use super::*;
++
++/// A coinbase puzzle commitment to a polynomial.
++#[derive(Copy, Clone, Eq, PartialEq, Hash)]
++pub struct PuzzleCommitment<N: Network> {
++    /// The commitment for the solution.
++    commitment: KZGCommitment<<N as Environment>::PairingCurve>,
++}
++
++impl<N: Network> PuzzleCommitment<N> {
++    /// Initializes a new instance of the puzzle commitment.
++    pub const fn new(commitment: KZGCommitment<<N as Environment>::PairingCurve>) -> Self {
++        Self { commitment }
++    }
++}
++
++impl<N: Network> From<KZGCommitment<<N as Environment>::PairingCurve>> for PuzzleCommitment<N> {
++    /// Initializes a new instance of the puzzle commitment.
++    fn from(commitment: KZGCommitment<<N as Environment>::PairingCurve>) -> Self {
++        Self::new(commitment)
++    }
++}
++
++impl<N: Network> Deref for PuzzleCommitment<N> {
++    type Target = KZGCommitment<<N as Environment>::PairingCurve>;
++
++    fn deref(&self) -> &Self::Target {
++        &self.commitment
++    }
++}
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/serialize.rs b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/serialize.rs
+new file mode 100644
+index 000000000..f5114d283
+--- /dev/null
++++ b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/serialize.rs
+@@ -0,0 +1,83 @@
++// Copyright (C) 2019-2022 Aleo Systems Inc.
++// This file is part of the snarkVM library.
++
++// The snarkVM library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkVM library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
++
++use super::*;
++
++impl<N: Network> Serialize for PuzzleCommitment<N> {
++    /// Serializes the puzzle commitment to a string or buffer.
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        match serializer.is_human_readable() {
++            true => serializer.collect_str(self),
++            false => ToBytesSerializer::serialize_with_size_encoding(self, serializer),
 +        }
 +    }
 +}
 +
- #[cfg(any(test, feature = "test-helpers"))]
- pub mod test_helpers {
-     use super::*;
-diff --git a/ledger/puzzle/src/lib.rs b/ledger/puzzle/src/lib.rs
-index b0c50ddc9..425bb2e6c 100644
---- a/ledger/puzzle/src/lib.rs
-+++ b/ledger/puzzle/src/lib.rs
-@@ -266,6 +266,34 @@ impl<N: Network> Puzzle<N> {
-         Ok(())
-     }
- 
-+    /// ATTENTION: This function will update the target if the solution target is different from the calculated one.
-+    /// Returns `Ok(())` if the solution is valid.
-+    pub fn check_solution_mut(
-+        &self,
-+        solution: &mut Solution<N>,
-+        expected_epoch_hash: N::BlockHash,
-+        expected_proof_target: u64,
-+    ) -> Result<()> {
-+        // Ensure the epoch hash matches.
-+        if solution.epoch_hash() != expected_epoch_hash {
-+            bail!(
-+                "Solution does not match the expected epoch hash (found '{}', expected '{expected_epoch_hash}')",
-+                solution.epoch_hash()
-+            )
++impl<'de, N: Network> Deserialize<'de> for PuzzleCommitment<N> {
++    /// Deserializes the puzzle commitment from a string or buffer.
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        match deserializer.is_human_readable() {
++            true => FromStr::from_str(&String::deserialize(deserializer)?).map_err(de::Error::custom),
++            false => FromBytesDeserializer::<Self>::deserialize_with_size_encoding(deserializer, "puzzle commitment"),
 +        }
-+        // Calculate the proof target of the solution.
-+        let proof_target = self.get_proof_target_unchecked(solution)?;
++    }
++}
 +
-+        // Set the target with the newly calculated proof target value.
-+        solution.target = proof_target;
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use console::network::Testnet3;
 +
-+        // Ensure the solution is greater than or equal to the expected proof target.
-+        if proof_target < expected_proof_target {
-+            bail!("Solution does not meet the proof target requirement ({proof_target} < {expected_proof_target})")
++    type CurrentNetwork = Testnet3;
++
++    #[test]
++    fn test_serde_json() -> Result<()> {
++        let mut rng = TestRng::default();
++
++        // Sample a new puzzle commitment.
++        let expected = PuzzleCommitment::<CurrentNetwork>::new(KZGCommitment(rng.gen()));
++
++        // Serialize
++        let expected_string = &expected.to_string();
++        let candidate_string = serde_json::to_string(&expected)?;
++        assert_eq!(expected, serde_json::from_str(&candidate_string)?);
++
++        // Deserialize
++        assert_eq!(expected, PuzzleCommitment::from_str(expected_string)?);
++        assert_eq!(expected, serde_json::from_str(&candidate_string)?);
++
++        Ok(())
++    }
++
++    #[test]
++    fn test_bincode() -> Result<()> {
++        let mut rng = TestRng::default();
++
++        // Sample a new puzzle commitment.
++        let expected = PuzzleCommitment::<CurrentNetwork>::new(KZGCommitment(rng.gen()));
++
++        // Serialize
++        let expected_bytes = expected.to_bytes_le()?;
++        let expected_bytes_with_size_encoding = bincode::serialize(&expected)?;
++        assert_eq!(&expected_bytes[..], &expected_bytes_with_size_encoding[8..]);
++
++        // Deserialize
++        assert_eq!(expected, PuzzleCommitment::read_le(&expected_bytes[..])?);
++        assert_eq!(expected, bincode::deserialize(&expected_bytes_with_size_encoding[..])?);
++
++        Ok(())
++    }
++}
+diff --git a/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/string.rs b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/string.rs
+new file mode 100644
+index 000000000..84d4f6f13
+--- /dev/null
++++ b/synthesizer/src/coinbase_puzzle/helpers/puzzle_commitment/string.rs
+@@ -0,0 +1,105 @@
++// Copyright (C) 2019-2022 Aleo Systems Inc.
++// This file is part of the snarkVM library.
++
++// The snarkVM library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkVM library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
++
++use super::*;
++
++static PUZZLE_COMMITMENT_PREFIX: &str = "puzzle";
++
++impl<N: Network> FromStr for PuzzleCommitment<N> {
++    type Err = Error;
++
++    /// Reads in the puzzle commitment string.
++    fn from_str(puzzle_commitment: &str) -> Result<Self, Self::Err> {
++        // Decode the puzzle commitment string from bech32m.
++        let (hrp, data, variant) = bech32::decode(puzzle_commitment)?;
++        if hrp != PUZZLE_COMMITMENT_PREFIX {
++            bail!("Failed to decode puzzle commitment: '{hrp}' is an invalid prefix")
++        } else if data.is_empty() {
++            bail!("Failed to decode puzzle commitment: data field is empty")
++        } else if variant != bech32::Variant::Bech32m {
++            bail!("Found a puzzle commitment that is not bech32m encoded: {puzzle_commitment}");
++        }
++        // Decode the puzzle commitment data from u5 to u8, and into the puzzle commitment.
++        Ok(Self::read_le(&Vec::from_base32(&data)?[..])?)
++    }
++}
++
++impl<N: Network> Debug for PuzzleCommitment<N> {
++    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
++        Display::fmt(self, f)
++    }
++}
++
++impl<N: Network> Display for PuzzleCommitment<N> {
++    /// Writes the puzzle commitment as a bech32m string.
++    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
++        // Convert the puzzle commitment to bytes.
++        let bytes = self.to_bytes_le().map_err(|_| fmt::Error)?;
++        // Encode the bytes into bech32m.
++        let string = bech32::encode(PUZZLE_COMMITMENT_PREFIX, bytes.to_base32(), bech32::Variant::Bech32m)
++            .map_err(|_| fmt::Error)?;
++        // Output the string.
++        Display::fmt(&string, f)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use console::network::Testnet3;
++
++    type CurrentNetwork = Testnet3;
++
++    const ITERATIONS: u64 = 1_000;
++
++    #[test]
++    fn test_string() -> Result<()> {
++        // Ensure type and empty value fails.
++        assert!(PuzzleCommitment::<CurrentNetwork>::from_str(&format!("{PUZZLE_COMMITMENT_PREFIX}1")).is_err());
++        assert!(PuzzleCommitment::<CurrentNetwork>::from_str("").is_err());
++
++        let mut rng = TestRng::default();
++
++        for _ in 0..ITERATIONS {
++            // Sample a new puzzle commitment.
++            let expected = PuzzleCommitment::<CurrentNetwork>::new(KZGCommitment(rng.gen()));
++
++            // Check the string representation.
++            let candidate = format!("{expected}");
++            assert_eq!(expected, PuzzleCommitment::from_str(&candidate)?);
++            assert_eq!(PUZZLE_COMMITMENT_PREFIX, candidate.to_string().split('1').next().unwrap());
 +        }
 +        Ok(())
 +    }
 +
-     /// Returns `Ok(())` if the solutions are valid.
-     pub fn check_solutions(
-         &self,
-diff --git a/ledger/puzzle/src/solution/mod.rs b/ledger/puzzle/src/solution/mod.rs
-index e163d4d73..04f4a7092 100644
---- a/ledger/puzzle/src/solution/mod.rs
-+++ b/ledger/puzzle/src/solution/mod.rs
-@@ -25,7 +25,7 @@ pub struct Solution<N: Network> {
-     /// The partial solution.
-     partial_solution: PartialSolution<N>,
-     /// The solution target.
--    target: u64,
-+    pub(super) target: u64,
- }
++    #[test]
++    fn test_display() -> Result<()> {
++        let mut rng = TestRng::default();
++
++        for _ in 0..ITERATIONS {
++            // Sample a new puzzle commitment.
++            let expected = PuzzleCommitment::<CurrentNetwork>::new(KZGCommitment(rng.gen()));
++
++            let candidate = expected.to_string();
++            assert_eq!(format!("{expected}"), candidate);
++            assert_eq!(PUZZLE_COMMITMENT_PREFIX, candidate.split('1').next().unwrap());
++
++            let candidate_recovered = PuzzleCommitment::<CurrentNetwork>::from_str(&candidate.to_string())?;
++            assert_eq!(expected, candidate_recovered);
++        }
++        Ok(())
++    }
++}
+diff --git a/synthesizer/src/coinbase_puzzle/mod.rs b/synthesizer/src/coinbase_puzzle/mod.rs
+index 064628242..4baffe980 100644
+--- a/synthesizer/src/coinbase_puzzle/mod.rs
++++ b/synthesizer/src/coinbase_puzzle/mod.rs
+@@ -132,7 +132,7 @@ impl<N: Network> CoinbasePuzzle<N> {
+         };
+         let (commitment, _rand) =
+             KZG10::commit_lagrange(&pk.lagrange_basis(), &product_evaluations, None, &Default::default(), None)?;
+-        let point = hash_commitment(commitment)?;
++        let point = hash_commitment(&commitment)?;
+         let product_eval_at_point = polynomial.evaluate(point) * epoch_challenge.epoch_polynomial().evaluate(point);
  
- impl<N: Network> Solution<N> {
-diff --git a/ledger/src/advance.rs b/ledger/src/advance.rs
-index 74529a693..ef97ac99a 100644
---- a/ledger/src/advance.rs
-+++ b/ledger/src/advance.rs
-@@ -127,8 +127,8 @@ pub fn split_candidate_solutions<T, F>(
-     verification_fn: F,
- ) -> (Vec<T>, Vec<T>)
- where
--    T: Sized,
--    F: Fn(&T) -> bool,
-+    T: Sized + Copy,
-+    F: Fn(&mut T) -> bool,
- {
-     // Separate the candidate solutions into valid and aborted solutions.
-     let mut valid_candidate_solutions = Vec::with_capacity(max_solutions);
-@@ -147,28 +147,24 @@ where
+         let proof = KZG10::open_lagrange(
+@@ -190,7 +190,7 @@ impl<N: Network> CoinbasePuzzle<N> {
+             .unzip();
+ 
+         // Compute the challenge points.
+-        let mut challenges = hash_commitments(partial_solutions.iter().map(|solution| solution.commitment()))?;
++        let mut challenges = hash_commitments(partial_solutions.iter().map(|solution| *solution.commitment()))?;
+         ensure!(challenges.len() == partial_solutions.len() + 1, "Invalid number of challenge points");
+ 
+         // Pop the last challenge as the accumulator challenge point.
+@@ -267,7 +267,7 @@ impl<N: Network> CoinbasePuzzle<N> {
          }
  
-         // Split off a chunk of the candidate solutions.
--        let candidates_chunk = if candidate_solutions.len() > chunk_size {
-+        let mut candidates_chunk = if candidate_solutions.len() > chunk_size {
-             candidate_solutions.split_off(candidate_solutions.len() - chunk_size)
-         } else {
-             std::mem::take(&mut candidate_solutions)
+         // Ensure the coinbase proof meets the required coinbase target.
+-        if coinbase_solution.to_cumulative_target()? < coinbase_target as u128 {
++        if coinbase_solution.to_cumulative_proof_target()? < coinbase_target as u128 {
+             bail!("The coinbase proof does not meet the coinbase target");
+         }
+ 
+@@ -283,7 +283,7 @@ impl<N: Network> CoinbasePuzzle<N> {
+ 
+         // Compute the challenge points.
+         let mut challenge_points =
+-            hash_commitments(coinbase_solution.partial_solutions().iter().map(|solution| solution.commitment()))?;
++            hash_commitments(coinbase_solution.partial_solutions().iter().map(|solution| *solution.commitment()))?;
+         ensure!(
+             challenge_points.len() == coinbase_solution.partial_solutions().len() + 1,
+             "Invalid number of challenge points"
+diff --git a/synthesizer/src/program/instruction/operation/macros.rs b/synthesizer/src/program/instruction/operation/macros.rs
+index 209f8b00c..ac377d323 100644
+--- a/synthesizer/src/program/instruction/operation/macros.rs
++++ b/synthesizer/src/program/instruction/operation/macros.rs
+@@ -710,14 +710,36 @@ mod tests {
+ 
+                     // Check the operation on randomly-sampled values.
+                     for i in 0..num_iterations {
++                        macro_rules! sample_value {
++                            (I8, I8) => { sample_value!(I128, I128) };
++                            (I16, I16) => { sample_value!(I128, I128) };
++                            (I32, I32) => { sample_value!(I128, I128) };
++                            (I64, I64) => { sample_value!(I128, I128) };
++                            (I128, I128) => {
++                                match i {
++                                    0 => ($input_a::zero(), $input_b::zero()),
++                                    1 => ($input_a::<CurrentNetwork>::rand(&mut rng), $input_b::zero()),
++                                    2 => ($input_a::zero(), $input_b::<CurrentNetwork>::rand(&mut rng)),
++                                    3 => ($input_a::MIN, $input_b::zero() - $input_b::one()),
++                                    4.. => ($input_b::<CurrentNetwork>::rand(&mut rng), $input_b::<CurrentNetwork>::rand(&mut rng))
++                                }
++                            };
++                            ($lhs:ident, $rhs:ident) => {
++                                match i {
++                                    0 => ($lhs::zero(), $rhs::zero()),
++                                    1 => ($lhs::<CurrentNetwork>::rand(&mut rng), $rhs::zero()),
++                                    2 => ($lhs::zero(), $rhs::<CurrentNetwork>::rand(&mut rng)),
++                                    3.. => ($lhs::<CurrentNetwork>::rand(&mut rng), $rhs::<CurrentNetwork>::rand(&mut rng))
++                                }
++                            }
++                        }
+                         // Sample the first and second value.
+                         #[allow(deprecated)]
+-                        let (a, b) = match i {
+-                            0 => ($input_a::zero(), $input_b::zero()),
+-                            1 => ($input_a::<CurrentNetwork>::rand(&mut rng), $input_b::zero()),
+-                            2 => ($input_a::zero(), $input_b::<CurrentNetwork>::rand(&mut rng)),
+-                            3.. => ($input_a::<CurrentNetwork>::rand(&mut rng), $input_b::<CurrentNetwork>::rand(&mut rng))
+-                        };
++                        let (a, b) = sample_value!($input_a, $input_b);
++
++                        // This flag is used to determine halting conditions.
++                        #[allow(deprecated)]
++                        let is_rhs_zero = (*b) == *$input_b::<CurrentNetwork>::zero();
+ 
+                         // Initialize an indicator whether the operation should succeed or not.
+                         #[allow(unused_mut)]
+@@ -785,8 +807,10 @@ mod tests {
+                                 let mut should_panic_on_halt = false;
+                                 // If the operation is a shift operator, check if the mode of the RHS is a constant and if the shift amount exceeds the bitwidth.
+                                 should_panic_on_halt |= is_shift_operator && shift_exceeds_bitwidth && mode_b.is_constant();
+-                                // If the operation is a division operator, check if the mode of the RHS is a constant.
+-                                should_panic_on_halt |= is_division_operator && mode_b.is_constant();
++                                // If the operation is a division operator, check if both operands are constant or if the RHS is a constant and zero.
++                                should_panic_on_halt |= is_division_operator && (
++                                    mode_b.is_constant() && (mode_a.is_constant() || is_rhs_zero)
++                                );
+ 
+                                 // If this iteration should succeed, ensure the evaluated and executed outputs match the expected output.
+                                 if should_succeed {
+diff --git a/synthesizer/src/store/block/mod.rs b/synthesizer/src/store/block/mod.rs
+index 1be3830a6..0bcfcb3c5 100644
+--- a/synthesizer/src/store/block/mod.rs
++++ b/synthesizer/src/store/block/mod.rs
+@@ -17,7 +17,7 @@
+ use crate::{
+     atomic_write_batch,
+     block::{Block, Header, Transactions},
+-    coinbase_puzzle::CoinbaseSolution,
++    coinbase_puzzle::{CoinbaseSolution, PuzzleCommitment},
+     cow_to_cloned,
+     cow_to_copied,
+     store::{
+@@ -63,8 +63,10 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+     type TransactionStorage: TransactionStorage<N, TransitionStorage = Self::TransitionStorage>;
+     /// The transition storage.
+     type TransitionStorage: TransitionStorage<N>;
+-    /// The mapping of `block hash` to `block coinbase proof`.
+-    type CoinbaseProofMap: for<'a> Map<'a, N::BlockHash, Option<CoinbaseSolution<N>>>;
++    /// The mapping of `block hash` to `block coinbase solution`.
++    type CoinbaseSolutionMap: for<'a> Map<'a, N::BlockHash, Option<CoinbaseSolution<N>>>;
++    /// The mapping of `puzzle commitment` to `block hash`.
++    type CoinbasePuzzleCommitmentMap: for<'a> Map<'a, PuzzleCommitment<N>, N::BlockHash>;
+     /// The mapping of `block hash` to `block signature`.
+     type SignatureMap: for<'a> Map<'a, N::BlockHash, Signature<N>>;
+ 
+@@ -87,8 +89,10 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+     fn reverse_transactions_map(&self) -> &Self::ReverseTransactionsMap;
+     /// Returns the transaction store.
+     fn transaction_store(&self) -> &TransactionStore<N, Self::TransactionStorage>;
+-    /// Returns the coinbase proof map.
+-    fn coinbase_proof_map(&self) -> &Self::CoinbaseProofMap;
++    /// Returns the coinbase solution map.
++    fn coinbase_solution_map(&self) -> &Self::CoinbaseSolutionMap;
++    /// Returns the coinbase puzzle commitment map.
++    fn coinbase_puzzle_commitment_map(&self) -> &Self::CoinbasePuzzleCommitmentMap;
+     /// Returns the signature map.
+     fn signature_map(&self) -> &Self::SignatureMap;
+ 
+@@ -112,7 +116,8 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+         self.transactions_map().start_atomic();
+         self.reverse_transactions_map().start_atomic();
+         self.transaction_store().start_atomic();
+-        self.coinbase_proof_map().start_atomic();
++        self.coinbase_solution_map().start_atomic();
++        self.coinbase_puzzle_commitment_map().start_atomic();
+         self.signature_map().start_atomic();
+     }
+ 
+@@ -126,7 +131,8 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+             || self.transactions_map().is_atomic_in_progress()
+             || self.reverse_transactions_map().is_atomic_in_progress()
+             || self.transaction_store().is_atomic_in_progress()
+-            || self.coinbase_proof_map().is_atomic_in_progress()
++            || self.coinbase_solution_map().is_atomic_in_progress()
++            || self.coinbase_puzzle_commitment_map().is_atomic_in_progress()
+             || self.signature_map().is_atomic_in_progress()
+     }
+ 
+@@ -140,7 +146,8 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+         self.transactions_map().abort_atomic();
+         self.reverse_transactions_map().abort_atomic();
+         self.transaction_store().abort_atomic();
+-        self.coinbase_proof_map().abort_atomic();
++        self.coinbase_solution_map().abort_atomic();
++        self.coinbase_puzzle_commitment_map().abort_atomic();
+         self.signature_map().abort_atomic();
+     }
+ 
+@@ -154,7 +161,8 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+         self.transactions_map().finish_atomic()?;
+         self.reverse_transactions_map().finish_atomic()?;
+         self.transaction_store().finish_atomic()?;
+-        self.coinbase_proof_map().finish_atomic()?;
++        self.coinbase_solution_map().finish_atomic()?;
++        self.coinbase_puzzle_commitment_map().finish_atomic()?;
+         self.signature_map().finish_atomic()
+     }
+ 
+@@ -184,8 +192,15 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+                 self.transaction_store().insert(transaction)?;
+             }
+ 
+-            // Store the block coinbase proof.
+-            self.coinbase_proof_map().insert(block.hash(), block.coinbase_proof().cloned())?;
++            // Store the block coinbase solution.
++            self.coinbase_solution_map().insert(block.hash(), block.coinbase().cloned())?;
++
++            // Store the block coinbase puzzle commitment.
++            if let Some(coinbase) = block.coinbase() {
++                for puzzle_commitment in coinbase.partial_solutions().iter().map(|s| s.commitment()) {
++                    self.coinbase_puzzle_commitment_map().insert(puzzle_commitment, block.hash())?;
++                }
++            }
+ 
+             // Store the block signature.
+             self.signature_map().insert(block.hash(), *block.signature())?;
+@@ -213,6 +228,13 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+             Some(transaction_ids) => transaction_ids,
+             None => bail!("Failed to remove block: missing transactions for block '{block_height}' ('{block_hash}')"),
+         };
++        // Retrieve the coinbase solution.
++        let coinbase = match self.coinbase_solution_map().get(block_hash)? {
++            Some(coinbase_solution) => cow_to_cloned!(coinbase_solution),
++            None => {
++                bail!("Failed to remove block: missing coinbase solution for block '{block_height}' ('{block_hash}')")
++            }
++        };
+ 
+         atomic_write_batch!(self, {
+             // Remove the (block height, state root) pair.
+@@ -238,8 +260,15 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+                 self.transaction_store().remove(transaction_id)?;
+             }
+ 
+-            // Remove the block coinbase proof.
+-            self.coinbase_proof_map().remove(block_hash)?;
++            // Remove the block coinbase solution.
++            self.coinbase_solution_map().remove(block_hash)?;
++
++            // Remove the block coinbase puzzle commitment.
++            if let Some(coinbase) = coinbase {
++                for puzzle_commitment in coinbase.partial_solutions().iter().map(|s| s.commitment()) {
++                    self.coinbase_puzzle_commitment_map().remove(&puzzle_commitment)?;
++                }
++            }
+ 
+             // Remove the block signature.
+             self.signature_map().remove(block_hash)?;
+@@ -266,6 +295,17 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+         }
+     }
+ 
++    /// Returns the block hash that contains the given `puzzle commitment`.
++    fn find_block_hash_from_puzzle_commitment(
++        &self,
++        puzzle_commitment: &PuzzleCommitment<N>,
++    ) -> Result<Option<N::BlockHash>> {
++        match self.coinbase_puzzle_commitment_map().get(puzzle_commitment)? {
++            Some(block_hash) => Ok(Some(cow_to_copied!(block_hash))),
++            None => Ok(None),
++        }
++    }
++
+     /// Returns the state root that contains the given `block height`.
+     fn get_state_root(&self, block_height: u32) -> Result<Option<Field<N>>> {
+         match self.state_root_map().get(&block_height)? {
+@@ -329,11 +369,11 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+         Ok(Some(Transactions::from(&transactions)))
+     }
+ 
+-    /// Returns the block coinbase proof for the given `block hash`.
+-    fn get_block_coinbase_proof(&self, block_hash: &N::BlockHash) -> Result<Option<CoinbaseSolution<N>>> {
+-        match self.coinbase_proof_map().get(block_hash)? {
+-            Some(coinbase_proof) => Ok(cow_to_cloned!(coinbase_proof)),
+-            None => bail!("Missing coinbase proof for block ('{block_hash}')"),
++    /// Returns the block coinbase solution for the given `block hash`.
++    fn get_block_coinbase(&self, block_hash: &N::BlockHash) -> Result<Option<CoinbaseSolution<N>>> {
++        match self.coinbase_solution_map().get(block_hash)? {
++            Some(coinbase_solution) => Ok(cow_to_cloned!(coinbase_solution)),
++            None => bail!("Missing coinbase solution for block ('{block_hash}')"),
+         }
+     }
+ 
+@@ -373,10 +413,10 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
+             Some(transactions) => transactions,
+             None => bail!("Missing transactions for block {height} ('{block_hash}')"),
+         };
+-        // Retrieve the block coinbase proof.
+-        let coinbase_proof = match self.get_block_coinbase_proof(block_hash) {
+-            Ok(coinbase_proof) => coinbase_proof,
+-            Err(_) => bail!("Missing coinbase proof for block {height} ('{block_hash}')"),
++        // Retrieve the block coinbase solution.
++        let coinbase = match self.get_block_coinbase(block_hash) {
++            Ok(coinbase_solution) => coinbase_solution,
++            Err(_) => bail!("Missing coinbase solution for block {height} ('{block_hash}')"),
+         };
+         // Retrieve the block signature.
+         let signature = match self.get_block_signature(block_hash)? {
+@@ -385,7 +425,7 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
          };
  
-         // Verify the solutions in the chunk.
--        let verification_results: Vec<_> = candidates_chunk
--            .into_iter()
--            .rev()
--            .map(|solution| {
--                let verified = verification_fn(&solution);
--                (solution, verified)
--            })
--            .collect();
-+        let verification_results = candidates_chunk.iter_mut().rev().map(|solution| {
-+            let verified = verification_fn(solution);
-+            (solution, verified)
-+        });
- 
-         // Process the results of the verification.
-         for (solution, is_valid) in verification_results.into_iter() {
-             if is_valid && valid_candidate_solutions.len() < max_solutions {
--                valid_candidate_solutions.push(solution);
-+                valid_candidate_solutions.push(*solution);
-             } else {
--                aborted_candidate_solutions.push(solution);
-+                aborted_candidate_solutions.push(*solution);
-             }
-         }
-     }
-@@ -201,7 +197,7 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
-                 // Separate the candidate solutions into valid and aborted solutions.
-                 let (valid_candidate_solutions, aborted_candidate_solutions) =
-                     split_candidate_solutions(candidate_solutions, N::MAX_SOLUTIONS, |solution| {
--                        self.puzzle().check_solution(solution, latest_epoch_hash, latest_proof_target).is_ok()
-+                        self.puzzle().check_solution_mut(solution, latest_epoch_hash, latest_proof_target).is_ok()
-                     });
- 
-                 // Check if there are any valid solutions.
-diff --git a/ledger/src/contains.rs b/ledger/src/contains.rs
-index 5f75b826b..e074ed43f 100644
---- a/ledger/src/contains.rs
-+++ b/ledger/src/contains.rs
-@@ -44,8 +44,8 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
-     pub fn contains_transmission(&self, transmission_id: &TransmissionID<N>) -> Result<bool> {
-         match transmission_id {
-             TransmissionID::Ratification => Ok(false),
--            TransmissionID::Solution(solution_id) => self.contains_solution_id(solution_id),
--            TransmissionID::Transaction(transaction_id) => self.contains_transaction_id(transaction_id),
-+            TransmissionID::Solution(solution_id, _) => self.contains_solution_id(solution_id),
-+            TransmissionID::Transaction(transaction_id, _) => self.contains_transaction_id(transaction_id),
-         }
-     }
- 
-diff --git a/ledger/src/helpers/bft.rs b/ledger/src/helpers/bft.rs
-index 3d786d6e9..a27acbbec 100644
---- a/ledger/src/helpers/bft.rs
-+++ b/ledger/src/helpers/bft.rs
-@@ -46,7 +46,9 @@ pub fn decouple_transmissions<N: Network>(
-         // Deserialize and store the transmission.
-         match (transmission_id, transmission) {
-             (TransmissionID::Ratification, Transmission::Ratification) => (),
--            (TransmissionID::Solution(commitment), Transmission::Solution(solution)) => {
-+            (TransmissionID::Solution(commitment, checksum), Transmission::Solution(solution)) => {
-+                // Ensure the transmission checksum corresponds to the solution.
-+                ensure!(checksum == solution.to_checksum::<N>()?, "Mismatching transmission checksum (solution)");
-                 // Deserialize the solution.
-                 let solution = solution.deserialize_blocking()?;
-                 // Ensure the transmission ID corresponds to the solution.
-@@ -54,7 +56,9 @@ pub fn decouple_transmissions<N: Network>(
-                 // Insert the solution into the list.
-                 solutions.push(solution);
-             }
--            (TransmissionID::Transaction(transaction_id), Transmission::Transaction(transaction)) => {
-+            (TransmissionID::Transaction(transaction_id, checksum), Transmission::Transaction(transaction)) => {
-+                // Ensure the transmission checksum corresponds to the transaction.
-+                ensure!(checksum == transaction.to_checksum::<N>()?, "Mismatching transmission checksum (transaction)");
-                 // Deserialize the transaction.
-                 let transaction = transaction.deserialize_blocking()?;
-                 // Ensure the transmission ID corresponds to the transaction.
-diff --git a/ledger/src/tests.rs b/ledger/src/tests.rs
-index 22f6046c1..b16971f69 100644
---- a/ledger/src/tests.rs
-+++ b/ledger/src/tests.rs
-@@ -1774,7 +1774,7 @@ fn test_split_candidate_solutions() {
-         let candidate_solutions: Vec<u8> = rng.sample_iter(Standard).take(num_candidates).collect();
- 
-         let (_accepted, _aborted) =
--            split_candidate_solutions(candidate_solutions, max_solutions, |candidate| candidate % 2 == 0);
-+            split_candidate_solutions(candidate_solutions, max_solutions, |candidate| *candidate % 2 == 0);
+         // Return the block.
+-        Ok(Some(Block::from(previous_hash, header, transactions, coinbase_proof, signature)?))
++        Ok(Some(Block::from(previous_hash, header, transactions, coinbase, signature)?))
      }
  }
  
-@@ -2351,6 +2351,7 @@ finalize is_id:
- #[cfg(feature = "test")]
- mod valid_solutions {
-     use super::*;
-+    use ledger_puzzle::Solution;
-     use rand::prelude::SliceRandom;
-     use std::collections::HashSet;
+@@ -408,8 +448,10 @@ pub struct BlockMemory<N: Network> {
+     reverse_transactions_map: MemoryMap<N::TransactionID, N::BlockHash>,
+     /// The transaction store.
+     transaction_store: TransactionStore<N, TransactionMemory<N>>,
+-    /// The coinbase proof map.
+-    coinbase_proof_map: MemoryMap<N::BlockHash, Option<CoinbaseSolution<N>>>,
++    /// The coinbase solution map.
++    coinbase_solution_map: MemoryMap<N::BlockHash, Option<CoinbaseSolution<N>>>,
++    /// The coinbase puzzle commitment map.
++    coinbase_puzzle_commitment_map: MemoryMap<PuzzleCommitment<N>, N::BlockHash>,
+     /// The signature map.
+     signature_map: MemoryMap<N::BlockHash, Signature<N>>,
+ }
+@@ -425,7 +467,8 @@ impl<N: Network> BlockStorage<N> for BlockMemory<N> {
+     type ReverseTransactionsMap = MemoryMap<N::TransactionID, N::BlockHash>;
+     type TransactionStorage = TransactionMemory<N>;
+     type TransitionStorage = TransitionMemory<N>;
+-    type CoinbaseProofMap = MemoryMap<N::BlockHash, Option<CoinbaseSolution<N>>>;
++    type CoinbaseSolutionMap = MemoryMap<N::BlockHash, Option<CoinbaseSolution<N>>>;
++    type CoinbasePuzzleCommitmentMap = MemoryMap<PuzzleCommitment<N>, N::BlockHash>;
+     type SignatureMap = MemoryMap<N::BlockHash, Signature<N>>;
  
-@@ -2668,4 +2669,146 @@ mod valid_solutions {
-             candidate_solutions.iter().skip(CurrentNetwork::MAX_SOLUTIONS).map(|s| s.id()).collect::<HashSet<_>>();
-         assert_eq!(block_aborted_solution_ids, expected_aborted_solutions, "Aborted solutions do not match");
+     /// Initializes the block storage.
+@@ -444,7 +487,8 @@ impl<N: Network> BlockStorage<N> for BlockMemory<N> {
+             transactions_map: MemoryMap::default(),
+             reverse_transactions_map: MemoryMap::default(),
+             transaction_store,
+-            coinbase_proof_map: MemoryMap::default(),
++            coinbase_solution_map: MemoryMap::default(),
++            coinbase_puzzle_commitment_map: MemoryMap::default(),
+             signature_map: MemoryMap::default(),
+         })
      }
-+
-+    #[test]
-+    fn test_malicious_solution() {
-+        // Initialize an RNG.
-+        let rng = &mut TestRng::default();
-+
-+        // Initialize the test environment.
-+        let crate::test_helpers::TestEnv { ledger, private_key, address, .. } =
-+            crate::test_helpers::sample_test_env(rng);
-+
-+        // Retrieve the puzzle parameters.
-+        let puzzle = ledger.puzzle();
-+        let latest_epoch_hash = ledger.latest_epoch_hash().unwrap();
-+        let minimum_proof_target = ledger.latest_proof_target();
-+
-+        // Initialize a valid solution object.
-+        let mut valid_solution = None;
-+        while valid_solution.is_none() {
-+            let solution = puzzle.prove(latest_epoch_hash, address, rng.gen(), None).unwrap();
-+            if puzzle.get_proof_target(&solution).unwrap() >= minimum_proof_target {
-+                valid_solution = Some(solution);
-+            }
-+        }
-+        // Unwrap the valid solution.
-+        let valid_solution = valid_solution.unwrap();
-+
-+        // Construct a malicious solution with a different target.
-+        let different_target = valid_solution.target().wrapping_sub(1);
-+        let malicious_solution = Solution::new(*valid_solution.partial_solution(), different_target);
-+
-+        assert_eq!(
-+            valid_solution.id(),
-+            malicious_solution.id(),
-+            "The malicious solution should have the same ID as the valid solution"
-+        );
-+        assert_ne!(
-+            valid_solution.target(),
-+            malicious_solution.target(),
-+            "The malicious solution should have a different target than the valid solution"
-+        );
-+
-+        // Create a valid transaction for the block.
-+        let inputs = [Value::from_str(&format!("{address}")).unwrap(), Value::from_str("10u64").unwrap()];
-+        let transfer_transaction = ledger
-+            .vm
-+            .execute(&private_key, ("credits.aleo", "transfer_public"), inputs.iter(), None, 0, None, rng)
-+            .unwrap();
-+
-+        // Check that the block creation fixes the malformed solution.
-+        let expected_solution_id = valid_solution.id();
-+        let expected_solution = valid_solution;
-+        let mut check_block = |candidate_solutions: Vec<Solution<CurrentNetwork>>| {
-+            // Create a block.
-+            let block = ledger
-+                .prepare_advance_to_next_beacon_block(
-+                    &private_key,
-+                    vec![],
-+                    candidate_solutions.clone(),
-+                    vec![transfer_transaction.clone()],
-+                    rng,
-+                )
-+                .unwrap();
-+
-+            // Check that the next block is valid.
-+            ledger.check_next_block(&block, rng).unwrap();
-+
-+            // Check that the block's solutions are well-formed.
-+            assert_eq!(block.solutions().len(), 1);
-+            assert_eq!(block.aborted_solution_ids().len(), 0);
-+
-+            // Fetch the solution from the block.
-+            let (solution_id, solution) = block.solutions().as_ref().unwrap().first().unwrap();
-+            assert_eq!(*solution_id, expected_solution_id, "Check that the block has the correct solution ID");
-+            assert_eq!(*solution, expected_solution, "Check that the block has the correct solution");
-+        };
-+
-+        // Case 1: The malicious solution is included in the block construction.
-+        let candidate_solutions = vec![malicious_solution];
-+        check_block(candidate_solutions);
-+
-+        // Case 2: The valid solution is included in the block construction.
-+        let candidate_solutions = vec![valid_solution];
-+        check_block(candidate_solutions);
+@@ -489,9 +533,14 @@ impl<N: Network> BlockStorage<N> for BlockMemory<N> {
+         &self.transaction_store
+     }
+ 
+-    /// Returns the coinbase proof map.
+-    fn coinbase_proof_map(&self) -> &Self::CoinbaseProofMap {
+-        &self.coinbase_proof_map
++    /// Returns the coinbase solution map.
++    fn coinbase_solution_map(&self) -> &Self::CoinbaseSolutionMap {
++        &self.coinbase_solution_map
 +    }
 +
-+    #[test]
-+    fn test_solution_with_insufficient_target() {
-+        // Initialize an RNG.
-+        let rng = &mut TestRng::default();
++    /// Returns the coinbase puzzle commitment map.
++    fn coinbase_puzzle_commitment_map(&self) -> &Self::CoinbasePuzzleCommitmentMap {
++        &self.coinbase_puzzle_commitment_map
+     }
+ 
+     /// Returns the signature map.
+@@ -579,6 +628,14 @@ impl<N: Network, B: BlockStorage<N>> BlockStore<N, B> {
+     pub fn find_block_hash(&self, transaction_id: &N::TransactionID) -> Result<Option<N::BlockHash>> {
+         self.storage.find_block_hash(transaction_id)
+     }
 +
-+        // Initialize the test environment.
-+        let crate::test_helpers::TestEnv { ledger, private_key, address, .. } =
-+            crate::test_helpers::sample_test_env(rng);
-+
-+        // Retrieve the puzzle parameters.
-+        let puzzle = ledger.puzzle();
-+        let latest_epoch_hash = ledger.latest_epoch_hash().unwrap();
-+        let minimum_proof_target = ledger.latest_proof_target();
-+
-+        // Initialize a valid solution object.
-+        let mut invalid_solution = None;
-+        while invalid_solution.is_none() {
-+            let solution = puzzle.prove(latest_epoch_hash, address, rng.gen(), None).unwrap();
-+            if puzzle.get_proof_target(&solution).unwrap() < minimum_proof_target {
-+                invalid_solution = Some(solution);
-+            }
-+        }
-+        // Unwrap the invalid solution.
-+        let invalid_solution = invalid_solution.unwrap();
-+
-+        // Create a valid transaction for the block.
-+        let inputs = [Value::from_str(&format!("{address}")).unwrap(), Value::from_str("10u64").unwrap()];
-+        let transfer_transaction = ledger
-+            .vm
-+            .execute(&private_key, ("credits.aleo", "transfer_public"), inputs.iter(), None, 0, None, rng)
-+            .unwrap();
-+
-+        // Create a block.
-+        let block = ledger
-+            .prepare_advance_to_next_beacon_block(
-+                &private_key,
-+                vec![],
-+                vec![invalid_solution],
-+                vec![transfer_transaction],
-+                rng,
-+            )
-+            .unwrap();
-+
-+        // Check that the next block is valid.
-+        ledger.check_next_block(&block, rng).unwrap();
-+
-+        // Add the deployment block to the ledger.
-+        ledger.advance_to_next_block(&block).unwrap();
-+
-+        // Check that the block's solutions are well-formed.
-+        assert_eq!(block.solutions().len(), 0);
-+        assert_eq!(block.aborted_solution_ids().len(), 1);
-+
-+        // Check that the aborted solution is correct.
-+        let block_aborted_solution_id = block.aborted_solution_ids().first().unwrap();
-+        assert_eq!(*block_aborted_solution_id, invalid_solution.id(), "Aborted solutions do not match");
++    /// Returns the block hash that contains the given `puzzle commitment`.
++    pub fn find_block_hash_from_puzzle_commitment(
++        &self,
++        puzzle_commitment: &PuzzleCommitment<N>,
++    ) -> Result<Option<N::BlockHash>> {
++        self.storage.find_block_hash_from_puzzle_commitment(puzzle_commitment)
 +    }
  }
-diff --git a/synthesizer/Cargo.toml b/synthesizer/Cargo.toml
-index d63e004d7..a60060fc8 100644
---- a/synthesizer/Cargo.toml
-+++ b/synthesizer/Cargo.toml
-@@ -91,6 +91,11 @@ package = "snarkvm-ledger-committee"
- path = "../ledger/committee"
- version = "=0.16.19"
  
-+[dependencies.ledger-narwhal-data]
-+package = "snarkvm-ledger-narwhal-data"
-+path = "../ledger/narwhal/data"
-+version = "=0.16.19"
-+
- [dependencies.ledger-puzzle]
- package = "snarkvm-ledger-puzzle"
- path = "../ledger/puzzle"
-diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
-index d1750c614..6f6565a35 100644
---- a/synthesizer/src/vm/mod.rs
-+++ b/synthesizer/src/vm/mod.rs
-@@ -44,6 +44,7 @@ use ledger_block::{
-     Transactions,
- };
- use ledger_committee::Committee;
-+use ledger_narwhal_data::Data;
- use ledger_puzzle::Puzzle;
- use ledger_query::Query;
- use ledger_store::{
-@@ -81,7 +82,7 @@ pub struct VM<N: Network, C: ConsensusStorage<N>> {
-     /// The VM store.
-     store: ConsensusStore<N, C>,
-     /// A cache containing the list of recent partially-verified transactions.
--    partially_verified_transactions: Arc<RwLock<LruCache<N::TransactionID, ()>>>,
-+    partially_verified_transactions: Arc<RwLock<LruCache<N::TransactionID, N::TransmissionChecksum>>>,
-     /// The restrictions list.
-     restrictions: Restrictions<N>,
-     /// The lock to guarantee atomicity over calls to speculate and finalize.
-@@ -218,7 +219,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
- 
-     /// Returns the partially-verified transactions.
-     #[inline]
--    pub fn partially_verified_transactions(&self) -> Arc<RwLock<LruCache<N::TransactionID, ()>>> {
-+    pub fn partially_verified_transactions(&self) -> Arc<RwLock<LruCache<N::TransactionID, N::TransmissionChecksum>>> {
-         self.partially_verified_transactions.clone()
+ impl<N: Network, B: BlockStorage<N>> BlockStore<N, B> {
+@@ -612,9 +669,9 @@ impl<N: Network, B: BlockStorage<N>> BlockStore<N, B> {
+         self.storage.get_block_transactions(block_hash)
      }
  
-diff --git a/synthesizer/src/vm/verify.rs b/synthesizer/src/vm/verify.rs
-index e1fea2b1c..12bbe95e1 100644
---- a/synthesizer/src/vm/verify.rs
-+++ b/synthesizer/src/vm/verify.rs
-@@ -134,8 +134,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
-         // First, verify the fee.
-         self.check_fee(transaction, rejected_id)?;
+-    /// Returns the block coinbase proof for the given `block hash`.
+-    pub fn get_block_coinbase_proof(&self, block_hash: &N::BlockHash) -> Result<Option<CoinbaseSolution<N>>> {
+-        self.storage.get_block_coinbase_proof(block_hash)
++    /// Returns the block coinbase solution for the given `block hash`.
++    pub fn get_block_coinbase(&self, block_hash: &N::BlockHash) -> Result<Option<CoinbaseSolution<N>>> {
++        self.storage.get_block_coinbase(block_hash)
+     }
  
-+        // Construct the transaction checksum.
-+        let checksum = Data::<Transaction<N>>::Buffer(transaction.to_bytes_le()?.into()).to_checksum::<N>()?;
+     /// Returns the block signature for the given `block hash`.
+@@ -643,6 +700,11 @@ impl<N: Network, B: BlockStorage<N>> BlockStore<N, B> {
+     pub fn contains_block_hash(&self, block_hash: &N::BlockHash) -> Result<bool> {
+         self.storage.reverse_id_map().contains_key(block_hash)
+     }
 +
-         // Check if the transaction exists in the partially-verified cache.
--        let is_partially_verified = self.partially_verified_transactions.read().peek(&transaction.id()).is_some();
-+        let is_partially_verified =
-+            self.partially_verified_transactions.read().peek(&(transaction.id())) == Some(&checksum);
++    /// Returns `true` if the given puzzle commitment exists.
++    pub fn contains_puzzle_commitment(&self, puzzle_commitment: &PuzzleCommitment<N>) -> Result<bool> {
++        self.storage.coinbase_puzzle_commitment_map().contains_key(puzzle_commitment)
++    }
+ }
  
-         // Next, verify the deployment or execution.
-         match transaction {
-@@ -188,7 +192,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
-         // If the above checks have passed and this is not a fee transaction,
-         // then add the transaction ID to the partially-verified transactions cache.
-         if !matches!(transaction, Transaction::Fee(..)) && !is_partially_verified {
--            self.partially_verified_transactions.write().push(transaction.id(), ());
-+            self.partially_verified_transactions.write().push(transaction.id(), checksum);
-         }
+ impl<N: Network, B: BlockStorage<N>> BlockStore<N, B> {
+@@ -660,6 +722,11 @@ impl<N: Network, B: BlockStorage<N>> BlockStore<N, B> {
+     pub fn hashes(&self) -> impl '_ + Iterator<Item = Cow<'_, N::BlockHash>> {
+         self.storage.reverse_id_map().keys()
+     }
++
++    /// Returns an iterator over the puzzle commitments, for all blocks in `self`.
++    pub fn puzzle_commitments(&self) -> impl '_ + Iterator<Item = Cow<'_, PuzzleCommitment<N>>> {
++        self.storage.coinbase_puzzle_commitment_map().keys()
++    }
+ }
  
-         finish!(timer, "Verify the transaction");
+ #[cfg(test)]

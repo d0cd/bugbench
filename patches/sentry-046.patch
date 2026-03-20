@@ -1,42 +1,229 @@
-diff --git a/static/app/components/modals/widgetViewerModal.tsx b/static/app/components/modals/widgetViewerModal.tsx
-index 7df94e7e342..92a19552184 100644
---- a/static/app/components/modals/widgetViewerModal.tsx
-+++ b/static/app/components/modals/widgetViewerModal.tsx
-@@ -526,7 +526,8 @@ function WidgetViewerModal(props: Props) {
-             widget={tableWidget}
-             selection={modalSelection}
-             limit={
--              widget.displayType === DisplayType.TABLE
-+              widget.displayType === DisplayType.TABLE ||
-+              widget.displayType === DisplayType.CATEGORICAL_BAR
-                 ? FULL_TABLE_ITEM_LIMIT
-                 : HALF_TABLE_ITEM_LIMIT
-             }
-@@ -543,7 +544,8 @@ function WidgetViewerModal(props: Props) {
-             widget={tableWidget}
-             selection={modalSelection}
-             limit={
--              widget.displayType === DisplayType.TABLE
-+              widget.displayType === DisplayType.TABLE ||
-+              widget.displayType === DisplayType.CATEGORICAL_BAR
-                 ? FULL_TABLE_ITEM_LIMIT
-                 : HALF_TABLE_ITEM_LIMIT
-             }
-@@ -561,7 +563,8 @@ function WidgetViewerModal(props: Props) {
-             widget={tableWidget}
-             selection={modalSelection}
-             limit={
--              widget.displayType === DisplayType.TABLE
-+              widget.displayType === DisplayType.TABLE ||
-+              widget.displayType === DisplayType.CATEGORICAL_BAR
-                 ? FULL_TABLE_ITEM_LIMIT
-                 : HALF_TABLE_ITEM_LIMIT
-             }
-@@ -605,6 +608,7 @@ function WidgetViewerModal(props: Props) {
-               dashboardFilters={dashboardFilters}
-               // Top N charts rely on the orderby of the table
-               widget={primaryWidget}
-+              tableItemLimit={widget.limit}
-               onZoom={onZoom}
-               onLegendSelectChanged={onLegendSelectChanged}
-               legendOptions={{
+diff --git a/src/sentry/autopilot/tasks/missing_sdk_integration.py b/src/sentry/autopilot/tasks/missing_sdk_integration.py
+index 4d3922e2309345..c944e6e206d199 100644
+--- a/src/sentry/autopilot/tasks/missing_sdk_integration.py
++++ b/src/sentry/autopilot/tasks/missing_sdk_integration.py
+@@ -316,7 +316,7 @@ def run_missing_sdk_integration_detector_for_project_task(
+         # Only create issues if the detection was successful
+         if finish_reason == MissingSdkIntegrationFinishReason.SUCCESS:
+             for integration in missing_integrations:
+-                description = f"{integration.summary}\n\n" f"Learn more: {integration.docs_url}"
++                description = f"{integration.summary}\n\nLearn more: {integration.docs_url}"
+ 
+                 logger.info(
+                     "missing_sdk_integration_detector.issue_would_be_created",
+diff --git a/src/sentry/preprod/api/endpoints/preprod_artifact_snapshot.py b/src/sentry/preprod/api/endpoints/preprod_artifact_snapshot.py
+index 70d56327ac7deb..4f186c54c90853 100644
+--- a/src/sentry/preprod/api/endpoints/preprod_artifact_snapshot.py
++++ b/src/sentry/preprod/api/endpoints/preprod_artifact_snapshot.py
+@@ -34,6 +34,7 @@
+ from sentry.preprod.snapshots.manifest import ComparisonManifest, ImageMetadata, SnapshotManifest
+ from sentry.preprod.snapshots.models import PreprodSnapshotComparison, PreprodSnapshotMetrics
+ from sentry.preprod.snapshots.tasks import compare_snapshots
++from sentry.preprod.snapshots.utils import find_base_snapshot_artifact
+ from sentry.ratelimits.config import RateLimitConfig
+ from sentry.types.ratelimit import RateLimit, RateLimitCategory
+ from sentry.utils import metrics
+@@ -374,19 +375,14 @@ def post(self, request: Request, project: Project) -> Response:
+ 
+         if base_sha and base_repo_name:
+             try:
+-                base_artifact = (
+-                    PreprodArtifact.objects.filter(
+-                        commit_comparison__organization_id=project.organization_id,
+-                        commit_comparison__head_sha=base_sha,
+-                        commit_comparison__head_repo_name=base_repo_name,
+-                        project=project,
+-                        preprodsnapshotmetrics__isnull=False,
+-                        app_id=artifact.app_id,
+-                        artifact_type=artifact.artifact_type,
+-                        build_configuration=artifact.build_configuration,
+-                    )
+-                    .order_by("-date_added")
+-                    .first()
++                base_artifact = find_base_snapshot_artifact(
++                    organization_id=project.organization_id,
++                    base_sha=base_sha,
++                    base_repo_name=base_repo_name,
++                    project_id=project.id,
++                    app_id=artifact.app_id,
++                    artifact_type=artifact.artifact_type,
++                    build_configuration=artifact.build_configuration,
+                 )
+                 if base_artifact:
+                     logger.info(
+diff --git a/src/sentry/preprod/api/endpoints/preprod_snapshot_recompare.py b/src/sentry/preprod/api/endpoints/preprod_snapshot_recompare.py
+new file mode 100644
+index 00000000000000..71a6f883ea792a
+--- /dev/null
++++ b/src/sentry/preprod/api/endpoints/preprod_snapshot_recompare.py
+@@ -0,0 +1,99 @@
++from __future__ import annotations
++
++import logging
++
++from rest_framework.request import Request
++from rest_framework.response import Response
++
++from sentry.api.api_owners import ApiOwner
++from sentry.api.api_publish_status import ApiPublishStatus
++from sentry.api.base import region_silo_endpoint
++from sentry.api.bases.organization import OrganizationEndpoint
++from sentry.api.permissions import StaffPermission
++from sentry.models.organization import Organization
++from sentry.preprod.models import PreprodArtifact
++from sentry.preprod.snapshots.models import PreprodSnapshotComparison, PreprodSnapshotMetrics
++from sentry.preprod.snapshots.tasks import compare_snapshots
++from sentry.preprod.snapshots.utils import find_base_snapshot_artifact
++
++logger = logging.getLogger(__name__)
++
++
++@region_silo_endpoint
++class PreprodSnapshotRecompareEndpoint(OrganizationEndpoint):
++    owner = ApiOwner.EMERGE_TOOLS
++    publish_status = {
++        "POST": ApiPublishStatus.PRIVATE,
++    }
++    permission_classes = (StaffPermission,)
++
++    def post(self, request: Request, organization: Organization, snapshot_id: str) -> Response:
++        try:
++            artifact = PreprodArtifact.objects.select_related("commit_comparison").get(
++                id=snapshot_id, project__organization_id=organization.id
++            )
++        except (PreprodArtifact.DoesNotExist, ValueError):
++            return Response({"detail": "Snapshot not found"}, status=404)
++
++        try:
++            snapshot_metrics = artifact.preprodsnapshotmetrics
++        except PreprodSnapshotMetrics.DoesNotExist:
++            return Response({"detail": "Snapshot metrics not found"}, status=404)
++
++        existing_comparison = (
++            PreprodSnapshotComparison.objects.select_related(
++                "base_snapshot_metrics",
++            )
++            .filter(head_snapshot_metrics=snapshot_metrics)
++            .order_by("-id")
++            .first()
++        )
++
++        base_artifact_id = None
++
++        if existing_comparison:
++            base_artifact_id = existing_comparison.base_snapshot_metrics.preprod_artifact_id
++            existing_comparison.delete()
++        else:
++            commit_comparison = artifact.commit_comparison
++            if not commit_comparison:
++                return Response({"detail": "No VCS info available to find base"}, status=400)
++
++            base_sha = commit_comparison.base_sha
++            base_repo_name = commit_comparison.base_repo_name
++
++            if not (base_sha and base_repo_name):
++                return Response({"detail": "Incomplete VCS info to find base"}, status=400)
++
++            base_artifact = find_base_snapshot_artifact(
++                organization_id=organization.id,
++                base_sha=base_sha,
++                base_repo_name=base_repo_name,
++                project_id=artifact.project_id,
++                app_id=artifact.app_id,
++                artifact_type=artifact.artifact_type,
++                build_configuration=artifact.build_configuration,
++            )
++            if not base_artifact:
++                return Response({"detail": "No base artifact found"}, status=404)
++            base_artifact_id = base_artifact.id
++
++        logger.info(
++            "Recompare: dispatching compare_snapshots task",
++            extra={
++                "head_artifact_id": artifact.id,
++                "base_artifact_id": base_artifact_id,
++                "org_id": organization.id,
++            },
++        )
++
++        compare_snapshots.apply_async(
++            kwargs={
++                "project_id": artifact.project_id,
++                "org_id": organization.id,
++                "head_artifact_id": artifact.id,
++                "base_artifact_id": base_artifact_id,
++            },
++        )
++
++        return Response({"status": "queued"}, status=200)
+diff --git a/src/sentry/preprod/api/endpoints/urls.py b/src/sentry/preprod/api/endpoints/urls.py
+index 8d3e0c3884f4e7..c0b782e05f7280 100644
+--- a/src/sentry/preprod/api/endpoints/urls.py
++++ b/src/sentry/preprod/api/endpoints/urls.py
+@@ -28,6 +28,7 @@
+ )
+ from .preprod_artifact_rerun_status_checks import PreprodArtifactRerunStatusChecksEndpoint
+ from .preprod_artifact_snapshot import ProjectPreprodSnapshotEndpoint
++from .preprod_snapshot_recompare import PreprodSnapshotRecompareEndpoint
+ from .project_installable_preprod_artifact_download import (
+     ProjectInstallablePreprodArtifactDownloadEndpoint,
+ )
+@@ -186,6 +187,12 @@
+         OrganizationPreprodPublicSizeAnalysisEndpoint.as_view(),
+         name="sentry-api-0-organization-preprod-artifact-public-size-analysis",
+     ),
++    # Snapshots
++    re_path(
++        r"^(?P<organization_id_or_slug>[^/]+)/preprodartifacts/snapshots/(?P<snapshot_id>[^/]+)/recompare/$",
++        PreprodSnapshotRecompareEndpoint.as_view(),
++        name="sentry-api-0-organization-preprod-snapshots-recompare",
++    ),
+ ]
+ 
+ preprod_internal_urlpatterns = [
+diff --git a/src/sentry/preprod/snapshots/utils.py b/src/sentry/preprod/snapshots/utils.py
+new file mode 100644
+index 00000000000000..3163e0acb17075
+--- /dev/null
++++ b/src/sentry/preprod/snapshots/utils.py
+@@ -0,0 +1,28 @@
++from __future__ import annotations
++
++from sentry.preprod.models import PreprodArtifact, PreprodBuildConfiguration
++
++
++def find_base_snapshot_artifact(
++    organization_id: int,
++    base_sha: str,
++    base_repo_name: str,
++    project_id: int,
++    app_id: str | None,
++    artifact_type: str | None,
++    build_configuration: PreprodBuildConfiguration | None,
++) -> PreprodArtifact | None:
++    return (
++        PreprodArtifact.objects.filter(
++            commit_comparison__organization_id=organization_id,
++            commit_comparison__head_sha=base_sha,
++            commit_comparison__head_repo_name=base_repo_name,
++            project_id=project_id,
++            preprodsnapshotmetrics__isnull=False,
++            app_id=app_id,
++            artifact_type=artifact_type,
++            build_configuration=build_configuration,
++        )
++        .order_by("-date_added")
++        .first()
++    )
+diff --git a/static/app/utils/api/knownSentryApiUrls.generated.ts b/static/app/utils/api/knownSentryApiUrls.generated.ts
+index e743ff6a26b717..c60d6fbdb179cf 100644
+--- a/static/app/utils/api/knownSentryApiUrls.generated.ts
++++ b/static/app/utils/api/knownSentryApiUrls.generated.ts
+@@ -474,6 +474,7 @@ export type KnownSentryApiUrls =
+   | '/organizations/$organizationIdOrSlug/preprodartifacts/$artifactId/install-details/'
+   | '/organizations/$organizationIdOrSlug/preprodartifacts/$artifactId/size-analysis/'
+   | '/organizations/$organizationIdOrSlug/preprodartifacts/list-builds/'
++  | '/organizations/$organizationIdOrSlug/preprodartifacts/snapshots/$snapshotId/recompare/'
+   | '/organizations/$organizationIdOrSlug/prevent/owner/$owner/repositories/'
+   | '/organizations/$organizationIdOrSlug/prevent/owner/$owner/repositories/sync/'
+   | '/organizations/$organizationIdOrSlug/prevent/owner/$owner/repositories/tokens/'

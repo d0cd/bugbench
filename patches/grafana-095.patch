@@ -1,0 +1,473 @@
+diff --git a/.github/workflows/trivy-scan.yml b/.github/workflows/trivy-scan.yml
+index 1a4a9a6ed11b6..e4f051fe614a2 100644
+--- a/.github/workflows/trivy-scan.yml
++++ b/.github/workflows/trivy-scan.yml
+@@ -15,6 +15,9 @@ on:
+ jobs:
+   trivy-scan:
+     runs-on: ubuntu-22.04
++    env:
++      # renovate: datasource=github-releases depName=trivy packageName=aquasecurity/trivy
++      TRIVY_VERSION: 'v0.69.2'
+     steps:
+     - uses: actions/checkout@v5
+       with:
+@@ -22,7 +25,7 @@ jobs:
+     - name: Install Trivy
+       uses: aquasecurity/setup-trivy@e6c2c5e321ed9123bda567646e2f96565e34abe1
+       with:
+-        version: v0.56.2
++        version: ${{ env.TRIVY_VERSION }}
+         cache: true
+     - name: Download Trivy DB
+       run: |
+diff --git a/conf/defaults.ini b/conf/defaults.ini
+index 31535fef05b05..aaabd828026bd 100644
+--- a/conf/defaults.ini
++++ b/conf/defaults.ini
+@@ -1444,6 +1444,15 @@ ha_reconnect_timeout = 6h
+ # The interval string is a possibly signed sequence of decimal numbers, followed by a unit suffix (ms, s, m, h, d), e.g. 30s or 1m.
+ ha_push_pull_interval = 60s
+ 
++# Enable single-node evaluation mode. When enabled, only one instance in the HA cluster evaluates
++# alert rules, reducing query load on data sources. Requires HA clustering to be configured.
++ha_single_node_evaluation = false
++
++# The size of the message queue used to broadcast alerts from the primary instance to other instances
++# in single-node evaluation mode. Increase this value if you have many alert rules and see broadcast
++# messages being dropped. Only used when ha_single_node_evaluation is true.
++ha_single_evaluation_alert_broadcast_queue_size = 200
++
+ # Enable or disable alerting rule execution. The alerting UI remains visible.
+ execute_alerts = true
+ 
+diff --git a/conf/sample.ini b/conf/sample.ini
+index ab3809a792100..7351a5f182ef7 100644
+--- a/conf/sample.ini
++++ b/conf/sample.ini
+@@ -1408,6 +1408,15 @@
+ # The interval string is a possibly signed sequence of decimal numbers, followed by a unit suffix (ms, s, m, h, d), e.g. 30s or 1m.
+ ;ha_push_pull_interval = "60s"
+ 
++# Enable single-node evaluation mode. When enabled, only one instance in the HA cluster evaluates
++# alert rules, reducing query load on data sources. Requires HA clustering to be configured.
++;ha_single_node_evaluation = false
++
++# The size of the message queue used to broadcast alerts from the primary instance to other instances
++# in single-node evaluation mode. Increase this value if you have many alert rules and see broadcast
++# messages being dropped. Only used when ha_single_node_evaluation is true.
++;ha_single_evaluation_alert_broadcast_queue_size = 200
++
+ # Enable or disable alerting rule execution. The alerting UI remains visible.
+ ;execute_alerts = true
+ 
+diff --git a/docs/sources/alerting/set-up/configure-high-availability/_index.md b/docs/sources/alerting/set-up/configure-high-availability/_index.md
+index 285f83bbd8f2e..a8360f87ec683 100644
+--- a/docs/sources/alerting/set-up/configure-high-availability/_index.md
++++ b/docs/sources/alerting/set-up/configure-high-availability/_index.md
+@@ -37,7 +37,9 @@ Grafana Alerting uses the Prometheus model of separating the evaluation of alert
+ 
+ {{< figure src="/static/img/docs/alerting/unified/high-availability-ua.png" class="docs-image--no-shadow" max-width= "750px" caption="High availability" >}}
+ 
+-When running multiple instances of Grafana, all alert rules are evaluated on all instances. You can think of the evaluation of alert rules as being duplicated by the number of running Grafana instances. This is how Grafana Alerting makes sure that as long as at least one Grafana instance is working, alert rules are still be evaluated and notifications for alerts are still sent.
++When running multiple instances of Grafana, all alert rules are evaluated on all instances by default. You can think of the evaluation of alert rules as being duplicated by the number of running Grafana instances. This is how Grafana Alerting ensures that as long as at least one Grafana instance is working, alert rules are still evaluated and notifications for alerts are still sent.
++
++If you want to reduce this duplication, you can enable [single-node evaluation mode](#single-node-evaluation-mode) so that only one instance evaluates alert rules.
+ 
+ You can find this duplication in state history and it is a good way to [verify your high availability setup](#verify-your-high-availability-setup).
+ 
+@@ -159,9 +161,81 @@ For a demo, see this [example using Docker Compose](https://github.com/grafana/a
+    ha_reconnect_timeout = 2m
+    ```
+ 
++## Single-node evaluation mode
++
++{{< docs/public-preview product="Single-node evaluation mode" >}}
++
++By default, all Grafana instances in a high-availability cluster evaluate all alert rules. This means query load on data sources is multiplied by the number of Grafana instances. Single-node evaluation mode changes this so that only one instance evaluates alert rules, reducing query load from N times to 1.
++
++**To enable single-node evaluation mode**, add the following to your `[unified_alerting]` section:
++
++```ini
++[unified_alerting]
++ha_single_node_evaluation = true
++```
++
++This setting requires high availability clustering to be configured (either Memberlist or Redis).
++
++### How it works
++
++The Grafana cluster automatically chooses a primary instance that is responsible for evaluating all alert rules. Other instances skip evaluation entirely.
++
++- **Alert broadcasting:** The primary instance broadcasts fired alerts to all other instances through the cluster communication channel. This ensures that every instance's embedded Alertmanager has the current alerts, which is needed for failure recovery and for the Alertmanager API to return correct data on all instances.
++- **Automatic failure recovery:** When the primary instance becomes unavailable, the cluster reassigns positions and a new instance becomes responsible for evaluation. During failure recovery, there is a brief gap in evaluations. Existing alert states remain in the database.
++
++### Tradeoffs
++
++| Default HA (all instances evaluate)         | Single-node evaluation mode                  |
++| ------------------------------------------- | -------------------------------------------- |
++| Redundant evaluation on all nodes           | Only one node evaluates                      |
++| Higher query load on data sources (N times) | Reduced query load (1 time)                  |
++| No evaluation gap on instance failure       | Brief evaluation gap during failure recovery |
++
++### Monitor single-node evaluation mode
++
++You can verify that single-node evaluation mode is working correctly by monitoring the following metrics.
++
++| Metric                                                 | Description                                                                                                                          |
++| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
++| `grafana_alertmanager_peer_position`                   | The position of each instance in the cluster. The instance at position 0 is the primary and evaluates all alert rules.               |
++| `grafana_alerting_alerts_received_total`               | Total number of alerts received by each instance. Non-primary instances should receive alerts through the cluster broadcast channel. |
++| `grafana_alerting_alertmanager_alerts{state="active"}` | Number of active alerts on each instance. This value should be the same across all instances.                                        |
++
++The following metrics are specific to the HA backend you are using:
++
++**Memberlist (gossip)**
++
++| Metric                                                                                  | Description                                                                                                |
++| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
++| `grafana_alertmanager_oversized_gossip_message_dropped_total{key="alerts:broadcast"}`   | Number of broadcast messages dropped due to a full message queue. A non-zero value indicates message loss. |
++| `grafana_alertmanager_oversized_gossip_message_failure_total{key="alerts:broadcast"}`   | Number of broadcast messages that failed to send to a peer.                                                |
++| `grafana_alertmanager_oversized_gossip_message_sent_total{key="alerts:broadcast"}`      | Number of broadcast messages sent to peers.                                                                |
++| `grafana_alertmanager_oversize_gossip_message_duration_seconds{key="alerts:broadcast"}` | Duration of broadcast message sends. Useful for detecting network latency between peers.                   |
++
++**Redis**
++
++| Metric                                                                                                     | Description                                                                                                                                                                                                                        |
++| ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `grafana_alertmanager_cluster_messages_publish_failures_total{msg_type="update",reason="buffer_overflow"}` | Number of state sync messages dropped due to a full message queue. A non-zero value indicates message loss. These metrics are shared across all HA state channels (alerts, silences, notification log), not only alert broadcasts. |
++| `grafana_alertmanager_cluster_messages_publish_failures_total{msg_type="update",reason="redis_issue"}`     | Number of state sync messages that failed due to a Redis error.                                                                                                                                                                    |
++| `grafana_alertmanager_cluster_messages_sent_total{msg_type="update"}`                                      | Total number of state sync messages sent to Redis. Includes all HA state channels, not only alert broadcasts.                                                                                                                      |
++
++### Tune alert broadcast queue size
++
++The primary instance uses a message queue to broadcast alerts to other instances. By default, the queue holds up to 200 messages. If you have a large number of alert rules, the queue may fill up, causing messages to be dropped. You can detect this by monitoring the drop metric for your HA backend (see metrics tables above).
++
++To increase the queue size, add the following to your `[unified_alerting]` section:
++
++```ini
++[unified_alerting]
++ha_single_evaluation_alert_broadcast_queue_size = 500
++```
++
++The default value is `200`. This setting applies to both Memberlist and Redis HA backends.
++
+ ## Verify your high availability setup
+ 
+-When running multiple Grafana instances, all alert rules are evaluated on every instance. This multiple evaluation of alert rules is visible in the [state history](ref:state-history) and provides a straightforward way to verify that your high availability configuration is working correctly.
++When running multiple Grafana instances, all alert rules are evaluated on every instance by default. This multiple evaluation of alert rules is visible in the [state history](ref:state-history) and provides a straightforward way to verify that your high availability configuration is working correctly.
+ 
+ {{< admonition type="note" >}}
+ 
+@@ -208,7 +282,7 @@ For more information on monitoring alerting metrics, refer to [Alerting meta-mon
+ 
+ In high-availability mode, each Grafana instance runs its own pre-configured alertmanager to handle alert notifications.
+ 
+-When multiple Grafana instances are running, all alert rules are evaluated on each instance. By default, each instance sends firing alerts to its respective alertmanager. This results in notification handling being duplicated across all running Grafana instances.
++When multiple Grafana instances are running, all alert rules are evaluated on each instance by default. Each instance sends firing alerts to its respective Alertmanager. This results in notification handling being duplicated across all running Grafana instances.
+ 
+ Alertmanagers in HA mode communicate with each other to coordinate notification delivery. However, this setup can sometimes lead to duplicated or out-of-order notifications. By design, HA prioritizes sending duplicate notifications over the risk of missing notifications.
+ 
+diff --git a/docs/sources/setup-grafana/configure-grafana/_index.md b/docs/sources/setup-grafana/configure-grafana/_index.md
+index 27c4c097c41b3..79c9d8441a8e9 100644
+--- a/docs/sources/setup-grafana/configure-grafana/_index.md
++++ b/docs/sources/setup-grafana/configure-grafana/_index.md
+@@ -1920,6 +1920,18 @@ The default value is `60s`.
+ 
+ The interval string is a possibly signed sequence of decimal numbers, followed by a unit suffix (ms, s, m, h, d), for example, 30s or 1m.
+ 
++#### `ha_single_node_evaluation`
++
++Enable single-node evaluation mode for alerting in high availability. When enabled, only one Grafana instance in the cluster evaluates alert rules instead of all instances evaluating all rules. This reduces query load on data sources from N times to 1. The default value is `false`.
++
++Requires high availability clustering to be configured (either Memberlist or Redis).
++
++For more information, refer to [Single-node evaluation mode](/docs/grafana/<GRAFANA_VERSION>/alerting/set-up/configure-high-availability/#single-node-evaluation-mode).
++
++#### `ha_single_evaluation_alert_broadcast_queue_size`
++
++The size of the message queue used to broadcast alerts from the primary instance to other instances in single-node evaluation mode. Increase this value if you have many alert rules and see broadcast messages being dropped. The default value is `200`. Only used when `ha_single_node_evaluation` is `true`.
++
+ #### `execute_alerts`
+ 
+ Enable or disable alerting rule execution. The default value is `true`. The alerting UI remains visible.
+diff --git a/packages/grafana-data/src/types/featureToggles.gen.ts b/packages/grafana-data/src/types/featureToggles.gen.ts
+index 981920669c4b1..5c8e6259131f5 100644
+--- a/packages/grafana-data/src/types/featureToggles.gen.ts
++++ b/packages/grafana-data/src/types/featureToggles.gen.ts
+@@ -589,6 +589,11 @@ export interface FeatureToggles {
+   */
+   dashboardAdHocAndGroupByWrapper?: boolean;
+   /**
++  * Enables configuring default origin filters for ad-hoc filter variables
++  * @default false
++  */
++  adHocFilterDefaultValues?: boolean;
++  /**
+   * Updates CloudWatch label parsing to be more accurate
+   * @default true
+   */
+diff --git a/packages/grafana-openapi/package.json b/packages/grafana-openapi/package.json
+index 7217d3307226e..dcda0e9c06d9f 100644
+--- a/packages/grafana-openapi/package.json
++++ b/packages/grafana-openapi/package.json
+@@ -13,7 +13,7 @@
+   "sideEffects": false,
+   "repository": {
+     "type": "git",
+-    "url": "git+http://github.com/grafana/grafana.git",
++    "url": "http://github.com/grafana/grafana.git",
+     "directory": "packages/grafana-openapi"
+   },
+   "exports": {
+diff --git a/packages/grafana-prometheus/src/datasource.test.ts b/packages/grafana-prometheus/src/datasource.test.ts
+index 1043ffa18f3aa..35848b3d41a17 100644
+--- a/packages/grafana-prometheus/src/datasource.test.ts
++++ b/packages/grafana-prometheus/src/datasource.test.ts
+@@ -318,6 +318,71 @@ describe('PrometheusDatasource', () => {
+         });
+       });
+     });
++
++    describe('with multi-value operators', () => {
++      it('should remap =| to =~ and apply filter to expression', () => {
++        const filters = [
++          {
++            key: 'cluster',
++            operator: '=|',
++            value: 'prod-us-east-1',
++            values: ['prod-us-east-1', 'staging-eu-west-1', 'dev-eu-west-2'],
++          },
++        ];
++        ds.query({
++          interval: '15s',
++          range: getMockTimeRange(),
++          filters,
++          targets: [target],
++        } as DataQueryRequest<PromQuery>);
++        const [result] = fetchMockCalledWith(fetchMock);
++        expect(result).toMatchObject({
++          expr: `metric{job="foo", cluster=~"prod-us-east-1|staging-eu-west-1|dev-eu-west-2"} - metric{cluster=~"prod-us-east-1|staging-eu-west-1|dev-eu-west-2"}`,
++        });
++      });
++
++      it('should remap !=| to !~ and apply filter to expression', () => {
++        const filters = [
++          {
++            key: 'namespace',
++            operator: '!=|',
++            value: 'kube-system',
++            values: ['kube-system', 'kube-public'],
++          },
++        ];
++        ds.query({
++          interval: '15s',
++          range: getMockTimeRange(),
++          filters,
++          targets: [target],
++        } as DataQueryRequest<PromQuery>);
++        const [result] = fetchMockCalledWith(fetchMock);
++        expect(result).toMatchObject({
++          expr: `metric{job="foo", namespace!~"kube-system|kube-public"} - metric{namespace!~"kube-system|kube-public"}`,
++        });
++      });
++
++      it('should handle =| with a single value', () => {
++        const filters = [
++          {
++            key: 'cluster',
++            operator: '=|',
++            value: 'prod',
++            values: ['prod'],
++          },
++        ];
++        ds.query({
++          interval: '15s',
++          range: getMockTimeRange(),
++          filters,
++          targets: [target],
++        } as DataQueryRequest<PromQuery>);
++        const [result] = fetchMockCalledWith(fetchMock);
++        expect(result).toMatchObject({
++          expr: `metric{job="foo", cluster=~"prod"} - metric{cluster=~"prod"}`,
++        });
++      });
++    });
+   });
+ 
+   describe('Test query range snapping', () => {
+diff --git a/packages/grafana-prometheus/src/datasource.ts b/packages/grafana-prometheus/src/datasource.ts
+index ae9f6754c2f67..e47a9a982f117 100644
+--- a/packages/grafana-prometheus/src/datasource.ts
++++ b/packages/grafana-prometheus/src/datasource.ts
+@@ -751,7 +751,7 @@ export class PrometheusDatasource
+       return expr;
+     }
+ 
+-    const finalQuery = filters.reduce((acc, filter) => {
++    const finalQuery = filters.map(remapOneOf).reduce((acc, filter) => {
+       const { key, operator } = filter;
+       let { value } = filter;
+       if (operator === '=~' || operator === '!~') {
+@@ -921,3 +921,17 @@ export const extractResourceMatcher = (
+   // Create a matcher using metric names and label filters
+   return `{${[...metricMatch, ...labelsMatch].join(',')}}`;
+ };
++
++export function remapOneOf(filter: AdHocVariableFilter) {
++  let { operator, value, values } = filter;
++  if (operator === '=|' || operator === '!=|') {
++    operator = operator === '=|' ? '=~' : '!~';
++    value = values?.map(prometheusRegularEscape).join('|') ?? '';
++  }
++
++  return {
++    ...filter,
++    operator,
++    value,
++  };
++}
+diff --git a/pkg/registry/apis/folders/register.go b/pkg/registry/apis/folders/register.go
+index 313612ffa680d..c19c7042d6a45 100644
+--- a/pkg/registry/apis/folders/register.go
++++ b/pkg/registry/apis/folders/register.go
+@@ -96,13 +96,14 @@ func RegisterAPIService(cfg *setting.Cfg,
+ 	return builder
+ }
+ 
+-func NewAPIService(ac authlib.AccessClient, searcher resource.ResourceClient, features featuremgmt.FeatureToggles, zanzanaClient zanzana.Client, resourcePermissionsSvc *dynamic.NamespaceableResourceInterface) *FolderAPIBuilder {
++func NewAPIService(ac authlib.AccessClient, searcher resource.ResourceClient, features featuremgmt.FeatureToggles, zanzanaClient zanzana.Client, resourcePermissionsSvc *dynamic.NamespaceableResourceInterface, maxNestedFolderDepth int) *FolderAPIBuilder {
+ 	return &FolderAPIBuilder{
+ 		features:               features,
+ 		accessClient:           ac,
+ 		searcher:               searcher,
+ 		permissionStore:        reconcilers.NewZanzanaPermissionStore(zanzanaClient),
+ 		resourcePermissionsSvc: resourcePermissionsSvc,
++		maxNestedFolderDepth:   maxNestedFolderDepth,
+ 	}
+ }
+ 
+diff --git a/pkg/services/featuremgmt/registry.go b/pkg/services/featuremgmt/registry.go
+index 610ec71cb6f1d..21095bd85841b 100644
+--- a/pkg/services/featuremgmt/registry.go
++++ b/pkg/services/featuremgmt/registry.go
+@@ -918,6 +918,15 @@ var (
+ 			HideFromDocs: true,
+ 			Expression:   "false",
+ 		},
++		{
++			Name:         "adHocFilterDefaultValues",
++			Description:  "Enables configuring default origin filters for ad-hoc filter variables",
++			Stage:        FeatureStageExperimental,
++			FrontendOnly: true,
++			Owner:        grafanaDashboardsSquad,
++			HideFromDocs: true,
++			Expression:   "false",
++		},
+ 		{
+ 			Name:         "cloudWatchNewLabelParsing",
+ 			Description:  "Updates CloudWatch label parsing to be more accurate",
+diff --git a/pkg/services/featuremgmt/toggles_gen.csv b/pkg/services/featuremgmt/toggles_gen.csv
+index ea3b90578c523..4911aeb19cae8 100644
+--- a/pkg/services/featuremgmt/toggles_gen.csv
++++ b/pkg/services/featuremgmt/toggles_gen.csv
+@@ -114,6 +114,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-11-19,refreshTokenRequired,experimental,@grafana/identity-access-team,false,false,false
+ 2024-04-04,newDashboardWithFiltersAndGroupBy,experimental,@grafana/dashboards-squad,false,false,false
+ 2025-12-18,dashboardAdHocAndGroupByWrapper,experimental,@grafana/dashboards-squad,false,false,false
++2026-03-02,adHocFilterDefaultValues,experimental,@grafana/dashboards-squad,false,false,true
+ 2024-04-05,cloudWatchNewLabelParsing,GA,@grafana/aws-datasources,false,false,false
+ 2024-04-16,disableNumericMetricsSortingInExpressions,experimental,@grafana/oss-big-tent,false,true,false
+ 2024-04-22,grafanaManagedRecordingRules,experimental,@grafana/alerting-squad,false,false,false
+diff --git a/pkg/services/featuremgmt/toggles_gen.json b/pkg/services/featuremgmt/toggles_gen.json
+index 1f9b90b14a320..1d84a9f9d5f45 100644
+--- a/pkg/services/featuremgmt/toggles_gen.json
++++ b/pkg/services/featuremgmt/toggles_gen.json
+@@ -3,6 +3,21 @@
+   "apiVersion": "featuretoggle.grafana.app/v0alpha1",
+   "metadata": {},
+   "items": [
++    {
++      "metadata": {
++        "name": "adHocFilterDefaultValues",
++        "resourceVersion": "1772476441363",
++        "creationTimestamp": "2026-03-02T18:34:01Z"
++      },
++      "spec": {
++        "description": "Enables configuring default origin filters for ad-hoc filter variables",
++        "stage": "experimental",
++        "codeowner": "@grafana/dashboards-squad",
++        "frontend": true,
++        "hideFromDocs": true,
++        "expression": "false"
++      }
++    },
+     {
+       "metadata": {
+         "name": "aiGeneratedDashboardChanges",
+diff --git a/pkg/setting/setting_folder.go b/pkg/setting/setting_folder.go
+index 60f554458fc5b..5afc62dcfb0ef 100644
+--- a/pkg/setting/setting_folder.go
++++ b/pkg/setting/setting_folder.go
+@@ -5,21 +5,21 @@ import (
+ )
+ 
+ const maxNestedFolderDepth = 7
+-const defaultMaxNestedFolderDepth = 4
++const DefaultMaxNestedFolderDepth = 4
+ 
+ func maxDeptFolderSettings(iniFile *ini.File) int {
+ 	if iniFile == nil {
+-		return defaultMaxNestedFolderDepth
++		return DefaultMaxNestedFolderDepth
+ 	}
+ 
+ 	folderSection := iniFile.Section("folder")
+-	cfgMaxNestedFolderDepth := folderSection.Key("max_nested_folder_depth").MustInt(defaultMaxNestedFolderDepth)
++	cfgMaxNestedFolderDepth := folderSection.Key("max_nested_folder_depth").MustInt(DefaultMaxNestedFolderDepth)
+ 	if cfgMaxNestedFolderDepth > maxNestedFolderDepth {
+ 		cfgMaxNestedFolderDepth = maxNestedFolderDepth
+ 	}
+ 
+ 	if cfgMaxNestedFolderDepth <= 0 {
+-		cfgMaxNestedFolderDepth = defaultMaxNestedFolderDepth
++		cfgMaxNestedFolderDepth = DefaultMaxNestedFolderDepth
+ 	}
+ 
+ 	return cfgMaxNestedFolderDepth
+diff --git a/pkg/setting/setting_folder_test.go b/pkg/setting/setting_folder_test.go
+index 07c189af4be6f..3cc436c37de4c 100644
+--- a/pkg/setting/setting_folder_test.go
++++ b/pkg/setting/setting_folder_test.go
+@@ -18,26 +18,26 @@ func TestMaxDeptFolderSettings(t *testing.T) {
+ 		{
+ 			name:     "returns default when ini file is nil",
+ 			noFile:   true,
+-			expected: defaultMaxNestedFolderDepth,
++			expected: DefaultMaxNestedFolderDepth,
+ 		},
+ 		{
+ 			name:     "returns default when key is absent",
+-			expected: defaultMaxNestedFolderDepth,
++			expected: DefaultMaxNestedFolderDepth,
+ 		},
+ 		{
+ 			name:     "returns default when value is not a valid integer",
+ 			iniValue: strp("notanint"),
+-			expected: defaultMaxNestedFolderDepth,
++			expected: DefaultMaxNestedFolderDepth,
+ 		},
+ 		{
+ 			name:     "returns default when value is zero",
+ 			iniValue: strp("0"),
+-			expected: defaultMaxNestedFolderDepth,
++			expected: DefaultMaxNestedFolderDepth,
+ 		},
+ 		{
+ 			name:     "returns default when value is negative",
+ 			iniValue: strp("-1"),
+-			expected: defaultMaxNestedFolderDepth,
++			expected: DefaultMaxNestedFolderDepth,
+ 		},
+ 		{
+ 			name:     "returns configured value when within range (3)",

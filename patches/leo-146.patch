@@ -1,171 +1,988 @@
-diff --git a/compiler/src/statement/assign/assignee/array_index.rs b/compiler/src/statement/assign/assignee/array_index.rs
-index c7f218527a..ecf6796486 100644
---- a/compiler/src/statement/assign/assignee/array_index.rs
-+++ b/compiler/src/statement/assign/assignee/array_index.rs
-@@ -89,19 +89,33 @@ impl<'a, F: PrimeField, G: GroupType<F>> ConstrainedProgram<'a, F, G> {
-                     .evaluate_equal(eq_namespace, &Integer::new(&const_index))
-                     .map_err(|_| ExpressionError::cannot_evaluate("==".to_string(), &span))?;
- 
--                let unique_namespace = cs.ns(|| {
-+                let mut unique_namespace = cs.ns(|| {
-                     format!(
-                         "select array dyn assignment {} {}:{}",
-                         i, span.line_start, span.col_start
-                     )
-                 });
--                let value = ConstrainedValue::conditionally_select(
--                    unique_namespace,
--                    &index_comparison,
--                    &context.target_value,
--                    &item,
--                )
--                .map_err(|e| ExpressionError::cannot_enforce("conditional select".to_string(), e, &span))?;
-+                let temp_item = {
-+                    let mut item = item.clone();
-+                    let mut new_context = ResolverContext {
-+                        input: vec![&mut item],
-+                        span: context.span.clone(),
-+                        target_value: context.target_value.clone(),
-+                        remaining_accesses: context.remaining_accesses,
-+                        indicator: context.indicator,
-+                        operation: context.operation,
-+                    };
-+                    if context.remaining_accesses.is_empty() {
-+                        let item = new_context.input.remove(0);
-+                        self.enforce_assign_context(&mut unique_namespace, &new_context, item)?;
-+                    } else {
-+                        self.resolve_target_access(&mut unique_namespace, new_context)?;
-+                    }
-+                    item
-+                };
-+                let value =
-+                    ConstrainedValue::conditionally_select(unique_namespace, &index_comparison, &temp_item, &item)
-+                        .map_err(|e| ExpressionError::cannot_enforce("conditional select".to_string(), e, &span))?;
-                 *item = value;
-             }
-             Ok(())
-diff --git a/compiler/src/statement/assign/assignee/mod.rs b/compiler/src/statement/assign/assignee/mod.rs
-index ed11f5323b..ca81ccc4ab 100644
---- a/compiler/src/statement/assign/assignee/mod.rs
-+++ b/compiler/src/statement/assign/assignee/mod.rs
-@@ -32,7 +32,7 @@ struct ResolverContext<'a, 'b, F: PrimeField, G: GroupType<F>> {
-     input: Vec<&'b mut ConstrainedValue<'a, F, G>>,
-     span: Span,
-     target_value: ConstrainedValue<'a, F, G>,
--    remaining_accesses: Vec<&'b AssignAccess<'a>>,
-+    remaining_accesses: &'b [&'b AssignAccess<'a>],
-     indicator: &'b Boolean,
-     operation: AssignOperation,
+diff --git a/compiler/src/statement/statement.rs b/compiler/src/statement/statement.rs
+index 5156df84b3..b97235d226 100644
+--- a/compiler/src/statement/statement.rs
++++ b/compiler/src/statement/statement.rs
+@@ -137,9 +137,10 @@ impl<F: Field + PrimeField, G: GroupType<F>> ConstrainedProgram<F, G> {
+     }
  }
-@@ -68,7 +68,9 @@ impl<'a, F: PrimeField, G: GroupType<F>> ConstrainedProgram<'a, F, G> {
-             self.enforce_assign_context(cs, &context, input)?;
-             return Ok(());
-         }
--        match context.remaining_accesses.pop().unwrap() {
-+        let access = context.remaining_accesses[context.remaining_accesses.len() - 1];
-+        context.remaining_accesses = &context.remaining_accesses[..context.remaining_accesses.len() - 1];
-+        match access {
-             AssignAccess::ArrayRange(start, stop) => {
-                 self.resolve_target_access_array_range(cs, context, start.get(), stop.get())
-             }
-@@ -89,11 +91,12 @@ impl<'a, F: PrimeField, G: GroupType<F>> ConstrainedProgram<'a, F, G> {
-         let variable = assignee.target_variable.get().borrow();
  
-         let mut target = self.get(variable.id).unwrap().clone();
-+        let accesses: Vec<_> = assignee.target_accesses.iter().rev().collect();
-         self.resolve_target_access(cs, ResolverContext {
-             input: vec![&mut target],
-             span,
-             target_value,
--            remaining_accesses: assignee.target_accesses.iter().rev().collect(),
-+            remaining_accesses: &accesses[..],
-             indicator,
-             operation: assignee.operation,
-         })?;
-diff --git a/compiler/src/value/integer/integer.rs b/compiler/src/value/integer/integer.rs
-index 306e845e4c..b9ccf614a9 100644
---- a/compiler/src/value/integer/integer.rs
-+++ b/compiler/src/value/integer/integer.rs
-@@ -90,25 +90,11 @@ impl Integer {
-         match_integer!(integer => integer.to_bits_le())
-     }
- 
--    // pub fn get_bits_typed(&self) -> (Vec<Boolean>, IntegerType) {
--    //     let integer = self;
--    //     (match_integer!(integer => integer.to_bits_le()), self.get_type())
--    // }
--
--    // pub fn from_bits_typed(type_: &IntegerType, bits: &[Boolean]) -> Integer {
--    //     match type_ {
--    //         IntegerType::U8 => Integer::U8(UInt8::from_bits_le(bits)),
--    //         IntegerType::U16 => Integer::U16(UInt16::from_bits_le(bits)),
--    //         IntegerType::U32 => Integer::U32(UInt32::from_bits_le(bits)),
--    //         IntegerType::U64 => Integer::U64(UInt64::from_bits_le(bits)),
--    //         IntegerType::U128 => Integer::U128(UInt128::from_bits_le(bits)),
--    //         IntegerType::I8 => Integer::I8(Int8::from_bits_le(bits)),
--    //         IntegerType::I16 => Integer::I16(Int16::from_bits_le(bits)),
--    //         IntegerType::I32 => Integer::I32(Int32::from_bits_le(bits)),
--    //         IntegerType::I64 => Integer::I64(Int64::from_bits_le(bits)),
--    //         IntegerType::I128 => Integer::I128(Int128::from_bits_le(bits)),
--    //     }
--    // }
-+    pub fn is_allocated(&self) -> bool {
-+        self.get_bits()
-+            .into_iter()
-+            .any(|b| matches!(b, Boolean::Is(_) | Boolean::Not(_)))
+-/// Returns the indicator boolean gadget value.
+-/// We can directly compare a boolean constant to the indicator since we are not enforcing any
+-/// constraints
++/// Unwraps the indicator boolean gadget value or `false` if `None`.
++/// This method is used by logging methods only.
++/// We can directly get the boolean value of the indicator since we are not enforcing any
++/// constraints.
+ pub fn get_indicator_value(indicator: &Boolean) -> bool {
+-    indicator.eq(&Boolean::constant(true))
++    indicator.get_value().unwrap_or(false)
+ }
+diff --git a/compiler/tests/console/input/input_equal.in b/compiler/tests/console/input/input_equal.in
+new file mode 100644
+index 0000000000..c147902071
+--- /dev/null
++++ b/compiler/tests/console/input/input_equal.in
+@@ -0,0 +1,3 @@
++[main]
++a: u32 = 1;
++b: u32 = 1;
+diff --git a/compiler/tests/console/input/input_unequal.in b/compiler/tests/console/input/input_unequal.in
+new file mode 100644
+index 0000000000..37e9e6a578
+--- /dev/null
++++ b/compiler/tests/console/input/input_unequal.in
+@@ -0,0 +1,3 @@
++[main]
++a: u32 = 1;
++b: u32 = 0;
+diff --git a/compiler/tests/console/log_conditional.leo b/compiler/tests/console/log_conditional.leo
+new file mode 100644
+index 0000000000..a9fdb6e698
+--- /dev/null
++++ b/compiler/tests/console/log_conditional.leo
+@@ -0,0 +1,6 @@
++// Conditionally add two u32 integers and log the result to the console.
++function main(a: u32, b: u32) {
++    if a == b {
++        console.log("{}=={}",a,b); // This line should not fail.
 +    }
++}
+\ No newline at end of file
+diff --git a/compiler/tests/console/mod.rs b/compiler/tests/console/mod.rs
+index 15b7c309a9..7741c9034c 100644
+--- a/compiler/tests/console/mod.rs
++++ b/compiler/tests/console/mod.rs
+@@ -14,7 +14,7 @@
+ // You should have received a copy of the GNU General Public License
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
  
-     pub fn get_value(&self) -> Option<String> {
-         let integer = self;
-@@ -116,6 +102,9 @@ impl Integer {
+-use crate::{assert_satisfied, expect_compiler_error, generate_main_input, parse_program};
++use crate::{assert_satisfied, expect_compiler_error, generate_main_input, parse_program, parse_program_with_input};
+ use leo_ast::InputValue;
+ 
+ #[test]
+@@ -84,6 +84,22 @@ fn test_log_input() {
+     assert_satisfied(program);
+ }
+ 
++#[test]
++fn test_log_conditional() {
++    let program_string = include_str!("log_conditional.leo");
++    let input_equal_string = include_str!("input/input_equal.in");
++
++    let program = parse_program_with_input(program_string.clone(), input_equal_string).unwrap();
++
++    assert_satisfied(program);
++
++    let input_unequal_string = include_str!("input/input_unequal.in");
++
++    let program = parse_program_with_input(program_string, input_unequal_string).unwrap();
++
++    assert_satisfied(program);
++}
++
+ // Debug
+ 
+ #[test]
+diff --git a/examples/pedersen-hash/src/main.leo b/examples/pedersen-hash/src/main.leo
+index 6b094d9aae..c1d79bf74f 100644
+--- a/examples/pedersen-hash/src/main.leo
++++ b/examples/pedersen-hash/src/main.leo
+@@ -2,11 +2,11 @@ circuit PedersenHash {
+     parameters: [group; 256],
+ 
+     // Instantiates a Pedersen hash circuit
+-    static function new(parameters: [group; 256]) -> Self {
++    function new(parameters: [group; 256]) -> Self {
+         return Self { parameters: parameters }
      }
  
-     pub fn to_usize(&self) -> Option<usize> {
-+        if self.is_allocated() {
-+            return None;
+-    function hash(bits: [bool; 256]) -> group {
++    function hash(self, bits: [bool; 256]) -> group {
+         let mut digest: group = 0;
+         for i in 0..256 {
+             if bits[i] {
+diff --git a/grammar/src/leo.pest b/grammar/src/leo.pest
+index 97e465cd8b..5f7e83dbf3 100644
+--- a/grammar/src/leo.pest
++++ b/grammar/src/leo.pest
+@@ -4,7 +4,7 @@
+ assignee = { self_keyword_or_identifier ~ access_assignee* }
+ 
+ // Declared in files/file.rs
+-file = { SOI ~ NEWLINE* ~ definition* ~ NEWLINE* ~ EOI }
++file = { SOI ~ definition* ~ EOI }
+ 
+ // Declared in definitions/definition.rs
+ definition = {
+@@ -16,7 +16,7 @@ definition = {
+ }
+ 
+ // Declared in definitions/annotated_definition.rs
+-definition_annotated = { annotation ~ NEWLINE* ~ definition}
++definition_annotated = { annotation ~ definition}
+ 
+ // Declared in common/identifier.rs
+ identifier = @{ ((!protected_name ~ ASCII_ALPHA) | (protected_name ~ (ASCII_ALPHANUMERIC | "_"))) ~ (ASCII_ALPHANUMERIC | "_")* }
+@@ -64,7 +64,7 @@ keyword_or_identifier = {
+ }
+ 
+ // Declared in common/line_end.rs
+-LINE_END = { ";" ~ NEWLINE* }
++LINE_END = { ";" }
+ 
+ // Declared in common/mutable.rs
+ mutable = { "mut " }
+@@ -230,7 +230,7 @@ dimension_single = {
+ // Declared in types/array_dimensions.rs
+ dimension_multiple = { "(" ~ number_positive ~ ("," ~ number_positive)* ~ ")"}
+ 
+-type_tuple = { "(" ~ NEWLINE* ~ (type_ ~ ("," ~ NEWLINE* ~ type_)+ ~ ","?)? ~ NEWLINE* ~ ")" }
++type_tuple = { "(" ~ (type_ ~ ("," ~ type_)+ ~ ","?)? ~ ")" }
+ 
+ /// Values
+ 
+@@ -317,7 +317,7 @@ access_static_member = ${ "::" ~ identifier }
+ /// Circuits
+ 
+ // Declared in circuits/circuit_definition.rs
+-circuit = { "circuit " ~ identifier ~ "{" ~ NEWLINE* ~ circuit_member* ~ NEWLINE* ~ "}" ~ NEWLINE* }
++circuit = { "circuit " ~ identifier ~ "{" ~ circuit_member* ~ "}" }
+ 
+ // Declared in circuits/circuit_variable.rs
+ circuit_variable = { identifier ~ ":" ~ expression }
+@@ -326,7 +326,7 @@ circuit_variable = { identifier ~ ":" ~ expression }
+ circuit_variable_definition = { identifier ~ ":" ~ type_ ~ ","?}
+ 
+ // Declared in circuits/circuit_member.rs
+-circuit_member = { function | circuit_variable_definition ~ NEWLINE*}
++circuit_member = { function | circuit_variable_definition}
+ 
+ /// Conditionals
+ 
+@@ -358,11 +358,11 @@ expression_tuple = { "(" ~ (expression ~ ("," ~ expression)+)? ~ ")" }
+ expression_array_initializer = { "[" ~ expression ~ ";" ~ array_dimensions ~ "]" }
+ 
+ // Declared in expressions/array_inline_expression.rs
+-expression_array_inline = { "[" ~ NEWLINE* ~ inline_array_inner ~ NEWLINE* ~ "]"}
+-inline_array_inner = _{(spread_or_expression ~ ("," ~ NEWLINE* ~ spread_or_expression)*)?}
++expression_array_inline = { "[" ~ inline_array_inner ~ "]"}
++inline_array_inner = _{(spread_or_expression ~ ("," ~ spread_or_expression)*)?}
+ 
+ // Declared in expressions/circuit_inline_expression.rs
+-expression_circuit_inline = { circuit_name ~ "{" ~ NEWLINE* ~ circuit_variable_list ~ NEWLINE* ~ "}" }
++expression_circuit_inline = { circuit_name ~ "{" ~ circuit_variable_list ~ "}" }
+ 
+ // Declared in expressions/circuit_inline_expression.rs
+ circuit_name = {
+@@ -371,7 +371,7 @@ circuit_name = {
+ }
+ 
+ // Declared in expressions/circuit_inline_expression.rs
+-circuit_variable_list = _{ (circuit_variable ~ ("," ~ NEWLINE* ~ circuit_variable)*)? ~ ","? }
++circuit_variable_list = _{ (circuit_variable ~ ("," ~ circuit_variable)*)? ~ ","? }
+ 
+ // Declared in expressions/unary_expression.rs
+ expression_unary = { operation_unary ~ expression_term }
+@@ -391,14 +391,14 @@ statement = {
+     | statement_assign
+     | statement_expression
+     | block
+-    ) ~ NEWLINE*
++    )
+ }
+ 
+ 
+ // Declared in statements/assign_statement.rs
+ statement_assign = { assignee ~ operation_assign ~ expression ~ LINE_END }
+ 
+-block = { "{" ~ NEWLINE* ~ statement* ~ NEWLINE* ~ "}" }
++block = { "{" ~ statement* ~ "}" }
+ 
+ // Declared in statements/conditional_statement.rs
+ statement_conditional = {"if " ~ expression ~ block ~ ("else " ~ conditional_nested_or_end_statement)?}
+@@ -422,7 +422,7 @@ statement_return = { "return " ~ expression}
+ test_function = { "test " ~ function }
+ 
+ // Declared in functions/function.rs
+-function = { "function " ~ identifier ~ input_tuple  ~ ("->" ~ type_)? ~ block ~ NEWLINE* }
++function = { "function " ~ identifier ~ input_tuple  ~ ("->" ~ type_)? ~ block }
+ 
+ // Declared in functions/input/function_input.rs
+ function_input = { mutable? ~ identifier ~ ":" ~ type_ }
+@@ -437,7 +437,7 @@ input = {
+     | mut_self_keyword
+     | function_input
+ }
+-input_tuple = _{ "(" ~ NEWLINE* ~ (input ~ ("," ~ NEWLINE* ~ input)* ~ ","?)? ~ NEWLINE* ~ ")"}
++input_tuple = _{ "(" ~ (input ~ ("," ~ input)* ~ ","?)? ~ ")"}
+ 
+ 
+ /// Imports
+@@ -459,7 +459,7 @@ package_access = {
+     | import_symbol
+ }
+ 
+-multiple_package_access = _{ "(" ~ NEWLINE* ~ package_access ~ ("," ~ NEWLINE* ~ package_access)* ~ ","? ~ NEWLINE* ~ ")"}
++multiple_package_access = _{ "(" ~ package_access ~ ("," ~ package_access)* ~ ","? ~ ")"}
+ 
+ // Declared in imports/star.rs
+ star = {"*"}
+@@ -470,7 +470,7 @@ import_symbol = { identifier ~ ("as " ~ identifier)? }
+ /// Utilities
+ 
+ COMMENT = _{ ("/*" ~ (!"*/" ~ ANY)* ~ "*/") | ("//" ~ (!NEWLINE ~ ANY)*) }
+-WHITESPACE = _{ " " | "\t" ~ (NEWLINE)* } // pest implicit whitespace keyword
++WHITESPACE = _{ (" " | "\t" | NEWLINE) ~ (NEWLINE)* } // pest implicit whitespace keyword
+ 
+ /// Console Functions
+ 
+@@ -528,6 +528,6 @@ annotation_name = {
+ context = {"context"}
+ 
+ // Declared in annotations/annotation_argument.rs
+-annotation_arguments = !{"(" ~ NEWLINE* ~ annotation_argument ~ ("," ~ NEWLINE* ~ annotation_argument)* ~ ","? ~  NEWLINE* ~ ")"}
++annotation_arguments = !{"(" ~ annotation_argument ~ ("," ~ annotation_argument)* ~ ","? ~  NEWLINE* ~ ")"}
+ 
+ annotation_argument = @{ (ASCII_ALPHANUMERIC | "_")+ }
+diff --git a/grammar/tests/leo-samples/multiline.leo b/grammar/tests/leo-samples/multiline.leo
+new file mode 100644
+index 0000000000..24eb4e5154
+--- /dev/null
++++ b/grammar/tests/leo-samples/multiline.leo
+@@ -0,0 +1,54 @@
++// adding multiline support for Leo
++// all the code in this file should compile just fine
++
++circuit BipBop {
++    bip
++    :
++    u32,
++
++    bop
++    : u32,
++    
++    blup :
++    u32,
++
++    function gimme_five() -> Self {
++        return Self {
++            bip: 1,
++            bop: 2,
++            blup: 3
 +        }
-         let unsigned_integer = self;
-         match_unsigned_integer!(unsigned_integer => unsigned_integer.value.map(|num| num.try_into().ok()).flatten())
++    }
++
++    function main() -> (
++        u32
++        ,
++        u64
++    ) {
++        return (
++            100
++            ,
++            1000
++        )
++    }
++}
++
++function main() -> (
++    u32
++    ,  
++    u64
++) {
++    let 
++    a 
++    : u32 
++    = 100
++    ;
++
++    let b : (
++        u32, 
++        u64
++    ) = BipBop::gimme_five().main();
++
++    console.assert(true);
++} 
++
+diff --git a/grammar/tests/multiline.rs b/grammar/tests/multiline.rs
+new file mode 100644
+index 0000000000..7974c04ed6
+--- /dev/null
++++ b/grammar/tests/multiline.rs
+@@ -0,0 +1,24 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use leo_grammar::ast::{LanguageParser, Rule};
++use pest::*;
++
++#[test]
++fn multiline() {
++    let multiline_sample = include_str!("leo-samples/multiline.leo");
++    LanguageParser::parse(Rule::file, multiline_sample).expect("Can't parse multiline expression");
++}
+diff --git a/imports/src/parser/import_parser.rs b/imports/src/parser/import_parser.rs
+index 3b4dc2fe7b..fde6aa4d95 100644
+--- a/imports/src/parser/import_parser.rs
++++ b/imports/src/parser/import_parser.rs
+@@ -37,7 +37,7 @@ impl ImportParser {
+     /// It is okay if the imported program is already present since importing multiple symbols from
+     /// the same file is allowed.
+     ///
+-    pub(crate) fn insert_import(&mut self, file_name: String, program: Program) {
++    pub fn insert_import(&mut self, file_name: String, program: Program) {
+         // Insert the imported program.
+         let _program = self.imports.insert(file_name, program);
      }
-diff --git a/tests/expectations/compiler/compiler/mutability/array_dyn_mut.leo.out b/tests/expectations/compiler/compiler/mutability/array_dyn_mut.leo.out
-index b766490e0c..3e44d8556b 100644
---- a/tests/expectations/compiler/compiler/mutability/array_dyn_mut.leo.out
-+++ b/tests/expectations/compiler/compiler/mutability/array_dyn_mut.leo.out
-@@ -4,11 +4,11 @@ expectation: Pass
- outputs:
-   - circuit:
-       num_public_variables: 0
--      num_private_variables: 65
--      num_constraints: 66
--      at: 0c8cb242ee3815f5ea6fdd08873577a6cc51fcfbda8cb5671f0b4dc851939d07
--      bt: 32bbce55a7ed95a5b0277ef5ddfa171ad065c5c7c743031d8b0bd8e50e51b0af
--      ct: b0a68f3915594800e43cb144dc499a002fd302374532313e835dfa163d38f0f1
-+      num_private_variables: 1087
-+      num_constraints: 1350
-+      at: aae29cb6b4a71a5cf49d3de006b415b9a7818a2e23191819692e8d2ee69d8be2
-+      bt: 11262f31fcaa7950be43eded328287305e7cbcb73c19455808f08f38116cfdd6
-+      ct: 01dfba9e0754ad9890117694c9b03f4646642140aa7b6c393b2e264e701c323e
-     output:
-       - input_file: input/index1.in
-         output:
-diff --git a/tests/expectations/compiler/compiler/mutability/array_dyn_mut_indirect.leo.out b/tests/expectations/compiler/compiler/mutability/array_dyn_mut_indirect.leo.out
-index 7c7f624238..bd396d450f 100644
---- a/tests/expectations/compiler/compiler/mutability/array_dyn_mut_indirect.leo.out
-+++ b/tests/expectations/compiler/compiler/mutability/array_dyn_mut_indirect.leo.out
-@@ -4,11 +4,11 @@ expectation: Pass
- outputs:
-   - circuit:
-       num_public_variables: 0
--      num_private_variables: 32
--      num_constraints: 32
--      at: 4f36fe54f989d60bb9c279120800f4f44596c2efb7ba703669d4c4d591569780
--      bt: d378030968a64801f66d95699329086ca17e676d8bffcf73f6b431cbda7c7005
--      ct: dbd098af6556ed79650d149b1691be336a46f8bad6f327e942508dd11342575e
-+      num_private_variables: 924
-+      num_constraints: 1310
-+      at: f4c2d999e3cfce5433bbde762d8c826c8df8764b9223dd5d7147cd09810f25b7
-+      bt: fa02e90dd0bde30bc5feab46c3ea4fae0493dc6808d56bc6a1d937eb17297981
-+      ct: 8f6f484310918a186286820e4efd1e7494774c314e9e5c6f78bb60bdeae948f4
-     output:
-       - input_file: input/index1_tuple.in
-         output:
+@@ -49,7 +49,7 @@ impl ImportParser {
+     ///
+     /// If the vector did have this file_name present, a duplicate import error is thrown.
+     ///
+-    pub(crate) fn insert_core_package(&mut self, package: &Package) -> Result<(), ImportParserError> {
++    pub fn insert_core_package(&mut self, package: &Package) -> Result<(), ImportParserError> {
+         // Check for duplicate core package name.
+         if self.core_packages.contains(package) {
+             return Err(ImportParserError::duplicate_core_package(package.name.clone()));
+diff --git a/symbol-table/src/errors/symbol_table.rs b/symbol-table/src/errors/symbol_table.rs
+index 7ec93ee2b1..e2ea24802c 100644
+--- a/symbol-table/src/errors/symbol_table.rs
++++ b/symbol-table/src/errors/symbol_table.rs
+@@ -92,7 +92,7 @@ impl SymbolTableError {
+     pub fn unknown_symbol(symbol: &ImportSymbol, program: &Program) -> Self {
+         let message = format!(
+             "Cannot find imported symbol `{}` in imported file `{}`",
+-            symbol, program.name
++            symbol.symbol, program.name
+         );
+ 
+         Self::new_from_span(message, symbol.span.to_owned())
+diff --git a/symbol-table/src/symbol_table.rs b/symbol-table/src/symbol_table.rs
+index 9c58914ada..d3cf5cdf1a 100644
+--- a/symbol-table/src/symbol_table.rs
++++ b/symbol-table/src/symbol_table.rs
+@@ -38,10 +38,10 @@ pub struct SymbolTable {
+     names: IndexMap<String, UserDefinedType>,
+ 
+     /// Maps circuit name -> circuit type.
+-    circuits: IndexMap<String, CircuitType>,
++    pub circuits: IndexMap<String, CircuitType>,
+ 
+     /// Maps function name -> function type.
+-    functions: IndexMap<String, FunctionType>,
++    pub functions: IndexMap<String, FunctionType>,
+ 
+     /// The parent of this symbol table.
+     parent: Option<Box<SymbolTable>>,
+@@ -68,7 +68,7 @@ impl SymbolTable {
+         table.insert_input(input)?;
+ 
+         // Check for duplicate program and import names.
+-        table.check_names(program, import_parser)?;
++        table.check_names(program, import_parser, input)?;
+ 
+         // Check for unknown or invalid types.
+         table.check_types(program)?;
+@@ -149,6 +149,24 @@ impl SymbolTable {
+         self.functions.insert(identifier.name, function_type)
+     }
+ 
++    ///
++    /// Insert all circuit and function types from another symbol table.
++    /// Used when importing names from another package.
++    ///
++    pub fn insert_table_types(&mut self, imported: &Self) -> Result<(), SymbolTableError> {
++        for (imported_circuit_name, imported_circuit_type) in imported.circuits.iter() {
++            self.circuits
++                .insert(imported_circuit_name.to_owned(), imported_circuit_type.to_owned());
++        }
++
++        for (imported_function_name, imported_function_type) in imported.functions.iter() {
++            self.functions
++                .insert(imported_function_name.to_owned(), imported_function_type.to_owned());
++        }
++
++        Ok(())
++    }
++
+     ///
+     /// Returns a reference to the circuit type corresponding to the name.
+     ///
+@@ -195,9 +213,14 @@ impl SymbolTable {
+     /// If a circuit or function name has no duplicates, then it is inserted into the symbol table.
+     /// Variables defined later in the unresolved program cannot have the same name.
+     ///
+-    pub fn check_names(&mut self, program: &Program, import_parser: &ImportParser) -> Result<(), SymbolTableError> {
++    pub fn check_names(
++        &mut self,
++        program: &Program,
++        import_parser: &ImportParser,
++        input: &Input,
++    ) -> Result<(), SymbolTableError> {
+         // Check unresolved program import names.
+-        self.check_import_names(&program.imports, import_parser)?;
++        self.check_import_names(&program.imports, import_parser, input)?;
+ 
+         // Check unresolved program circuit names.
+         self.check_circuit_names(&program.circuits)?;
+@@ -250,10 +273,11 @@ impl SymbolTable {
+         &mut self,
+         imports: &[ImportStatement],
+         import_parser: &ImportParser,
++        input: &Input,
+     ) -> Result<(), SymbolTableError> {
+         // Iterate over imported names.
+         for import in imports {
+-            self.check_import_statement(import, import_parser)?;
++            self.check_import_statement(import, import_parser, input)?;
+         }
+ 
+         Ok(())
+@@ -269,6 +293,7 @@ impl SymbolTable {
+         &mut self,
+         import: &ImportStatement,
+         import_parser: &ImportParser,
++        input: &Input,
+     ) -> Result<(), SymbolTableError> {
+         // Check if the import name exists as core package.
+         let core_package = import_parser.get_core_package(&import.package);
+@@ -279,7 +304,7 @@ impl SymbolTable {
+         }
+ 
+         // Attempt to insert the imported names into the symbol table.
+-        self.check_package(import, import_parser)
++        self.check_package(import, import_parser, input)
+     }
+ 
+     ///
+@@ -320,6 +345,7 @@ impl SymbolTable {
+         &mut self,
+         import: &ImportStatement,
+         import_parser: &ImportParser,
++        input: &Input,
+     ) -> Result<(), SymbolTableError> {
+         // Get imported symbols from statement.
+         let imported_symbols = ImportedSymbols::new(import);
+@@ -341,14 +367,11 @@ impl SymbolTable {
+                 continue;
+             };
+ 
+-            // Check the imported program for duplicate types.
+-            self.check_names(program, import_parser)?;
+-
+-            // Check the imported program for undefined types.
+-            self.check_types(program)?;
++            // Check the imported program for duplicate or undefined types.
++            let import_symbol_table = SymbolTable::new(program, import_parser, input)?;
+ 
+-            // Store the imported symbol.
+-            // self.insert_import_symbol(symbol, program)?; // TODO (collinc97) uncomment this line when public/private import scopes are implemented.
++            // Import symbols into the self symbol table.
++            self.insert_import_symbol(symbol, import_symbol_table, program)?;
+         }
+ 
+         Ok(())
+@@ -357,37 +380,34 @@ impl SymbolTable {
+     ///
+     /// Inserts the imported symbol into the symbol table if it is present in the given program.
+     ///
+-    pub fn insert_import_symbol(&mut self, symbol: ImportSymbol, program: &Program) -> Result<(), SymbolTableError> {
++    pub fn insert_import_symbol(
++        &mut self,
++        symbol: ImportSymbol,
++        table: SymbolTable,
++        program: &Program,
++    ) -> Result<(), SymbolTableError> {
+         // Check for import *.
+         if symbol.is_star() {
+-            // Insert all program circuits.
+-            self.check_circuit_names(&program.circuits)?;
+-
+-            // Insert all program functions.
+-            self.check_function_names(&program.functions)
++            // Insert all program circuits and functions.
++            self.insert_table_types(&table)
+         } else {
+             // Check for a symbol alias.
+-            let identifier = symbol.alias.to_owned().unwrap_or_else(|| symbol.symbol.to_owned());
+-
+-            // Check if the imported symbol is a circuit
+-            match program.circuits.get(&symbol.symbol) {
+-                Some(circuit) => {
+-                    // Insert imported circuit.
+-                    self.insert_circuit_name(identifier.to_string(), UserDefinedType::from(circuit.to_owned()))
+-                }
+-                None => {
+-                    // Check if the imported symbol is a function.
+-                    match program.functions.get(&symbol.symbol) {
+-                        Some(function) => {
+-                            // Insert the imported function.
+-                            self.insert_function_name(
+-                                identifier.to_string(),
+-                                UserDefinedType::from(function.to_owned()),
+-                            )
+-                        }
+-                        None => Err(SymbolTableError::unknown_symbol(&symbol, program)),
+-                    }
+-                }
++            let identifier = symbol.alias.to_owned().unwrap_or_else(|| symbol.symbol.clone());
++
++            // Check if the imported symbol is a circuit or a function.
++            if let Some(circuit_type) = table.get_circuit_type(&symbol.symbol.name) {
++                // Insert the circuit into the self symbol table.
++                self.insert_circuit_type(identifier, circuit_type.to_owned());
++
++                Ok(())
++            } else if let Some(function_type) = table.get_function_type(&symbol.symbol.name) {
++                // Insert the function into the self symbol table.
++                self.insert_function_type(identifier, function_type.to_owned());
++
++                Ok(())
++            } else {
++                // Return an error if we cannot find the imported symbol.
++                Err(SymbolTableError::unknown_symbol(&symbol, program))
+             }
+         }
+     }
+diff --git a/symbol-table/tests/mod.rs b/symbol-table/tests/mod.rs
+index 21c7710cb6..e73dc0d233 100644
+--- a/symbol-table/tests/mod.rs
++++ b/symbol-table/tests/mod.rs
+@@ -52,13 +52,10 @@ impl TestSymbolTable {
+     ///
+     /// Expect no errors during parsing.
+     ///
+-    pub fn expect_success(self) {
++    pub fn expect_success(self, import_parser: ImportParser) {
+         // Get program.
+         let program = self.ast.into_repr();
+ 
+-        // Create empty import parser.
+-        let import_parser = ImportParser::default();
+-
+         // Create empty input.
+         let input = Input::new();
+ 
+@@ -82,7 +79,9 @@ impl TestSymbolTable {
+         let import_parser = ImportParser::default();
+ 
+         // Run pass one and expect an error.
+-        let error = static_check.check_names(&program, &import_parser).unwrap_err();
++        let error = static_check
++            .check_names(&program, &import_parser, &Input::new())
++            .unwrap_err();
+ 
+         match error {
+             SymbolTableError::Error(_) => {} // Ok
+@@ -106,7 +105,9 @@ impl TestSymbolTable {
+         let import_parser = ImportParser::default();
+ 
+         // Run the pass one and expect no errors.
+-        static_check.check_names(&program, &import_parser).unwrap();
++        static_check
++            .check_names(&program, &import_parser, &Input::new())
++            .unwrap();
+ 
+         // Run the pass two and expect and error.
+         let error = static_check.check_types(&program).unwrap_err();
+diff --git a/symbol-table/tests/symbol_table/import_circuit_alias.leo b/symbol-table/tests/symbol_table/import_circuit_alias.leo
+new file mode 100644
+index 0000000000..f0bbc156fd
+--- /dev/null
++++ b/symbol-table/tests/symbol_table/import_circuit_alias.leo
+@@ -0,0 +1,9 @@
++import bar.Bar as Baz;
++
++circuit Bar {
++    r: bool,
++}
++function main() {
++    let z = Baz { z: 0u32 };
++    let r = Bar { r: true };
++}
+\ No newline at end of file
+diff --git a/symbol-table/tests/symbol_table/import_function_alias.leo b/symbol-table/tests/symbol_table/import_function_alias.leo
+new file mode 100644
+index 0000000000..125b2095c8
+--- /dev/null
++++ b/symbol-table/tests/symbol_table/import_function_alias.leo
+@@ -0,0 +1,10 @@
++import foo.foo as boo;
++
++function foo() -> bool {
++    return false
++}
++
++function main() {
++    let z: u8 = boo();
++    let r: bool = foo();
++}
+\ No newline at end of file
+diff --git a/symbol-table/tests/symbol_table/import_star.leo b/symbol-table/tests/symbol_table/import_star.leo
+new file mode 100644
+index 0000000000..ad7be78c89
+--- /dev/null
++++ b/symbol-table/tests/symbol_table/import_star.leo
+@@ -0,0 +1,5 @@
++import foo.*;
++
++function main() {
++    let x: u8 = boo();
++}
+\ No newline at end of file
+diff --git a/symbol-table/tests/symbol_table/import_undefined.leo b/symbol-table/tests/symbol_table/import_undefined.leo
+new file mode 100644
+index 0000000000..9e4063b297
+--- /dev/null
++++ b/symbol-table/tests/symbol_table/import_undefined.leo
+@@ -0,0 +1,5 @@
++import foo.boo;
++
++function main() {
++    let x: u8 = boo();
++}
+\ No newline at end of file
+diff --git a/symbol-table/tests/symbol_table/imports/bar.leo b/symbol-table/tests/symbol_table/imports/bar.leo
+new file mode 100644
+index 0000000000..26ac259dee
+--- /dev/null
++++ b/symbol-table/tests/symbol_table/imports/bar.leo
+@@ -0,0 +1,3 @@
++circuit Bar {
++    z: u32
++}
+\ No newline at end of file
+diff --git a/symbol-table/tests/symbol_table/imports/foo.leo b/symbol-table/tests/symbol_table/imports/foo.leo
+new file mode 100644
+index 0000000000..b462c11d57
+--- /dev/null
++++ b/symbol-table/tests/symbol_table/imports/foo.leo
+@@ -0,0 +1,3 @@
++function foo() -> u8 {
++    return 5u8
++}
+\ No newline at end of file
+diff --git a/symbol-table/tests/symbol_table/mod.rs b/symbol-table/tests/symbol_table/mod.rs
+index e5b820d4a4..3a3d15b57f 100644
+--- a/symbol-table/tests/symbol_table/mod.rs
++++ b/symbol-table/tests/symbol_table/mod.rs
+@@ -16,6 +16,10 @@
+ 
+ use crate::TestSymbolTable;
+ 
++use leo_ast::Input;
++use leo_imports::ImportParser;
++use leo_symbol_table::{SymbolTable, SymbolTableError};
++
+ ///
+ /// Defines a circuit `Foo {}`.
+ /// Attempts to define a second circuit `Foo {}`.
+@@ -73,3 +77,106 @@ fn test_undefined_circuit() {
+ 
+     resolver.expect_pass_two_error();
+ }
++
++///
++/// Imports an undefined function `boo` from file foo.leo.
++///
++/// Expected output: SymbolTableError
++/// Message: Cannot find imported symbol `boo` in imported file ``
++///
++#[test]
++fn test_import_undefined() {
++    let program_string = include_str!("import_undefined.leo");
++    let import_string = include_str!("imports/foo.leo");
++
++    let program_table = TestSymbolTable::new(program_string);
++    let import_table = TestSymbolTable::new(import_string);
++
++    let import_program = import_table.ast.into_repr();
++
++    let mut imports = ImportParser::default();
++    imports.insert_import("foo".to_owned(), import_program);
++
++    // Create new symbol table.
++    let static_check = &mut SymbolTable::default();
++
++    // Run pass one and expect an error.
++    let error = static_check
++        .check_names(&program_table.ast.into_repr(), &imports, &Input::new())
++        .unwrap_err();
++
++    match error {
++        SymbolTableError::Error(_) => {} // Ok
++        error => panic!("Expected a symbol table error found `{}`", error),
++    }
++}
++
++///
++/// Imports all functions from file foo.leo.
++/// Calls function `foo` defined in foo.leo.
++///
++/// Expected output: Test Pass
++///
++#[test]
++fn test_import_star() {
++    let program_string = include_str!("import_star.leo");
++    let import_string = include_str!("imports/foo.leo");
++
++    let program_table = TestSymbolTable::new(program_string);
++    let import_table = TestSymbolTable::new(import_string);
++
++    let import_program = import_table.ast.into_repr();
++
++    let mut imports = ImportParser::default();
++    imports.insert_import("foo".to_owned(), import_program);
++
++    program_table.expect_success(imports);
++}
++
++///
++/// Imports a circuit named `Bar` from file bar.leo.
++/// Renames `Bar` => `Baz`.
++/// Defines a circuit named `Bar` in main.leo.
++/// Instantiates circuits `Bar` and `Baz`.
++///
++/// Expected output: Test Pass
++///
++#[test]
++fn test_import_circuit_alias() {
++    let program_string = include_str!("import_circuit_alias.leo");
++    let import_string = include_str!("imports/bar.leo");
++
++    let program_table = TestSymbolTable::new(program_string);
++    let import_table = TestSymbolTable::new(import_string);
++
++    let import_program = import_table.ast.into_repr();
++
++    let mut imports = ImportParser::default();
++    imports.insert_import("bar".to_owned(), import_program);
++
++    program_table.expect_success(imports);
++}
++
++///
++/// Imports a function named `foo` from file foo.leo.
++/// Renames `foo` => `boo`.
++/// Defines a function named `foo` in main.leo.
++/// Calls functions `foo` and `boo`.
++///
++/// Expected output: Test Pass
++///
++#[test]
++fn test_import_function_alias() {
++    let program_string = include_str!("import_function_alias.leo");
++    let import_string = include_str!("imports/foo.leo");
++
++    let program_table = TestSymbolTable::new(program_string);
++    let import_table = TestSymbolTable::new(import_string);
++
++    let import_program = import_table.ast.into_repr();
++
++    let mut imports = ImportParser::default();
++    imports.insert_import("foo".to_owned(), import_program);
++
++    program_table.expect_success(imports);
++}
+diff --git a/type-inference/src/objects/frame.rs b/type-inference/src/objects/frame.rs
+index b84d784c80..f97580f165 100644
+--- a/type-inference/src/objects/frame.rs
++++ b/type-inference/src/objects/frame.rs
+@@ -426,8 +426,8 @@ impl Frame {
+         let _expect_none = self.insert_variable(statement.variable.name.to_owned(), u32_type.clone(), &statement.span);
+ 
+         // Parse `from` and `to` expressions.
+-        let from_type = self.parse_expression(&statement.start)?;
+-        let to_type = self.parse_expression(&statement.stop)?;
++        let from_type = self.parse_index(&statement.start)?;
++        let to_type = self.parse_index(&statement.stop)?;
+ 
+         // Assert `from` and `to` types are a u32 or implicit.
+         self.assert_equal(u32_type.clone(), from_type, &statement.span);
+@@ -798,6 +798,18 @@ impl Frame {
+         }
+     }
+ 
++    ///
++    /// Returns `Type::U32` if the given index has `Type::TypeVariable`.
++    /// Hard codes all implicitly typed indices to u32.
++    /// Ex: `arr[0]` => `arr[0u32]`
++    ///
++    fn parse_index(&mut self, index: &Expression) -> Result<Type, FrameError> {
++        Ok(match self.parse_expression(index)? {
++            Type::TypeVariable(_) => Type::IntegerType(IntegerType::U32),
++            type_ => type_,
++        })
++    }
++
+     ///
+     /// Returns the type of the accessed array element.
+     ///
+@@ -809,7 +821,7 @@ impl Frame {
+         };
+ 
+         // Parse the expression type.
+-        let type_ = self.parse_expression(index)?;
++        let type_ = self.parse_index(index)?;
+ 
+         // Assert the type is an index.
+         self.assert_index(&type_, span);
+@@ -836,14 +848,14 @@ impl Frame {
+ 
+         if let Some(expression) = left {
+             // Parse the expression type.
+-            let type_ = self.parse_expression(expression)?;
++            let type_ = self.parse_index(expression)?;
+ 
+             self.assert_index(&type_, span);
+         }
+ 
+         if let Some(expression) = right {
+             // Parse the expression type.
+-            let type_ = self.parse_expression(expression)?;
++            let type_ = self.parse_index(expression)?;
+ 
+             self.assert_index(&type_, span);
+         }
+diff --git a/type-inference/tests/arrays/index_implicit.leo b/type-inference/tests/arrays/index_implicit.leo
+new file mode 100644
+index 0000000000..351ca31eea
+--- /dev/null
++++ b/type-inference/tests/arrays/index_implicit.leo
+@@ -0,0 +1,5 @@
++function main() {
++    let a = [0u32; 4];
++
++    let b = a[0]; // This should not cause a type inference error
++}
+\ No newline at end of file
+diff --git a/type-inference/tests/arrays/mod.rs b/type-inference/tests/arrays/mod.rs
+index 6877b90b76..d26c9c2bb7 100644
+--- a/type-inference/tests/arrays/mod.rs
++++ b/type-inference/tests/arrays/mod.rs
+@@ -42,3 +42,21 @@ fn test_invalid_spread() {
+ 
+     check.expect_error();
+ }
++
++#[test]
++fn test_index_implicit() {
++    let program_string = include_str!("index_implicit.leo");
++
++    let check = TestTypeInference::new(program_string);
++
++    check.check()
++}
++
++#[test]
++fn test_slice_implicit() {
++    let program_string = include_str!("slice_implicit.leo");
++
++    let check = TestTypeInference::new(program_string);
++
++    check.check();
++}
+diff --git a/type-inference/tests/arrays/slice_implicit.leo b/type-inference/tests/arrays/slice_implicit.leo
+new file mode 100644
+index 0000000000..902f34465b
+--- /dev/null
++++ b/type-inference/tests/arrays/slice_implicit.leo
+@@ -0,0 +1,5 @@
++function main() {
++    let a = [0u32; 4];
++
++    let b = a[0..2]; // This should not cause a type inference error
++}
+\ No newline at end of file
+diff --git a/type-inference/tests/mod.rs b/type-inference/tests/mod.rs
+index 40924eabfe..45dbd3696c 100644
+--- a/type-inference/tests/mod.rs
++++ b/type-inference/tests/mod.rs
+@@ -17,6 +17,7 @@
+ pub mod arrays;
+ pub mod circuits;
+ pub mod functions;
++pub mod statements;
+ pub mod tuples;
+ pub mod variables;
+ 
+diff --git a/type-inference/tests/statements/array_loop_implicit.leo b/type-inference/tests/statements/array_loop_implicit.leo
+new file mode 100644
+index 0000000000..5b77fa6472
+--- /dev/null
++++ b/type-inference/tests/statements/array_loop_implicit.leo
+@@ -0,0 +1,7 @@
++function main() {
++    let a = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
++
++    for i in 0..10 {
++        console.log("{}", a[i]);
++    }
++}
+\ No newline at end of file
+diff --git a/type-inference/tests/statements/loop_implicit.leo b/type-inference/tests/statements/loop_implicit.leo
+new file mode 100644
+index 0000000000..b1358fe6d7
+--- /dev/null
++++ b/type-inference/tests/statements/loop_implicit.leo
+@@ -0,0 +1,5 @@
++function main() {
++    for i in 0..10 {
++        console.log("{}", i);
++    }
++}
+\ No newline at end of file
+diff --git a/type-inference/tests/statements/mod.rs b/type-inference/tests/statements/mod.rs
+new file mode 100644
+index 0000000000..1bab5af354
+--- /dev/null
++++ b/type-inference/tests/statements/mod.rs
+@@ -0,0 +1,35 @@
++// Copyright (C) 2019-2020 Aleo Systems Inc.
++// This file is part of the Leo library.
++
++// The Leo library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The Leo library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
++
++use crate::TestTypeInference;
++
++#[test]
++fn test_loop_implicit() {
++    let program_string = include_str!("loop_implicit.leo");
++
++    let check = TestTypeInference::new(program_string);
++
++    check.check();
++}
++
++#[test]
++fn test_array_loop_implicit() {
++    let program_string = include_str!("array_loop_implicit.leo");
++
++    let check = TestTypeInference::new(program_string);
++
++    check.check();
++}

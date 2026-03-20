@@ -9,6 +9,7 @@ from bugeval.io import (
     load_all_cases,
     load_candidates,
     load_case,
+    load_eval_cases,
     save_candidates,
     save_case,
     write_run_metadata,
@@ -130,6 +131,63 @@ class TestLoadAllCases:
         assert loaded == []
 
 
+class TestLoadEvalCases:
+    def test_excludes_invalid_for_code_review(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        valid = make_test_case("valid-001")
+        invalid = make_test_case("invalid-001")
+        invalid = invalid.model_copy(update={"valid_for_code_review": False})
+        save_case(valid, cases_dir / "valid-001.yaml")
+        save_case(invalid, cases_dir / "invalid-001.yaml")
+        loaded = load_eval_cases(cases_dir)
+        assert len(loaded) == 1
+        assert loaded[0].id == "valid-001"
+
+    def test_excludes_empty_expected_findings(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        valid = make_test_case("valid-001")
+        no_findings = make_test_case("no-findings-001")
+        no_findings = no_findings.model_copy(update={"expected_findings": []})
+        save_case(valid, cases_dir / "valid-001.yaml")
+        save_case(no_findings, cases_dir / "no-findings-001.yaml")
+        loaded = load_eval_cases(cases_dir)
+        assert len(loaded) == 1
+        assert loaded[0].id == "valid-001"
+
+    def test_load_all_cases_returns_unfiltered(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        valid = make_test_case("valid-001")
+        invalid = make_test_case("invalid-001")
+        invalid = invalid.model_copy(update={"valid_for_code_review": False})
+        save_case(valid, cases_dir / "valid-001.yaml")
+        save_case(invalid, cases_dir / "invalid-001.yaml")
+        loaded = load_all_cases(cases_dir)
+        assert len(loaded) == 2
+
+    def test_includes_clean_cases_without_expected_findings(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        fix = make_test_case("fix-001")
+        clean = make_test_case("clean-001")
+        clean = clean.model_copy(update={"expected_findings": [], "case_type": "clean"})
+        save_case(fix, cases_dir / "fix-001.yaml")
+        save_case(clean, cases_dir / "clean-001.yaml")
+        loaded = load_eval_cases(cases_dir)
+        assert len(loaded) == 2
+        ids = {c.id for c in loaded}
+        assert "fix-001" in ids
+        assert "clean-001" in ids
+
+    def test_empty_dir(self, tmp_path: Path) -> None:
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        loaded = load_eval_cases(cases_dir)
+        assert loaded == []
+
+
 class TestWriteRunMetadata:
     def test_creates_metadata_file(self, tmp_path: Path) -> None:
         cases_dir = tmp_path / "cases"
@@ -192,6 +250,7 @@ class TestWriteRunMetadata:
 
         orig = Path.cwd()
         import os
+
         os.chdir(tmp_path)
         try:
             write_run_metadata(tmp_path, ["tool-a"], "diff+repo", cases_dir)
@@ -214,6 +273,7 @@ class TestWriteRunMetadata:
         (config_dir / "agent_prompt.md").write_text("generic prompt")
 
         import os
+
         orig = Path.cwd()
         os.chdir(tmp_path)
         try:
@@ -232,6 +292,7 @@ class TestWriteRunMetadata:
         cases_dir.mkdir()
 
         import os
+
         orig = Path.cwd()
         os.chdir(tmp_path)
         try:

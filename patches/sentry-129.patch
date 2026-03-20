@@ -1,0 +1,3791 @@
+diff --git a/eslint.config.ts b/eslint.config.ts
+index 2096b5d666d847..9d4ee8ca785076 100644
+--- a/eslint.config.ts
++++ b/eslint.config.ts
+@@ -591,6 +591,7 @@ export default typescript.config([
+           '@typescript-eslint/no-base-to-string': 'error',
+           '@typescript-eslint/no-duplicate-type-constituents': 'error',
+           '@typescript-eslint/no-for-in-array': 'error',
++          '@typescript-eslint/no-unnecessary-template-expression': 'error',
+           '@typescript-eslint/no-unnecessary-type-assertion': 'error',
+           '@typescript-eslint/only-throw-error': 'error',
+           '@typescript-eslint/prefer-optional-chain': 'error',
+diff --git a/scripts/type-coverage-diff.ts b/scripts/type-coverage-diff.ts
+index 995eb3263fc79b..1734df6a932fe4 100644
+--- a/scripts/type-coverage-diff.ts
++++ b/scripts/type-coverage-diff.ts
+@@ -528,7 +528,9 @@ async function main() {
+     );
+ 
+     console.log(
+-      `${colors.dim(`\n📝 Note: Only showing type issues on lines that were literally added (+) or removed (-) in git diff`)}`
++      colors.dim(
++        `\n📝 Note: Only showing type issues on lines that were literally added (+) or removed (-) in git diff`
++      )
+     );
+ 
+     // Compare any-typed symbols (only in actually modified code)
+diff --git a/src/sentry/api/urls.py b/src/sentry/api/urls.py
+index 3de10f1aa95524..e4a0f02f857f9f 100644
+--- a/src/sentry/api/urls.py
++++ b/src/sentry/api/urls.py
+@@ -511,6 +511,7 @@
+     ProjectRuleGroupHistoryIndexEndpoint,
+ )
+ from sentry.rules.history.endpoints.project_rule_stats import ProjectRuleStatsIndexEndpoint
++from sentry.scm.endpoints.scm_rpc import ScmRpcServiceEndpoint
+ from sentry.seer.endpoints.group_ai_autofix import GroupAutofixEndpoint
+ from sentry.seer.endpoints.group_ai_summary import GroupAiSummaryEndpoint
+ from sentry.seer.endpoints.group_autofix_setup_check import GroupAutofixSetupCheck
+@@ -3569,6 +3570,11 @@ def create_group_urls(name_prefix: str) -> list[URLPattern | URLResolver]:
+         InternalRpcServiceEndpoint.as_view(),
+         name="sentry-api-0-rpc-service",
+     ),
++    re_path(
++        r"^scm-rpc/(?P<method_name>\w+)/$",
++        ScmRpcServiceEndpoint.as_view(),
++        name="sentry-api-0-scm-rpc-service",
++    ),
+     re_path(
+         r"^seer-rpc/(?P<method_name>\w+)/$",
+         SeerRpcServiceEndpoint.as_view(),
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 5cdced677d91f3..ce6889588207a3 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -773,6 +773,10 @@ def SOCIAL_AUTH_DEFAULT_USERNAME() -> str:
+ # Shared secret used to sign cross-region RPC requests to the seer microservice.
+ SEER_API_SHARED_SECRET: str = ""
+ 
++# Sign requests to the SCM RPC endpoint
++# First element is used to sign requests; request is accepted if signed with any element in the list.
++SCM_RPC_SHARED_SECRET: list[str] | None = None
++
+ # Shared secret used to sign cross-region RPC requests from the launchpad microservice.
+ LAUNCHPAD_RPC_SHARED_SECRET: list[str] | None = None
+ if (val := os.environ.get("LAUNCHPAD_RPC_SHARED_SECRET")) is not None:
+diff --git a/src/sentry/features/temporary.py b/src/sentry/features/temporary.py
+index 02f2f6f6e0e431..afd4fd84dbd7aa 100644
+--- a/src/sentry/features/temporary.py
++++ b/src/sentry/features/temporary.py
+@@ -128,9 +128,6 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     manager.add("organizations:gen-ai-search-agent-translate", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable GenAI consent
+     manager.add("organizations:gen-ai-consent", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+-    # Enable granular permissions for replay features
+-    manager.add("organizations:granular-replay-permissions", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+-
+     # Enable increased issue_owners rate limit for auto-assignment
+     manager.add("organizations:increased-issue-owners-rate-limit", OrganizationFeature, FeatureHandlerStrategy.INTERNAL, api_expose=False)
+     # Starfish: extract metrics from the spans
+@@ -245,7 +242,7 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     # Enable writing preprod build distribution data to EAP for querying
+     manager.add("organizations:preprod-build-distribution-eap-write", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
+     # Enable preprod PR comments for build distribution
+-    manager.add("organizations:preprod-build-distribution-pr-comments", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
++    manager.add("organizations:preprod-build-distribution-pr-comments", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable preprod app size dashboard widget
+     manager.add("organizations:preprod-app-size-dashboard", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable enforcement of preprod size quota checks (when disabled, size quota checks always return True)
+diff --git a/src/sentry/preprod/api/endpoints/project_preprod_upload_options.py b/src/sentry/preprod/api/endpoints/project_preprod_upload_options.py
+index 9a0ecde8e5a130..0d05dfdd39ae46 100644
+--- a/src/sentry/preprod/api/endpoints/project_preprod_upload_options.py
++++ b/src/sentry/preprod/api/endpoints/project_preprod_upload_options.py
+@@ -43,7 +43,9 @@ def get(self, request: Request, project: Project) -> Response:
+                 "path": "",
+             },
+         )
+-        url = absolute_uri(path, generate_locality_url())
++        # Strip trailing slash so the objectstore client can append subpaths
++        # without producing a double slash (e.g. /objectstore//v1/...).
++        url = absolute_uri(path, generate_locality_url()).rstrip("/")
+ 
+         options = ObjectstoreUploadOptions(
+             url=url,
+diff --git a/src/sentry/scm/actions.py b/src/sentry/scm/actions.py
+index 40a918048a8f8b..4bcb04f621a178 100644
+--- a/src/sentry/scm/actions.py
++++ b/src/sentry/scm/actions.py
+@@ -118,7 +118,7 @@ def make_from_integration(
+     def _exec[P, T](self, protocol: type[P], provider_fn: Callable[[P], T]) -> T:
+         provider = self.provider
+         if not isinstance(provider, protocol):
+-            raise SCMProviderNotSupported
++            raise SCMProviderNotSupported("Action not supported.")
+ 
+         return exec_provider_fn(
+             self.provider,
+diff --git a/src/sentry/scm/endpoints/scm_rpc.py b/src/sentry/scm/endpoints/scm_rpc.py
+new file mode 100644
+index 00000000000000..9978858e7f0095
+--- /dev/null
++++ b/src/sentry/scm/endpoints/scm_rpc.py
+@@ -0,0 +1,242 @@
++import hashlib
++import hmac
++import logging
++from typing import Any
++
++import sentry_sdk
++from django.conf import settings
++from django.contrib.auth.models import AnonymousUser
++from rest_framework.exceptions import (
++    AuthenticationFailed,
++    PermissionDenied,
++)
++from rest_framework.request import Request
++from rest_framework.response import Response
++
++from sentry.api.api_owners import ApiOwner
++from sentry.api.api_publish_status import ApiPublishStatus
++from sentry.api.authentication import AuthenticationSiloLimit, StandardAuthentication
++from sentry.api.base import Endpoint, internal_region_silo_endpoint
++from sentry.hybridcloud.rpc.service import RpcAuthenticationSetupException
++from sentry.scm.errors import (
++    SCMError,
++    SCMProviderException,
++    SCMProviderNotSupported,
++    SCMRpcActionCallError,
++    SCMRpcActionNotFound,
++    SCMRpcCouldNotDeserializeRequest,
++)
++from sentry.scm.private.rpc import dispatch
++from sentry.silo.base import SiloMode
++
++logger = logging.getLogger(__name__)
++
++
++def generate_request_signature(url_path: str, body: bytes) -> str:
++    """
++    Generate a signature for the request body
++    with the first shared secret. If there are other
++    shared secrets in the list they are only to be used
++    for verification during key rotation.
++    """
++    if not settings.SCM_RPC_SHARED_SECRET:
++        raise RpcAuthenticationSetupException(
++            "Cannot sign RPC requests without SCM_RPC_SHARED_SECRET"
++        )
++
++    signature_input = body
++    secret = settings.SCM_RPC_SHARED_SECRET[0]
++    signature = hmac.new(secret.encode("utf-8"), signature_input, hashlib.sha256).hexdigest()
++    return f"rpc0:{signature}"
++
++
++@AuthenticationSiloLimit(SiloMode.CONTROL, SiloMode.REGION)
++class ScmRpcSignatureAuthentication(StandardAuthentication):
++    """
++    Authentication for SCM RPC requests.
++    Requests are sent with an HMAC signed by a shared private key.
++    """
++
++    token_name = b"rpcsignature"
++
++    def accepts_auth(self, auth: list[bytes]) -> bool:
++        if not auth or len(auth) < 2:
++            return False
++        return auth[0].lower() == self.token_name
++
++    def authenticate_token(self, request: Request, token: str) -> tuple[Any, Any]:
++        signature_validation_error = get_signature_validation_error(
++            request.path_info, request.body, token
++        )
++        if signature_validation_error:
++            raise AuthenticationFailed(
++                {
++                    "errors": [
++                        {
++                            "detail": f"SCM RPC signature validation failed: {signature_validation_error}"
++                        }
++                    ]
++                }
++            )
++
++        sentry_sdk.get_isolation_scope().set_tag("scm_rpc_auth", True)
++
++        return (AnonymousUser(), token)
++
++
++def get_signature_validation_error(url: str, body: bytes, signature: str) -> str | None:
++    """
++    Compare request data + signature signed by one of the shared secrets.
++
++    Once a key has been able to validate the signature other keys will
++    not be attempted. We should only have multiple keys during key rotations.
++    """
++    if not settings.SCM_RPC_SHARED_SECRET:
++        raise RpcAuthenticationSetupException(
++            "Cannot validate RPC request signatures without SCM_RPC_SHARED_SECRET"
++        )
++
++    signature_parts = signature.split(":", 1)
++    if len(signature_parts) != 2:
++        return "invalid signature format"
++
++    signature_prefix, signature_data = signature_parts
++
++    if signature_prefix != "rpc0":
++        return "invalid signature prefix"
++
++    if not body:
++        return "no body"
++
++    for key in settings.SCM_RPC_SHARED_SECRET:
++        computed = hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
++        is_valid = hmac.compare_digest(computed.encode(), signature_data.encode())
++        if is_valid:
++            return None
++
++    return "wrong secret"
++
++
++@internal_region_silo_endpoint
++class ScmRpcServiceEndpoint(Endpoint):
++    """
++    RPC endpoint for SCM interactions. Authenticated with a shared secret.
++    Copied from the normal rpc endpoint and modified for use with SCM.
++    """
++
++    publish_status = {
++        "POST": ApiPublishStatus.EXPERIMENTAL,
++    }
++    owner = ApiOwner.CODING_WORKFLOWS
++    authentication_classes = (ScmRpcSignatureAuthentication,)
++    permission_classes = ()
++    enforce_rate_limit = False
++
++    @staticmethod
++    @sentry_sdk.trace
++    def _is_authorized(request: Request) -> bool:
++        if request.auth and isinstance(
++            request.successful_authenticator, ScmRpcSignatureAuthentication
++        ):
++            return True
++        return False
++
++    @sentry_sdk.trace
++    def post(self, request: Request, method_name: str) -> Response:
++        sentry_sdk.set_tag("rpc.method", method_name)
++
++        if not self._is_authorized(request):
++            raise PermissionDenied()
++
++        try:
++            result = dispatch(method_name, request.data)
++        except SCMRpcActionNotFound as e:
++            return Response(
++                {
++                    "errors": [
++                        {
++                            "status": "404",
++                            "title": "Not found",
++                            "detail": f"Could not find action {e.action_name}",
++                        }
++                    ]
++                },
++                status=404,
++            )
++        except SCMRpcCouldNotDeserializeRequest as e:
++            return Response(
++                {
++                    "errors": [
++                        {
++                            "status": "400",
++                            "title": "The request could not be deserialized.",
++                            "meta": error,
++                        }
++                        for error in e.args[0]
++                    ]
++                },
++                status=400,
++            )
++        except SCMRpcActionCallError as e:
++            return Response(
++                {
++                    "errors": [
++                        {
++                            "status": "500",
++                            "title": "An unexpected error occurred.",
++                            "detail": e.message,
++                        }
++                    ]
++                },
++                status=500,
++            )
++        except SCMProviderNotSupported as e:
++            sentry_sdk.capture_exception()
++            return Response(
++                data={
++                    "errors": [
++                        {"status": "400", "title": "Provider not supported.", "detail": e.message}
++                    ]
++                },
++                status=400,
++            )
++        except SCMProviderException as e:
++            sentry_sdk.capture_exception()
++            return Response(
++                data={
++                    "errors": [
++                        {
++                            "status": "503",
++                            "title": "The service provider raised an error.",
++                            "detail": self._make_details(e),
++                        }
++                    ]
++                },
++                status=503,
++            )
++        except SCMError as e:
++            sentry_sdk.capture_exception()
++            return Response(
++                data={
++                    "errors": [
++                        {
++                            "status": "500",
++                            "title": "An unexpected error occurred.",
++                            "detail": self._make_details(e),
++                        }
++                    ]
++                },
++                status=500,
++            )
++        except Exception:
++            sentry_sdk.capture_exception()
++            raise
++        else:
++            return Response(data={"data": result})
++
++    def _make_details(self, e: BaseException) -> list[Any]:
++        details = list(e.args)
++        while e.__cause__:
++            e = e.__cause__
++            details.extend(e.args)
++        return details
+diff --git a/src/sentry/scm/errors.py b/src/sentry/scm/errors.py
+index eefee2d872309d..69e9763b5509d7 100644
+--- a/src/sentry/scm/errors.py
++++ b/src/sentry/scm/errors.py
+@@ -7,6 +7,7 @@
+     "rate_limit_exceeded",
+     "integration_not_found",
+     "unsupported_integration",
++    "unknown_provider",
+ ]
+ 
+ ERROR_CODES: dict[ErrorCode, str] = {
+@@ -16,6 +17,7 @@
+     "rate_limit_exceeded": "Exhausted allocated service-provider quota.",
+     "integration_not_found": "An unsupported integration provider was found.",
+     "unsupported_integration": "An unsupported integration provider was found.",
++    "unknown_provider": "Could not resolve source code management provider.",
+ }
+ 
+ 
+@@ -39,4 +41,23 @@ class SCMProviderException(SCMError):
+ 
+ 
+ class SCMProviderNotSupported(SCMError):
++    def __init__(self, message: str) -> None:
++        self.message = message
++        super().__init__(message)
++
++
++class SCMRpcActionCallError(SCMError):
++    def __init__(self, action_name: str, error_message: str) -> None:
++        self.action_name = action_name
++        self.message = f"Error calling method {action_name}: {error_message}"
++        super().__init__(self.message)
++
++
++class SCMRpcActionNotFound(SCMError):
++    def __init__(self, action_name: str) -> None:
++        self.action_name = action_name
++        super().__init__(action_name)
++
++
++class SCMRpcCouldNotDeserializeRequest(SCMError):
+     pass
+diff --git a/src/sentry/scm/private/rpc.py b/src/sentry/scm/private/rpc.py
+new file mode 100644
+index 00000000000000..65861b7e3672cb
+--- /dev/null
++++ b/src/sentry/scm/private/rpc.py
+@@ -0,0 +1,128 @@
++from typing import Any, Callable, cast
++
++import pydantic
++
++from sentry.scm.actions import SourceCodeManager
++from sentry.scm.errors import (
++    SCMProviderNotSupported,
++    SCMRpcActionCallError,
++    SCMRpcActionNotFound,
++    SCMRpcCouldNotDeserializeRequest,
++)
++from sentry.scm.types import PROVIDER_SET, ProviderName
++
++
++def dispatch(action_name: str, raw_request_data: dict[str, Any]):
++    """
++    Dispatch an RPC request.
++
++    Action arguments are yolo'd for now. Better type-safety and error messages will be introduced
++    later. Our dedicated client should make this less of a practical concern.
++    """
++    if action_name not in scm_action_registry:
++        raise SCMRpcActionNotFound(action_name)
++
++    try:
++        request = RequestData.parse_obj(raw_request_data)
++    except pydantic.ValidationError as e:
++        raise SCMRpcCouldNotDeserializeRequest(e.errors()) from e
++
++    organization_id = request.args.organization_id
++
++    repository_id: int | tuple[str, str]
++    if isinstance(request.args.repository_id, RequestData.Args.CompositeRepositoryId):
++        if request.args.repository_id.provider not in PROVIDER_SET:
++            raise SCMProviderNotSupported(
++                f"{request.args.repository_id.provider} is not supported."
++            )
++
++        repository_id = (
++            cast(ProviderName, request.args.repository_id.provider),
++            request.args.repository_id.external_id,
++        )
++    else:
++        repository_id = request.args.repository_id
++
++    scm = SourceCodeManager.make_from_repository_id(organization_id, repository_id)
++
++    try:
++        return scm_action_registry[action_name](scm, **request.args.get_extra_fields())
++    except TypeError as e:
++        raise SCMRpcActionCallError(action_name, str(e)) from e
++
++
++class RequestData(pydantic.BaseModel, extra=pydantic.Extra.allow):
++    class Args(pydantic.BaseModel, extra=pydantic.Extra.allow):
++        organization_id: int
++
++        class CompositeRepositoryId(pydantic.BaseModel, extra=pydantic.Extra.forbid):
++            provider: str
++            external_id: str
++
++        repository_id: int | CompositeRepositoryId
++
++        def get_extra_fields(self) -> dict[str, Any]:
++            return {k: v for k, v in self.__dict__.items() if k not in self.__fields__}
++
++    args: Args
++
++
++scm_action_registry: dict[str, Callable] = {
++    # These callables must accept a SourceCodeManager as their first argument,
++    # and then they are free to accept any other **kwargs they want.
++    # Their return type must be JSON-serializable.
++    #
++    # This dict could be populated dynamically by scanning the SourceCodeManager class for methods.
++    # Explicit listing give us more control: we can rename methods,
++    # delay exposing them as RPC, adapt their interface, etc.
++    #
++    # If a method of SourceCodeManager accepts only JSON-serializable arguments, by names, and
++    # returns a JSON-serializable type, then it can be listed here directly.
++    # Else, an adapter function must be used.
++    "can_v1": SourceCodeManager.can,
++    "get_issue_comments_v1": SourceCodeManager.get_issue_comments,
++    "create_issue_comment_v1": SourceCodeManager.create_issue_comment,
++    "delete_issue_comment_v1": SourceCodeManager.delete_issue_comment,
++    "get_pull_request_v1": SourceCodeManager.get_pull_request,
++    "get_pull_request_comments_v1": SourceCodeManager.get_pull_request_comments,
++    "create_pull_request_comment_v1": SourceCodeManager.create_pull_request_comment,
++    "delete_pull_request_comment_v1": SourceCodeManager.delete_pull_request_comment,
++    "get_issue_comment_reactions_v1": SourceCodeManager.get_issue_comment_reactions,
++    "create_issue_comment_reaction_v1": SourceCodeManager.create_issue_comment_reaction,
++    "delete_issue_comment_reaction_v1": SourceCodeManager.delete_issue_comment_reaction,
++    "get_pull_request_comment_reactions_v1": SourceCodeManager.get_pull_request_comment_reactions,
++    "create_pull_request_comment_reaction_v1": SourceCodeManager.create_pull_request_comment_reaction,
++    "delete_pull_request_comment_reaction_v1": SourceCodeManager.delete_pull_request_comment_reaction,
++    "get_issue_reactions_v1": SourceCodeManager.get_issue_reactions,
++    "create_issue_reaction_v1": SourceCodeManager.create_issue_reaction,
++    "delete_issue_reaction_v1": SourceCodeManager.delete_issue_reaction,
++    "get_pull_request_reactions_v1": SourceCodeManager.get_pull_request_reactions,
++    "create_pull_request_reaction_v1": SourceCodeManager.create_pull_request_reaction,
++    "delete_pull_request_reaction_v1": SourceCodeManager.delete_pull_request_reaction,
++    "get_branch_v1": SourceCodeManager.get_branch,
++    "create_branch_v1": SourceCodeManager.create_branch,
++    "update_branch_v1": SourceCodeManager.update_branch,
++    "create_git_blob_v1": SourceCodeManager.create_git_blob,
++    "get_file_content_v1": SourceCodeManager.get_file_content,
++    "get_commit_v1": SourceCodeManager.get_commit,
++    "get_commits_v1": SourceCodeManager.get_commits,
++    "compare_commits_v1": SourceCodeManager.compare_commits,
++    "get_tree_v1": SourceCodeManager.get_tree,
++    "get_git_commit_v1": SourceCodeManager.get_git_commit,
++    "create_git_tree_v1": SourceCodeManager.create_git_tree,
++    "create_git_commit_v1": SourceCodeManager.create_git_commit,
++    "get_pull_request_files_v1": SourceCodeManager.get_pull_request_files,
++    "get_pull_request_commits_v1": SourceCodeManager.get_pull_request_commits,
++    "get_pull_request_diff_v1": SourceCodeManager.get_pull_request_diff,
++    "get_pull_requests_v1": SourceCodeManager.get_pull_requests,
++    "create_pull_request_v1": SourceCodeManager.create_pull_request,
++    "update_pull_request_v1": SourceCodeManager.update_pull_request,
++    "request_review_v1": SourceCodeManager.request_review,
++    "create_review_comment_file_v1": SourceCodeManager.create_review_comment_file,
++    "create_review_comment_reply_v1": SourceCodeManager.create_review_comment_reply,
++    "create_review_v1": SourceCodeManager.create_review,
++    "create_check_run_v1": SourceCodeManager.create_check_run,
++    "get_check_run_v1": SourceCodeManager.get_check_run,
++    "update_check_run_v1": SourceCodeManager.update_check_run,
++    "minimize_comment_v1": SourceCodeManager.minimize_comment,
++}
+diff --git a/src/sentry/scm/types.py b/src/sentry/scm/types.py
+index a5d5648517f2f4..a85d4445b57382 100644
+--- a/src/sentry/scm/types.py
++++ b/src/sentry/scm/types.py
+@@ -11,6 +11,8 @@
+ type ProviderName = Literal["bitbucket", "github", "github_enterprise", "gitlab"]
+ """The SCM provider that owns an integration or repository."""
+ 
++PROVIDER_SET: set[ProviderName] = set(["bitbucket", "github", "github_enterprise", "gitlab"])
++
+ type ExternalId = str
+ """
+ Identifier whose origin is an external, source-code-management provider. Refers specifically to
+diff --git a/static/app/components/activity/note/mentionStyle.tsx b/static/app/components/activity/note/mentionStyle.tsx
+index 0abf4f9f256770..daf4f0cf8da02d 100644
+--- a/static/app/components/activity/note/mentionStyle.tsx
++++ b/static/app/components/activity/note/mentionStyle.tsx
+@@ -32,7 +32,7 @@ export function mentionStyle({theme, minHeight, streamlined}: Options) {
+ 
+   return {
+     control: {
+-      backgroundColor: `${theme.tokens.background.primary}`,
++      backgroundColor: theme.tokens.background.primary,
+       fontSize: 15,
+       fontWeight: 'normal',
+     },
+@@ -74,7 +74,7 @@ export function mentionStyle({theme, minHeight, streamlined}: Options) {
+         maxHeight: 142,
+         minWidth: 220,
+         overflow: 'auto',
+-        backgroundColor: `${theme.tokens.background.primary}`,
++        backgroundColor: theme.tokens.background.primary,
+         border: '1px solid rgba(0,0,0,0.15)',
+         borderRadius: theme.radius.md,
+         fontSize: theme.font.size.sm,
+diff --git a/static/app/components/assigneeSelectorDropdown.spec.tsx b/static/app/components/assigneeSelectorDropdown.spec.tsx
+index dc723fff959582..a4fa4357334ac0 100644
+--- a/static/app/components/assigneeSelectorDropdown.spec.tsx
++++ b/static/app/components/assigneeSelectorDropdown.spec.tsx
+@@ -241,7 +241,7 @@ describe('AssigneeSelectorDropdown', () => {
+     );
+     expect(updateGroupSpy).toHaveBeenCalledWith(GROUP_1, {
+       assignee: USER_1,
+-      id: `${USER_1.id}`,
++      id: USER_1.id,
+       type: 'user',
+       suggestedAssignee: undefined,
+     });
+@@ -299,7 +299,7 @@ describe('AssigneeSelectorDropdown', () => {
+         name: TEAM_1.slug,
+         type: 'team',
+       },
+-      id: `${TEAM_1.id}`,
++      id: TEAM_1.id,
+       type: 'team',
+       suggestedAssignee: undefined,
+     });
+@@ -358,7 +358,7 @@ describe('AssigneeSelectorDropdown', () => {
+ 
+     expect(updateGroupSpy).toHaveBeenCalledWith(GROUP_1, {
+       assignee: USER_1,
+-      id: `${USER_1.id}`,
++      id: USER_1.id,
+       type: 'user',
+       suggestedAssignee: undefined,
+     });
+@@ -389,7 +389,7 @@ describe('AssigneeSelectorDropdown', () => {
+     );
+     expect(updateGroupSpy).toHaveBeenCalledWith(GROUP_1, {
+       assignee: USER_1,
+-      id: `${USER_1.id}`,
++      id: USER_1.id,
+       type: 'user',
+       suggestedAssignee: undefined,
+     });
+@@ -495,9 +495,9 @@ describe('AssigneeSelectorDropdown', () => {
+       expect(screen.getAllByRole('option')).toHaveLength(1);
+     });
+ 
+-    expect(await screen.findByText(`${USER_2.name}`)).toBeInTheDocument();
++    expect(await screen.findByText(USER_2.name)).toBeInTheDocument();
+ 
+-    await userEvent.click(await screen.findByText(`${USER_2.name}`));
++    await userEvent.click(await screen.findByText(USER_2.name));
+ 
+     await waitFor(() =>
+       expect(assignMock).toHaveBeenLastCalledWith(
+@@ -540,7 +540,7 @@ describe('AssigneeSelectorDropdown', () => {
+       expect(screen.getAllByRole('option')).toHaveLength(1);
+     });
+ 
+-    expect(await screen.findByText(`${USER_4.name}`)).toBeInTheDocument();
++    expect(await screen.findByText(USER_4.name)).toBeInTheDocument();
+   });
+ 
+   it('successfully shows suggested assignees and suggestion reason', async () => {
+@@ -609,7 +609,7 @@ describe('AssigneeSelectorDropdown', () => {
+ 
+     expect(updateGroupSpy).toHaveBeenCalledWith(GROUP_2, {
+       assignee: USER_1,
+-      id: `${USER_1.id}`,
++      id: USER_1.id,
+       type: 'user',
+       suggestedAssignee: expect.objectContaining({id: USER_1.id}),
+     });
+diff --git a/static/app/components/charts/components/tooltip.tsx b/static/app/components/charts/components/tooltip.tsx
+index 7b1ef74cbd6df3..eea1fd9c21939b 100644
+--- a/static/app/components/charts/components/tooltip.tsx
++++ b/static/app/components/charts/components/tooltip.tsx
+@@ -371,7 +371,7 @@ export function computeChartTooltip(
+   return {
+     show: true,
+     trigger: 'item',
+-    backgroundColor: `${theme.tokens.background.primary}`,
++    backgroundColor: theme.tokens.background.primary,
+     borderWidth: 0,
+     extraCssText: `box-shadow: 0 0 0 1px ${theme.tokens.border.transparent.neutral.muted}, ${theme.dropShadowHeavy}`,
+     transitionDuration: 0,
+diff --git a/static/app/components/charts/groupStatusChart.tsx b/static/app/components/charts/groupStatusChart.tsx
+index e3627edc89db73..a158bb8ce9ddf7 100644
+--- a/static/app/components/charts/groupStatusChart.tsx
++++ b/static/app/components/charts/groupStatusChart.tsx
+@@ -77,7 +77,7 @@ function GroupStatusChart({
+         color: theme.tokens.content.secondary,
+         fontFamily: 'Rubik',
+         fontSize: 10,
+-        formatter: `${formattedMarkLine}`,
++        formatter: formattedMarkLine,
+       },
+     });
+ 
+diff --git a/static/app/components/core/button/styles.tsx b/static/app/components/core/button/styles.tsx
+index 51eb2429a7183e..d2154d1abcdf62 100644
+--- a/static/app/components/core/button/styles.tsx
++++ b/static/app/components/core/button/styles.tsx
+@@ -99,7 +99,7 @@ export function DO_NOT_USE_getButtonStyles(
+       position: 'absolute',
+       inset: '0',
+       height: `calc(100% - ${buttonElevation})`,
+-      top: `${buttonElevation}`,
++      top: buttonElevation,
+       transform: `translateY(-${buttonElevation})`,
+       boxShadow: `0 ${buttonElevation} 0 0px ${buttonTheme.background}`,
+       background: buttonTheme.background,
+diff --git a/static/app/components/events/contexts/utils.spec.tsx b/static/app/components/events/contexts/utils.spec.tsx
+index 33d56cd66828d1..7c0c8a998e4858 100644
+--- a/static/app/components/events/contexts/utils.spec.tsx
++++ b/static/app/components/events/contexts/utils.spec.tsx
+@@ -135,7 +135,7 @@ describe('contexts utils', () => {
+       expect(knownData[0]!.key).toEqual(knownStructuredData[0]!.key);
+       expect(knownData[0]!.subject).toEqual(knownStructuredData[0]!.subject);
+       render(<Fragment>{knownStructuredData[0]!.value as React.ReactNode}</Fragment>);
+-      expect(screen.getByText(`${knownData[0]!.value as string}`)).toBeInTheDocument();
++      expect(screen.getByText(knownData[0]!.value as string)).toBeInTheDocument();
+       expect(screen.getByTestId('annotated-text-error-icon')).toBeInTheDocument();
+     });
+   });
+diff --git a/static/app/components/events/eventTagsAndScreenshot/tags.tsx b/static/app/components/events/eventTagsAndScreenshot/tags.tsx
+index b2c7022f916c0b..82323c664b1455 100644
+--- a/static/app/components/events/eventTagsAndScreenshot/tags.tsx
++++ b/static/app/components/events/eventTagsAndScreenshot/tags.tsx
+@@ -77,7 +77,7 @@ export function EventTagsDataSection({
+         onChange={handleTagFilterChange}
+       >
+         {[TagFilter.ALL, TagFilter.CUSTOM, ...availableFilters].map(v => (
+-          <SegmentedControl.Item key={v}>{`${v}`}</SegmentedControl.Item>
++          <SegmentedControl.Item key={v}>{v}</SegmentedControl.Item>
+         ))}
+       </SegmentedControl>
+     </Grid>
+diff --git a/static/app/components/events/interfaces/frame/deprecatedLine.tsx b/static/app/components/events/interfaces/frame/deprecatedLine.tsx
+index f42921f07f6a85..8cedc75b1a5cbb 100644
+--- a/static/app/components/events/interfaces/frame/deprecatedLine.tsx
++++ b/static/app/components/events/interfaces/frame/deprecatedLine.tsx
+@@ -416,9 +416,7 @@ const DefaultLine = styled('div')<{
+   justify-content: space-between;
+   align-items: center;
+   background: ${p =>
+-    p.isSubFrame
+-      ? `${p.theme.colors.surface200}`
+-      : `${p.theme.tokens.background.tertiary}`};
++    p.isSubFrame ? p.theme.colors.surface200 : p.theme.tokens.background.tertiary};
+   min-height: 40px;
+   word-break: break-word;
+   padding: ${p => p.theme.space.sm} ${p => p.theme.space.lg};
+diff --git a/static/app/components/events/interfaces/frame/stacktraceLink.tsx b/static/app/components/events/interfaces/frame/stacktraceLink.tsx
+index 214928b0c882e9..e3071c0c8e6502 100644
+--- a/static/app/components/events/interfaces/frame/stacktraceLink.tsx
++++ b/static/app/components/events/interfaces/frame/stacktraceLink.tsx
+@@ -237,7 +237,7 @@ export function StacktraceLink({frame, event, line, disableSetup}: StacktraceLin
+         ) : coverage &&
+           shouldShowCodecovFeatures(organization, match, coverage.status) ? (
+           <CodecovLink
+-            coverageUrl={`${frame.sourceLink}`}
++            coverageUrl={frame.sourceLink}
+             status={coverage.status}
+             organization={organization}
+             event={event}
+diff --git a/static/app/components/events/interfaces/nativeFrame.tsx b/static/app/components/events/interfaces/nativeFrame.tsx
+index 60516f54767d14..62e903789d3292 100644
+--- a/static/app/components/events/interfaces/nativeFrame.tsx
++++ b/static/app/components/events/interfaces/nativeFrame.tsx
+@@ -363,7 +363,7 @@ function NativeFrame({
+                 <AnnotatedText value={functionName.value} meta={functionName.meta} />
+               </Tooltip>
+             ) : isDartAsyncSuspensionFrame ? (
+-              `${t('Dart')}`
++              t('Dart')
+             ) : (
+               `<${t('unknown')}>`
+             )}{' '}
+@@ -547,8 +547,8 @@ const RowHeader = styled('span')<{
+   column-gap: ${p => p.theme.space.md};
+   background-color: ${p =>
+     !p.isInAppFrame && p.isSubFrame
+-      ? `${p.theme.colors.surface200}`
+-      : `${p.theme.tokens.background.secondary}`};
++      ? p.theme.colors.surface200
++      : p.theme.tokens.background.secondary};
+   font-size: ${p => p.theme.font.size.sm};
+   padding: ${p => p.theme.space.md};
+   color: ${p => (p.isInAppFrame ? '' : p.theme.tokens.content.secondary)};
+diff --git a/static/app/components/globalDrawer/useDrawerResizing.tsx b/static/app/components/globalDrawer/useDrawerResizing.tsx
+index 7ea41c2746ffe8..158aef023cf994 100644
+--- a/static/app/components/globalDrawer/useDrawerResizing.tsx
++++ b/static/app/components/globalDrawer/useDrawerResizing.tsx
+@@ -77,9 +77,9 @@ export function useDrawerResizing({
+       panelRef.current?.style.setProperty('--drawer-min-width', '100%');
+       panelRef.current?.style.setProperty('--drawer-max-width', '100%');
+     } else if (!enabled && drawerWidth) {
+-      panelRef.current?.style.setProperty('--drawer-width', `${drawerWidth}`);
+-      panelRef.current?.style.setProperty('--drawer-min-width', `${drawerWidth}`);
+-      panelRef.current?.style.setProperty('--drawer-max-width', `${drawerWidth}`);
++      panelRef.current?.style.setProperty('--drawer-width', drawerWidth);
++      panelRef.current?.style.setProperty('--drawer-min-width', drawerWidth);
++      panelRef.current?.style.setProperty('--drawer-max-width', drawerWidth);
+     } else {
+       panelRef.current?.style.setProperty('--drawer-width', `${persistedWidthPercent}%`);
+       panelRef.current?.style.setProperty('--drawer-min-width', `${MIN_WIDTH_PERCENT}%`);
+diff --git a/static/app/components/group/sentryAppExternalIssueForm.spec.tsx b/static/app/components/group/sentryAppExternalIssueForm.spec.tsx
+index d12f86ef941547..da105a7b42a5a1 100644
+--- a/static/app/components/group/sentryAppExternalIssueForm.spec.tsx
++++ b/static/app/components/group/sentryAppExternalIssueForm.spec.tsx
+@@ -107,7 +107,7 @@ describe('SentryAppExternalIssueForm', () => {
+           action="create"
+         />
+       );
+-      expect(screen.getByRole('textbox', {name: 'Title'})).toHaveValue(`${group.title}`);
++      expect(screen.getByRole('textbox', {name: 'Title'})).toHaveValue(group.title);
+ 
+       const url = addQueryParamsToExistingUrl(group.permalink, {
+         referrer: sentryApp.name,
+diff --git a/static/app/components/layouts/thirds.tsx b/static/app/components/layouts/thirds.tsx
+index 739091fd55061f..3cecec228663eb 100644
+--- a/static/app/components/layouts/thirds.tsx
++++ b/static/app/components/layouts/thirds.tsx
+@@ -147,7 +147,7 @@ export const Body = styled('div')<{noRowGap?: boolean}>`
+     display: grid;
+     grid-template-columns: minmax(100px, auto) 325px;
+     align-content: start;
+-    gap: ${p => (p.noRowGap ? `0 ${p.theme.space['2xl']}` : `${p.theme.space['2xl']}`)};
++    gap: ${p => (p.noRowGap ? `0 ${p.theme.space['2xl']}` : p.theme.space['2xl'])};
+   }
+ `;
+ 
+diff --git a/static/app/components/replays/breadcrumbs/replayTimeline.tsx b/static/app/components/replays/breadcrumbs/replayTimeline.tsx
+index 1758f25585e9d5..ae94261a798989 100644
+--- a/static/app/components/replays/breadcrumbs/replayTimeline.tsx
++++ b/static/app/components/replays/breadcrumbs/replayTimeline.tsx
+@@ -54,7 +54,7 @@ export default function ReplayTimeline() {
+   return (
+     <CenteredStack
+       style={{
+-        width: `${toPercent(timelineScale)}`,
++        width: toPercent(timelineScale),
+         translate: `${toPercent(translate())} 0%`,
+       }}
+       ref={stackedRef}
+diff --git a/static/app/components/replays/preferences/replayPreferenceDropdown.tsx b/static/app/components/replays/preferences/replayPreferenceDropdown.tsx
+index a558ca0ce7c22d..f8df4acb50921d 100644
+--- a/static/app/components/replays/preferences/replayPreferenceDropdown.tsx
++++ b/static/app/components/replays/preferences/replayPreferenceDropdown.tsx
+@@ -95,7 +95,7 @@ export default function ReplayPreferenceDropdown({
+         value={prefs.timestampType}
+         onChange={opt => setPrefs({timestampType: opt.value})}
+         options={REPLAY_TIMESTAMP_OPTIONS.map(option => ({
+-          label: `${toTitleCase(option)}`,
++          label: toTitleCase(option),
+           value: option,
+         }))}
+       />
+diff --git a/static/app/components/search/sources/apiSource.tsx b/static/app/components/search/sources/apiSource.tsx
+index fbf3763543c9ec..6e62ee75ac6c6c 100644
+--- a/static/app/components/search/sources/apiSource.tsx
++++ b/static/app/components/search/sources/apiSource.tsx
+@@ -238,8 +238,8 @@ async function createShortIdResult(
+   const issue = shortIdLookup?.group;
+   return [
+     {
+-      title: `${issue?.metadata?.type ?? shortIdLookup.shortId}`,
+-      description: `${issue?.metadata?.value ?? t('Issue')}`,
++      title: issue?.metadata?.type ?? shortIdLookup.shortId,
++      description: issue?.metadata?.value ?? t('Issue'),
+       model: shortIdLookup.group,
+       sourceType: 'issue',
+       resultType: 'issue',
+@@ -262,7 +262,7 @@ async function createEventIdResult(
+   const event = eventIdLookup?.event;
+   return [
+     {
+-      title: `${event?.metadata?.type ?? t('Event')}`,
++      title: event?.metadata?.type ?? t('Event'),
+       description: event?.metadata?.value,
+       model: event,
+       sourceType: 'event',
+diff --git a/static/app/components/searchQueryBuilder/tokens/components.tsx b/static/app/components/searchQueryBuilder/tokens/components.tsx
+index 1f12e5dc2cce1b..bd291739632317 100644
+--- a/static/app/components/searchQueryBuilder/tokens/components.tsx
++++ b/static/app/components/searchQueryBuilder/tokens/components.tsx
+@@ -42,6 +42,8 @@ export function FilterWrapper({children, ...props}: FilterWrapperProps) {
+ }
+ 
+ const StyledFilterWrapper = styled(Container)<{state: 'invalid' | 'warning' | 'valid'}>`
++  max-width: calc(100% - ${p => p.theme.space['2xl']});
++
+   :focus,
+   &[aria-selected='true'] {
+     background-color: ${p => p.theme.colors.gray100};
+diff --git a/static/app/components/searchSyntax/mutableSearch.spec.tsx b/static/app/components/searchSyntax/mutableSearch.spec.tsx
+index d60c33c2fae94a..76e98bbd15eee3 100644
+--- a/static/app/components/searchSyntax/mutableSearch.spec.tsx
++++ b/static/app/components/searchSyntax/mutableSearch.spec.tsx
+@@ -557,7 +557,9 @@ describe('MutableSearch', () => {
+     ];
+ 
+     for (const {name, string, object} of cases) {
+-      it(`${name}`, () => expect(object.formatString()).toEqual(string));
++      // https://github.com/jest-community/eslint-plugin-jest/issues/1940
++      // eslint-disable-next-line jest/valid-title
++      it(name, () => expect(object.formatString()).toEqual(string));
+     }
+   });
+ });
+diff --git a/static/app/components/searchSyntax/parser.spec.tsx b/static/app/components/searchSyntax/parser.spec.tsx
+index 48402ca9805980..42bbec1548aa59 100644
+--- a/static/app/components/searchSyntax/parser.spec.tsx
++++ b/static/app/components/searchSyntax/parser.spec.tsx
+@@ -184,7 +184,9 @@ describe('searchSyntax/parser', () => {
+     });
+ 
+   Object.entries(testData).map(([name, cases]) =>
+-    describe(`${name}`, () => {
++    // https://github.com/jest-community/eslint-plugin-jest/issues/1940
++    // eslint-disable-next-line jest/valid-title
++    describe(name, () => {
+       cases.map(c => registerTestCase(c, {parse: true}));
+     })
+   );
+diff --git a/static/app/components/stream/groupChart.tsx b/static/app/components/stream/groupChart.tsx
+index f49e25b1513169..28ac6e54b5b004 100644
+--- a/static/app/components/stream/groupChart.tsx
++++ b/static/app/components/stream/groupChart.tsx
+@@ -82,10 +82,10 @@ function GroupChart({
+                 label: {
+                   show: true,
+                   position: 'start',
+-                  color: `${theme.tokens.content.secondary}`,
++                  color: theme.tokens.content.secondary,
+                   fontFamily: 'Rubik',
+                   fontSize: 10,
+-                  formatter: `${formattedMarkLine}`,
++                  formatter: formattedMarkLine,
+                 },
+               })
+             : undefined,
+diff --git a/static/app/components/timeRangeSelector/utils.tsx b/static/app/components/timeRangeSelector/utils.tsx
+index 80929f99322e52..75a3864671c09d 100644
+--- a/static/app/components/timeRangeSelector/utils.tsx
++++ b/static/app/components/timeRangeSelector/utils.tsx
+@@ -202,7 +202,7 @@ function filterItems(items: TimeRangeItem[], inputValue: string): TimeRangeItem[
+   return items.filter(item =>
+     (typeof item.textValue === 'string' && item.textValue.length > 0
+       ? item.textValue
+-      : `${item.value}`
++      : item.value
+     )
+       .toLowerCase()
+       .includes(inputValue.toLowerCase())
+diff --git a/static/app/gettingStartedDocs/capacitor/utils.tsx b/static/app/gettingStartedDocs/capacitor/utils.tsx
+index 001a0a00517598..81cf30ee3b6c96 100644
+--- a/static/app/gettingStartedDocs/capacitor/utils.tsx
++++ b/static/app/gettingStartedDocs/capacitor/utils.tsx
+@@ -58,13 +58,11 @@ const isVue = (siblingOption: string): boolean =>
+   siblingOption === SiblingOption.VUE2 || siblingOption === SiblingOption.VUE3;
+ 
+ function getPerformanceIntegration(siblingOption: string): string {
+-  return `${
+-    isVue(siblingOption)
+-      ? `routingInstrumentation: SentryVue.vueRouterInstrumentation(router),`
+-      : isAngular(siblingOption)
+-        ? `routingInstrumentation: SentryAngular.routingInstrumentation,`
+-        : ''
+-  }`;
++  return isVue(siblingOption)
++    ? `routingInstrumentation: SentryVue.vueRouterInstrumentation(router),`
++    : isAngular(siblingOption)
++      ? `routingInstrumentation: SentryAngular.routingInstrumentation,`
++      : '';
+ }
+ 
+ const performanceAngularErrorHandler = `,
+diff --git a/static/app/gettingStartedDocs/java/utils.tsx b/static/app/gettingStartedDocs/java/utils.tsx
+index fd1cb6b5cba569..eabf9c8b3bf37c 100644
+--- a/static/app/gettingStartedDocs/java/utils.tsx
++++ b/static/app/gettingStartedDocs/java/utils.tsx
+@@ -89,7 +89,7 @@ sentry {
+   projectName = "${params.project.slug}"
+   authToken = System.getenv("SENTRY_AUTH_TOKEN")
+ }
+-${params.isProfilingSelected ? `${wrappedGradleSnippet(params)}` : ''}`;
++${params.isProfilingSelected ? wrappedGradleSnippet(params) : ''}`;
+ 
+ const wrappedGradleSnippet = (params: Params) => `
+ dependencies {
+diff --git a/static/app/gettingStartedDocs/javascript-vue/utils.tsx b/static/app/gettingStartedDocs/javascript-vue/utils.tsx
+index 05ef4f3326a787..60ec884e207bd5 100644
+--- a/static/app/gettingStartedDocs/javascript-vue/utils.tsx
++++ b/static/app/gettingStartedDocs/javascript-vue/utils.tsx
+@@ -147,7 +147,7 @@ function getSentryInitLayout(params: Params, siblingOption: string): string {
+   const config = buildSdkConfig({
+     params,
+     staticParts: [
+-      `${siblingOption === VueVersion.VUE2 ? 'Vue' : 'app'}`,
++      siblingOption === VueVersion.VUE2 ? 'Vue' : 'app',
+       `dsn: "${params.dsn.public}"`,
+       `// Setting this option to true will send default PII data to Sentry.
+       // For example, automatic IP address collection on events
+diff --git a/static/app/gettingStartedDocs/javascript/profiling.tsx b/static/app/gettingStartedDocs/javascript/profiling.tsx
+index 7e0a04ca9c8e20..fd3346ba3567d9 100644
+--- a/static/app/gettingStartedDocs/javascript/profiling.tsx
++++ b/static/app/gettingStartedDocs/javascript/profiling.tsx
+@@ -271,7 +271,7 @@ export const profilingFullStack = <
+         {
+           type: 'text',
+           text: tct('For more information see the [link:node profiling documentation].', {
+-            link: <ExternalLink href={`${nodeProfilingLink}`} />,
++            link: <ExternalLink href={nodeProfilingLink} />,
+           }),
+         },
+       ],
+diff --git a/static/app/gettingStartedDocs/python/featureFlag.tsx b/static/app/gettingStartedDocs/python/featureFlag.tsx
+index da6b56d62c7364..47dc7ad0382204 100644
+--- a/static/app/gettingStartedDocs/python/featureFlag.tsx
++++ b/static/app/gettingStartedDocs/python/featureFlag.tsx
+@@ -146,7 +146,7 @@ export const featureFlag: OnboardingConfig = {
+               featureFlagOptions.integration === FeatureFlagProviderEnum.GENERIC
+                 ? `You don't need an integration for a generic usecase. Simply use this API after initializing Sentry.`
+                 : tct('Add [name] to your integrations list.', {
+-                    name: <code>{`${integrationName}`}</code>,
++                    name: <code>{integrationName}</code>,
+                   }),
+           },
+           {
+diff --git a/static/app/stories/view/storyTree.tsx b/static/app/stories/view/storyTree.tsx
+index 9498b34187d128..ea0830a3dca2da 100644
+--- a/static/app/stories/view/storyTree.tsx
++++ b/static/app/stories/view/storyTree.tsx
+@@ -44,7 +44,7 @@ export class StoryTreeNode {
+           : '';
+       this.slug = `${pathPrefix}${this.label.replaceAll(' ', '-').toLowerCase()}`;
+     } else {
+-      this.slug = `${this.label.replaceAll(' ', '-').toLowerCase()}`;
++      this.slug = this.label.replaceAll(' ', '-').toLowerCase();
+     }
+   }
+ 
+diff --git a/static/app/utils/api/knownSentryApiUrls.generated.ts b/static/app/utils/api/knownSentryApiUrls.generated.ts
+index e6add14bc7a195..67f2ec406a2251 100644
+--- a/static/app/utils/api/knownSentryApiUrls.generated.ts
++++ b/static/app/utils/api/knownSentryApiUrls.generated.ts
+@@ -117,6 +117,7 @@ export type KnownSentryApiUrls =
+   | '/internal/preprod-artifact/rerun-analysis/'
+   | '/internal/project-config/'
+   | '/internal/rpc/$serviceName/$methodName/'
++  | '/internal/scm-rpc/$methodName/'
+   | '/internal/seer-rpc/$methodName/'
+   | '/internal/warnings/'
+   | '/issues/$issueId/'
+diff --git a/static/app/utils/formatters.tsx b/static/app/utils/formatters.tsx
+index 6f8ec3917f87ea..8fbddc520329d2 100644
+--- a/static/app/utils/formatters.tsx
++++ b/static/app/utils/formatters.tsx
+@@ -135,7 +135,7 @@ export function formatRate(
+ 
+   // 0 is special!
+   if (value === 0) {
+-    return `${0}${RATE_UNIT_LABELS[unit]}`;
++    return `0${RATE_UNIT_LABELS[unit]}`;
+   }
+ 
+   const minimumValue = options.minimumValue ?? 0;
+diff --git a/static/app/utils/performance/contexts/metricsEnhancedSetting.tsx b/static/app/utils/performance/contexts/metricsEnhancedSetting.tsx
+index 5c8b6f376ca845..4772a37610a3e6 100644
+--- a/static/app/utils/performance/contexts/metricsEnhancedSetting.tsx
++++ b/static/app/utils/performance/contexts/metricsEnhancedSetting.tsx
+@@ -141,7 +141,7 @@ export function MEPSettingProvider({
+   const shouldQueryProvideMEPTransactionParams =
+     canUseMEP && metricSettingState === MEPState.TRANSACTIONS_ONLY;
+ 
+-  const memoizationKey = `${metricSettingState}`;
++  const memoizationKey = metricSettingState;
+ 
+   return (
+     <_MEPSettingProvider
+diff --git a/static/app/utils/tokenizeSearch.spec.tsx b/static/app/utils/tokenizeSearch.spec.tsx
+index 5071ca9d6f0ab4..55c20e50c34c35 100644
+--- a/static/app/utils/tokenizeSearch.spec.tsx
++++ b/static/app/utils/tokenizeSearch.spec.tsx
+@@ -260,7 +260,9 @@ describe('utils/tokenizeSearch', () => {
+     ];
+ 
+     for (const {name, string, object} of cases) {
+-      it(`${name}`, () => expect(new MutableSearch(string)).toEqual(object));
++      // https://github.com/jest-community/eslint-plugin-jest/issues/1940
++      // eslint-disable-next-line jest/valid-title
++      it(name, () => expect(new MutableSearch(string)).toEqual(object));
+     }
+   });
+ 
+@@ -695,7 +697,9 @@ describe('utils/tokenizeSearch', () => {
+     ];
+ 
+     for (const {name, string, object} of cases) {
+-      it(`${name}`, () => expect(object.formatString()).toEqual(string));
++      // https://github.com/jest-community/eslint-plugin-jest/issues/1940
++      // eslint-disable-next-line jest/valid-title
++      it(name, () => expect(object.formatString()).toEqual(string));
+     }
+   });
+ 
+diff --git a/static/app/views/alerts/rules/issue/index.spec.tsx b/static/app/views/alerts/rules/issue/index.spec.tsx
+index 0b164b4613ea34..808d8d12cfdbbd 100644
+--- a/static/app/views/alerts/rules/issue/index.spec.tsx
++++ b/static/app/views/alerts/rules/issue/index.spec.tsx
+@@ -581,7 +581,7 @@ describe('IssueRuleEditor', () => {
+           location: {
+             query: {
+               createFromDuplicate: 'true',
+-              duplicateRuleId: `${rule.id}`,
++              duplicateRuleId: rule.id,
+             },
+           },
+         },
+@@ -606,7 +606,7 @@ describe('IssueRuleEditor', () => {
+           location: {
+             query: {
+               createFromDuplicate: 'true',
+-              duplicateRuleId: `${rule.id}`,
++              duplicateRuleId: rule.id,
+             },
+           },
+         },
+diff --git a/static/app/views/alerts/rules/issue/index.tsx b/static/app/views/alerts/rules/issue/index.tsx
+index 93d2b9ef1950a2..8e7f6f842ea239 100644
+--- a/static/app/views/alerts/rules/issue/index.tsx
++++ b/static/app/views/alerts/rules/issue/index.tsx
+@@ -1093,7 +1093,7 @@ class IssueRuleEditor extends DeprecatedAsyncComponent<Props, State> {
+               styles={{
+                 container: (provided: Record<string, string | number | boolean>) => ({
+                   ...provided,
+-                  marginBottom: `${space(1)}`,
++                  marginBottom: space(1),
+                 }),
+               }}
+               options={projectOptions}
+diff --git a/static/app/views/alerts/rules/metric/duplicate.spec.tsx b/static/app/views/alerts/rules/metric/duplicate.spec.tsx
+index 8d4fc1a2d6eb53..fdf4624dc850fe 100644
+--- a/static/app/views/alerts/rules/metric/duplicate.spec.tsx
++++ b/static/app/views/alerts/rules/metric/duplicate.spec.tsx
+@@ -83,7 +83,7 @@ describe('MetricRuleDuplicate', () => {
+         location: {
+           query: {
+             createFromDuplicate: 'true',
+-            duplicateRuleId: `${rule.id}`,
++            duplicateRuleId: rule.id,
+           },
+         },
+       },
+@@ -138,7 +138,7 @@ describe('MetricRuleDuplicate', () => {
+         location: {
+           query: {
+             createFromDuplicate: 'true',
+-            duplicateRuleId: `${rule.id}`,
++            duplicateRuleId: rule.id,
+           },
+         },
+       },
+@@ -182,7 +182,7 @@ describe('MetricRuleDuplicate', () => {
+         location: {
+           query: {
+             createFromDuplicate: 'true',
+-            duplicateRuleId: `${ruleWithExtrapolation.id}`,
++            duplicateRuleId: ruleWithExtrapolation.id,
+           },
+         },
+       },
+diff --git a/static/app/views/alerts/rules/metric/eapMetricsField.tsx b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+index 51d779b2764a8e..7c2a5c4396c7c6 100644
+--- a/static/app/views/alerts/rules/metric/eapMetricsField.tsx
++++ b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+@@ -109,7 +109,7 @@ export default function EAPMetricsField({
+     return [
+       ...(shouldIncludeOptionFromTraceMetric ? [optionFromTraceMetric] : []),
+       ...(metricOptionsData?.data?.map(option => ({
+-        label: `${option[TraceMetricKnownFieldKey.METRIC_NAME]}`,
++        label: option[TraceMetricKnownFieldKey.METRIC_NAME],
+         value: makeMetricSelectValue({
+           name: option[TraceMetricKnownFieldKey.METRIC_NAME],
+           type: option[TraceMetricKnownFieldKey.METRIC_TYPE] as TraceMetricTypeValue,
+diff --git a/static/app/views/alerts/rules/metric/ruleConditionsForm.tsx b/static/app/views/alerts/rules/metric/ruleConditionsForm.tsx
+index 72359f1ddc21eb..9aee2fe30f35ed 100644
+--- a/static/app/views/alerts/rules/metric/ruleConditionsForm.tsx
++++ b/static/app/views/alerts/rules/metric/ruleConditionsForm.tsx
+@@ -213,7 +213,7 @@ class RuleConditionsForm extends PureComponent<Props, State> {
+   };
+ 
+   formElemBaseStyle = {
+-    padding: `${space(0.5)}`,
++    padding: space(0.5),
+     border: 'none',
+   };
+ 
+@@ -286,7 +286,7 @@ class RuleConditionsForm extends PureComponent<Props, State> {
+       }),
+       container: (provided: Record<string, string | number | boolean>) => ({
+         ...provided,
+-        margin: `${space(0.5)}`,
++        margin: space(0.5),
+       }),
+     };
+   }
+diff --git a/static/app/views/alerts/rules/metric/ruleNameOwnerForm.tsx b/static/app/views/alerts/rules/metric/ruleNameOwnerForm.tsx
+index 879ee8c7b196bf..28fc1d54703ab0 100644
+--- a/static/app/views/alerts/rules/metric/ruleNameOwnerForm.tsx
++++ b/static/app/views/alerts/rules/metric/ruleNameOwnerForm.tsx
+@@ -91,5 +91,5 @@ const StyledFormField = styled(FormField)<{extraMargin?: boolean}>`
+     width: 100%;
+   }
+ 
+-  margin-bottom: ${p => `${p.extraMargin ? '60px' : p.theme.space.md}`};
++  margin-bottom: ${p => (p.extraMargin ? '60px' : p.theme.space.md)};
+ `;
+diff --git a/static/app/views/alerts/rules/metric/triggers/actionsPanel/index.tsx b/static/app/views/alerts/rules/metric/triggers/actionsPanel/index.tsx
+index 90b487d9f717e8..794b1bad7229d7 100644
+--- a/static/app/views/alerts/rules/metric/triggers/actionsPanel/index.tsx
++++ b/static/app/views/alerts/rules/metric/triggers/actionsPanel/index.tsx
+@@ -113,7 +113,7 @@ const getFullActionTitle = ({
+     if (status && status !== 'published') {
+       return `${sentryAppName} (${status})`;
+     }
+-    return `${sentryAppName}`;
++    return sentryAppName;
+   }
+ 
+   const label = ActionLabel[type];
+diff --git a/static/app/views/alerts/rules/utils.tsx b/static/app/views/alerts/rules/utils.tsx
+index 71bc29c339d242..a904e0ec069b9d 100644
+--- a/static/app/views/alerts/rules/utils.tsx
++++ b/static/app/views/alerts/rules/utils.tsx
+@@ -182,7 +182,7 @@ export function getAlertRuleLogsUrl({
+     }
+   }
+ 
+-  return `${basePath}` + `?${qs.stringify(queryParams, {skipNull: true})}`;
++  return basePath + `?${qs.stringify(queryParams, {skipNull: true})}`;
+ }
+ 
+ export function getAlertRuleMetricsUrl({
+diff --git a/static/app/views/alerts/utils/getMetricRuleDiscoverUrl.tsx b/static/app/views/alerts/utils/getMetricRuleDiscoverUrl.tsx
+index bbeaedf1979021..9616c1fa55a1d6 100644
+--- a/static/app/views/alerts/utils/getMetricRuleDiscoverUrl.tsx
++++ b/static/app/views/alerts/utils/getMetricRuleDiscoverUrl.tsx
+@@ -73,7 +73,7 @@ export function getMetricRuleDiscoverQuery({
+       : [
+           'transaction',
+           'project',
+-          `${rule.aggregate}`,
++          rule.aggregate,
+           'count_unique(user)',
+           `user_misery(${DEFAULT_PROJECT_THRESHOLD})`,
+         ];
+diff --git a/static/app/views/automations/components/actionFilters/assignedTo.tsx b/static/app/views/automations/components/actionFilters/assignedTo.tsx
+index fece0e625f2ed9..74d7ea341a186c 100644
+--- a/static/app/views/automations/components/actionFilters/assignedTo.tsx
++++ b/static/app/views/automations/components/actionFilters/assignedTo.tsx
+@@ -43,7 +43,7 @@ function AssignedToTeam({teamId}: {teamId: string}) {
+ 
+ function AssignedToMember({memberId}: {memberId: number}) {
+   const {data: user} = useUserFromId({id: memberId});
+-  return t('Issue is assigned to member %s', `${user?.email ?? 'unknown'}`);
++  return t('Issue is assigned to member %s', user?.email ?? 'unknown');
+ }
+ 
+ export function AssignedToNode() {
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
+index 4b824596a41d79..d3b9bb144f0ac5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
+@@ -108,7 +108,7 @@ const BIG_NUMBER_ROW_WIDGETS = spaceWidgetsEquallyOnRow(
+       queries: [
+         {
+           name: t('3XX'),
+-          conditions: `${FILTER_STRING}`,
++          conditions: FILTER_STRING,
+           fields: [PERCENTAGE_3XX],
+           aggregates: [PERCENTAGE_3XX],
+           columns: [],
+@@ -126,7 +126,7 @@ const BIG_NUMBER_ROW_WIDGETS = spaceWidgetsEquallyOnRow(
+       queries: [
+         {
+           name: t('4XX'),
+-          conditions: `${FILTER_STRING}`,
++          conditions: FILTER_STRING,
+           fields: [PERCENTAGE_4XX],
+           aggregates: [PERCENTAGE_4XX],
+           columns: [],
+@@ -144,7 +144,7 @@ const BIG_NUMBER_ROW_WIDGETS = spaceWidgetsEquallyOnRow(
+       queries: [
+         {
+           name: t('5XX'),
+-          conditions: `${FILTER_STRING}`,
++          conditions: FILTER_STRING,
+           fields: [PERCENTAGE_5XX],
+           aggregates: [PERCENTAGE_5XX],
+           columns: [],
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
+index c7f043537f5eec..393559d59c27a5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
+@@ -192,7 +192,7 @@ const COLD_START_DEVICE_DISTRIBUTION_WIDGET: Widget = {
+       aggregates: [`avg(${SpanFields.APP_START_COLD})`],
+       columns: [SpanFields.DEVICE_CLASS],
+       conditions: TRANSACTION_OP_CONDITION,
+-      orderby: `${SpanFields.DEVICE_CLASS}`,
++      orderby: SpanFields.DEVICE_CLASS,
+     },
+   ],
+   layout: {
+@@ -219,7 +219,7 @@ const WARM_START_DEVICE_DISTRIBUTION_WIDGET: Widget = {
+       aggregates: [`avg(${SpanFields.APP_START_WARM})`],
+       columns: [SpanFields.DEVICE_CLASS],
+       conditions: TRANSACTION_OP_CONDITION,
+-      orderby: `${SpanFields.DEVICE_CLASS}`,
++      orderby: SpanFields.DEVICE_CLASS,
+     },
+   ],
+   layout: {
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+index 65cdd12992fc60..5762a455132f88 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+@@ -192,7 +192,7 @@ const TTID_BAR_CHART_WIDGET: Widget = {
+       columns: [SpanFields.DEVICE_CLASS],
+       fieldAliases: ['Device Class', 'AVG TTID'],
+       conditions: TRANSACTION_CONDITION,
+-      orderby: `${SpanFields.DEVICE_CLASS}`,
++      orderby: SpanFields.DEVICE_CLASS,
+     },
+   ],
+   layout: {
+@@ -223,7 +223,7 @@ const TTFD_BAR_CHART_WIDGET: Widget = {
+       columns: [SpanFields.DEVICE_CLASS],
+       fieldAliases: ['Device Class', 'AVG TTFD'],
+       conditions: TRANSACTION_CONDITION,
+-      orderby: `${SpanFields.DEVICE_CLASS}`,
++      orderby: SpanFields.DEVICE_CLASS,
+     },
+   ],
+   layout: {
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
+index 2437106f89d350..1bd509f861a8fc 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
+@@ -15,7 +15,9 @@ export const WEB_VITALS_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+     {
+       id: 'score-breakdown-chart',
+       title: t('Score Breakdown'),
+-      description: `${t(`Each Web Vital score contributes a different amount to the total score. Refer to the Performance Score wheel for total contribution.`)}`,
++      description: t(
++        `Each Web Vital score contributes a different amount to the total score. Refer to the Performance Score wheel for total contribution.`
++      ),
+       displayType: DisplayType.AREA,
+       widgetType: WidgetType.SPANS,
+       interval: '5m',
+diff --git a/static/app/views/dashboards/widgetBuilder/components/sortBySelectors.tsx b/static/app/views/dashboards/widgetBuilder/components/sortBySelectors.tsx
+index e73d6f729462cb..d095930112be32 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/sortBySelectors.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/sortBySelectors.tsx
+@@ -73,7 +73,7 @@ export function SortBySelectors({
+   const columnSet = new Set(widgetQuery.columns);
+   const [showCustomEquation, setShowCustomEquation] = useState(false);
+   const [customEquation, setCustomEquation] = useState<Values>({
+-    sortBy: `${EQUATION_PREFIX}`,
++    sortBy: EQUATION_PREFIX,
+     sortDirection: values.sortDirection,
+   });
+   useEffect(() => {
+diff --git a/static/app/views/dashboards/widgetBuilder/releaseWidget/fields.tsx b/static/app/views/dashboards/widgetBuilder/releaseWidget/fields.tsx
+index c01e4d355df1a8..db448623b85a63 100644
+--- a/static/app/views/dashboards/widgetBuilder/releaseWidget/fields.tsx
++++ b/static/app/views/dashboards/widgetBuilder/releaseWidget/fields.tsx
+@@ -334,7 +334,7 @@ export function generateReleaseWidgetFieldOptions(
+     .sort((a, b) => a.localeCompare(b))
+     .forEach(operation => {
+       fieldOptions[`function:${operation}`] = {
+-        label: `${operation}(${'\u2026'})`,
++        label: `${operation}(\u2026)`,
+         value: {
+           kind: FieldValueKind.FUNCTION,
+           meta: {
+diff --git a/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx b/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx
+index 7796f102d2c3e2..086118ebbf1de5 100644
+--- a/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx
++++ b/static/app/views/dashboards/widgetCard/widgetCardContextMenu.tsx
+@@ -306,7 +306,7 @@ export function getMenuOptions(
+         const search = new MutableSearch(baseQuery);
+         for (const group of timeSeries.groupBy ?? []) {
+           if (group.value !== null && !Array.isArray(group.value)) {
+-            search.addFilterValue(group.key, `${group.value}`);
++            search.addFilterValue(group.key, group.value);
+           }
+         }
+ 
+diff --git a/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesLabel.tsx b/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesLabel.tsx
+index 40d9775789930f..980331beaf111d 100644
+--- a/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesLabel.tsx
++++ b/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesLabel.tsx
+@@ -19,7 +19,7 @@ export function formatCategoricalSeriesLabel(series: CategoricalSeries): string
+           return t('(no value)');
+         }
+ 
+-        return `${groupBy.value}`;
++        return groupBy.value;
+       })
+       .join(',');
+   }
+diff --git a/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesName.tsx b/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesName.tsx
+index ba753ea110404d..884153f5a1980d 100644
+--- a/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesName.tsx
++++ b/static/app/views/dashboards/widgets/categoricalSeriesWidget/formatters/formatCategoricalSeriesName.tsx
+@@ -5,7 +5,7 @@ import type {CategoricalSeries} from 'sentry/views/dashboards/widgets/common/typ
+  * Combines valueAxis with groupBy information to create unique series names.
+  */
+ export function formatCategoricalSeriesName(series: CategoricalSeries): string {
+-  let name = `${series.valueAxis}`;
++  let name = series.valueAxis;
+ 
+   if (series.groupBy?.length) {
+     name += ` : ${series.groupBy
+diff --git a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesLabel.tsx b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesLabel.tsx
+index 7075ab0cf836b8..2e665853c1a96a 100644
+--- a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesLabel.tsx
++++ b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesLabel.tsx
+@@ -13,7 +13,7 @@ export function formatTimeSeriesLabel(timeSeries: TimeSeries): string {
+   }
+ 
+   if (timeSeries.groupBy?.length && timeSeries.groupBy.length > 0) {
+-    return `${timeSeries.groupBy
++    return timeSeries.groupBy
+       ?.map(groupBy => {
+         if (Array.isArray(groupBy.value)) {
+           return JSON.stringify(groupBy.value);
+@@ -27,9 +27,9 @@ export function formatTimeSeriesLabel(timeSeries: TimeSeries): string {
+           return t('(no value)');
+         }
+ 
+-        return `${groupBy.value}`;
++        return groupBy.value;
+       })
+-      .join(',')}`;
++      .join(',');
+   }
+ 
+   let {yAxis: seriesName} = timeSeries;
+diff --git a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesName.tsx b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesName.tsx
+index 879a04de8a0bc8..5a650cf19d80ba 100644
+--- a/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesName.tsx
++++ b/static/app/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesName.tsx
+@@ -1,7 +1,7 @@
+ import type {TimeSeries} from 'sentry/views/dashboards/widgets/common/types';
+ 
+ export function formatTimeSeriesName(timeSeries: TimeSeries): string {
+-  let name = `${timeSeries.yAxis}`;
++  let name = timeSeries.yAxis;
+ 
+   if (timeSeries.groupBy?.length) {
+     name += ` : ${timeSeries.groupBy
+diff --git a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+index 0a10282111c3a6..59324a865d1bbe 100644
+--- a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
++++ b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+@@ -113,7 +113,7 @@ export function MetricsVisualize() {
+     return [
+       ...(shouldIncludeOptionFromTraceMetric ? [optionFromTraceMetric] : []),
+       ...(metricOptionsData?.data?.map(option => ({
+-        label: `${option[TraceMetricKnownFieldKey.METRIC_NAME]}`,
++        label: option[TraceMetricKnownFieldKey.METRIC_NAME],
+         value: makeMetricSelectValue({
+           name: option[TraceMetricKnownFieldKey.METRIC_NAME],
+           type: option[TraceMetricKnownFieldKey.METRIC_TYPE] as TraceMetricTypeValue,
+diff --git a/static/app/views/discover/utils.tsx b/static/app/views/discover/utils.tsx
+index 137fb0aece121d..a1ceef3d959c86 100644
+--- a/static/app/views/discover/utils.tsx
++++ b/static/app/views/discover/utils.tsx
+@@ -170,7 +170,7 @@ export function getPrebuiltQueries(organization: Organization) {
+ function disableMacros(value: string | null | boolean | number) {
+   const unsafeCharacterRegex = /^[=+\-@]/;
+ 
+-  if (typeof value === 'string' && `${value}`.match(unsafeCharacterRegex)) {
++  if (typeof value === 'string' && value.match(unsafeCharacterRegex)) {
+     return `'${value}`;
+   }
+ 
+diff --git a/static/app/views/explore/components/toolbar/toolbarVisualize/index.tsx b/static/app/views/explore/components/toolbar/toolbarVisualize/index.tsx
+index 718b8855dc4eed..827b594aef217d 100644
+--- a/static/app/views/explore/components/toolbar/toolbarVisualize/index.tsx
++++ b/static/app/views/explore/components/toolbar/toolbarVisualize/index.tsx
+@@ -35,21 +35,19 @@ export function ToolbarVisualizeHeader() {
+ 
+ interface ToolbarVisualizeDropdownProps {
+   aggregateOptions: Array<SelectOption<SelectKey>>;
+-  canDelete: boolean;
+   fieldOptions: Array<SelectOption<SelectKey>>;
+   onChangeAggregate: (option: SelectOption<SelectKey>) => void;
+   onChangeArgument: (index: number, option: SelectOption<SelectKey>) => void;
+-  onDelete: () => void;
+   parsedFunction: ParsedFunction | null;
+   label?: ReactNode;
+   loading?: boolean;
+   onClose?: () => void;
++  onDelete?: () => void;
+   onSearch?: (search: string) => void;
+ }
+ 
+ export function ToolbarVisualizeDropdown({
+   aggregateOptions,
+-  canDelete,
+   fieldOptions,
+   onChangeAggregate,
+   onChangeArgument,
+@@ -99,7 +97,7 @@ export function ToolbarVisualizeDropdown({
+           loading={loading}
+         />
+       )}
+-      {canDelete ? (
++      {onDelete ? (
+         <Button
+           priority="transparent"
+           icon={<IconDelete />}
+diff --git a/static/app/views/explore/components/toolbar/toolbarVisualize/visualizeEquation.tsx b/static/app/views/explore/components/toolbar/toolbarVisualize/visualizeEquation.tsx
+index dc8815a4ebecff..0598f7ffea2f11 100644
+--- a/static/app/views/explore/components/toolbar/toolbarVisualize/visualizeEquation.tsx
++++ b/static/app/views/explore/components/toolbar/toolbarVisualize/visualizeEquation.tsx
+@@ -20,10 +20,10 @@ import {useExploreSuggestedAttribute} from 'sentry/views/explore/hooks/useExplor
+ import {Visualize} from 'sentry/views/explore/queryParams/visualize';
+ 
+ interface VisualizeEquationProps {
+-  onDelete: () => void;
+   onReplace: (visualize: Visualize) => void;
+   visualize: Visualize;
+   label?: ReactNode;
++  onDelete?: () => void;
+ }
+ 
+ export function VisualizeEquation({
+@@ -94,13 +94,15 @@ export function VisualizeEquation({
+           getSuggestedKey={getSuggestedAttribute}
+         />
+       </Flex>
+-      <Button
+-        priority="transparent"
+-        icon={<IconDelete />}
+-        size="zero"
+-        onClick={onDelete}
+-        aria-label={t('Remove Overlay')}
+-      />
++      {onDelete && (
++        <Button
++          priority="transparent"
++          icon={<IconDelete />}
++          size="zero"
++          onClick={onDelete}
++          aria-label={t('Remove Overlay')}
++        />
++      )}
+     </ToolbarRow>
+   );
+ }
+diff --git a/static/app/views/explore/logs/logsTab.tsx b/static/app/views/explore/logs/logsTab.tsx
+index d074fddfc3ba3d..71434026b55ec9 100644
+--- a/static/app/views/explore/logs/logsTab.tsx
++++ b/static/app/views/explore/logs/logsTab.tsx
+@@ -1,4 +1,4 @@
+-import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
++import {Fragment, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+ 
+ import {Button} from '@sentry/scraps/button';
+ import {TabList, Tabs} from '@sentry/scraps/tabs';
+@@ -21,6 +21,7 @@ import {t} from 'sentry/locale';
+ import {LogsAnalyticsPageSource} from 'sentry/utils/analytics/logsAnalyticsEvent';
+ import {DiscoverDatasets} from 'sentry/utils/discover/types';
+ import {parsePeriodToHours} from 'sentry/utils/duration/parsePeriodToHours';
++import type {AggregationKey} from 'sentry/utils/fields';
+ import {HOUR} from 'sentry/utils/formatters';
+ import {useQueryClient, type InfiniteData} from 'sentry/utils/queryClient';
+ import {useChartInterval} from 'sentry/utils/useChartInterval';
+@@ -112,13 +113,136 @@ function LogsSearchBar({tracesItemSearchQueryBuilderProps}: LogsSearchBarProps)
+   return <TraceItemSearchQueryBuilder {...tracesItemSearchQueryBuilderProps} />;
+ }
+ 
+-export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
++interface LogsSearchSectionProps {
++  datePageFilterProps: DatePageFilterProps;
++  searchBarWidthOffset?: number;
++}
++
++const LogsSearchSection = memo(function LogsSearchSection({
++  datePageFilterProps,
++  searchBarWidthOffset,
++}: LogsSearchSectionProps) {
+   const organization = useOrganization();
+-  const pageFilters = usePageFilters();
+   const logsSearch = useQueryParamsSearch();
+-  const fields = useQueryParamsFields();
++  const logsSearchQuery = logsSearch.formatString();
+   const groupBys = useQueryParamsGroupBys();
+   const mode = useQueryParamsMode();
++  const [interval] = useChartInterval();
++  const visualizes = useQueryParamsVisualizes();
++  const aggregateSortBys = useQueryParamsAggregateSortBys();
++
++  // AI search is gated behind the gen-ai-search-agent-translate feature flag
++  const areAiFeaturesAllowed =
++    !organization?.hideAiFeatures &&
++    organization.features.includes('gen-ai-features') &&
++    organization.features.includes('gen-ai-search-agent-translate');
++
++  const saveAsItems = useSaveAsItems({
++    visualizes,
++    groupBys,
++    interval,
++    mode,
++    search: logsSearch,
++    sortBys: aggregateSortBys,
++  });
++
++  const {
++    attributes: stringAttributes,
++    isLoading: stringAttributesLoading,
++    secondaryAliases: stringSecondaryAliases,
++  } = useLogItemAttributes({}, 'string', HiddenLogSearchFields);
++  const {
++    attributes: numberAttributes,
++    isLoading: numberAttributesLoading,
++    secondaryAliases: numberSecondaryAliases,
++  } = useLogItemAttributes({}, 'number', HiddenLogSearchFields);
++  const {
++    attributes: booleanAttributes,
++    isLoading: booleanAttributesLoading,
++    secondaryAliases: booleanSecondaryAliases,
++  } = useLogItemAttributes({}, 'boolean', HiddenLogSearchFields);
++
++  const {tracesItemSearchQueryBuilderProps, searchQueryBuilderProviderProps} =
++    useLogsSearchQueryBuilderProps({
++      booleanAttributes,
++      numberAttributes,
++      stringAttributes,
++      booleanSecondaryAliases,
++      numberSecondaryAliases,
++      stringSecondaryAliases,
++    });
++
++  const supportedAggregates = useMemo<AggregationKey[]>(() => {
++    return [];
++  }, []);
++
++  return (
++    <SearchQueryBuilderProvider
++      enableAISearch={areAiFeaturesAllowed}
++      aiSearchBadgeType="alpha"
++      {...searchQueryBuilderProviderProps}
++    >
++      <ExploreBodySearch>
++        <Layout.Main width="full">
++          <LogsFilterSection>
++            <StyledPageFilterBar condensed>
++              <ProjectPageFilter />
++              <EnvironmentPageFilter />
++              <DatePageFilter
++                {...datePageFilterProps}
++                searchPlaceholder={t('Custom range: 2h, 4d, 3w')}
++              />
++            </StyledPageFilterBar>
++            <LogsSearchBar
++              tracesItemSearchQueryBuilderProps={tracesItemSearchQueryBuilderProps}
++            />
++            {saveAsItems.length > 0 && (
++              <DropdownMenu
++                items={saveAsItems}
++                trigger={triggerProps => (
++                  <Button
++                    {...triggerProps}
++                    priority="default"
++                    aria-label={t('Save as')}
++                    onClick={e => {
++                      e.stopPropagation();
++                      e.preventDefault();
++
++                      triggerProps.onClick?.(e);
++                    }}
++                  >
++                    {t('Save as')}
++                  </Button>
++                )}
++              />
++            )}
++          </LogsFilterSection>
++          <ExploreSchemaHintsSection>
++            <SchemaHintsList
++              supportedAggregates={supportedAggregates}
++              booleanTags={booleanAttributes}
++              numberTags={numberAttributes}
++              stringTags={stringAttributes}
++              isLoading={
++                numberAttributesLoading ||
++                stringAttributesLoading ||
++                booleanAttributesLoading
++              }
++              exploreQuery={logsSearchQuery}
++              source={SchemaHintsSources.LOGS}
++              searchBarWidthOffset={searchBarWidthOffset}
++            />
++          </ExploreSchemaHintsSection>
++        </Layout.Main>
++      </ExploreBodySearch>
++    </SearchQueryBuilderProvider>
++  );
++});
++
++export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
++  const pageFilters = usePageFilters();
++  const fields = useQueryParamsFields();
++  const mode = useQueryParamsMode();
+   const topEventsLimit = useQueryParamsTopEventsLimit();
+   const queryClient = useQueryClient();
+   const sortBys = useQueryParamsSortBys();
+@@ -128,11 +252,6 @@ export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
+   const tableData = useLogsPageDataQueryResult();
+   const autorefreshEnabled = useLogsAutoRefreshEnabled();
+ 
+-  // AI search is gated behind the gen-ai-search-agent-translate feature flag
+-  const areAiFeaturesAllowed =
+-    !organization?.hideAiFeatures &&
+-    organization.features.includes('gen-ai-features') &&
+-    organization.features.includes('gen-ai-search-agent-translate');
+   const [timeseriesIngestDelay, setTimeseriesIngestDelay] = useState<bigint>(
+     getMaxIngestDelayTimestamp()
+   );
+@@ -169,21 +288,21 @@ export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
+     limit: 50,
+   });
+ 
+-  const {
+-    attributes: stringAttributes,
+-    isLoading: stringAttributesLoading,
+-    secondaryAliases: stringSecondaryAliases,
+-  } = useLogItemAttributes({}, 'string', HiddenLogSearchFields);
+-  const {
+-    attributes: numberAttributes,
+-    isLoading: numberAttributesLoading,
+-    secondaryAliases: numberSecondaryAliases,
+-  } = useLogItemAttributes({}, 'number', HiddenLogSearchFields);
+-  const {
+-    attributes: booleanAttributes,
+-    isLoading: booleanAttributesLoading,
+-    secondaryAliases: booleanSecondaryAliases,
+-  } = useLogItemAttributes({}, 'boolean', HiddenLogSearchFields);
++  const {attributes: stringAttributes} = useLogItemAttributes(
++    {},
++    'string',
++    HiddenLogSearchFields
++  );
++  const {attributes: numberAttributes} = useLogItemAttributes(
++    {},
++    'number',
++    HiddenLogSearchFields
++  );
++  const {attributes: booleanAttributes} = useLogItemAttributes(
++    {},
++    'boolean',
++    HiddenLogSearchFields
++  );
+ 
+   const averageLogsPerSecond = calculateAverageLogsPerSecond(timeseriesResult);
+ 
+@@ -200,20 +319,6 @@ export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
+     aggregateSortBys,
+   });
+ 
+-  const {tracesItemSearchQueryBuilderProps, searchQueryBuilderProviderProps} =
+-    useLogsSearchQueryBuilderProps({
+-      booleanAttributes,
+-      numberAttributes,
+-      stringAttributes,
+-      booleanSecondaryAliases,
+-      numberSecondaryAliases,
+-      stringSecondaryAliases,
+-    });
+-
+-  const supportedAggregates = useMemo(() => {
+-    return [];
+-  }, []);
+-
+   const refreshTable = useCallback(async () => {
+     setTimeseriesIngestDelay(getMaxIngestDelayTimestamp());
+     queryClient.setQueryData(
+@@ -277,15 +382,6 @@ export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
+     [setSidebarOpen, setMode]
+   );
+ 
+-  const saveAsItems = useSaveAsItems({
+-    visualizes,
+-    groupBys,
+-    interval,
+-    mode,
+-    search: logsSearch,
+-    sortBys: aggregateSortBys,
+-  });
+-
+   /**
+    * Manual refresh doesn't work for longer relative periods as it hits cacheing. Only allow manual refresh if the relative period or absolute time range is less than 1 hour.
+    */
+@@ -330,65 +426,11 @@ export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
+   const {infiniteLogsQueryResult} = useLogsPageData();
+ 
+   return (
+-    <SearchQueryBuilderProvider
+-      enableAISearch={areAiFeaturesAllowed}
+-      aiSearchBadgeType="alpha"
+-      {...searchQueryBuilderProviderProps}
+-    >
+-      <ExploreBodySearch>
+-        <Layout.Main width="full">
+-          <LogsFilterSection>
+-            <StyledPageFilterBar condensed>
+-              <ProjectPageFilter />
+-              <EnvironmentPageFilter />
+-              <DatePageFilter
+-                {...datePageFilterProps}
+-                searchPlaceholder={t('Custom range: 2h, 4d, 3w')}
+-              />
+-            </StyledPageFilterBar>
+-            <LogsSearchBar
+-              tracesItemSearchQueryBuilderProps={tracesItemSearchQueryBuilderProps}
+-            />
+-            {saveAsItems.length > 0 && (
+-              <DropdownMenu
+-                items={saveAsItems}
+-                trigger={triggerProps => (
+-                  <Button
+-                    {...triggerProps}
+-                    priority="default"
+-                    aria-label={t('Save as')}
+-                    onClick={e => {
+-                      e.stopPropagation();
+-                      e.preventDefault();
+-
+-                      triggerProps.onClick?.(e);
+-                    }}
+-                  >
+-                    {t('Save as')}
+-                  </Button>
+-                )}
+-              />
+-            )}
+-          </LogsFilterSection>
+-          <ExploreSchemaHintsSection>
+-            <SchemaHintsList
+-              supportedAggregates={supportedAggregates}
+-              booleanTags={booleanAttributes}
+-              numberTags={numberAttributes}
+-              stringTags={stringAttributes}
+-              isLoading={
+-                numberAttributesLoading ||
+-                stringAttributesLoading ||
+-                booleanAttributesLoading
+-              }
+-              exploreQuery={logsSearch.formatString()}
+-              source={SchemaHintsSources.LOGS}
+-              searchBarWidthOffset={columnEditorButtonRef.current?.clientWidth}
+-            />
+-          </ExploreSchemaHintsSection>
+-        </Layout.Main>
+-      </ExploreBodySearch>
+-
++    <Fragment>
++      <LogsSearchSection
++        datePageFilterProps={datePageFilterProps}
++        searchBarWidthOffset={columnEditorButtonRef.current?.clientWidth}
++      />
+       <ExploreBodyContent>
+         <ExploreControlSection expanded={sidebarOpen}>
+           {sidebarOpen ? <LogsToolbar /> : null}
+@@ -482,6 +524,6 @@ export function LogsTabContent({datePageFilterProps}: LogsTabProps) {
+           </LogsItemContainer>
+         </ExploreContentSection>
+       </ExploreBodyContent>
+-    </SearchQueryBuilderProvider>
++    </Fragment>
+   );
+ }
+diff --git a/static/app/views/explore/logs/logsToolbar.tsx b/static/app/views/explore/logs/logsToolbar.tsx
+index 6a411f40ef868c..d5d36689b14a7d 100644
+--- a/static/app/views/explore/logs/logsToolbar.tsx
++++ b/static/app/views/explore/logs/logsToolbar.tsx
+@@ -165,7 +165,7 @@ function ToolbarVisualize() {
+     [setVisualizes, visualizes]
+   );
+ 
+-  const onDelete = useCallback(
++  const handleDelete = useCallback(
+     (group: number) => {
+       const newVisualizes = visualizes.toSpliced(group, 1).map(visualize => {
+         return visualize.serialize();
+@@ -183,11 +183,11 @@ function ToolbarVisualize() {
+       <ToolbarVisualizeHeader />
+       {visualizes.map((visualize, group) => {
+         if (isVisualizeFunction(visualize)) {
++          const onDelete = canDelete ? () => handleDelete(group) : undefined;
+           return (
+             <VisualizeDropdown
+               key={group}
+-              canDelete={canDelete}
+-              onDelete={() => onDelete(group)}
++              onDelete={onDelete}
+               onReplace={newVisualize => replaceOverlay(group, newVisualize)}
+               visualize={visualize}
+               sortedBooleanKeys={sortedBooleanKeys}
+@@ -212,20 +212,18 @@ function ToolbarVisualize() {
+ }
+ 
+ interface VisualizeDropdownProps {
+-  canDelete: boolean;
+   loading: boolean;
+   onClose: () => void;
+-  onDelete: () => void;
+   onReplace: (visualize: Visualize) => void;
+   onSearch: (search: string) => void;
+   sortedBooleanKeys: string[];
+   sortedNumberKeys: string[];
+   sortedStringKeys: string[];
+   visualize: VisualizeFunction;
++  onDelete?: () => void;
+ }
+ 
+ function VisualizeDropdown({
+-  canDelete,
+   loading,
+   onDelete,
+   onReplace,
+@@ -324,7 +322,6 @@ function VisualizeDropdown({
+     <ToolbarVisualizeDropdown
+       aggregateOptions={aggregateOptions}
+       fieldOptions={fieldOptions}
+-      canDelete={canDelete}
+       onChangeAggregate={onChangeAggregate}
+       onChangeArgument={onChangeArgument}
+       onDelete={onDelete}
+diff --git a/static/app/views/explore/logs/useLogsSearchQueryBuilderProps.tsx b/static/app/views/explore/logs/useLogsSearchQueryBuilderProps.tsx
+index aca9f25f1702a7..e6307fd97e81b0 100644
+--- a/static/app/views/explore/logs/useLogsSearchQueryBuilderProps.tsx
++++ b/static/app/views/explore/logs/useLogsSearchQueryBuilderProps.tsx
+@@ -1,4 +1,4 @@
+-import {useCallback} from 'react';
++import {useCallback, useMemo} from 'react';
+ 
+ import {useCaseInsensitivity} from 'sentry/components/searchQueryBuilder/hooks';
+ import type {TagCollection} from 'sentry/types/group';
+@@ -69,22 +69,38 @@ export function useLogsSearchQueryBuilderProps({
+     ]
+   );
+ 
+-  const tracesItemSearchQueryBuilderProps: TraceItemSearchQueryBuilderProps = {
+-    initialQuery: logsSearch.formatString(),
+-    searchSource: 'ourlogs',
+-    onSearch,
+-    booleanAttributes,
+-    numberAttributes,
+-    stringAttributes,
+-    itemType: TraceItemDataset.LOGS as TraceItemDataset.LOGS,
+-    booleanSecondaryAliases,
+-    numberSecondaryAliases,
+-    stringSecondaryAliases,
+-    caseInsensitive,
+-    onCaseInsensitiveClick: setCaseInsensitive,
+-    replaceRawSearchKeys: hasRawSearchReplacement ? ['message'] : undefined,
+-    matchKeySuggestions: [{key: 'trace', valuePattern: /^[0-9a-fA-F]{32}$/}],
+-  };
++  const initialQuery = logsSearch.formatString();
++  const tracesItemSearchQueryBuilderProps = useMemo<TraceItemSearchQueryBuilderProps>(
++    () => ({
++      initialQuery,
++      searchSource: 'ourlogs',
++      onSearch,
++      booleanAttributes,
++      numberAttributes,
++      stringAttributes,
++      itemType: TraceItemDataset.LOGS as TraceItemDataset.LOGS,
++      booleanSecondaryAliases,
++      numberSecondaryAliases,
++      stringSecondaryAliases,
++      caseInsensitive,
++      onCaseInsensitiveClick: setCaseInsensitive,
++      replaceRawSearchKeys: hasRawSearchReplacement ? ['message'] : undefined,
++      matchKeySuggestions: [{key: 'trace', valuePattern: /^[0-9a-fA-F]{32}$/}],
++    }),
++    [
++      booleanAttributes,
++      booleanSecondaryAliases,
++      caseInsensitive,
++      hasRawSearchReplacement,
++      initialQuery,
++      numberAttributes,
++      numberSecondaryAliases,
++      onSearch,
++      setCaseInsensitive,
++      stringAttributes,
++      stringSecondaryAliases,
++    ]
++  );
+ 
+   const searchQueryBuilderProviderProps = useTraceItemSearchQueryBuilderProps(
+     tracesItemSearchQueryBuilderProps
+diff --git a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+index cb810fc8744169..c5d25c5c55b965 100644
+--- a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
++++ b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+@@ -41,7 +41,7 @@ export function MetricSelector({
+   );
+   const optionFromTraceMetric: MetricSelectOption = useMemo(
+     () => ({
+-      label: `${traceMetric.name}`,
++      label: traceMetric.name,
+       value: metricSelectValue,
+       metricType: traceMetric.type as TraceMetricTypeValue,
+       metricUnit: hasMetricUnitsUI ? (traceMetric.unit ?? '-') : undefined,
+@@ -83,7 +83,7 @@ export function MetricSelector({
+     return [
+       ...(shouldIncludeOptionFromTraceMetric ? [optionFromTraceMetric] : []),
+       ...(metricOptionsData?.data?.map(option => ({
+-        label: `${option[TraceMetricKnownFieldKey.METRIC_NAME]}`,
++        label: option[TraceMetricKnownFieldKey.METRIC_NAME],
+         value: makeMetricSelectValue({
+           name: option[TraceMetricKnownFieldKey.METRIC_NAME],
+           type: option[TraceMetricKnownFieldKey.METRIC_TYPE] as TraceMetricTypeValue,
+diff --git a/static/app/views/explore/multiQueryMode/content.tsx b/static/app/views/explore/multiQueryMode/content.tsx
+index 2253c2681cce58..77ea6a3aed05bc 100644
+--- a/static/app/views/explore/multiQueryMode/content.tsx
++++ b/static/app/views/explore/multiQueryMode/content.tsx
+@@ -177,7 +177,7 @@ function Content({datePageFilterProps}: ContentProps) {
+                   triggerProps.onClick?.(e);
+                 }}
+               >
+-                {shouldHighlightSaveButton ? `${t('Save')}` : `${t('Save as')}\u2026`}
++                {shouldHighlightSaveButton ? t('Save') : `${t('Save as')}\u2026`}
+               </Button>
+             )}
+           />
+diff --git a/static/app/views/explore/toolbar/toolbarSaveAs.tsx b/static/app/views/explore/toolbar/toolbarSaveAs.tsx
+index 014731307853f4..a4a734c5462ecf 100644
+--- a/static/app/views/explore/toolbar/toolbarSaveAs.tsx
++++ b/static/app/views/explore/toolbar/toolbarSaveAs.tsx
+@@ -310,7 +310,7 @@ export function ToolbarSaveAs() {
+                   triggerProps.onClick?.(e);
+                 }}
+               >
+-                {shouldHighlightSaveButton ? `${t('Save')}` : `${t('Save as')}\u2026`}
++                {shouldHighlightSaveButton ? t('Save') : `${t('Save as')}\u2026`}
+               </SaveAsButton>
+             )}
+           />
+diff --git a/static/app/views/explore/toolbar/toolbarVisualize.tsx b/static/app/views/explore/toolbar/toolbarVisualize.tsx
+index 13968016d72d96..0a225b5d90daf1 100644
+--- a/static/app/views/explore/toolbar/toolbarVisualize.tsx
++++ b/static/app/views/explore/toolbar/toolbarVisualize.tsx
+@@ -29,7 +29,6 @@ import {useSpanItemAttributes} from 'sentry/views/explore/contexts/traceItemAttr
+ import {useVisualizeFields} from 'sentry/views/explore/hooks/useVisualizeFields';
+ import {
+   isVisualizeEquation,
+-  isVisualizeFunction,
+   MAX_VISUALIZES,
+   Visualize,
+   VisualizeEquation,
+@@ -89,7 +88,7 @@ export function ToolbarVisualize({
+     [setVisualizes, visualizes]
+   );
+ 
+-  const onDelete = useCallback(
++  const handleOnDelete = useCallback(
+     (group: number) => {
+       const newVisualizes = visualizes
+         .toSpliced(group, 1)
+@@ -99,8 +98,6 @@ export function ToolbarVisualize({
+     [setVisualizes, visualizes]
+   );
+ 
+-  const canDelete = visualizes.filter(isVisualizeFunction).length > 1;
+-
+   return (
+     <ToolbarSection data-test-id="section-visualizes">
+       <ToolbarVisualizeHeader />
+@@ -112,12 +109,13 @@ export function ToolbarVisualize({
+             onClick={() => toggleVisibility(group)}
+           />
+         );
++        const onDelete = visualizes.length > 1 ? () => handleOnDelete(group) : undefined;
+ 
+         if (isVisualizeEquation(visualize)) {
+           return (
+             <VisualizeEquationInput
+               key={group}
+-              onDelete={() => onDelete(group)}
++              onDelete={onDelete}
+               onReplace={newVisualize => replaceOverlay(group, newVisualize)}
+               visualize={visualize}
+               label={label}
+@@ -128,8 +126,7 @@ export function ToolbarVisualize({
+         return (
+           <ToolbarVisualizeItem
+             key={group}
+-            canDelete={canDelete}
+-            onDelete={() => onDelete(group)}
++            onDelete={onDelete}
+             onReplace={newVisualize => replaceOverlay(group, newVisualize)}
+             visualize={visualize}
+             label={label}
+@@ -153,15 +150,13 @@ export function ToolbarVisualize({
+ }
+ 
+ interface VisualizeDropdownProps {
+-  canDelete: boolean;
+   label: ReactNode;
+-  onDelete: () => void;
+   onReplace: (visualize: Visualize) => void;
+   visualize: Visualize;
++  onDelete?: () => void;
+ }
+ 
+ function ToolbarVisualizeItem({
+-  canDelete,
+   label,
+   onDelete,
+   onReplace,
+@@ -239,7 +234,6 @@ function ToolbarVisualizeItem({
+     <ToolbarVisualizeDropdown
+       aggregateOptions={aggregateOptions}
+       fieldOptions={fieldOptions}
+-      canDelete={canDelete}
+       onChangeAggregate={onChangeAggregate}
+       onChangeArgument={onChangeArgument}
+       onDelete={onDelete}
+diff --git a/static/app/views/insights/pages/agents/components/llmCallsWidget.tsx b/static/app/views/insights/pages/agents/components/llmCallsWidget.tsx
+index 7264d28353098b..f786468888d7e8 100644
+--- a/static/app/views/insights/pages/agents/components/llmCallsWidget.tsx
++++ b/static/app/views/insights/pages/agents/components/llmCallsWidget.tsx
+@@ -109,7 +109,7 @@ export default function LLMCallsWidget() {
+   const footer = hasData && (
+     <WidgetFooterTable>
+       {models?.map((item, index) => {
+-        const modelId = `${item['gen_ai.request.model']}`;
++        const modelId = item['gen_ai.request.model'];
+         return (
+           <Fragment key={modelId}>
+             <div>
+diff --git a/static/app/views/insights/pages/agents/components/modelsTable.tsx b/static/app/views/insights/pages/agents/components/modelsTable.tsx
+index a1ac9e86d0c723..bded061d396f58 100644
+--- a/static/app/views/insights/pages/agents/components/modelsTable.tsx
++++ b/static/app/views/insights/pages/agents/components/modelsTable.tsx
+@@ -126,7 +126,7 @@ export function ModelsTable() {
+     }
+ 
+     return modelsRequest.data.map(span => ({
+-      model: `${span['gen_ai.request.model']}`,
++      model: span['gen_ai.request.model'],
+       requests: span['count()'] ?? 0,
+       avg: span['avg(span.duration)'] ?? 0,
+       p95: span['p95(span.duration)'] ?? 0,
+diff --git a/static/app/views/insights/pages/agents/components/toolsTable.tsx b/static/app/views/insights/pages/agents/components/toolsTable.tsx
+index 21956ff60c6a11..4526aeb19db3a7 100644
+--- a/static/app/views/insights/pages/agents/components/toolsTable.tsx
++++ b/static/app/views/insights/pages/agents/components/toolsTable.tsx
+@@ -95,7 +95,7 @@ export function ToolsTable() {
+     }
+ 
+     return toolsRequest.data.map(span => ({
+-      tool: `${span['gen_ai.tool.name']}`,
++      tool: span['gen_ai.tool.name'],
+       requests: Number(span['count()']),
+       avg: Number(span['avg(span.duration)']),
+       p95: Number(span['p95(span.duration)']),
+diff --git a/static/app/views/insights/pages/platform/nextjs/serverTree.tsx b/static/app/views/insights/pages/platform/nextjs/serverTree.tsx
+index ca3f52a0db3253..7e904637235ca5 100644
+--- a/static/app/views/insights/pages/platform/nextjs/serverTree.tsx
++++ b/static/app/views/insights/pages/platform/nextjs/serverTree.tsx
+@@ -339,7 +339,7 @@ function TreeNodeRenderer({
+                 showUnderline={!exploreLink}
+                 body={
+                   <OneLineCodeBlock>
+-                    <code>{`${itemPath.join('/')}`}</code>
++                    <code>{itemPath.join('/')}</code>
+                     <Button
+                       size="zero"
+                       priority="transparent"
+diff --git a/static/app/views/integrationPipeline/githubInstallationSelect.tsx b/static/app/views/integrationPipeline/githubInstallationSelect.tsx
+index a00d0448408d16..51339f49b6e123 100644
+--- a/static/app/views/integrationPipeline/githubInstallationSelect.tsx
++++ b/static/app/views/integrationPipeline/githubInstallationSelect.tsx
+@@ -126,7 +126,7 @@ export function GithubInstallationSelect({
+               name={installation.github_account}
+             />
+           )}
+-          <span>{`${installation.github_account}`}</span>
++          <span>{installation.github_account}</span>
+           {!doesntRequireUpgrade(installation.installation_id) && (
+             <IconLightning size="xs" />
+           )}
+diff --git a/static/app/views/issueDetails/groupEventAttachments/useGroupEventAttachments.tsx b/static/app/views/issueDetails/groupEventAttachments/useGroupEventAttachments.tsx
+index 2a81a73ffdb283..2101467af110b7 100644
+--- a/static/app/views/issueDetails/groupEventAttachments/useGroupEventAttachments.tsx
++++ b/static/app/views/issueDetails/groupEventAttachments/useGroupEventAttachments.tsx
+@@ -49,9 +49,7 @@ interface GroupEventAttachmentsQuery {
+   screenshot?: '1';
+   start?: DateString;
+   statsPeriod?: string;
+-  types?:
+-    | `${GroupEventAttachmentsTypeFilter}`
+-    | Array<`${GroupEventAttachmentsTypeFilter}`>;
++  types?: GroupEventAttachmentsTypeFilter | GroupEventAttachmentsTypeFilter[];
+ }
+ 
+ export const makeFetchGroupEventAttachmentsQueryKey = ({
+diff --git a/static/app/views/issueDetails/groupReplays/groupReplays.tsx b/static/app/views/issueDetails/groupReplays/groupReplays.tsx
+index 6c0cf51c374b57..913ecb242b3346 100644
+--- a/static/app/views/issueDetails/groupReplays/groupReplays.tsx
++++ b/static/app/views/issueDetails/groupReplays/groupReplays.tsx
+@@ -305,7 +305,7 @@ function ReplayOverlay({
+ 
+   const nextReplay = replays?.[selectedReplayIndex + 1];
+   const nextReplayText = nextReplay?.id
+-    ? `${nextReplay.user.display_name || t('Anonymous User')}`
++    ? nextReplay.user.display_name || t('Anonymous User')
+     : undefined;
+ 
+   if (!nextReplayText || !replayCount) {
+diff --git a/static/app/views/issueDetails/header.spec.tsx b/static/app/views/issueDetails/header.spec.tsx
+index e50ae32e2a87c1..e3510d22a08773 100644
+--- a/static/app/views/issueDetails/header.spec.tsx
++++ b/static/app/views/issueDetails/header.spec.tsx
+@@ -67,7 +67,7 @@ describe('GroupHeader', () => {
+         expect(router.location.query).toEqual({});
+       };
+ 
+-      expectLocation(`${baseUrl}`);
++      expectLocation(baseUrl);
+ 
+       await userEvent.click(screen.getByRole('tab', {name: /activity/i}));
+       expectLocation(`${baseUrl}activity/`);
+@@ -91,7 +91,7 @@ describe('GroupHeader', () => {
+       expectLocation(`${baseUrl}replays/`);
+ 
+       await userEvent.click(screen.getByRole('tab', {name: /details/i}));
+-      expectLocation(`${baseUrl}`);
++      expectLocation(baseUrl);
+ 
+       expect(screen.getByRole('tab', {name: /replays/i})).toBeInTheDocument();
+     });
+@@ -190,7 +190,7 @@ describe('GroupHeader', () => {
+         expect(router.location.query).toEqual({});
+       };
+ 
+-      expectLocation(`${baseUrl}`);
++      expectLocation(baseUrl);
+ 
+       await userEvent.click(screen.getByRole('tab', {name: /tags/i}));
+       expectLocation(`${baseUrl}distributions/`);
+diff --git a/static/app/views/nav/secondary/sections/prevent/preventSecondaryNav.tsx b/static/app/views/nav/secondary/sections/prevent/preventSecondaryNav.tsx
+index e5e8b732cfbb1a..2d6d0117721943 100644
+--- a/static/app/views/nav/secondary/sections/prevent/preventSecondaryNav.tsx
++++ b/static/app/views/nav/secondary/sections/prevent/preventSecondaryNav.tsx
+@@ -45,7 +45,7 @@ export default function PreventSecondaryNav() {
+         </SecondaryNav.Section>
+         <Feature features={['prevent-test-analytics']}>
+           <SecondaryNav.Section id="prevent-configure" title={t('Configure')}>
+-            <SecondaryNav.Item to={`${tokensPathName}`} activeTo={tokensPathName}>
++            <SecondaryNav.Item to={tokensPathName} activeTo={tokensPathName}>
+               {t('Tokens')}
+             </SecondaryNav.Item>
+           </SecondaryNav.Section>
+diff --git a/static/app/views/performance/newTraceDetails/traceContextVitals.tsx b/static/app/views/performance/newTraceDetails/traceContextVitals.tsx
+index 7cb48ce4d2af08..561bdeb6a83f8d 100644
+--- a/static/app/views/performance/newTraceDetails/traceContextVitals.tsx
++++ b/static/app/views/performance/newTraceDetails/traceContextVitals.tsx
+@@ -81,7 +81,7 @@ export function TraceContextVitals({rootEventResults, tree, containerWidth}: Pro
+         return (
+           <div key={vitalKey}>
+             <strong>
+-              {`${vitalDetails.acronym ? vitalDetails.acronym : vitalDetails.name}`}:
++              {vitalDetails.acronym ? vitalDetails.acronym : vitalDetails.name}:
+             </strong>{' '}
+             <span>{formattedValue}</span>
+             {vital?.score !== undefined &&
+@@ -144,7 +144,7 @@ function VitalPill({vital, vitalDetails}: VitalPillProps) {
+   return (
+     <Flex>
+       <VitalPillName status={status}>
+-        <Tooltip title={toolTipTitle}>{`${acronym}`}</Tooltip>
++        <Tooltip title={toolTipTitle}>{acronym}</Tooltip>
+       </VitalPillName>
+       <VitalPillValue>{formattedMeterValueText}</VitalPillValue>
+     </Flex>
+diff --git a/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/aiInput.tsx b/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/aiInput.tsx
+index 5104fa7cf94ea5..d7785045a84e4d 100644
+--- a/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/aiInput.tsx
++++ b/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/aiInput.tsx
+@@ -118,14 +118,7 @@ function parseAIMessages(messages: string): AIMessage[] | string {
+         (message): message is Exclude<typeof message, null> =>
+           message !== null && Boolean(message.content)
+       );
+-  } catch (error) {
+-    try {
+-      Sentry.captureException(
+-        new Error('Error parsing ai.prompt.messages', {cause: error})
+-      );
+-    } catch {
+-      // ignore errors with browsers that don't support `cause`
+-    }
++  } catch {
+     return messages;
+   }
+ }
+@@ -157,14 +150,7 @@ function transformInputMessages(inputMessages: string): {
+       result: JSON.stringify(result),
+       fixedInvalidJson,
+     };
+-  } catch (error) {
+-    try {
+-      Sentry.captureException(
+-        new Error('Error parsing ai.input_messages', {cause: error})
+-      );
+-    } catch {
+-      // ignore errors with browsers that don't support `cause`
+-    }
++  } catch {
+     return {
+       result: undefined,
+       fixedInvalidJson: false,
+@@ -197,12 +183,7 @@ function transformPrompt(prompt: string): {
+       result: JSON.stringify(result),
+       fixedInvalidJson,
+     };
+-  } catch (error) {
+-    try {
+-      Sentry.captureException(new Error('Error parsing ai.prompt', {cause: error}));
+-    } catch {
+-      // ignore errors with browsers that don't support `cause`
+-    }
++  } catch {
+     return {
+       result: undefined,
+       fixedInvalidJson: false,
+@@ -265,14 +246,7 @@ export function transformPartsMessages(messages: string): {
+       result: JSON.stringify(transformed),
+       fixedInvalidJson,
+     };
+-  } catch (error) {
+-    try {
+-      Sentry.captureException(
+-        new Error('Error parsing gen_ai messages with parts format', {cause: error})
+-      );
+-    } catch {
+-      // ignore errors with browsers that don't support `cause`
+-    }
++  } catch {
+     return {
+       result: undefined,
+       fixedInvalidJson: false,
+diff --git a/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/description.tsx b/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/description.tsx
+index 359e345e5ce6f5..eac66ab7d47189 100644
+--- a/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/description.tsx
++++ b/static/app/views/performance/newTraceDetails/traceDrawer/details/span/eapSections/description.tsx
+@@ -109,9 +109,7 @@ export function SpanDescription({
+ 
+   const actions = exploreAttributeValue ? (
+     <BodyContentWrapper
+-      padding={
+-        resolvedModule === ModuleName.DB ? `${space(1)} ${space(2)}` : `${space(1)}`
+-      }
++      padding={resolvedModule === ModuleName.DB ? `${space(1)} ${space(2)}` : space(1)}
+     >
+       {node.value.is_transaction ? (
+         <StyledLink
+diff --git a/static/app/views/performance/newTraceDetails/traceDrawer/details/span/sections/description.tsx b/static/app/views/performance/newTraceDetails/traceDrawer/details/span/sections/description.tsx
+index 76c010efcf2a0a..93b3d2ea28bd5d 100644
+--- a/static/app/views/performance/newTraceDetails/traceDrawer/details/span/sections/description.tsx
++++ b/static/app/views/performance/newTraceDetails/traceDrawer/details/span/sections/description.tsx
+@@ -103,9 +103,7 @@ export function SpanDescription({
+ 
+   const actions = showAction ? (
+     <BodyContentWrapper
+-      padding={
+-        resolvedModule === ModuleName.DB ? `${space(1)} ${space(2)}` : `${space(1)}`
+-      }
++      padding={resolvedModule === ModuleName.DB ? `${space(1)} ${space(2)}` : space(1)}
+     >
+       <SpanSummaryLink
+         op={span.op}
+diff --git a/static/app/views/performance/newTraceDetails/traceDrawer/details/utils.tsx b/static/app/views/performance/newTraceDetails/traceDrawer/details/utils.tsx
+index 2e35ea2e5e4e40..76b1b2910e4248 100644
+--- a/static/app/views/performance/newTraceDetails/traceDrawer/details/utils.tsx
++++ b/static/app/views/performance/newTraceDetails/traceDrawer/details/utils.tsx
+@@ -66,7 +66,7 @@ export function getSearchInExploreTarget(
+   if (kind === TraceDrawerActionKind.INCLUDE) {
+     search.setFilterValues(key, [value]);
+   } else if (kind === TraceDrawerActionKind.EXCLUDE) {
+-    search.setFilterValues(`!${key}`, [`${value}`]);
++    search.setFilterValues(`!${key}`, [value]);
+   } else if (kind === TraceDrawerActionKind.GREATER_THAN) {
+     search.setFilterValues(key, [`>${value}`]);
+   } else {
+diff --git a/static/app/views/performance/newTraceDetails/traceDrawer/traceDrawer.tsx b/static/app/views/performance/newTraceDetails/traceDrawer/traceDrawer.tsx
+index ab7c08ac0adbcb..e2127365d40396 100644
+--- a/static/app/views/performance/newTraceDetails/traceDrawer/traceDrawer.tsx
++++ b/static/app/views/performance/newTraceDetails/traceDrawer/traceDrawer.tsx
+@@ -291,11 +291,11 @@ export function TraceDrawer(props: TraceDrawerProps) {
+         props.traceGridRef.style.gridTemplateRows = `1fr minmax(${minimizedBottomDrawerSize}px, 0%)`;
+         size.current = minimizedBottomDrawerSize;
+       } else if (traceStateRef.current.preferences.layout === 'drawer left') {
+-        props.traceGridRef.style.gridTemplateColumns = `minmax(${0}px, 0%) 1fr`;
++        props.traceGridRef.style.gridTemplateColumns = `minmax(0px, 0%) 1fr`;
+         props.traceGridRef.style.gridTemplateRows = '1fr auto';
+         size.current = 0;
+       } else {
+-        props.traceGridRef.style.gridTemplateColumns = `1fr minmax(${0}px, 0%)`;
++        props.traceGridRef.style.gridTemplateColumns = `1fr minmax(0px, 0%)`;
+         props.traceGridRef.style.gridTemplateRows = '1fr auto';
+         size.current = 0;
+       }
+diff --git a/static/app/views/performance/newTraceDetails/traceOurlogs.tsx b/static/app/views/performance/newTraceDetails/traceOurlogs.tsx
+index 33cd8a1888664a..5fe91744591961 100644
+--- a/static/app/views/performance/newTraceDetails/traceOurlogs.tsx
++++ b/static/app/views/performance/newTraceDetails/traceOurlogs.tsx
+@@ -2,13 +2,20 @@ import type React from 'react';
+ import {Fragment} from 'react';
+ import styled from '@emotion/styled';
+ 
++import {LinkButton} from '@sentry/scraps/button';
++import {Flex} from '@sentry/scraps/layout';
++
++import usePageFilters from 'sentry/components/pageFilters/usePageFilters';
+ import Panel from 'sentry/components/panels/panel';
+ import {SearchQueryBuilder} from 'sentry/components/searchQueryBuilder';
+ import {t} from 'sentry/locale';
+ import {LogsAnalyticsPageSource} from 'sentry/utils/analytics/logsAnalyticsEvent';
++import useOrganization from 'sentry/utils/useOrganization';
+ import {LogsPageDataProvider} from 'sentry/views/explore/contexts/logs/logsPageData';
++import {useLogsFrozenTraceIds} from 'sentry/views/explore/logs/logsFrozenContext';
+ import {LogsQueryParamsProvider} from 'sentry/views/explore/logs/logsQueryParamsProvider';
+ import {LogsInfiniteTable} from 'sentry/views/explore/logs/tables/logsInfiniteTable';
++import {adjustLogTraceID, getLogsUrl} from 'sentry/views/explore/logs/utils';
+ import {
+   useQueryParamsSearch,
+   useSetQueryParamsQuery,
+@@ -51,19 +58,32 @@ function LogsSectionContent({
+ }: {
+   scrollContainer: React.RefObject<HTMLDivElement | null>;
+ }) {
++  const organization = useOrganization();
++  const {selection} = usePageFilters();
++  const traceIds = useLogsFrozenTraceIds();
+   const setLogsQuery = useSetQueryParamsQuery();
+   const logsSearch = useQueryParamsSearch();
+ 
++  const traceId = traceIds?.[0] && adjustLogTraceID(traceIds[0]);
++  const logsUrl = getLogsUrl({
++    organization,
++    selection,
++    query: traceId ? `trace:${traceId}` : undefined,
++  });
++
+   return (
+     <Fragment>
+-      <SearchQueryBuilder
+-        placeholder={t('Search logs for this event')}
+-        filterKeys={{}}
+-        getTagValues={() => new Promise<string[]>(() => [])}
+-        initialQuery={logsSearch.formatString()}
+-        searchSource="ourlogs"
+-        onSearch={query => setLogsQuery(query)}
+-      />
++      <Flex gap="lg">
++        <SearchQueryBuilder
++          placeholder={t('Search logs for this event')}
++          filterKeys={{}}
++          getTagValues={() => new Promise<string[]>(() => [])}
++          initialQuery={logsSearch.formatString()}
++          searchSource="ourlogs"
++          onSearch={query => setLogsQuery(query)}
++        />
++        <LinkButton to={logsUrl}>{t('Open in Logs')}</LinkButton>
++      </Flex>
+       <TableContainer>
+         <LogsInfiniteTable embedded scrollContainer={scrollContainer} />
+       </TableContainer>
+diff --git a/static/app/views/performance/newTraceDetails/traceSearch/traceSearchInput.tsx b/static/app/views/performance/newTraceDetails/traceSearch/traceSearchInput.tsx
+index 29a9ede0b7a657..d731e07ee389ff 100644
+--- a/static/app/views/performance/newTraceDetails/traceSearch/traceSearchInput.tsx
++++ b/static/app/views/performance/newTraceDetails/traceSearch/traceSearchInput.tsx
+@@ -237,16 +237,14 @@ export function TraceSearchInput(props: TraceSearchInputProps) {
+       />
+       <InputGroup.TrailingItems>
+         <StyledTrailingText data-test-id="trace-search-result-iterator">
+-          {`${
+-            traceState.search.query && !traceState.search.results?.length
+-              ? t('no results')
+-              : traceState.search.query
+-                ? (traceState.search.resultIteratorIndex === null
+-                    ? '-'
+-                    : traceState.search.resultIteratorIndex + 1) +
+-                  `/${traceState.search.results?.length ?? 0}`
+-                : ''
+-          }`}
++          {traceState.search.query && !traceState.search.results?.length
++            ? t('no results')
++            : traceState.search.query
++              ? (traceState.search.resultIteratorIndex === null
++                  ? '-'
++                  : traceState.search.resultIteratorIndex + 1) +
++                `/${traceState.search.results?.length ?? 0}`
++              : ''}
+         </StyledTrailingText>
+         {traceState.search.query ? (
+           <Fragment>
+diff --git a/static/app/views/projectDetail/projectIssues.tsx b/static/app/views/projectDetail/projectIssues.tsx
+index eb95f81d3fa3c1..3be5a04a551527 100644
+--- a/static/app/views/projectDetail/projectIssues.tsx
++++ b/static/app/views/projectDetail/projectIssues.tsx
+@@ -82,11 +82,11 @@ function ProjectIssues({organization, location, projectId, query, api}: Props) {
+       return `${issuesCountPath}?${qs.stringify(queryParameters)}`;
+     };
+     const params = [
+-      `${IssuesQuery.NEW}`,
+-      `${IssuesQuery.ALL}`,
+-      `${IssuesQuery.RESOLVED}`,
+-      `${IssuesQuery.UNHANDLED}`,
+-      `${IssuesQuery.REGRESSED}`,
++      IssuesQuery.NEW,
++      IssuesQuery.ALL,
++      IssuesQuery.RESOLVED,
++      IssuesQuery.UNHANDLED,
++      IssuesQuery.REGRESSED,
+     ];
+     const queryParams = params.map(param => param);
+     const queryParameters = {
+@@ -106,11 +106,11 @@ function ProjectIssues({organization, location, projectId, query, api}: Props) {
+     try {
+       const data = await api.requestPromise(issueCountEndpoint);
+       setIssuesCount({
+-        all: data[`${IssuesQuery.ALL}`] || 0,
+-        new: data[`${IssuesQuery.NEW}`] || 0,
+-        resolved: data[`${IssuesQuery.RESOLVED}`] || 0,
+-        unhandled: data[`${IssuesQuery.UNHANDLED}`] || 0,
+-        regressed: data[`${IssuesQuery.REGRESSED}`] || 0,
++        all: data[IssuesQuery.ALL] || 0,
++        new: data[IssuesQuery.NEW] || 0,
++        resolved: data[IssuesQuery.RESOLVED] || 0,
++        unhandled: data[IssuesQuery.UNHANDLED] || 0,
++        regressed: data[IssuesQuery.REGRESSED] || 0,
+       });
+     } catch {
+       // do nothing
+@@ -170,7 +170,7 @@ function ProjectIssues({organization, location, projectId, query, api}: Props) {
+   const issueQuery = (Object.values(IssuesType) as string[]).includes(issuesType)
+     ? // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+       [`${IssuesQuery[issuesType.toUpperCase()]}`, query].join(' ').trim()
+-    : [`${IssuesQuery.ALL}`, query].join(' ').trim();
++    : [IssuesQuery.ALL, query].join(' ').trim();
+ 
+   const queryParams = {
+     limit: 5,
+diff --git a/static/app/views/projectInstall/createProject.tsx b/static/app/views/projectInstall/createProject.tsx
+index b47ab2eda2bea4..b4fb6886d1f1e9 100644
+--- a/static/app/views/projectInstall/createProject.tsx
++++ b/static/app/views/projectInstall/createProject.tsx
+@@ -311,12 +311,8 @@ export function CreateProject() {
+ 
+         addSuccessMessage(
+           team
+-            ? t('Created project %s', `${project.slug}`)
+-            : t(
+-                'Created %s under new team %s',
+-                `${project.slug}`,
+-                `#${project.team.slug}`
+-              )
++            ? t('Created project %s', project.slug)
++            : t('Created %s under new team %s', project.slug, `#${project.team.slug}`)
+         );
+ 
+         setCreatedProject({
+@@ -338,7 +334,7 @@ export function CreateProject() {
+           )
+         );
+       } catch (error: any) {
+-        addErrorMessage(t('Failed to create project %s', `${projectName}`));
++        addErrorMessage(t('Failed to create project %s', projectName));
+ 
+         if (error.status === 403) {
+           Sentry.withScope(scope => {
+diff --git a/static/app/views/replays/list/replayIndexTimestampPrefPicker.tsx b/static/app/views/replays/list/replayIndexTimestampPrefPicker.tsx
+index 37de770443d495..b145abdfccfd31 100644
+--- a/static/app/views/replays/list/replayIndexTimestampPrefPicker.tsx
++++ b/static/app/views/replays/list/replayIndexTimestampPrefPicker.tsx
+@@ -17,7 +17,7 @@ export default function ReplayIndexTimestampPrefPicker() {
+           key: t('Timestamps'),
+           label: t('Timestamps'),
+           options: REPLAY_TIMESTAMP_OPTIONS.map(option => ({
+-            label: `${toTitleCase(option)}`,
++            label: toTitleCase(option),
+             value: option,
+             key: option,
+           })),
+diff --git a/static/app/views/settings/account/accountSecurity/index.tsx b/static/app/views/settings/account/accountSecurity/index.tsx
+index df7a6594c43938..e6683a36cda492 100644
+--- a/static/app/views/settings/account/accountSecurity/index.tsx
++++ b/static/app/views/settings/account/accountSecurity/index.tsx
+@@ -91,7 +91,7 @@ export default function AccountSecurity() {
+           <TabsContainer>
+             <Tabs value={activeTab}>
+               <TabList>
+-                <TabList.Item key="settings" to={`${routePrefix}`}>
++                <TabList.Item key="settings" to={routePrefix}>
+                   {t('Settings')}
+                 </TabList.Item>
+                 <TabList.Item key="sessionHistory" to={`${routePrefix}session-history/`}>
+diff --git a/static/app/views/settings/account/accountSecurity/sessionHistory/index.tsx b/static/app/views/settings/account/accountSecurity/sessionHistory/index.tsx
+index dc59d2d1386f03..65ea00f4048341 100644
+--- a/static/app/views/settings/account/accountSecurity/sessionHistory/index.tsx
++++ b/static/app/views/settings/account/accountSecurity/sessionHistory/index.tsx
+@@ -64,7 +64,7 @@ export default function SessionHistory() {
+           <TabsContainer>
+             <Tabs value={activeTab}>
+               <TabList>
+-                <TabList.Item key="settings" to={`${routePrefix}`}>
++                <TabList.Item key="settings" to={routePrefix}>
+                   {t('Settings')}
+                 </TabList.Item>
+                 <TabList.Item key="sessionHistory" to={`${routePrefix}session-history/`}>
+diff --git a/static/app/views/settings/account/notifications/notificationSettingsByEntity.tsx b/static/app/views/settings/account/notifications/notificationSettingsByEntity.tsx
+index 55cd0978b4c504..2019465515a6d2 100644
+--- a/static/app/views/settings/account/notifications/notificationSettingsByEntity.tsx
++++ b/static/app/views/settings/account/notifications/notificationSettingsByEntity.tsx
+@@ -134,7 +134,7 @@ function NotificationSettingsByEntity({
+       option => option.type === notificationType && option.scopeType === entityType
+     );
+     return matchedOptions.map(option => {
+-      const entity = entityById[`${option.scopeIdentifier}`];
++      const entity = entityById[option.scopeIdentifier];
+       if (!entity) {
+         return null;
+       }
+diff --git a/static/app/views/settings/organizationIntegrations/installedIntegration.tsx b/static/app/views/settings/organizationIntegrations/installedIntegration.tsx
+index 3eb915e4cc8f8d..b685c802da14c5 100644
+--- a/static/app/views/settings/organizationIntegrations/installedIntegration.tsx
++++ b/static/app/views/settings/organizationIntegrations/installedIntegration.tsx
+@@ -225,15 +225,15 @@ function IntegrationStatus(
+   const inner = (
+     <div {...p}>
+       <CircleIndicator size={6} color={color} />
+-      <IntegrationStatusText data-test-id="integration-status">{`${
+-        status === 'active'
++      <IntegrationStatusText data-test-id="integration-status">
++        {status === 'active'
+           ? t('enabled')
+           : status === 'pending_deletion'
+             ? t('pending deletion')
+             : status === 'disabled'
+               ? t('disabled')
+-              : t('unknown')
+-      }`}</IntegrationStatusText>
++              : t('unknown')}
++      </IntegrationStatusText>
+     </div>
+   );
+   return hideTooltip ? (
+diff --git a/static/app/views/settings/organizationIntegrations/integrationExternalUserMappings.tsx b/static/app/views/settings/organizationIntegrations/integrationExternalUserMappings.tsx
+index a2f6d3e3b4da7f..40296fb9c08f6a 100644
+--- a/static/app/views/settings/organizationIntegrations/integrationExternalUserMappings.tsx
++++ b/static/app/views/settings/organizationIntegrations/integrationExternalUserMappings.tsx
+@@ -112,7 +112,7 @@ function IntegrationExternalUserMappings(props: Props) {
+     return membersList
+       .filter(member => member.user)
+       .map(({user, email, name}) => {
+-        const label = email === name ? `${email}` : `${name} - ${email}`;
++        const label = email === name ? email : `${name} - ${email}`;
+         return {id: user?.id!, name: label};
+       });
+   };
+diff --git a/static/app/views/settings/organizationIntegrations/sentryAppDetailedView.spec.tsx b/static/app/views/settings/organizationIntegrations/sentryAppDetailedView.spec.tsx
+index a5a282c7af7113..73260e6b2fb24d 100644
+--- a/static/app/views/settings/organizationIntegrations/sentryAppDetailedView.spec.tsx
++++ b/static/app/views/settings/organizationIntegrations/sentryAppDetailedView.spec.tsx
+@@ -97,7 +97,7 @@ describe('SentryAppDetailedView', () => {
+         url: `/organizations/${organization.slug}/sentry-app-installations/`,
+         body: {
+           status: 'installed',
+-          organization: {slug: `${organization.slug}`},
++          organization: {slug: organization.slug},
+           app: {uuid: '5d547ecb-7eb8-4ed2-853b-40256177d526', slug: 'clickup'},
+           code: '1dc8b0a28b7f45959d01bbc99d9bd568',
+           uuid: '687323fd-9fa4-4f8f-9bee-ca0089224b3e',
+diff --git a/static/app/views/settings/project/projectFilters/projectFiltersSettings.tsx b/static/app/views/settings/project/projectFilters/projectFiltersSettings.tsx
+index c883c16bae4256..03b40d603d8727 100644
+--- a/static/app/views/settings/project/projectFilters/projectFiltersSettings.tsx
++++ b/static/app/views/settings/project/projectFilters/projectFiltersSettings.tsx
+@@ -1,4 +1,4 @@
+-import {Component, Fragment, useCallback} from 'react';
++import {Fragment, useCallback, useState} from 'react';
+ import {css} from '@emotion/react';
+ import styled from '@emotion/styled';
+ import iconAndroid from 'sentry-logos/logo-android.svg';
+@@ -185,6 +185,8 @@ const LEGACY_BROWSER_SUBFILTERS = {
+   },
+ };
+ 
++type LegacyBrowserSubfilterKeys = Array<keyof typeof LEGACY_BROWSER_SUBFILTERS>;
++
+ type FormFieldProps = React.ComponentProps<typeof FormField>;
+ 
+ type RowProps = {
+@@ -193,142 +195,116 @@ type RowProps = {
+   };
+   onToggle: (
+     data: RowProps['data'],
+-    filters: RowState['subfilters'],
+-    event: React.MouseEvent
++    filters: Set<string>,
++    event: React.ChangeEvent | React.MouseEvent
+   ) => void;
+   disabled?: boolean;
+ };
+ 
+-type RowState = {
+-  error: boolean | Error;
+-  loading: boolean;
+-  subfilters: Set<string>;
+-};
+-
+-class LegacyBrowserFilterRow extends Component<RowProps, RowState> {
+-  constructor(props: RowProps) {
+-    super(props);
+-
+-    let initialSubfilters: any;
+-    if (props.data.active === true) {
+-      initialSubfilters = new Set(
+-        Object.keys(LEGACY_BROWSER_SUBFILTERS).filter(
+-          key =>
+-            !LEGACY_BROWSER_SUBFILTERS[key as keyof typeof LEGACY_BROWSER_SUBFILTERS]
+-              .legacy
+-        )
+-      );
+-    } else if (props.data.active === false) {
+-      initialSubfilters = new Set<string>();
+-    } else {
+-      initialSubfilters = new Set(props.data.active);
+-    }
++function getActiveSubfilters() {
++  return new Set(
++    Object.keys(LEGACY_BROWSER_SUBFILTERS).filter(
++      key =>
++        !LEGACY_BROWSER_SUBFILTERS[key as keyof typeof LEGACY_BROWSER_SUBFILTERS].legacy
++    )
++  );
++}
+ 
+-    this.state = {
+-      loading: false,
+-      error: false,
+-      subfilters: initialSubfilters,
+-    };
++function getInitialSubfilters(active: boolean | string[]): Set<string> {
++  switch (active) {
++    case true:
++      return getActiveSubfilters();
++    case false:
++      return new Set();
++    default:
++      return new Set(active);
+   }
++}
+ 
+-  handleToggleSubfilters = (subfilter: boolean, e: React.MouseEvent) => {
+-    let {subfilters} = this.state;
+-
+-    if (subfilter === true) {
+-      subfilters = new Set(
+-        Object.keys(LEGACY_BROWSER_SUBFILTERS).filter(
+-          key =>
+-            !LEGACY_BROWSER_SUBFILTERS[key as keyof typeof LEGACY_BROWSER_SUBFILTERS]
+-              .legacy
+-        )
+-      );
+-    } else if (subfilter === false) {
+-      subfilters = new Set();
+-    } else if (subfilters.has(subfilter)) {
+-      subfilters.delete(subfilter);
+-    } else {
+-      subfilters.add(subfilter);
+-    }
+-
+-    this.setState(
+-      {
+-        subfilters: new Set(subfilters),
+-      },
+-      () => {
+-        this.props.onToggle(this.props.data, subfilters, e);
++function LegacyBrowserFilterRow({data, disabled, onToggle}: RowProps) {
++  const [subfilters, setSubfilters] = useState(getInitialSubfilters(data.active));
++
++  const createHandleToggleSubfilters = (subfilter: boolean | string) => {
++    return (e: React.ChangeEvent | React.MouseEvent) => {
++      let newSubfilters = new Set(subfilters);
++
++      if (subfilter === true) {
++        newSubfilters = getActiveSubfilters();
++      } else if (subfilter === false) {
++        newSubfilters = new Set();
++      } else if (newSubfilters.has(subfilter)) {
++        newSubfilters.delete(subfilter);
++      } else {
++        newSubfilters.add(subfilter);
+       }
+-    );
++
++      setSubfilters(newSubfilters);
++      onToggle(data, newSubfilters, e);
++    };
+   };
+ 
+-  render() {
+-    const {disabled} = this.props;
+-    return (
++  return (
++    <div>
+       <div>
+-        <div>
+-          <Flex align="center" gap="xs">
+-            <FieldLabel disabled={disabled}>
+-              {t('Filter out legacy browsers')}:
+-            </FieldLabel>
+-            <Grid flow="column" align="center" gap="md">
+-              <Button
+-                priority="link"
+-                onClick={this.handleToggleSubfilters.bind(this, true)}
+-                disabled={disabled}
+-              >
+-                {t('All')}
+-              </Button>
+-              <Button
+-                priority="link"
+-                onClick={this.handleToggleSubfilters.bind(this, false)}
+-                disabled={disabled}
+-              >
+-                {t('None')}
+-              </Button>
+-            </Grid>
+-          </Flex>
+-          <FieldHelp>
+-            {t(
+-              'The browser versions filtered out will be periodically evaluated and updated.'
+-            )}
+-          </FieldHelp>
+-        </div>
+-        <FilterGrid>
+-          {Object.keys(LEGACY_BROWSER_SUBFILTERS)
+-            .filter(key => {
+-              // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+-              if (!LEGACY_BROWSER_SUBFILTERS[key].legacy) {
+-                return true;
+-              }
+-              return this.state.subfilters.has(key);
+-            })
+-            .map(key => {
+-              // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+-              const subfilter = LEGACY_BROWSER_SUBFILTERS[key];
+-              return (
+-                <FilterGridItem key={key}>
+-                  <FilterGridIcon src={subfilter.icon} />
+-                  <div>
+-                    <FilterTitle>{subfilter.title}</FilterTitle>
+-                    <FilterDescription>{subfilter.helpText}</FilterDescription>
+-                  </div>
+-                  <Switch
+-                    aria-label={`${subfilter.title} ${subfilter.helpText}`}
+-                    checked={this.state.subfilters.has(key)}
+-                    disabled={disabled}
+-                    css={css`
+-                      flex-shrink: 0;
+-                      margin-left: 6;
+-                    `}
+-                    onChange={this.handleToggleSubfilters.bind(this, key)}
+-                    size="lg"
+-                  />
+-                </FilterGridItem>
+-              );
+-            })}
+-        </FilterGrid>
++        <Flex align="center" gap="xs">
++          <FieldLabel disabled={disabled}>{t('Filter out legacy browsers')}:</FieldLabel>
++          <Grid flow="column" align="center" gap="md">
++            <Button
++              priority="link"
++              onClick={createHandleToggleSubfilters(true)}
++              disabled={disabled}
++            >
++              {t('All')}
++            </Button>
++            <Button
++              priority="link"
++              onClick={createHandleToggleSubfilters(false)}
++              disabled={disabled}
++            >
++              {t('None')}
++            </Button>
++          </Grid>
++        </Flex>
++        <FieldHelp>
++          {t(
++            'The browser versions filtered out will be periodically evaluated and updated.'
++          )}
++        </FieldHelp>
+       </div>
+-    );
+-  }
++      <FilterGrid>
++        {(Object.keys(LEGACY_BROWSER_SUBFILTERS) as LegacyBrowserSubfilterKeys)
++          .filter(key => {
++            if (!LEGACY_BROWSER_SUBFILTERS[key].legacy) {
++              return true;
++            }
++            return subfilters.has(key);
++          })
++          .map(key => {
++            const subfilter = LEGACY_BROWSER_SUBFILTERS[key];
++            return (
++              <FilterGridItem key={key}>
++                <FilterGridIcon src={subfilter.icon} />
++                <div>
++                  <FilterTitle>{subfilter.title}</FilterTitle>
++                  <FilterDescription>{subfilter.helpText}</FilterDescription>
++                </div>
++                <Switch
++                  aria-label={`${subfilter.title} ${subfilter.helpText}`}
++                  checked={subfilters.has(key)}
++                  disabled={disabled}
++                  css={css`
++                    flex-shrink: 0;
++                    margin-left: 6;
++                  `}
++                  onChange={createHandleToggleSubfilters(key)}
++                  size="lg"
++                />
++              </FilterGridItem>
++            );
++          })}
++      </FilterGrid>
++    </div>
++  );
+ }
+ 
+ function CustomFilters({project, disabled}: {disabled: boolean; project: Project}) {
+@@ -445,10 +421,10 @@ export function ProjectFiltersSettings({project, params, features}: Props) {
+       event,
+       subfilters,
+     }: {
+-      event: React.MouseEvent;
++      event: React.ChangeEvent | React.MouseEvent;
+       onBlur: FormFieldProps['onBlur'];
+       onChange: FormFieldProps['onChange'];
+-      subfilters: RowState['subfilters'];
++      subfilters: Set<string>;
+     }) => {
+       onChange?.(subfilters, event);
+       onBlur?.(subfilters, event);
+diff --git a/static/app/views/settings/project/projectOwnership/ownershipRulesTable.tsx b/static/app/views/settings/project/projectOwnership/ownershipRulesTable.tsx
+index 15103d0b6fe27a..129231fa4a7e59 100644
+--- a/static/app/views/settings/project/projectOwnership/ownershipRulesTable.tsx
++++ b/static/app/views/settings/project/projectOwnership/ownershipRulesTable.tsx
+@@ -64,7 +64,7 @@ export function OwnershipRulesTable({
+     const actors = combinedRules
+       .flatMap(rule => rule.owners)
+       .filter(actor => actor.name)
+-      .map(owner => ({...owner, id: `${owner.id}`}));
++      .map(owner => ({...owner, id: owner.id}));
+     return (
+       uniqBy(actors, actor => `${actor.type}:${actor.id}`)
+         // Sort by type, then by name
+@@ -168,7 +168,7 @@ export function OwnershipRulesTable({
+         {chunkedRules[page]?.map((rule, index) => {
+           let name: string | undefined = 'unknown';
+           // ID might not be a string, so we need to convert it
+-          const owners = rule.owners.map(owner => ({...owner, id: `${owner.id}`}));
++          const owners = rule.owners.map(owner => ({...owner, id: owner.id}));
+           if (owners[0]?.type === 'team') {
+             const team = TeamStore.getById(owners[0].id);
+             if (team?.slug) {
+diff --git a/static/gsAdmin/components/customers/customerOverview.tsx b/static/gsAdmin/components/customers/customerOverview.tsx
+index 7e65742e06c593..2429124fccbde4 100644
+--- a/static/gsAdmin/components/customers/customerOverview.tsx
++++ b/static/gsAdmin/components/customers/customerOverview.tsx
+@@ -85,7 +85,7 @@ function SoftCapTypeDetail({
+                 capitalize: true,
+                 hadCustomDynamicSampling: shouldUseDsNames,
+               })}: `}
+-              {`${softCapName}`}
++              {softCapName}
+             </small>
+             <br />
+           </Fragment>
+@@ -130,7 +130,7 @@ function SubscriptionSummary({customer, onAction}: SubscriptionSummaryProps) {
+                   onAction={onAction}
+                 />
+               )) ||
+-              `${moment(customer.contractPeriodEnd).format('ll')}`}
++              moment(customer.contractPeriodEnd).format('ll')}
+ 
+             <br />
+             <small>{customer.contractInterval}</small>
+diff --git a/static/gsAdmin/views/relocationDetails.tsx b/static/gsAdmin/views/relocationDetails.tsx
+index ec33a0f68fac9f..4fdedaf041c354 100644
+--- a/static/gsAdmin/views/relocationDetails.tsx
++++ b/static/gsAdmin/views/relocationDetails.tsx
+@@ -398,12 +398,12 @@ function RelocationDetails() {
+           </DetailLabel>
+           <DetailLabel title="Autopause">
+             {relocationData.scheduledPauseAtStep
+-              ? `${titleCase(relocationData.scheduledPauseAtStep)}`
++              ? titleCase(relocationData.scheduledPauseAtStep)
+               : '--'}
+           </DetailLabel>
+           <DetailLabel title="Owner Notified Of">
+             {relocationData.latestNotified
+-              ? `${titleCase(relocationData.latestNotified)}`
++              ? titleCase(relocationData.latestNotified)
+               : '--'}
+           </DetailLabel>
+           <DetailLabel title="Unclaimed Users Last Notified">
+@@ -438,7 +438,7 @@ function RelocationDetails() {
+         }
+ 
+         acc.push(
+-          <span key={`${step}`}>
++          <span key={step}>
+             {acc.length > 0 ? <span> | </span> : null}
+             {text}
+           </span>
+diff --git a/static/gsAdmin/views/relocations.tsx b/static/gsAdmin/views/relocations.tsx
+index 69a5a46da3b01a..1d03470c8b6ea7 100644
+--- a/static/gsAdmin/views/relocations.tsx
++++ b/static/gsAdmin/views/relocations.tsx
+@@ -27,7 +27,7 @@ const getRow = (row: Relocation) => {
+       {titleCase(row.step)}
+     </td>,
+     <td key="pause" style={{textAlign: 'center'}}>
+-      {row.scheduledPauseAtStep ? `${titleCase(row.scheduledPauseAtStep)}` : '--'}
++      {row.scheduledPauseAtStep ? titleCase(row.scheduledPauseAtStep) : '--'}
+     </td>,
+     <td key="owner" style={{textAlign: 'right'}}>
+       {row.owner ? (
+diff --git a/static/gsApp/components/billingDetails/panel.tsx b/static/gsApp/components/billingDetails/panel.tsx
+index a7fec4d70769a9..56f8d859bdd0b9 100644
+--- a/static/gsApp/components/billingDetails/panel.tsx
++++ b/static/gsApp/components/billingDetails/panel.tsx
+@@ -75,7 +75,7 @@ function BillingDetailsPanel({
+       ? tct('[credits] credit', {
+           credits: formatCurrency(0 - subscription.accountBalance),
+         })
+-      : `${formatCurrency(subscription.accountBalance)}`;
++      : formatCurrency(subscription.accountBalance);
+ 
+   return (
+     <Flex
+diff --git a/static/gsApp/utils/formatCurrency.tsx b/static/gsApp/utils/formatCurrency.tsx
+index dcb296d4475c29..61e0d088743f82 100644
+--- a/static/gsApp/utils/formatCurrency.tsx
++++ b/static/gsApp/utils/formatCurrency.tsx
+@@ -12,7 +12,7 @@ import {displayPrice} from 'getsentry/views/amCheckout/utils';
+  */
+ const formatCurrency = (value: number | string) => {
+   const cents = Number(value);
+-  return `${displayPrice({cents})}`;
++  return displayPrice({cents});
+ };
+ 
+ export default formatCurrency;
+diff --git a/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx b/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx
+index c4a5a7fd6736b1..7d89e67be003c1 100644
+--- a/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx
++++ b/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx
+@@ -103,7 +103,7 @@ function BillingDetailsInfo({subscription}: {subscription: Subscription}) {
+       ? tct('[credits] credit', {
+           credits: formatCurrency(0 - subscription.accountBalance),
+         })
+-      : `${formatCurrency(subscription.accountBalance)}`;
++      : formatCurrency(subscription.accountBalance);
+ 
+   return (
+     <Flex
+diff --git a/tests/js/sentry-test/snapshots/snapshot.ts b/tests/js/sentry-test/snapshots/snapshot.ts
+index fcf9f471841a69..6f9c6c84559b79 100644
+--- a/tests/js/sentry-test/snapshots/snapshot.ts
++++ b/tests/js/sentry-test/snapshots/snapshot.ts
+@@ -123,7 +123,7 @@ export async function takeSnapshot(
+     const relativePath = path.relative(PROJECT_ROOT, testFilePath);
+     const dirOfTestFile = path.dirname(relativePath);
+     const sanitizedName = name.replace(/[^a-zA-Z0-9_-]/g, '-');
+-    const coreFilename = `${sanitizedName}`;
++    const coreFilename = sanitizedName;
+     const imageFilename = `${coreFilename}.png`;
+ 
+     const outputDir = path.join(getOutputDir(), dirOfTestFile);
+diff --git a/tests/sentry/preprod/api/endpoints/test_project_preprod_upload_options.py b/tests/sentry/preprod/api/endpoints/test_project_preprod_upload_options.py
+index 80900727caf0b3..b4199a16a93474 100644
+--- a/tests/sentry/preprod/api/endpoints/test_project_preprod_upload_options.py
++++ b/tests/sentry/preprod/api/endpoints/test_project_preprod_upload_options.py
+@@ -23,7 +23,7 @@ def test_returns_upload_options(self):
+         assert response.status_code == 200
+         data = response.data["objectstore"]
+ 
+-        assert f"/api/0/organizations/{self.org.id}/objectstore/" in data["url"]
++        assert data["url"].endswith(f"/api/0/organizations/{self.org.id}/objectstore")
+ 
+         assert data["scopes"] == [("org", str(self.org.id)), ("project", str(self.project.id))]
+ 
+@@ -40,7 +40,7 @@ def test_objectstore_url_uses_region_endpoint(self):
+         url = response.data["objectstore"]["url"]
+         region = settings.SENTRY_REGION
+         assert url.startswith(f"https://{region}.testserver/")
+-        assert f"/api/0/organizations/{self.org.id}/objectstore/" in url
++        assert url.endswith(f"/api/0/organizations/{self.org.id}/objectstore")
+ 
+     def test_without_feature_flag(self):
+         response = self.client.get(self.url)
+diff --git a/tests/sentry/relay/snapshots/test_config/test_get_project_config/REGION.pysnap b/tests/sentry/relay/snapshots/test_config/test_get_project_config/REGION.pysnap
+index b6173d9349385e..4c81c60c9a1e35 100644
+--- a/tests/sentry/relay/snapshots/test_config/test_get_project_config/REGION.pysnap
++++ b/tests/sentry/relay/snapshots/test_config/test_get_project_config/REGION.pysnap
+@@ -159,6 +159,7 @@ config:
+       isEnabled: true
+       patterns:
+       - '*healthcheck*'
++      - '*health-check*'
+       - '*heartbeat*'
+       - '*/health{/,}'
+       - '*/healthy{/,}'
+diff --git a/tests/sentry/runner/commands/test_backup.py b/tests/sentry/runner/commands/test_backup.py
+index 78442ca811ebd1..b5600e1189d233 100644
+--- a/tests/sentry/runner/commands/test_backup.py
++++ b/tests/sentry/runner/commands/test_backup.py
+@@ -891,8 +891,8 @@ def test_import_invalid_public_key(self) -> None:
+                     ],
+                     catch_exceptions=False,
+                 )
+-            (msg, _) = excinfo.value.args
+-            assert msg.startswith("Could not deserialize")
++            (msg,) = excinfo.value.args
++            assert msg.startswith("Unable to load PEM file")
+ 
+     def test_import_unreadable_gcp_kms_config(self) -> None:
+         with TemporaryDirectory() as tmp_dir:
+diff --git a/tests/sentry/scm/endpoints/test_scm_rpc.py b/tests/sentry/scm/endpoints/test_scm_rpc.py
+new file mode 100644
+index 00000000000000..20a90542881517
+--- /dev/null
++++ b/tests/sentry/scm/endpoints/test_scm_rpc.py
+@@ -0,0 +1,601 @@
++from __future__ import annotations
++
++import contextlib
++from typing import TYPE_CHECKING, Any
++
++import orjson
++from django.test import override_settings
++from django.urls import reverse
++
++if TYPE_CHECKING:
++    from rest_framework.response import _MonkeyPatchedResponse as Response
++
++from sentry.constants import ObjectStatus
++from sentry.models.repository import Repository
++from sentry.scm.actions import SourceCodeManager
++from sentry.scm.endpoints.scm_rpc import generate_request_signature
++from sentry.scm.errors import SCMCodedError, SCMError, SCMProviderException, SCMUnhandledException
++from sentry.scm.private.rpc import scm_action_registry
++from sentry.testutils.cases import APITestCase
++
++
++@contextlib.contextmanager
++def add_method(method_name: str, method_fn: Any):
++    # Inject a test-only RPC method for cases that go beyond common arguments validation
++    assert method_name not in scm_action_registry
++    scm_action_registry[method_name] = method_fn
++    try:
++        yield
++    finally:
++        del scm_action_registry[method_name]
++
++
++@contextlib.contextmanager
++def add_say_hello():
++    def say_hello(scm: SourceCodeManager, *, name: str) -> dict[str, str]:
++        return {
++            "message": f"Hello, {name}! You are from organization {scm.provider.repository['organization_id']} and repository {scm.provider.repository['name']}."
++        }
++
++    with add_method("say_hello", say_hello):
++        yield
++
++
++@contextlib.contextmanager
++def add_raise_scm_error(error: SCMError):
++    def raise_scm_error(scm: SourceCodeManager) -> dict[str, str]:
++        raise error
++
++    with add_method("raise_scm_error", raise_scm_error):
++        yield
++
++
++@override_settings(SCM_RPC_SHARED_SECRET=["a-long-value-that-is-hard-to-guess"])
++class TestScmRpc(APITestCase):
++    def setUp(self) -> None:
++        integration = self.create_integration(
++            organization=self.organization,
++            provider="github",
++            name="Github Test Org",
++            external_id="1",
++        )
++        self.repo = Repository.objects.create(
++            organization_id=self.organization.id,
++            name="test-org/test-repo",
++            provider="integrations:github",
++            external_id="12345",
++            status=ObjectStatus.ACTIVE,
++            integration_id=integration.id,
++        )
++
++    def call(self, method_name: str, data: Any) -> Response:
++        path = reverse("sentry-api-0-scm-rpc-service", kwargs={"method_name": method_name})
++        return self.client.post(
++            path,
++            data=data,
++            HTTP_AUTHORIZATION=f"rpcsignature {generate_request_signature(path, orjson.dumps(data))}",
++        )
++
++    def test_simplest_success(self) -> None:
++        with add_say_hello():
++            response = self.call(
++                "say_hello",
++                {
++                    "args": {
++                        "name": "World",
++                        "organization_id": self.organization.id,
++                        "repository_id": self.repo.id,
++                    },
++                    "meta": {},
++                },
++            )
++            assert response.status_code == 200, response.json()
++            assert response.json() == {
++                "data": {
++                    "message": f"Hello, World! You are from organization {self.organization.id} and repository test-org/test-repo."
++                }
++            }
++
++    def test_no_authorization_header(self) -> None:
++        path = reverse("sentry-api-0-scm-rpc-service", kwargs={"method_name": "say_hello"})
++        data = {
++            "args": {
++                "name": "World",
++                "organization_id": self.organization.id,
++                "repository_id": self.repo.id,
++            }
++        }
++        response = self.client.post(path, data=data)
++        assert response.status_code == 403
++        # Response body is built by DRF before we can format it as {"errors": [{"detail": ...}]}
++        assert response.json() == {"detail": "You do not have permission to perform this action."}
++
++    def test_wrong_name_in_authorization_header(self) -> None:
++        path = reverse("sentry-api-0-scm-rpc-service", kwargs={"method_name": "say_hello"})
++        data = {
++            "args": {
++                "name": "World",
++                "organization_id": self.organization.id,
++                "repository_id": self.repo.id,
++            }
++        }
++        response = self.client.post(
++            path,
++            data=data,
++            HTTP_AUTHORIZATION=f"not_rpcsignature {generate_request_signature(path, orjson.dumps(data))}",
++        )
++        assert response.status_code == 403
++        assert response.json() == {"detail": "You do not have permission to perform this action."}
++
++    def test_wrong_signature_version_in_authorization_header(self) -> None:
++        path = reverse("sentry-api-0-scm-rpc-service", kwargs={"method_name": "say_hello"})
++        data = {
++            "args": {
++                "name": "World",
++                "organization_id": self.organization.id,
++                "repository_id": self.repo.id,
++            }
++        }
++        response = self.client.post(path, data=data, HTTP_AUTHORIZATION="rpcsignature rpc42:foobar")
++        assert response.status_code == 401
++        assert response.json() == {
++            "errors": [{"detail": "SCM RPC signature validation failed: invalid signature prefix"}]
++        }
++
++    def test_wrong_signature_in_authorization_header(self) -> None:
++        path = reverse("sentry-api-0-scm-rpc-service", kwargs={"method_name": "say_hello"})
++        data = {
++            "args": {
++                "name": "World",
++                "organization_id": self.organization.id,
++                "repository_id": self.repo.id,
++            }
++        }
++        response = self.client.post(
++            path, data=data, HTTP_AUTHORIZATION="rpcsignature rpc0:wrong-signature"
++        )
++        assert response.status_code == 401
++        assert response.json() == {
++            "errors": [{"detail": "SCM RPC signature validation failed: wrong secret"}]
++        }
++
++    def test_signature_with_more_colons_in_authorization_header(self) -> None:
++        path = reverse("sentry-api-0-scm-rpc-service", kwargs={"method_name": "say_hello"})
++        data = {
++            "args": {
++                "name": "World",
++                "organization_id": self.organization.id,
++                "repository_id": self.repo.id,
++            }
++        }
++        response = self.client.post(
++            path, data=data, HTTP_AUTHORIZATION="rpcsignature rpc0:signature:with:colons"
++        )
++        assert response.status_code == 401
++        assert response.json() == {
++            "errors": [{"detail": "SCM RPC signature validation failed: wrong secret"}]
++        }
++
++    def test_signature_without_prefix_in_authorization_header(self) -> None:
++        path = reverse("sentry-api-0-scm-rpc-service", kwargs={"method_name": "say_hello"})
++        data = {
++            "args": {
++                "name": "World",
++                "organization_id": self.organization.id,
++                "repository_id": self.repo.id,
++            }
++        }
++        response = self.client.post(
++            path, data=data, HTTP_AUTHORIZATION="rpcsignature signature-without-prefix"
++        )
++        assert response.status_code == 401
++        assert response.json() == {
++            "errors": [{"detail": "SCM RPC signature validation failed: invalid signature format"}]
++        }
++
++    def test_invalid_endpoint(self) -> None:
++        response = self.call("not_a_method", {"args": {}})
++        assert response.status_code == 404
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "404",
++                    "title": "Not found",
++                    "detail": "Could not find action not_a_method",
++                }
++            ]
++        }
++
++    def test_no_organization_id(self) -> None:
++        response = self.call("get_issue_comments_v1", {"args": {"repository_id": 57}, "meta": {}})
++        assert response.status_code == 400
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "organization_id"],
++                        "msg": "field required",
++                        "type": "value_error.missing",
++                    },
++                }
++            ]
++        }
++
++    def test_string_as_organization_id(self) -> None:
++        response = self.call(
++            "get_issue_comments_v1",
++            {"args": {"organization_id": "invalid", "repository_id": 57}, "meta": {}},
++        )
++        assert response.status_code == 400
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "organization_id"],
++                        "msg": "value is not a valid integer",
++                        "type": "type_error.integer",
++                    },
++                }
++            ]
++        }
++
++    def test_no_repository_id(self) -> None:
++        response = self.call("get_issue_comments_v1", {"args": {"organization_id": 42}, "meta": {}})
++        assert response.status_code == 400
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id"],
++                        "msg": "field required",
++                        "type": "value_error.missing",
++                    },
++                }
++            ]
++        }
++
++    def test_string_as_repository_id(self) -> None:
++        response = self.call(
++            "get_issue_comments_v1",
++            {"args": {"organization_id": 42, "repository_id": "invalid"}, "meta": {}},
++        )
++        assert response.status_code == 400
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id"],
++                        "msg": "value is not a valid integer",
++                        "type": "type_error.integer",
++                    },
++                },
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id"],
++                        "msg": "value is not a valid dict",
++                        "type": "type_error.dict",
++                    },
++                },
++            ]
++        }
++
++    def test_dict_with_missing_provider_as_repository_id(self) -> None:
++        response = self.call(
++            "get_issue_comments_v1",
++            {
++                "args": {"organization_id": 42, "repository_id": {"external_id": "repo1"}},
++                "meta": {},
++            },
++        )
++        assert response.status_code == 400
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id"],
++                        "msg": "value is not a valid integer",
++                        "type": "type_error.integer",
++                    },
++                },
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id", "provider"],
++                        "msg": "field required",
++                        "type": "value_error.missing",
++                    },
++                },
++            ]
++        }
++
++    def test_dict_with_missing_external_id_as_repository_id(self) -> None:
++        response = self.call(
++            "get_issue_comments_v1",
++            {"args": {"organization_id": 42, "repository_id": {"provider": "github"}}, "meta": {}},
++        )
++        assert response.status_code == 400
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id"],
++                        "msg": "value is not a valid integer",
++                        "type": "type_error.integer",
++                    },
++                },
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id", "external_id"],
++                        "msg": "field required",
++                        "type": "value_error.missing",
++                    },
++                },
++            ]
++        }
++
++    def test_dict_with_extra_attribute_as_repository_id(self) -> None:
++        response = self.call(
++            "get_issue_comments_v1",
++            {
++                "args": {
++                    "organization_id": 42,
++                    "repository_id": {
++                        "provider": "github",
++                        "external_id": "repo1",
++                        "extra": "value",
++                    },
++                },
++                "meta": {},
++            },
++        )
++        assert response.status_code == 400
++        assert response.json() == {
++            "errors": [
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id"],
++                        "msg": "value is not a valid integer",
++                        "type": "type_error.integer",
++                    },
++                },
++                {
++                    "status": "400",
++                    "title": "The request could not be deserialized.",
++                    "meta": {
++                        "loc": ["args", "repository_id", "extra"],
++                        "msg": "extra fields not permitted",
++                        "type": "value_error.extra",
++                    },
++                },
++            ]
++        }
++
++    def test_correct_dict_as_repository_id(self) -> None:
++        with add_say_hello():
++            response = self.call(
++                "say_hello",
++                {
++                    "args": {
++                        "name": "Vincent",
++                        "organization_id": self.organization.id,
++                        "repository_id": {"provider": "github", "external_id": "12345"},
++                    },
++                    "meta": {},
++                },
++            )
++            assert response.status_code == 200
++            assert response.json() == {
++                "data": {
++                    "message": f"Hello, Vincent! You are from organization {self.organization.id} and repository test-org/test-repo."
++                }
++            }
++
++    def test_missing_method_argument(self) -> None:
++        with add_say_hello():
++            response = self.call(
++                "say_hello",
++                {
++                    "args": {
++                        "organization_id": self.organization.id,
++                        "repository_id": self.repo.id,
++                    },
++                    "meta": {},
++                },
++            )
++            assert response.status_code == 500
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "500",
++                        "title": "An unexpected error occurred.",
++                        "detail": "Error calling method say_hello: add_say_hello.<locals>.say_hello() missing 1 required keyword-only argument: 'name'",
++                    }
++                ]
++            }
++
++    def test_extra_method_argument(self) -> None:
++        with add_say_hello():
++            response = self.call(
++                "say_hello",
++                {
++                    "args": {
++                        "organization_id": self.organization.id,
++                        "repository_id": self.repo.id,
++                        "name": "World",
++                        "login": "jacquev6",
++                    },
++                    "meta": {},
++                },
++            )
++            assert response.status_code == 500
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "500",
++                        "title": "An unexpected error occurred.",
++                        "detail": "Error calling method say_hello: add_say_hello.<locals>.say_hello() got an unexpected keyword argument 'login'",
++                    }
++                ]
++            }
++
++    def test_misspelled_method_argument(self) -> None:
++        with add_say_hello():
++            response = self.call(
++                "say_hello",
++                {
++                    "args": {
++                        "organization_id": self.organization.id,
++                        "repository_id": self.repo.id,
++                        "fame": "World",
++                    },
++                    "meta": {},
++                },
++            )
++            assert response.status_code == 500
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "500",
++                        "title": "An unexpected error occurred.",
++                        "detail": "Error calling method say_hello: add_say_hello.<locals>.say_hello() got an unexpected keyword argument 'fame'. Did you mean 'name'?",
++                    }
++                ]
++            }
++
++    def test_list_as_data(self) -> None:
++        with add_say_hello():
++            response = self.call("say_hello", [])
++            assert response.status_code == 400
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "400",
++                        "title": "The request could not be deserialized.",
++                        "meta": {
++                            "loc": ["args"],
++                            "msg": "field required",
++                            "type": "value_error.missing",
++                        },
++                    }
++                ]
++            }
++
++    def test_empty_dict_as_data(self) -> None:
++        with add_say_hello():
++            response = self.call("say_hello", {})
++            assert response.status_code == 400
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "400",
++                        "title": "The request could not be deserialized.",
++                        "meta": {
++                            "loc": ["args"],
++                            "msg": "field required",
++                            "type": "value_error.missing",
++                        },
++                    }
++                ]
++            }
++
++    def test_list_as_args(self) -> None:
++        with add_say_hello():
++            response = self.call("say_hello", {"args": []})
++            assert response.status_code == 400
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "400",
++                        "title": "The request could not be deserialized.",
++                        "meta": {
++                            "loc": ["args", "organization_id"],
++                            "msg": "field required",
++                            "type": "value_error.missing",
++                        },
++                    },
++                    {
++                        "status": "400",
++                        "title": "The request could not be deserialized.",
++                        "meta": {
++                            "loc": ["args", "repository_id"],
++                            "msg": "field required",
++                            "type": "value_error.missing",
++                        },
++                    },
++                ]
++            }
++
++    def test_scm_error_in_provider_method(self) -> None:
++        with add_raise_scm_error(SCMUnhandledException("Blah", 68)):
++            response = self.call(
++                "raise_scm_error",
++                {"args": {"organization_id": self.organization.id, "repository_id": self.repo.id}},
++            )
++            assert response.status_code == 500
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "500",
++                        "title": "An unexpected error occurred.",
++                        "detail": ["Blah", 68],
++                    }
++                ]
++            }
++
++    def test_scm_coded_error_in_provider_method(self) -> None:
++        with add_raise_scm_error(SCMCodedError("Blah", 68, code="repository_not_found")):
++            response = self.call(
++                "raise_scm_error",
++                {"args": {"organization_id": self.organization.id, "repository_id": self.repo.id}},
++            )
++            assert response.status_code == 500
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "500",
++                        "title": "An unexpected error occurred.",
++                        "detail": [
++                            "repository_not_found",
++                            "A repository could not be found.",
++                            "Blah",
++                            68,
++                        ],
++                    }
++                ]
++            }
++
++    def test_scm_provider_exception_in_provider_method(self) -> None:
++        with add_raise_scm_error(SCMProviderException("Blah", 68)):
++            response = self.call(
++                "raise_scm_error",
++                {"args": {"organization_id": self.organization.id, "repository_id": self.repo.id}},
++            )
++            assert response.status_code == 503
++            assert response.json() == {
++                "errors": [
++                    {
++                        "status": "503",
++                        "title": "The service provider raised an error.",
++                        "detail": ["Blah", 68],
++                    }
++                ]
++            }
+diff --git a/uv.lock b/uv.lock
+index bf3cd62590c825..9b6857ef71357d 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -138,19 +138,19 @@ wheels = [
+ 
+ [[package]]
+ name = "cffi"
+-version = "1.17.1"
++version = "2.0.0"
+ source = { registry = "https://pypi.devinfra.sentry.io/simple" }
+ dependencies = [
+-    { name = "pycparser", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "pycparser", marker = "(implementation_name != 'PyPy' and sys_platform == 'darwin') or (implementation_name != 'PyPy' and sys_platform == 'linux')" },
+ ]
+ wheels = [
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-1.17.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:f3a2b4222ce6b60e2e8b337bb9596923045681d71e5a082783484d845390938e" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-1.17.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:0984a4925a435b1da406122d4d7968dd861c1385afe3b45ba82b750f229811e2" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-1.17.1-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:706510fe141c86a69c8ddc029c7910003a17353970cff3b904ff0686a5927683" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-1.17.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:dd398dbc6773384a17fe0d3e7eeb8d1a21c2200473ee6806bb5e6a8e62bb73dd" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-1.17.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:b68a8fc9d607e33a63857a353e9255b52b4b9dfcf1259ba72d82658440865724" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-1.17.1-cp314-cp314-manylinux_2_31_aarch64.whl", hash = "sha256:246b02d160e8bf9d2db536b2c49cda912e83a4bc12ccadfbe1154a9965c89b75" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-1.17.1-cp314-cp314-manylinux_2_31_x86_64.whl", hash = "sha256:2336726f5b751a982dcf99bc97f9683db0cc9fe8eec6118865edad9a478149d6" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-2.0.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:00bdf7acc5f795150faa6957054fbbca2439db2f775ce831222b66f192f03beb" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-2.0.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:45d5e886156860dc35862657e1494b9bae8dfa63bf56796f2fb56e1679fc0bca" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-2.0.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d48a880098c96020b02d5a1f7d9251308510ce8858940e6fa99ece33f610838b" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-2.0.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:c8d3b5532fc71b7a77c09192b4a5a200ea992702734a2e9279a37f2478236f26" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-2.0.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:c654de545946e0db659b3400168c9ad31b5d29593291482c43e3564effbcee13" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-2.0.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:24b6f81f1983e6df8db3adc38562c83f7d4a0c36162885ec7f7b77c7dcbec97b" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cffi-2.0.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:afb8db5439b81cf9c9d0c80404b60c3cc9c3add93e114dcae767f1477cb53775" },
+ ]
+ 
+ [[package]]
+@@ -235,15 +235,15 @@ wheels = [
+ 
+ [[package]]
+ name = "cryptography"
+-version = "44.0.1"
++version = "46.0.5"
+ source = { registry = "https://pypi.devinfra.sentry.io/simple" }
+ dependencies = [
+     { name = "cffi", marker = "(platform_python_implementation != 'PyPy' and sys_platform == 'darwin') or (platform_python_implementation != 'PyPy' and sys_platform == 'linux')" },
+ ]
+ wheels = [
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cryptography-44.0.1-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:a2d8a7045e1ab9b9f803f0d9531ead85f90c5f2859e653b61497228b18452008" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cryptography-44.0.1-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:436df4f203482f41aad60ed1813811ac4ab102765ecae7a2bbb1dbb66dcff5a7" },
+-    { url = "https://pypi.devinfra.sentry.io/wheels/cryptography-44.0.1-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:72198e2b5925155497a5a3e8c216c7fb3e64c16ccee11f0e7da272fa93b35c4c" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cryptography-46.0.5-cp311-abi3-macosx_10_9_universal2.whl", hash = "sha256:351695ada9ea9618b3500b490ad54c739860883df6c1f555e088eaf25b1bbaad" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cryptography-46.0.5-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:50bfb6925eff619c9c023b967d5b77a54e04256c4281b0e21336a130cd7fc263" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/cryptography-46.0.5-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:3ee190460e2fbe447175cda91b88b84ae8322a104fc27766ad09428754a618ed" },
+ ]
+ 
+ [[package]]

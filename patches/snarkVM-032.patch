@@ -1,35 +1,832 @@
-diff --git a/synthesizer/program/src/resources/credits.aleo b/synthesizer/program/src/resources/credits.aleo
-index 4ac0a7f37..fb370ef29 100644
---- a/synthesizer/program/src/resources/credits.aleo
-+++ b/synthesizer/program/src/resources/credits.aleo
-@@ -43,7 +43,7 @@
- // 10. count committee[] == metadata[aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc]
- // 11. 100,000 + count committee[] >= count bonded[] >= count delegated[] >= count committee[]
- // 12. bond[*].microcredits > 100
--// 13. delegated[*] >= 10,000
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index 8e50d222b..072fa4404 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -54,6 +54,10 @@ jobs:
+           name: Build and run tests
+           no_output_timeout: 30m
+           command: RUST_MIN_STACK=8388608 cargo test --all
++      - run:
++          name: Build and run snarkOS integration tests
++          no_output_timeout: 30m
++          command: cd snarkos-integration && RUST_MIN_STACK=8388608 cargo test
+       - persist_to_workspace:
+           root: ~/
+           paths: project/
+@@ -88,6 +92,10 @@ jobs:
+           name: Build and test
+           no_output_timeout: 30m
+           command: RUST_MIN_STACK=8388608 cargo test --all
++      - run:
++          name: Build and run snarkOS integration tests
++          no_output_timeout: 30m
++          command: cd snarkos-integration && RUST_MIN_STACK=8388608 cargo test
+       - clear_environment:
+           cache_key: snarkvm-nightly-cache
+ 
+diff --git a/Cargo.lock b/Cargo.lock
+index b14ebd3b8..beb82f905 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -378,9 +378,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "curl"
+-version = "0.4.37"
++version = "0.4.38"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "adba2012502267c1fdde381e0e3acc44bf8be96b2f7d455089dcc2c8ad2f67bd"
++checksum = "003cb79c1c6d1c93344c7e1201bb51c2148f24ec2bd9c253709d6b2efb796515"
+ dependencies = [
+  "curl-sys",
+  "libc",
+@@ -393,9 +393,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "curl-sys"
+-version = "0.4.43+curl-7.76.0"
++version = "0.4.44+curl-7.77.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a802c7a9828b7d139efaed1bc92471ab6681ed86d19a105605f5eadcb0837d11"
++checksum = "4b6d85e9322b193f117c966e79c2d6929ec08c02f339f950044aba12e20bbaf1"
+ dependencies = [
+  "cc",
+  "libc",
+@@ -1503,7 +1503,7 @@ checksum = "fe0f37c9e8f3c5a4a66ad655a93c74daac4ad00c441533bf5c6e7990bb42604e"
+ 
+ [[package]]
+ name = "snarkvm"
+-version = "0.3.1"
++version = "0.3.2"
+ dependencies = [
+  "anyhow",
+  "colored",
+@@ -1888,18 +1888,18 @@ dependencies = [
+ 
+ [[package]]
+ name = "thiserror"
+-version = "1.0.24"
++version = "1.0.25"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e0f4a65597094d4483ddaed134f409b2cb7c1beccf25201a9f73c719254fa98e"
++checksum = "fa6f76457f59514c7eeb4e59d891395fab0b2fd1d40723ae737d64153392e9c6"
+ dependencies = [
+  "thiserror-impl",
+ ]
+ 
+ [[package]]
+ name = "thiserror-impl"
+-version = "1.0.24"
++version = "1.0.25"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7765189610d8241a44529806d6fd1f2e0a08734313a35d5b3a556f92b381f3c0"
++checksum = "8a36768c0fbf1bb15eca10defa29526bda730a2376c2ab4393ccfa16fb1a318d"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+diff --git a/gadgets/src/algorithms/snark/groth16.rs b/gadgets/src/algorithms/snark/groth16.rs
+index df5656ca3..a9cf3fac3 100644
+--- a/gadgets/src/algorithms/snark/groth16.rs
++++ b/gadgets/src/algorithms/snark/groth16.rs
+@@ -622,4 +622,100 @@ mod test {
+             assert!(cs.is_satisfied());
+         }
+     }
 +
++    #[test]
++    fn groth16_verifier_num_constraints_test() {
++        let num_inputs = 100;
++        let num_constraints = num_inputs;
++        let rng = &mut test_rng();
++        let mut inputs: Vec<Option<Fr>> = Vec::with_capacity(num_inputs);
++        for _ in 0..num_inputs {
++            inputs.push(Some(rng.gen()));
++        }
++        let params = {
++            let c = Bench::<Fr> {
++                inputs: vec![None; num_inputs],
++                num_constraints,
++            };
++
++            generate_random_parameters(&c, rng).unwrap()
++        };
++
++        {
++            let proof = {
++                // Create an instance of our circuit (with the
++                // witness)
++                let c = Bench {
++                    inputs: inputs.clone(),
++                    num_constraints,
++                };
++                // Create a groth16 proof with our parameters.
++                create_random_proof(&c, &params, rng).unwrap()
++            };
++
++            // assert!(!verify_proof(&pvk, &proof, &[a]).unwrap());
++            let mut cs = TestConstraintSystem::<Fq>::new();
++
++            let inputs = inputs.into_iter().map(|input| input.unwrap());
++            let mut input_gadgets = Vec::new();
++
++            {
++                let mut cs = cs.ns(|| "Allocate Input");
++                for (i, input) in inputs.enumerate() {
++                    let mut input_bits = BitIteratorBE::new(input.into_repr()).collect::<Vec<_>>();
++                    // Input must be in little-endian, but BitIterator outputs in big-endian.
++                    input_bits.reverse();
++
++                    let input_bits =
++                        Vec::<Boolean>::alloc_input(cs.ns(|| format!("Input {}", i)), || Ok(input_bits)).unwrap();
++                    input_gadgets.push(input_bits);
++                }
++            }
++
++            let input_gadget_constraints = cs.num_constraints();
++
++            let vk_gadget = TestVkGadget::alloc_input(cs.ns(|| "Vk"), || Ok(&params.vk)).unwrap();
++
++            let vk_gadget_constraints = cs.num_constraints() - input_gadget_constraints;
++
++            let proof_gadget = TestProofGadget::alloc(cs.ns(|| "Proof"), || Ok(proof.clone())).unwrap();
++
++            let proof_gadget_constraints = cs.num_constraints() - vk_gadget_constraints;
++
++            <TestVerifierGadget as SNARKVerifierGadget<TestProofSystem, Fq>>::check_verify(
++                cs.ns(|| "Verify"),
++                &vk_gadget,
++                input_gadgets.iter(),
++                &proof_gadget,
++            )
++            .unwrap();
++
++            let verifier_gadget_constraints = cs.num_constraints() - proof_gadget_constraints;
++
++            if !cs.is_satisfied() {
++                println!("=========================================================");
++                println!("Unsatisfied constraints:");
++                println!("{:?}", cs.which_is_unsatisfied().unwrap());
++                println!("=========================================================");
++            }
++
++            // cs.print_named_objects();
++            assert!(cs.is_satisfied());
++
++            println!("input_gadget_constraints : {:?}", input_gadget_constraints);
++            println!("vk_gadget_constraints : {:?}", vk_gadget_constraints);
++            println!("proof_gadget_constraints : {:?}", proof_gadget_constraints);
++            println!("verifier_gadget_constraints : {:?}", verifier_gadget_constraints);
++
++            const INPUT_GADGET_CONSTRAINTS: usize = 25600;
++            const VK_GADGET_CONSTRAINTS: usize = 105;
++            const PROOF_GADGET_CONSTRAINTS: usize = 30199;
++            const VERIFIER_GADGET_CONSTRAINTS: usize = 316635;
++
++            assert_eq!(input_gadget_constraints, INPUT_GADGET_CONSTRAINTS);
++            assert_eq!(vk_gadget_constraints, VK_GADGET_CONSTRAINTS);
++            assert_eq!(proof_gadget_constraints, PROOF_GADGET_CONSTRAINTS);
++            assert_eq!(verifier_gadget_constraints, VERIFIER_GADGET_CONSTRAINTS);
++        }
++    }
+ }
+diff --git a/gadgets/src/algorithms/snark/tests.rs b/gadgets/src/algorithms/snark/tests.rs
+index e889d63b6..e01209eef 100644
+--- a/gadgets/src/algorithms/snark/tests.rs
++++ b/gadgets/src/algorithms/snark/tests.rs
+@@ -228,3 +228,100 @@ fn gm17_verifier_bytes_test() {
+         assert!(cs.is_satisfied());
+     }
+ }
++
++#[test]
++fn gm17_verifier_num_constraints_test() {
++    let num_inputs = 100;
++    let num_constraints = num_inputs;
++    let rng = &mut thread_rng();
++    let mut inputs: Vec<Option<Fr>> = Vec::with_capacity(num_inputs);
++    for _ in 0..num_inputs {
++        inputs.push(Some(rng.gen()));
++    }
++    let params = generate_random_parameters(
++        &Bench::<Fr> {
++            inputs: vec![None; num_inputs],
++            num_constraints,
++        },
++        rng,
++    )
++    .unwrap();
++
++    {
++        let proof = {
++            // Create an instance of our circuit (with the witness).
++            // Create a gm17 proof with our parameters.
++            create_random_proof(
++                &Bench {
++                    inputs: inputs.clone(),
++                    num_constraints,
++                },
++                &params,
++                rng,
++            )
++            .unwrap()
++        };
++
++        let mut cs = TestConstraintSystem::<Fq>::new();
++
++        let inputs: Vec<_> = inputs.into_iter().map(|input| input.unwrap()).collect();
++        let mut input_gadgets = Vec::new();
++
++        {
++            let mut cs = cs.ns(|| "Allocate Input");
++            for (i, input) in inputs.into_iter().enumerate() {
++                let mut input_bits = BitIteratorBE::new(input.into_repr()).collect::<Vec<_>>();
++                // Input must be in little-endian, but BitIterator outputs in big-endian.
++                input_bits.reverse();
++
++                let input_bits =
++                    Vec::<Boolean>::alloc_input(cs.ns(|| format!("Input {}", i)), || Ok(input_bits)).unwrap();
++                input_gadgets.push(input_bits);
++            }
++        }
++
++        let input_gadget_constraints = cs.num_constraints();
++
++        let vk_gadget = TestVkGadget::alloc_input(cs.ns(|| "Vk"), || Ok(&params.vk)).unwrap();
++
++        let vk_gadget_constraints = cs.num_constraints() - input_gadget_constraints;
++
++        let proof_gadget = TestProofGadget::alloc(cs.ns(|| "Proof"), || Ok(proof.clone())).unwrap();
++
++        let proof_gadget_constraints = cs.num_constraints() - vk_gadget_constraints;
++
++        <TestVerifierGadget as SNARKVerifierGadget<TestProofSystem, Fq>>::check_verify(
++            cs.ns(|| "Verify"),
++            &vk_gadget,
++            input_gadgets.iter(),
++            &proof_gadget,
++        )
++        .unwrap();
++
++        let verifier_gadget_constraints = cs.num_constraints() - proof_gadget_constraints;
++
++        if !cs.is_satisfied() {
++            println!("=========================================================");
++            println!("Unsatisfied constraints:");
++            println!("{:?}", cs.which_is_unsatisfied().unwrap());
++            println!("=========================================================");
++        }
++
++        assert!(cs.is_satisfied());
++
++        println!("input_gadget_constraints : {:?}", input_gadget_constraints);
++        println!("vk_gadget_constraints : {:?}", vk_gadget_constraints);
++        println!("proof_gadget_constraints : {:?}", proof_gadget_constraints);
++        println!("verifier_gadget_constraints : {:?}", verifier_gadget_constraints);
++
++        const INPUT_GADGET_CONSTRAINTS: usize = 25600;
++        const VK_GADGET_CONSTRAINTS: usize = 106;
++        const PROOF_GADGET_CONSTRAINTS: usize = 30199;
++        const VERIFIER_GADGET_CONSTRAINTS: usize = 323348;
++
++        assert_eq!(input_gadget_constraints, INPUT_GADGET_CONSTRAINTS);
++        assert_eq!(vk_gadget_constraints, VK_GADGET_CONSTRAINTS);
++        assert_eq!(proof_gadget_constraints, PROOF_GADGET_CONSTRAINTS);
++        assert_eq!(verifier_gadget_constraints, VERIFIER_GADGET_CONSTRAINTS);
++    }
++}
+diff --git a/marlin/Cargo.toml b/marlin/Cargo.toml
+index e788d0c24..b81564c1f 100644
+--- a/marlin/Cargo.toml
++++ b/marlin/Cargo.toml
+@@ -81,7 +81,6 @@ version = "0.11.2"
  
- /**********************************************************************************************************************/
+ [dependencies.rand]
+ version = "0.8"
+-default-features = false
  
-@@ -284,7 +284,7 @@ finalize bond_validator:
- // This function allows any delegator to bond their microcredits to a validator and specify a withdrawal address.
- //
- // The declared validator is **not** required to be in the committee yet, however it may **not** be unbonding.
--// This function enforces a minimum of 10,000 microcredits for each delegator.
-+// This function enforces a minimum of 10,000 credits for each delegator.
- // The maximum number of delegators allowed in the committee is 100,000 delegator addresses.
- //
- // The corresponding functions for 'bond_public' are 'bond_validator', 'unbond_public', and 'claim_unbond_public'.
-diff --git a/synthesizer/src/vm/helpers/rewards.rs b/synthesizer/src/vm/helpers/rewards.rs
-index 6dcc5af96..3ffc3a740 100644
---- a/synthesizer/src/vm/helpers/rewards.rs
-+++ b/synthesizer/src/vm/helpers/rewards.rs
-@@ -34,7 +34,7 @@ const MAX_COINBASE_REWARD: u64 = ledger_block::MAX_COINBASE_REWARD; // Coinbase
- ///
- /// This method ensures that stakers who are bonded to validators with more than **25%**
- /// of the total stake will not receive a staking reward. In addition, this method
--/// ensures stakers who have less than 10 credit are not eligible for a staking reward.
-+/// ensures delegators who have less than 10,000 credits are not eligible for a staking reward.
- ///
- /// The choice of 25% is to ensure at least 4 validators are operational at any given time,
- /// since our security model adheres to 3f+1, where f=1. As such, we tolerate Byzantine behavior
+ [dependencies.rand_chacha]
+ version = "0.3"
+diff --git a/marlin/benches/marlin.rs b/marlin/benches/marlin.rs
+index e70ca92e4..c1055592a 100644
+--- a/marlin/benches/marlin.rs
++++ b/marlin/benches/marlin.rs
+@@ -18,101 +18,138 @@
+ extern crate criterion;
+ 
+ use snarkvm_algorithms::traits::SNARK;
+-use snarkvm_curves::bls12_377::{Bls12_377, Fr};
++use snarkvm_curves::{
++    bls12_377::{Bls12_377, Fq, Fr},
++    bw6_761::BW6_761,
++};
+ use snarkvm_fields::Field;
+-use snarkvm_r1cs::errors::SynthesisError;
+-
+-use snarkvm_marlin::snark::MarlinSystem;
+-use snarkvm_r1cs::{ConstraintSynthesizer, ConstraintSystem};
++use snarkvm_gadgets::{
++    curves::bls12_377::PairingGadget as Bls12_377PairingGadget,
++    traits::algorithms::SNARKGadget,
++    utilities::{alloc::AllocGadget, boolean::Boolean, eq::EqGadget},
++};
++use snarkvm_marlin::{
++    constraints::snark::{MarlinSNARK, MarlinSNARKGadget},
++    marlin::{MarlinRecursiveMode, MarlinSNARK as MarlinCore},
++    snark::MarlinSystem,
++    FiatShamirAlgebraicSpongeRng,
++    FiatShamirAlgebraicSpongeRngVar,
++    PoseidonSponge,
++    PoseidonSpongeVar,
++};
++use snarkvm_polycommit::marlin_pc::{marlin_kzg10::MarlinKZG10Gadget, MarlinKZG10};
++use snarkvm_r1cs::{errors::SynthesisError, ConstraintSynthesizer, ConstraintSystem, TestConstraintSystem};
++use snarkvm_utilities::UniformRand;
+ 
+ use criterion::Criterion;
+-use rand::{
+-    thread_rng,
+-    Rng,
+-    {self},
+-};
++use rand::{self, thread_rng};
++use std::ops::MulAssign;
++
++// TODO (raychu86): Unify the Marlin instances. Currently too convoluted.
++
++// Standard Marlin instances
++
++type Marlin = MarlinSystem<Bls12_377, Benchmark<Fr>, Vec<Fr>>;
++type MarlinInst = MarlinCore<Fr, Fq, PC, FS, MarlinRecursiveMode>;
++
++// Used for Marlin Verification Gadget
+ 
+-type Marlin = MarlinSystem<Bls12_377, Benchmark<Fr>, Fr>;
++type PC = MarlinKZG10<Bls12_377>;
++type PCGadget = MarlinKZG10Gadget<Bls12_377, BW6_761, Bls12_377PairingGadget>;
+ 
+-struct Benchmark<F: Field> {
+-    inputs: Vec<Option<F>>,
+-    num_constraints: usize,
++type FS = FiatShamirAlgebraicSpongeRng<Fr, Fq, PoseidonSponge<Fq>>;
++type FSG = FiatShamirAlgebraicSpongeRngVar<Fr, Fq, PoseidonSponge<Fq>, PoseidonSpongeVar<Fq>>;
++
++type TestSNARK = MarlinSNARK<Fr, Fq, PC, FS, MarlinRecursiveMode, Benchmark<Fr>>;
++type TestSNARKGadget = MarlinSNARKGadget<Fr, Fq, PC, FS, MarlinRecursiveMode, PCGadget, FSG>;
++
++#[derive(Copy, Clone)]
++pub struct Benchmark<F: Field> {
++    pub a: Option<F>,
++    pub b: Option<F>,
++    pub num_constraints: usize,
++    pub num_variables: usize,
+ }
+ 
+-impl<F: Field> ConstraintSynthesizer<F> for Benchmark<F> {
+-    fn generate_constraints<CS: ConstraintSystem<F>>(&self, cs: &mut CS) -> Result<(), SynthesisError> {
+-        assert!(self.inputs.len() >= 2);
+-        assert!(self.num_constraints >= self.inputs.len());
++impl<ConstraintF: Field> ConstraintSynthesizer<ConstraintF> for Benchmark<ConstraintF> {
++    fn generate_constraints<CS: ConstraintSystem<ConstraintF>>(&self, cs: &mut CS) -> Result<(), SynthesisError> {
++        let a = cs.alloc(|| "a", || self.a.ok_or(SynthesisError::AssignmentMissing))?;
++        let b = cs.alloc(|| "b", || self.b.ok_or(SynthesisError::AssignmentMissing))?;
++        let c = cs.alloc_input(
++            || "c",
++            || {
++                let mut a = self.a.ok_or(SynthesisError::AssignmentMissing)?;
++                let b = self.b.ok_or(SynthesisError::AssignmentMissing)?;
+ 
+-        let mut variables: Vec<_> = Vec::with_capacity(self.inputs.len());
+-        for (i, input) in self.inputs.iter().cloned().enumerate() {
+-            let input_var = cs.alloc_input(
+-                || format!("input_{}", i),
+-                || input.ok_or(SynthesisError::AssignmentMissing),
++                a.mul_assign(&b);
++                Ok(a)
++            },
++        )?;
++
++        for i in 0..(self.num_variables - 3) {
++            let _ = cs.alloc(
++                || format!("var {}", i),
++                || self.a.ok_or(SynthesisError::AssignmentMissing),
+             )?;
+-            variables.push((input, input_var));
+         }
+ 
+-        for i in 0..self.num_constraints {
+-            let new_entry = {
+-                let (input_1_val, input_1_var) = variables[i];
+-                let (input_2_val, input_2_var) = variables[i + 1];
+-                let result_val = input_1_val.and_then(|input_1| input_2_val.map(|input_2| input_1 * &input_2));
+-                let result_var = cs.alloc(
+-                    || format!("result_{}", i),
+-                    || result_val.ok_or(SynthesisError::AssignmentMissing),
+-                )?;
+-                cs.enforce(
+-                    || format!("enforce_constraint_{}", i),
+-                    |lc| lc + input_1_var,
+-                    |lc| lc + input_2_var,
+-                    |lc| lc + result_var,
+-                );
+-                (result_val, result_var)
+-            };
+-            variables.push(new_entry);
++        for i in 0..(self.num_constraints - 1) {
++            cs.enforce(|| format!("constraint {}", i), |lc| lc + a, |lc| lc + b, |lc| lc + c);
+         }
++
+         Ok(())
+     }
+ }
+ 
+-fn snark_setup(c: &mut Criterion) {
+-    let num_inputs = 2;
+-    let num_constraints = 1000;
++fn snark_universal_setup(c: &mut Criterion) {
+     let rng = &mut thread_rng();
+-    let mut inputs: Vec<Option<Fr>> = Vec::with_capacity(num_inputs);
+-    for _ in 0..num_inputs {
+-        inputs.push(Some(rng.gen()));
+-    }
+ 
+-    c.bench_function("snark_setup", move |b| {
++    c.bench_function("snark_universal_setup", move |b| {
+         b.iter(|| {
+-            let universal_srs = snarkvm_marlin::MarlinTestnet1::universal_setup(1000, 1000, 1000, rng).unwrap();
++            MarlinInst::universal_setup(1000000, 1000000, 1000000, rng).unwrap();
++        })
++    });
++}
++
++fn snark_circuit_setup(c: &mut Criterion) {
++    let num_constraints = 100;
++    let num_variables = 100;
++    let rng = &mut thread_rng();
++
++    let x = Fr::rand(rng);
++    let y = Fr::rand(rng);
+ 
++    let universal_srs = MarlinInst::universal_setup(100000, 100000, 100000, rng).unwrap();
++
++    c.bench_function("snark_circuit_setup", move |b| {
++        b.iter(|| {
+             let circuit = Benchmark::<Fr> {
+-                inputs: vec![None; num_inputs],
++                a: Some(x),
++                b: Some(y),
+                 num_constraints,
++                num_variables,
+             };
+ 
+-            Marlin::setup(&(circuit, universal_srs), rng).unwrap()
++            Marlin::setup(&(circuit, universal_srs.clone()), rng).unwrap()
+         })
+     });
+ }
+ 
+ fn snark_prove(c: &mut Criterion) {
+-    let num_inputs = 2;
+-    let num_constraints = 1000;
++    let num_constraints = 100;
++    let num_variables = 100;
+     let rng = &mut thread_rng();
+-    let mut inputs: Vec<Option<Fr>> = Vec::with_capacity(num_inputs);
+-    for _ in 0..num_inputs {
+-        inputs.push(Some(rng.gen()));
+-    }
+ 
+-    let universal_srs = snarkvm_marlin::MarlinTestnet1::universal_setup(1000, 1000, 1000, rng).unwrap();
++    let x = Fr::rand(rng);
++    let y = Fr::rand(rng);
++
++    let universal_srs = MarlinInst::universal_setup(1000, 1000, 1000, rng).unwrap();
+ 
+     let circuit = Benchmark::<Fr> {
+-        inputs: vec![None; num_inputs],
++        a: Some(x),
++        b: Some(y),
+         num_constraints,
++        num_variables,
+     };
+ 
+     let params = Marlin::setup(&(circuit, universal_srs), rng).unwrap();
+@@ -122,8 +159,10 @@ fn snark_prove(c: &mut Criterion) {
+             Marlin::prove(
+                 &params.0,
+                 &Benchmark {
+-                    inputs: inputs.clone(),
++                    a: Some(x),
++                    b: Some(y),
+                     num_constraints,
++                    num_variables,
+                 },
+                 rng,
+             )
+@@ -132,10 +171,127 @@ fn snark_prove(c: &mut Criterion) {
+     });
+ }
+ 
++fn snark_verify(c: &mut Criterion) {
++    let num_constraints = 1000;
++    let num_variables = 25;
++    let rng = &mut thread_rng();
++
++    let x = Fr::rand(rng);
++    let y = Fr::rand(rng);
++    let mut z = x;
++    z.mul_assign(&y);
++
++    let universal_srs = MarlinInst::universal_setup(1000000, 100000, 1000000, rng).unwrap();
++
++    let circuit = Benchmark::<Fr> {
++        a: Some(x),
++        b: Some(y),
++        num_constraints,
++        num_variables,
++    };
++
++    let params = MarlinInst::circuit_setup(&universal_srs, &circuit).unwrap();
++
++    let proof = MarlinInst::prove(
++        &params.0,
++        &Benchmark {
++            a: Some(x),
++            b: Some(y),
++            num_constraints,
++            num_variables,
++        },
++        rng,
++    )
++    .unwrap();
++
++    c.bench_function("snark_verify", move |b| {
++        b.iter(|| {
++            let verification = Marlin::verify(&params.1, &vec![z], &proof).unwrap();
++            assert_eq!(verification, true);
++        })
++    });
++}
++
++fn snark_verify_gadget(c: &mut Criterion) {
++    let num_constraints = 2000;
++    let num_variables = 25;
++    let rng = &mut thread_rng();
++
++    let x = Fr::rand(rng);
++    let y = Fr::rand(rng);
++    let mut z = x;
++    z.mul_assign(&y);
++
++    let universal_srs = MarlinInst::universal_setup(1000000, 100000, 1000000, rng).unwrap();
++
++    let circuit = Benchmark::<Fr> {
++        a: Some(x),
++        b: Some(y),
++        num_constraints,
++        num_variables,
++    };
++
++    let params = MarlinInst::circuit_setup(&universal_srs, &circuit).unwrap();
++
++    let proof = MarlinInst::prove(
++        &params.0,
++        &Benchmark {
++            a: Some(x),
++            b: Some(y),
++            num_constraints,
++            num_variables,
++        },
++        rng,
++    )
++    .unwrap();
++
++    let mut cs = TestConstraintSystem::<Fq>::new();
++
++    let input_gadget = <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::InputVar::alloc_input(
++        cs.ns(|| "alloc_input_gadget"),
++        || Ok(vec![z]),
++    )
++    .unwrap();
++
++    let proof_gadget =
++        <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::ProofVar::alloc(cs.ns(|| "alloc_proof"), || Ok(proof))
++            .unwrap();
++
++    let vk_gadget =
++        <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::VerifyingKeyVar::alloc(cs.ns(|| "alloc_vk"), || {
++            Ok(params.1.clone())
++        })
++        .unwrap();
++
++    c.bench_function("snark_verify_gadget", move |b| {
++        b.iter(|| {
++            println!("cs: {}", cs.num_constraints());
++
++            let verification_result = <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::verify(
++                cs.ns(|| "marlin_verify"),
++                &vk_gadget,
++                &input_gadget,
++                &proof_gadget,
++            )
++            .unwrap();
++
++            verification_result
++                .enforce_equal(cs.ns(|| "enforce_equal_verification"), &Boolean::Constant(true))
++                .unwrap();
++
++            assert!(
++                cs.is_satisfied(),
++                "Constraints not satisfied: {}",
++                cs.which_is_unsatisfied().unwrap()
++            );
++        })
++    });
++}
++
+ criterion_group! {
+     name = marlin_snark;
+     config = Criterion::default().sample_size(10);
+-    targets = snark_setup, snark_prove
++    targets = snark_universal_setup, snark_circuit_setup, snark_prove, snark_verify, snark_verify_gadget
+ }
+ 
+ criterion_main!(marlin_snark);
+diff --git a/marlin/src/constraints/snark.rs b/marlin/src/constraints/snark.rs
+index c4f54f9a0..87a243011 100644
+--- a/marlin/src/constraints/snark.rs
++++ b/marlin/src/constraints/snark.rs
+@@ -519,4 +519,91 @@ pub mod test {
+             );
+         }
+     }
++
++    #[test]
++    fn marlin_verifier_num_constraints_test() {
++        let mut rng = test_rng();
++
++        // Construct the circuit.
++
++        let a = Fr::rand(&mut rng);
++        let b = Fr::rand(&mut rng);
++        let mut c = a;
++        c.mul_assign(&b);
++
++        let circ = Circuit {
++            a: Some(a),
++            b: Some(b),
++            num_constraints: rng.gen_range(1000..100000),
++            num_variables: rng.gen_range(100..1000),
++        };
++
++        // Generate the circuit parameters.
++
++        let (pk, vk) = TestSNARK::circuit_specific_setup(circ, &mut rng).unwrap();
++
++        // Test native proof and verification.
++
++        let proof = TestSNARK::prove(&pk, &circ, &mut rng).unwrap();
++
++        assert!(
++            TestSNARK::verify(&vk.clone().into(), &[c], &proof).unwrap(),
++            "The native verification check fails."
++        );
++
++        // Initialize constraint system.
++        let mut cs = TestConstraintSystem::<Fq>::new();
++
++        let input_gadget = <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::InputVar::alloc_input(
++            cs.ns(|| "alloc_input_gadget"),
++            || Ok(vec![c]),
++        )
++        .unwrap();
++
++        let input_gadget_constraints = cs.num_constraints();
++
++        let proof_gadget =
++            <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::ProofVar::alloc(cs.ns(|| "alloc_proof"), || Ok(proof))
++                .unwrap();
++
++        let proof_gadget_constraints = cs.num_constraints() - input_gadget_constraints;
++
++        let vk_gadget =
++            <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::VerifyingKeyVar::alloc(cs.ns(|| "alloc_vk"), || {
++                Ok(vk.clone())
++            })
++            .unwrap();
++
++        let vk_gadget_constraints = cs.num_constraints() - input_gadget_constraints;
++
++        let verification_result = <TestSNARKGadget as SNARKGadget<Fr, Fq, TestSNARK>>::verify(
++            cs.ns(|| "marlin_verify"),
++            &vk_gadget,
++            &input_gadget,
++            &proof_gadget,
++        )
++        .unwrap();
++
++        let verifier_gadget_constraints = cs.num_constraints() - proof_gadget_constraints;
++
++        verification_result
++            .enforce_equal(cs.ns(|| "enforce_equal_verification"), &Boolean::Constant(true))
++            .unwrap();
++
++        assert!(
++            cs.is_satisfied(),
++            "Constraints not satisfied: {}",
++            cs.which_is_unsatisfied().unwrap()
++        );
++
++        const INPUT_GADGET_CONSTRAINTS: usize = 383;
++        const PROOF_GADGET_CONSTRAINTS: usize = 56;
++        const VK_GADGET_CONSTRAINTS: usize = 136;
++        const VERIFIER_GADGET_CONSTRAINTS: usize = 152885;
++
++        assert_eq!(input_gadget_constraints, INPUT_GADGET_CONSTRAINTS);
++        assert_eq!(proof_gadget_constraints, PROOF_GADGET_CONSTRAINTS);
++        assert_eq!(vk_gadget_constraints, VK_GADGET_CONSTRAINTS);
++        assert_eq!(verifier_gadget_constraints, VERIFIER_GADGET_CONSTRAINTS);
++    }
+ }
+diff --git a/marlin/src/constraints/verifier.rs b/marlin/src/constraints/verifier.rs
+index 0def59d13..20ef16d8b 100644
+--- a/marlin/src/constraints/verifier.rs
++++ b/marlin/src/constraints/verifier.rs
+@@ -389,8 +389,6 @@ mod test {
+         .enforce_equal(cs.ns(|| "enforce_equal"), &Boolean::Constant(true))
+         .unwrap();
+ 
+-        println!("after Marlin, num_of_constraints = {}", cs.num_constraints());
+-
+         assert!(
+             cs.is_satisfied(),
+             "Constraints not satisfied: {}",
+diff --git a/marlin/src/marlin/marlin.rs b/marlin/src/marlin/marlin.rs
+index 7afd6614b..9315d7bd2 100644
+--- a/marlin/src/marlin/marlin.rs
++++ b/marlin/src/marlin/marlin.rs
+@@ -501,14 +501,6 @@ where
+         proof.print_size_info();
+         end_timer!(prover_time);
+ 
+-        println!("Number of proof commitments: {}", proof.commitments.len());
+-        println!("Number of proof evaluations: {}", proof.evaluations.len());
+-        println!("Number of proof messages: {}", proof.prover_messages.len());
+-        println!(
+-            "Number of proof batch evaluations: {}",
+-            proof.clone().pc_proof.proof.into().len()
+-        );
+-
+         Ok(proof)
+     }
+ 
+diff --git a/parameters/Cargo.toml b/parameters/Cargo.toml
+index 7773d3e86..2d8486387 100644
+--- a/parameters/Cargo.toml
++++ b/parameters/Cargo.toml
+@@ -28,7 +28,7 @@ version = "0.3.1"
+ default-features = false
+ 
+ [dependencies.curl]
+-version = "0.4.37"
++version = "0.4.38"
+ optional = true
+ 
+ [dependencies.hex]
+diff --git a/r1cs/src/linear_combination.rs b/r1cs/src/linear_combination.rs
+index 771ad17d6..85a6cdb49 100644
+--- a/r1cs/src/linear_combination.rs
++++ b/r1cs/src/linear_combination.rs
+@@ -91,7 +91,11 @@ impl<F: Field> LinearCombination<F> {
+                     found_index += 1;
+                 }
+             }
+-            Err(found_index)
++            if self.0.get(found_index).map(|x| &x.0 == search_var).unwrap_or_default() {
++                Ok(found_index)
++            } else {
++                Err(found_index)
++            }
+         } else {
+             self.0.binary_search_by_key(search_var, |&(cur_var, _)| cur_var)
+         }
+@@ -479,3 +483,20 @@ impl<'a, F: Field> Sub<(F, LinearCombination<F>)> for LinearCombination<F> {
+         self + (-coeff, other)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use crate::Index;
++
++    use super::*;
++    use snarkvm_curves::bls12_377::Fr;
++
++    #[test]
++    fn linear_combination_append() {
++        let mut combo = LinearCombination::<Fr>::zero();
++        for i in 0..100u64 {
++            combo += (i.into(), Variable::new_unchecked(Index::Public(0)));
++        }
++        assert_eq!(combo.0.len(), 1);
++    }
++}

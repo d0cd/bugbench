@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -67,6 +68,34 @@ def get_diff_stats(base: str, head: str, cwd: Path) -> CaseStats:
     )
 
 
+def stats_from_patch(patch_content: str) -> CaseStats:
+    """Compute diff stats by parsing patch content directly (no repo needed)."""
+    lines_added = 0
+    lines_deleted = 0
+    files: set[str] = set()
+    hunks = 0
+
+    for line in patch_content.splitlines():
+        if line.startswith("diff --git "):
+            # Extract file path from "diff --git a/path b/path"
+            parts = line.split(" b/", 1)
+            if len(parts) == 2:
+                files.add(parts[1])
+        elif line.startswith("@@ "):
+            hunks += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            lines_added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            lines_deleted += 1
+
+    return CaseStats(
+        lines_added=lines_added,
+        lines_deleted=lines_deleted,
+        files_changed=len(files),
+        hunks=hunks,
+    )
+
+
 def get_changed_files(base: str, head: str, cwd: Path) -> list[str]:
     """Return list of files changed between two commits."""
     output = run_git("diff", "--name-only", base, head, cwd=cwd)
@@ -120,3 +149,38 @@ def is_repo(path: Path) -> bool:
         return True
     except (GitError, FileNotFoundError):
         return False
+
+
+def sanitize_patch(patch_content: str) -> str:
+    """Strip identifying metadata from patch content that could be used for web lookups.
+
+    Removes:
+    - ``index <sha>..<sha>`` lines (blob SHAs)
+    - git format-patch envelope headers (From, Author, Date, Subject, commit body)
+    """
+    has_envelope = bool(re.match(r"^From [0-9a-f]+ ", patch_content))
+
+    lines = patch_content.splitlines(keepends=True)
+    filtered: list[str] = []
+    in_envelope = has_envelope
+
+    for line in lines:
+        stripped = line.rstrip("\n")
+
+        if re.match(r"^index [0-9a-f]+\.\.[0-9a-f]+", stripped):
+            continue
+
+        if in_envelope:
+            if re.match(r"^From [0-9a-f]+ ", stripped):
+                continue
+            if stripped.startswith(("From:", "Date:", "Subject:")):
+                continue
+            if stripped.startswith("diff --git "):
+                in_envelope = False
+                filtered.append(line)
+                continue
+            continue
+
+        filtered.append(line)
+
+    return "".join(filtered)

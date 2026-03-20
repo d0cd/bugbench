@@ -1,127 +1,437 @@
-diff --git a/compiler/passes/src/type_checking/check_expressions.rs b/compiler/passes/src/type_checking/check_expressions.rs
-index 36f84c612b..3000a2b296 100644
---- a/compiler/passes/src/type_checking/check_expressions.rs
-+++ b/compiler/passes/src/type_checking/check_expressions.rs
-@@ -677,8 +677,9 @@ impl<'a, N: Network> ExpressionVisitor<'a> for TypeChecker<'a, N> {
-                     // Check function argument types.
-                     self.scope_state.is_call = true;
-                     let (mut input_futures, mut inferred_finalize_inputs) = (Vec::new(), Vec::new());
--                    func.input.iter().zip(input.arguments.iter()).for_each(|(expected, argument)| {
--                        let ty = self.visit_expression(argument, &Some(expected.type_().clone()));
-+                    for (expected, argument) in func.input.iter().zip(input.arguments.iter()) {
-+                        // Get the type of the expression. If the type is not known, do not attempt to attempt any futher inference.
-+                        let ty = self.visit_expression(argument, &Some(expected.type_().clone()))?;
-                         // Extract information about futures that are being consumed.
-                         if func.variant == Variant::AsyncFunction && matches!(expected.type_(), Type::Future(_)) {
-                             match argument {
-@@ -690,7 +691,7 @@ impl<'a, N: Network> ExpressionVisitor<'a> for TypeChecker<'a, N> {
-                                             // Get the external program and function name.
-                                             input_futures.push(location);
-                                             // Get the full inferred type.
--                                            inferred_finalize_inputs.push(ty.unwrap());
-+                                            inferred_finalize_inputs.push(ty);
-                                         }
-                                         None => {
-                                             self.emit_err(TypeCheckerError::unknown_future_consumed(
-@@ -708,9 +709,9 @@ impl<'a, N: Network> ExpressionVisitor<'a> for TypeChecker<'a, N> {
-                                 }
-                             }
-                         } else {
--                            inferred_finalize_inputs.push(ty.unwrap());
-+                            inferred_finalize_inputs.push(ty);
-                         }
--                    });
-+                    }
-                     self.scope_state.is_call = false;
+diff --git a/Cargo.lock b/Cargo.lock
+index 35c1b808e4..d7563d136d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1073,9 +1073,9 @@ dependencies = [
  
-                     // Add the call to the call graph.
-diff --git a/tests/expectations/compiler/bugs/unknown_variable_fail.out b/tests/expectations/compiler/bugs/unknown_variable_fail.out
+ [[package]]
+ name = "indexmap"
+-version = "1.8.2"
++version = "1.8.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e6012d540c5baa3589337a98ce73408de9b5a25ec9fc2c6fd6be8f0d39e0ca5a"
++checksum = "0f647032dfaa1f8b6dc29bd3edb7bbef4861b8b8007ebb118d6db284fd59f6ee"
+ dependencies = [
+  "autocfg",
+  "hashbrown 0.11.2",
+diff --git a/compiler/parser/src/tokenizer/lexer.rs b/compiler/parser/src/tokenizer/lexer.rs
+index f53bdc404d..5b0a705b3d 100644
+--- a/compiler/parser/src/tokenizer/lexer.rs
++++ b/compiler/parser/src/tokenizer/lexer.rs
+@@ -149,10 +149,10 @@ impl Token {
+     // }
+ 
+     /// Returns a tuple: [(integer length, integer token)] if an integer can be eaten, otherwise returns [`None`].
+-    /// An integer can be eaten if its bytes are at the front of the given `input_tendril` string.
++    /// An integer can be eaten if its bytes are at the front of the given `input` string.
+     fn eat_integer(input: &mut Peekable<impl Iterator<Item = char>>) -> Result<(usize, Token)> {
+         if input.peek().is_none() {
+-            return Err(ParserError::lexer_empty_input_tendril().into());
++            return Err(ParserError::lexer_empty_input().into());
+         }
+ 
+         let mut int = String::new();
+@@ -170,9 +170,13 @@ impl Token {
+     }
+ 
+     /// Returns a tuple: [(token length, token)] if the next token can be eaten, otherwise returns [`None`].
+-    /// The next token can be eaten if the bytes at the front of the given `input_tendril` string can be scanned into a token.
+-    pub(crate) fn eat(input_tendril: &str) -> Result<(usize, Token)> {
+-        let mut input = input_tendril.chars().peekable();
++    /// The next token can be eaten if the bytes at the front of the given `input` string can be scanned into a token.
++    pub(crate) fn eat(input: &str) -> Result<(usize, Token)> {
++        if input.is_empty() {
++            return Err(ParserError::lexer_empty_input().into());
++        }
++
++        let mut input = input.chars().peekable();
+ 
+         // Consumes a single character token.
+         let single = |input: &mut Peekable<_>, token| {
+@@ -196,11 +200,11 @@ impl Token {
+             } else if let Some(found) = input.next() {
+                 Err(ParserError::lexer_expected_but_found(found, on).into())
+             } else {
+-                Err(ParserError::lexer_empty_input_tendril().into())
++                Err(ParserError::lexer_empty_input().into())
+             }
+         };
+ 
+-        match *input.peek().ok_or_else(ParserError::lexer_empty_input_tendril)? {
++        match *input.peek().ok_or_else(ParserError::lexer_empty_input)? {
+             x if x.is_ascii_whitespace() => return single(&mut input, Token::WhiteSpace),
+             '"' => {
+                 let mut string = String::new();
+diff --git a/compiler/passes/src/type_checker/check_expressions.rs b/compiler/passes/src/type_checker/check_expressions.rs
+index ff921d4b24..097aaf85b6 100644
+--- a/compiler/passes/src/type_checker/check_expressions.rs
++++ b/compiler/passes/src/type_checker/check_expressions.rs
+@@ -226,11 +226,20 @@ impl<'a> ExpressionVisitorDirector<'a> for Director<'a> {
+                             self.visitor.assert_type(Type::Group, expected, input.right.span());
+                             Some(Type::Group)
+                         }
+-                        _ => {
+-                            self.visitor.assert_type(t1.unwrap(), expected, input.left.span());
+-                            self.visitor.assert_type(t2.unwrap(), expected, input.right.span());
+-                            return_incorrect_type(t1, t2, expected)
++                        (Some(t1), Some(t2)) => {
++                            self.visitor.assert_type(*t1, expected, input.left.span());
++                            self.visitor.assert_type(*t2, expected, input.right.span());
++                            return_incorrect_type(Some(*t1), Some(*t2), expected)
++                        }
++                        (Some(type_), None) => {
++                            self.visitor.assert_type(*type_, expected, input.left.span());
++                            None
++                        }
++                        (None, Some(type_)) => {
++                            self.visitor.assert_type(*type_, expected, input.right.span());
++                            None
+                         }
++                        (None, None) => None,
+                     }
+                 }
+                 BinaryOperation::Div => {
+@@ -272,7 +281,7 @@ impl<'a> ExpressionVisitorDirector<'a> for Director<'a> {
+                             );
+                         }
+                         // The base is some type thats not an int or field.
+-                        (Some(t), _) => {
++                        (Some(t), _) if !matches!(t, Type::IntegerType(_) | Type::Field) => {
+                             self.visitor
+                                 .handler
+                                 .emit_err(TypeCheckerError::incorrect_pow_base_type(t, input.left.span()).into());
+diff --git a/compiler/passes/src/type_checker/check_file.rs b/compiler/passes/src/type_checker/check_file.rs
+index 3258fc28f7..72d64e6f8e 100644
+--- a/compiler/passes/src/type_checker/check_file.rs
++++ b/compiler/passes/src/type_checker/check_file.rs
+@@ -15,33 +15,42 @@
+ // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use leo_ast::*;
++use leo_errors::TypeCheckerError;
+ 
+ use crate::{Declaration, TypeChecker, VariableSymbol};
+ 
+ use super::director::Director;
+ 
+-impl<'a> ProgramVisitor<'a> for TypeChecker<'a> {
+-    fn visit_function(&mut self, input: &'a Function) -> VisitResult {
+-        self.symbol_table.clear_variables();
+-        self.parent = Some(input.name());
+-        input.input.iter().for_each(|i| {
+-            let input_var = i.get_variable();
+-            self.validate_ident_type(&Some(input_var.type_));
+-
+-            if let Err(err) = self.symbol_table.insert_variable(
+-                input_var.identifier.name,
+-                VariableSymbol {
+-                    type_: &input_var.type_,
+-                    span: input_var.identifier.span(),
+-                    declaration: Declaration::Input(input_var.mode()),
+-                },
+-            ) {
+-                self.handler.emit_err(err);
++impl<'a> ProgramVisitor<'a> for TypeChecker<'a> {}
++
++impl<'a> ProgramVisitorDirector<'a> for Director<'a> {
++    fn visit_function(&mut self, input: &'a Function) {
++        if let VisitResult::VisitChildren = self.visitor_ref().visit_function(input) {
++            self.visitor.has_return = false;
++            self.visitor.symbol_table.clear_variables();
++            self.visitor.parent = Some(input.name());
++            input.input.iter().for_each(|i| {
++                let input_var = i.get_variable();
++                self.visitor.validate_ident_type(&Some(input_var.type_));
++
++                if let Err(err) = self.visitor.symbol_table.insert_variable(
++                    input_var.identifier.name,
++                    VariableSymbol {
++                        type_: &input_var.type_,
++                        span: input_var.identifier.span(),
++                        declaration: Declaration::Input(input_var.mode()),
++                    },
++                ) {
++                    self.visitor.handler.emit_err(err);
++                }
++            });
++            self.visit_block(&input.block);
++
++            if !self.visitor.has_return {
++                self.visitor
++                    .handler
++                    .emit_err(TypeCheckerError::function_has_no_return(input.name(), input.span()).into());
+             }
+-        });
+-
+-        VisitResult::VisitChildren
++        }
+     }
+ }
+-
+-impl<'a> ProgramVisitorDirector<'a> for Director<'a> {}
+diff --git a/compiler/passes/src/type_checker/check_statements.rs b/compiler/passes/src/type_checker/check_statements.rs
+index 5c2e3204fc..ea24da7067 100644
+--- a/compiler/passes/src/type_checker/check_statements.rs
++++ b/compiler/passes/src/type_checker/check_statements.rs
+@@ -31,6 +31,7 @@ impl<'a> StatementVisitorDirector<'a> for Director<'a> {
+ 
+         let return_type = &self.visitor.symbol_table.lookup_fn(&parent).map(|f| f.output);
+         self.visitor.validate_ident_type(return_type);
++        self.visitor.has_return = true;
+ 
+         self.visit_expression(&input.expression, return_type);
+     }
+@@ -45,6 +46,8 @@ impl<'a> StatementVisitorDirector<'a> for Director<'a> {
+         input.variable_names.iter().for_each(|v| {
+             self.visitor.validate_ident_type(&Some(input.type_));
+ 
++            self.visit_expression(&input.value, &Some(input.type_));
++
+             if let Err(err) = self.visitor.symbol_table.insert_variable(
+                 v.identifier.name,
+                 VariableSymbol {
+@@ -55,8 +58,6 @@ impl<'a> StatementVisitorDirector<'a> for Director<'a> {
+             ) {
+                 self.visitor.handler.emit_err(err);
+             }
+-
+-            self.visit_expression(&input.value, &Some(input.type_));
+         });
+     }
+ 
+@@ -92,6 +93,10 @@ impl<'a> StatementVisitorDirector<'a> for Director<'a> {
+ 
+     fn visit_conditional(&mut self, input: &'a ConditionalStatement) {
+         self.visit_expression(&input.condition, &Some(Type::Boolean));
++        self.visit_block(&input.block);
++        if let Some(s) = input.next.as_ref() {
++            self.visit_statement(s)
++        }
+     }
+ 
+     fn visit_iteration(&mut self, input: &'a IterationStatement) {
+@@ -124,8 +129,8 @@ impl<'a> StatementVisitorDirector<'a> for Director<'a> {
+     }
+ 
+     fn visit_block(&mut self, input: &'a Block) {
++        // creates a new sub-scope since we are in a block.
+         self.visitor.symbol_table.push_variable_scope();
+-        // have to redo the logic here so we have scoping
+         input.statements.iter().for_each(|stmt| {
+             match stmt {
+                 Statement::Return(stmt) => self.visit_return(stmt),
+diff --git a/compiler/passes/src/type_checker/checker.rs b/compiler/passes/src/type_checker/checker.rs
+index 40a89ec679..274041724f 100644
+--- a/compiler/passes/src/type_checker/checker.rs
++++ b/compiler/passes/src/type_checker/checker.rs
+@@ -26,6 +26,7 @@ pub struct TypeChecker<'a> {
+     pub(crate) symbol_table: &'a mut SymbolTable<'a>,
+     pub(crate) handler: &'a Handler,
+     pub(crate) parent: Option<Symbol>,
++    pub(crate) has_return: bool,
+     pub(crate) negate: bool,
+     pub(crate) account_types: IndexSet<Symbol>,
+     pub(crate) algorithms_types: IndexSet<Symbol>,
+@@ -77,6 +78,7 @@ impl<'a> TypeChecker<'a> {
+             symbol_table,
+             handler,
+             parent: None,
++            has_return: false,
+             negate: false,
+             account_types: Account::types(),
+             algorithms_types: Algorithms::types(),
+diff --git a/docs/grammar/abnf-grammar.txt b/docs/grammar/abnf-grammar.txt
+index 51fb2ba0b8..62cb621ed1 100644
+--- a/docs/grammar/abnf-grammar.txt
++++ b/docs/grammar/abnf-grammar.txt
+@@ -214,7 +214,9 @@ boolean-type = %s"bool"
+ 
+ address-type = %s"address"
+ 
+-primitive-type =  boolean-type / arithmetic-type / address-type
++string-type = %s"string"
++
++primitive-type =  boolean-type / arithmetic-type / address-type / string-type
+ 
+ type = primitive-type / identifier
+ 
+diff --git a/leo/errors/README.md b/leo/errors/README.md
+index 0a0c4aa726..1e334f0f1d 100644
+--- a/leo/errors/README.md
++++ b/leo/errors/README.md
+@@ -23,7 +23,6 @@ The common section of this crate contains a few sub files:
+ - [Formatted Error](./src/common/formatted.rs): Which contains the information needed to create a formatted error for Leo.
+ - [Macros](./src/common/macros.rs): Which contains the logic to make creating errors easy through a DSL. It also figures out the error codes for each error via a **top down** method. Meaning all new errors should be added to the bottom of the file. You can specify whether an error is formatted or backtraced through a decorator above a function name, where the formatted ones require a Span as an argument by default. The body takes any additional arguments you want provided to the function, the message, and the optional help message for the error. The additional arguments are just specified to implement traits to avoid as many type conversions in other Leo crates.
+ - [Span](./src/common/span.rs): Which contains the span object used throughout the other Leo crates (with the exception of the Input crate see more [below](#input)).
+-- [Tendril JSON](./src/common/tendril_json.rs): Which contains the common logic for how to searlize a StrTendril from the tendril crate.
+ - [Traits](./src/common/traits.rs): Which contains the common traits in errors to make defining errors easier.
+ 
+ ## Error Types
+diff --git a/leo/errors/src/errors/parser/parser_errors.rs b/leo/errors/src/errors/parser/parser_errors.rs
+index 721ee49c2e..f750fc57ad 100644
+--- a/leo/errors/src/errors/parser/parser_errors.rs
++++ b/leo/errors/src/errors/parser/parser_errors.rs
+@@ -200,9 +200,9 @@ create_messages!(
+         help: None,
+     }
+ 
+-    /// When an empty input tendril was expected but not found.
++    /// When more input was expected but not found.
+     @backtraced
+-    lexer_empty_input_tendril {
++    lexer_empty_input {
+         args: (),
+         msg: "Expected more characters to lex but found none.",
+         help: None,
+diff --git a/leo/errors/src/errors/type_checker/type_checker_error.rs b/leo/errors/src/errors/type_checker/type_checker_error.rs
+index 2965891cf4..8f11c90016 100644
+--- a/leo/errors/src/errors/type_checker/type_checker_error.rs
++++ b/leo/errors/src/errors/type_checker/type_checker_error.rs
+@@ -142,4 +142,14 @@ create_messages!(
+         ),
+         help: None,
+     }
++
++    /// For when a function doesn't have a return statement.
++    @formatted
++    function_has_no_return {
++        args: (func: impl Display),
++        msg: format!(
++            "The function {func} has no return statement.",
++        ),
++        help: None,
++    }
+ );
+diff --git a/tests/compiler/definition/use_decl_variable_as_assign_fail.leo b/tests/compiler/definition/use_decl_variable_as_assign_fail.leo
 new file mode 100644
-index 0000000000..9d53affe71
+index 0000000000..79d1af8554
 --- /dev/null
-+++ b/tests/expectations/compiler/bugs/unknown_variable_fail.out
-@@ -0,0 +1,5 @@
-+---
++++ b/tests/compiler/definition/use_decl_variable_as_assign_fail.leo
+@@ -0,0 +1,10 @@
++/*
 +namespace: Compile
 +expectation: Fail
-+outputs:
-+  - "Error [ETYC0372005]: Unknown variable `caller`\n    --> compiler-test:37:44\n     |\n  37 |         return (self.caller, finalize_init(caller));\n     |                                            ^^^^^^\nError [ETYC0372088]: An async transition must call an async function.\n    --> compiler-test:36:5\n     |\n  36 |     async transition init(b: bool) -> (address, Future) {\n  37 |         return (self.caller, finalize_init(caller));\n  38 |     }\n     |     ^\n     |\n     = Example: `async transition foo() -> Future { let a: Future = bar(); return await_futures(a); }`\nError [ETYC0372005]: Unknown variable `account`\n    --> compiler-test:54:53\n     |\n  54 |         let owner_amount: u64 = Mapping::get_or_use(account, caller, 0u64);\n     |                                                     ^^^^^^^\nError [ETYC0372005]: Unknown variable `account`\n    --> compiler-test:56:22\n     |\n  56 |         Mapping::set(account, caller, owner_amount + admin_token_amt);\n     |                      ^^^^^^^\nWarning [WTYC0372002]: The async function `finalize_init` is never called by an async transition.\n    --> compiler-test:40:5\n     |\n  40 |     async function finalize_init(caller: address) {\n  41 |         let gs: GlobalState = Mapping::get_or_use(global_state, true, GlobalState {\n  42 |             next_token_id: 0field,\n  43 |             admin: aleo1az8p9vlllyqwtj0c2g9svkd0e5v0p3zzdflwwrpa7kpe8xrfxgfqqpru7m,\n  44 |         });\n  45 |         assert_eq(gs.next_token_id, 0field);\n  46 |         assert_eq(caller, gs.admin);\n  47 |         Mapping::set(global_state, true, GlobalState {\n  48 |             next_token_id: 1field,\n  49 |             admin: gs.admin,\n  50 |         });\n  51 | \n  52 |         let test_supply: u64 = 15000000000000u64;\n  53 |         let admin_token_amt: u64 = 60000000u64;\n  54 |         let owner_amount: u64 = Mapping::get_or_use(account, caller, 0u64);\n  55 |         assert(owner_amount == 0u64);\n  56 |         Mapping::set(account, caller, owner_amount + admin_token_amt);\n  57 | \n  58 |         Mapping::set(test_token, test_supply, TestToken {\n  59 |             name: 4577111110111112111108121field,\n  60 |             symbol: 4577111110111112111108121field,\n  61 |             decimals: 6u8,\n  62 |             circulating_supply: 0u64 + admin_token_amt,\n  63 |             total_supply: test_supply,\n  64 |             admin: gs.admin,\n  65 |         });\n  66 |     }\n     |     ^"
-diff --git a/tests/tests/compiler/bugs/unknown_variable_fail.leo b/tests/tests/compiler/bugs/unknown_variable_fail.leo
++input_file: inputs/dummy.in
++*/
++
++function main(y: bool) -> bool {
++	let b: u8 = b;
++    return y == true;
++}
+\ No newline at end of file
+diff --git a/tests/compiler/function/no_return_fail.leo b/tests/compiler/function/no_return_fail.leo
 new file mode 100644
-index 0000000000..ad4c34e782
+index 0000000000..eacda3f528
 --- /dev/null
-+++ b/tests/tests/compiler/bugs/unknown_variable_fail.leo
-@@ -0,0 +1,73 @@
++++ b/tests/compiler/function/no_return_fail.leo
+@@ -0,0 +1,6 @@
 +/*
 +namespace: Compile
 +expectation: Fail
 +*/
 +
-+program test.aleo {
++function main() -> u8 {}
+\ No newline at end of file
+diff --git a/tests/compiler/group/ternary.leo b/tests/compiler/group/ternary.leo
+index f3bf0e0705..72312ac337 100644
+--- a/tests/compiler/group/ternary.leo
++++ b/tests/compiler/group/ternary.leo
+@@ -8,4 +8,5 @@ function main(a: group, b: group, c: group) -> bool {
+     const r: group = true ? a : b;
+ 
+     console.assert(r == c);
++    return r == c;
+ }
+\ No newline at end of file
+diff --git a/tests/compiler/statements/non_existant_var_exp_fail.leo b/tests/compiler/statements/non_existant_var_exp_fail.leo
+new file mode 100644
+index 0000000000..6ac1d5ff33
+--- /dev/null
++++ b/tests/compiler/statements/non_existant_var_exp_fail.leo
+@@ -0,0 +1,10 @@
++/*
++namespace: Compile
++expectation: Fail
++input_file: inputs/dummy.in
++*/
 +
-+    struct TokenInfo {
-+        name: field,
-+        symbol: field,
-+        decimals: u8,
-+        circulating_supply: u64,
-+        total_supply: u64,
-+        testers: u64
-+        admin: address,
-+    }
-+
-+
-+    struct TestToken {
-+        name: field,
-+        symbol: field,
-+        decimals: u8,
-+        circulating_supply: u64,
-+        total_supply: u64,
-+        admin: address,
-+    }
-+
-+    struct GlobalState {
-+        next_token_id: field,
-+        admin: address,
-+    }
-+
-+    mapping tokens: u64 => TokenInfo;
-+
-+    mapping test_token: u64 => TestToken;
-+
-+    mapping global_state: bool => GlobalState;
-+
-+    async transition init(b: bool) -> (address, Future) {
-+        return (self.caller, finalize_init(caller));
-+    }
-+
-+    async function finalize_init(caller: address) {
-+        let gs: GlobalState = Mapping::get_or_use(global_state, true, GlobalState {
-+            next_token_id: 0field,
-+            admin: aleo1az8p9vlllyqwtj0c2g9svkd0e5v0p3zzdflwwrpa7kpe8xrfxgfqqpru7m,
-+        });
-+        assert_eq(gs.next_token_id, 0field);
-+        assert_eq(caller, gs.admin);
-+        Mapping::set(global_state, true, GlobalState {
-+            next_token_id: 1field,
-+            admin: gs.admin,
-+        });
-+
-+        let test_supply: u64 = 15000000000000u64;
-+        let admin_token_amt: u64 = 60000000u64;
-+        let owner_amount: u64 = Mapping::get_or_use(account, caller, 0u64);
-+        assert(owner_amount == 0u64);
-+        Mapping::set(account, caller, owner_amount + admin_token_amt);
-+
-+        Mapping::set(test_token, test_supply, TestToken {
-+            name: 4577111110111112111108121field,
-+            symbol: 4577111110111112111108121field,
-+            decimals: 6u8,
-+            circulating_supply: 0u64 + admin_token_amt,
-+            total_supply: test_supply,
-+            admin: gs.admin,
-+        });
-+    }
-+
++function main(k: bool) -> bool {
++	let b: u8 = 1u8**z;
++    return k == true;
 +}
+\ No newline at end of file
+diff --git a/tests/compiler/statements/non_existant_vars_mul_fail.leo b/tests/compiler/statements/non_existant_vars_mul_fail.leo
+new file mode 100644
+index 0000000000..9b44527dde
+--- /dev/null
++++ b/tests/compiler/statements/non_existant_vars_mul_fail.leo
+@@ -0,0 +1,10 @@
++/*
++namespace: Compile
++expectation: Fail
++input_file: inputs/dummy.in
++*/
 +
-+
++function main(k: bool) -> bool {
++	let b: u8 = x*z;
++    return k == true;
++}
+\ No newline at end of file
+diff --git a/tests/expectations/compiler/compiler/definition/use_decl_variable_as_assign_fail.leo.out b/tests/expectations/compiler/compiler/definition/use_decl_variable_as_assign_fail.leo.out
+new file mode 100644
+index 0000000000..9442d7d720
+--- /dev/null
++++ b/tests/expectations/compiler/compiler/definition/use_decl_variable_as_assign_fail.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Compile
++expectation: Fail
++outputs:
++  - "Error [ETYC0372003]: Unknown variable `b`\n    --> compiler-test:4:14\n     |\n   4 | \tlet b: u8 = b;\n     |              ^\n"
+diff --git a/tests/expectations/compiler/compiler/function/no_return_fail.leo.out b/tests/expectations/compiler/compiler/function/no_return_fail.leo.out
+new file mode 100644
+index 0000000000..e584776b23
+--- /dev/null
++++ b/tests/expectations/compiler/compiler/function/no_return_fail.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Compile
++expectation: Fail
++outputs:
++  - "Error [ETYC0372012]: The function main has no return statement.\n    --> compiler-test:3:1\n     |\n   3 | function main() -> u8 {}\n     | ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+diff --git a/tests/expectations/compiler/compiler/group/ternary.leo.out b/tests/expectations/compiler/compiler/group/ternary.leo.out
+index 90fc3d3550..3e8db521b5 100644
+--- a/tests/expectations/compiler/compiler/group/ternary.leo.out
++++ b/tests/expectations/compiler/compiler/group/ternary.leo.out
+@@ -3,6 +3,6 @@ namespace: Compile
+ expectation: Pass
+ outputs:
+   - output:
+-      - initial_input_ast: abe58c662f85737a1bdb4b3e55c3e455e128ff543cbee00637b5b33aee554202
+-    initial_ast: d75014d735c603b442bf7e21a9c0c40880a44bc4a2b47d99d87b1c396290f814
+-    symbol_table: 5e96e4138e5643222224de143ab32b6716c4dbaf965318b48eaf9e4ba63f8586
++      - initial_input_ast: a18a82ee746e1fd1f9c6c09c36b055f9d3b44a17dd778c5081f9258d6bb9f3ae
++    initial_ast: dab5600564d366fe0b548228bd230a25aa65fa8902ea7f21cf01ba8e16df1f9f
++    symbol_table: 35465ba1d734747d0265a3b89c9cee8fe0beda4cfb42b477010c902472e57cc1
+diff --git a/tests/expectations/compiler/compiler/statements/non_existant_var_exp_fail.leo.out b/tests/expectations/compiler/compiler/statements/non_existant_var_exp_fail.leo.out
+new file mode 100644
+index 0000000000..7cf5b586ac
+--- /dev/null
++++ b/tests/expectations/compiler/compiler/statements/non_existant_var_exp_fail.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Compile
++expectation: Fail
++outputs:
++  - "Error [ETYC0372003]: Unknown variable `z`\n    --> compiler-test:4:19\n     |\n   4 | \tlet b: u8 = 1u8**z;\n     |                   ^\n"
+diff --git a/tests/expectations/compiler/compiler/statements/non_existant_vars_mul_fail.leo.out b/tests/expectations/compiler/compiler/statements/non_existant_vars_mul_fail.leo.out
+new file mode 100644
+index 0000000000..012ae3bd2c
+--- /dev/null
++++ b/tests/expectations/compiler/compiler/statements/non_existant_vars_mul_fail.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Compile
++expectation: Fail
++outputs:
++  - "Error [ETYC0372003]: Unknown variable `x`\n    --> compiler-test:4:14\n     |\n   4 | \tlet b: u8 = x*z;\n     |              ^\nError [ETYC0372003]: Unknown variable `z`\n    --> compiler-test:4:16\n     |\n   4 | \tlet b: u8 = x*z;\n     |                ^\n"

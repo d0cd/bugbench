@@ -1,0 +1,2311 @@
+diff --git a/frontend/discourse/app/controllers/topic.js b/frontend/discourse/app/controllers/topic.js
+index 844dc0012d45c..cc23eb85b5469 100644
+--- a/frontend/discourse/app/controllers/topic.js
++++ b/frontend/discourse/app/controllers/topic.js
+@@ -37,6 +37,7 @@ import QuoteState from "discourse/lib/quote-state";
+ import { extractLinkMeta } from "discourse/lib/render-topic-featured-link";
+ import { fancyTitle } from "discourse/lib/topic-fancy-title";
+ import { trackedArray } from "discourse/lib/tracked-tools";
++import { applyBehaviorTransformer } from "discourse/lib/transformer";
+ import DiscourseURL, { userPath } from "discourse/lib/url";
+ import { escapeExpression } from "discourse/lib/utilities";
+ import Bookmark, { AUTO_DELETE_PREFERENCES } from "discourse/models/bookmark";
+@@ -1252,25 +1253,37 @@ export default class TopicController extends Controller {
+     if (!this.editingTopic) {
+       return;
+     }
+-    const props = this.get("buffered.buffer");
+-    const hasCategoryOrTagChanges =
+-      props.category_id !== undefined || props.tags !== undefined;
+ 
+-    try {
+-      if (this.editingTopicLocalization) {
+-        await this._saveTopicLocalization();
+-      }
++    return applyBehaviorTransformer(
++      "topic-controller:finished-editing",
++      async ({ context }) => {
++        const props = context.buffered;
++        const hasCategoryOrTagChanges =
++          props.category_id !== undefined || props.tags !== undefined;
+ 
+-      if (hasCategoryOrTagChanges || !this.editingTopicLocalization) {
+-        await Topic.update(this.model, props, { fastEdit: true });
+-      }
++        try {
++          if (context.editingTopicLocalization) {
++            await this._saveTopicLocalization();
++          }
+ 
+-      this.buffered.discardChanges();
+-      this._resetTranslationState();
+-      this.set("editingTopic", false);
+-    } catch (error) {
+-      popupAjaxError(error);
+-    }
++          if (hasCategoryOrTagChanges || !context.editingTopicLocalization) {
++            await Topic.update(context.model, props, { fastEdit: true });
++          }
++
++          this.buffered.discardChanges();
++          this._resetTranslationState();
++          this.set("editingTopic", false);
++        } catch (error) {
++          popupAjaxError(error);
++        }
++      },
++      {
++        editingTopic: this.editingTopic,
++        editingTopicLocalization: this.editingTopicLocalization,
++        buffered: this.get("buffered.buffer"),
++        model: this.model,
++      }
++    );
+   }
+ 
+   async _saveTopicLocalization() {
+diff --git a/frontend/discourse/app/lib/plugin-api.gjs b/frontend/discourse/app/lib/plugin-api.gjs
+index 9e4506cc78ab9..989823c4297b5 100644
+--- a/frontend/discourse/app/lib/plugin-api.gjs
++++ b/frontend/discourse/app/lib/plugin-api.gjs
+@@ -117,7 +117,10 @@ import Composer, {
+ } from "discourse/models/composer";
+ import { addNavItem } from "discourse/models/nav-item";
+ import { _addTrackedPostProperty } from "discourse/models/post";
+-import { registerCustomLastUnreadUrlCallback } from "discourse/models/topic";
++import {
++  _addTrackedTopicProperty,
++  registerCustomLastUnreadUrlCallback,
++} from "discourse/models/topic";
+ import {
+   addSaveableUserField,
+   addSaveableUserOptionField,
+@@ -736,6 +739,20 @@ class _PluginApi {
+     names.forEach((name) => _addTrackedPostProperty(name));
+   }
+ 
++  /**
++   * Adds tracked properties to the topic model.
++   *
++   * This method is used to mark properties as tracked for topic updates.
++   *
++   * You'll need to do this if you've added properties to a Topic and need them to be
++   * automatically updated in the UI when there are changes in the model.
++   *
++   * @param {...string} names - The names of the properties to be tracked.
++   */
++  addTrackedTopicProperties(...names) {
++    names.forEach((name) => _addTrackedTopicProperty(name));
++  }
++
+   /**
+    * Decommissioned API
+    **/
+diff --git a/frontend/discourse/app/lib/transformer/registry.js b/frontend/discourse/app/lib/transformer/registry.js
+index a80f8d11efd51..c47ae2f880e7f 100644
+--- a/frontend/discourse/app/lib/transformer/registry.js
++++ b/frontend/discourse/app/lib/transformer/registry.js
+@@ -6,6 +6,7 @@ export const BEHAVIOR_TRANSFORMERS = Object.freeze([
+   "full-page-search-load-more",
+   "post-menu-toggle-like-action",
+   "post-stream-error-loading",
++  "topic-controller:finished-editing",
+   "topic-list-item-click",
+ ]);
+ 
+diff --git a/frontend/discourse/app/models/topic.js b/frontend/discourse/app/models/topic.js
+index 3cd7bdfc16289..44feb61b39bb4 100644
+--- a/frontend/discourse/app/models/topic.js
++++ b/frontend/discourse/app/models/topic.js
+@@ -19,7 +19,10 @@ import { deepMerge } from "discourse/lib/object";
+ import PreloadStore from "discourse/lib/preload-store";
+ import { emojiUnescape } from "discourse/lib/text";
+ import { fancyTitle } from "discourse/lib/topic-fancy-title";
+-import { trackedArray } from "discourse/lib/tracked-tools";
++import {
++  defineTrackedProperty,
++  trackedArray,
++} from "discourse/lib/tracked-tools";
+ import DiscourseURL, { userPath } from "discourse/lib/url";
+ import ActionSummary from "discourse/models/action-summary";
+ import Bookmark from "discourse/models/bookmark";
+@@ -30,6 +33,16 @@ import { flushMap } from "discourse/services/store";
+ import { i18n } from "discourse-i18n";
+ import Category from "./category";
+ 
++const pluginTrackedProperties = new Set();
++
++export function _addTrackedTopicProperty(propertyKey) {
++  pluginTrackedProperties.add(propertyKey);
++}
++
++export function clearAddedTrackedTopicProperties() {
++  pluginTrackedProperties.clear();
++}
++
+ export function loadTopicView(topic, args) {
+   const data = deepMerge({}, args);
+   const url = `/t/${topic.id}`;
+@@ -347,6 +360,14 @@ export default class Topic extends RestModel {
+     topic: this,
+   });
+ 
++  constructor() {
++    super(...arguments);
++
++    pluginTrackedProperties.forEach((propertyKey) => {
++      defineTrackedProperty(this, propertyKey);
++    });
++  }
++
+   @discourseComputed("last_read_post_number", "highest_post_number")
+   visited(lastReadPostNumber, highestPostNumber) {
+     // >= to handle case where there are deleted posts at the end of the topic
+diff --git a/frontend/discourse/tests/helpers/qunit-helpers.js b/frontend/discourse/tests/helpers/qunit-helpers.js
+index b9c8a595c123b..ec0c473406799 100644
+--- a/frontend/discourse/tests/helpers/qunit-helpers.js
++++ b/frontend/discourse/tests/helpers/qunit-helpers.js
+@@ -90,6 +90,7 @@ import { clearNavItems } from "discourse/models/nav-item";
+ import { clearAddedTrackedPostProperties } from "discourse/models/post";
+ import { resetLastEditNotificationClick } from "discourse/models/post-stream";
+ import Site from "discourse/models/site";
++import { clearAddedTrackedTopicProperties } from "discourse/models/topic";
+ import User from "discourse/models/user";
+ import { clearResolverOptions } from "discourse/resolver";
+ import { _clearSnapshots } from "discourse/select-kit/components/composer-actions";
+@@ -268,6 +269,7 @@ export function testCleanup(container, app) {
+   clearRegisteredTabs();
+   clearRegisteredEditCategoryTabs();
+   clearAddedTrackedPostProperties();
++  clearAddedTrackedTopicProperties();
+   resetGroupPostSmallActionCodes();
+   enableClearA11yAnnouncementsInTests();
+   resetHtmlDecorators();
+diff --git a/frontend/discourse/tests/unit/controllers/topic-test.js b/frontend/discourse/tests/unit/controllers/topic-test.js
+index 145752ffad7ab..dec99c855b2ac 100644
+--- a/frontend/discourse/tests/unit/controllers/topic-test.js
++++ b/frontend/discourse/tests/unit/controllers/topic-test.js
+@@ -6,6 +6,7 @@ import { module, test } from "qunit";
+ import sinon from "sinon";
+ import { removeValueFromArray } from "discourse/lib/array-tools";
+ import { forceMobile } from "discourse/lib/mobile";
++import { withPluginApi } from "discourse/lib/plugin-api";
+ import { Placeholder } from "discourse/models/post-stream";
+ import pretender, { response } from "discourse/tests/helpers/create-pretender";
+ 
+@@ -621,4 +622,44 @@ module("Unit | Controller | topic", function (hooks) {
+ 
+     assert.true(destroyed, "post was destroyed");
+   });
++
++  test("topic-controller:finished-editing behavior transformer", async function (assert) {
++    const controller = getOwner(this).lookup("controller:topic");
++    const model = this.store.createRecord("topic", {
++      id: 123,
++      title: "Test",
++    });
++    controller.setProperties({ model });
++    controller.set("editingTopic", true);
++
++    sinon.stub(model.constructor, "update").resolves();
++    sinon.stub(controller, "send");
++
++    withPluginApi((api) => {
++      api.registerBehaviorTransformer(
++        "topic-controller:finished-editing",
++        ({ next }) => {
++          if (controller.blockWithTransformer) {
++            return;
++          }
++          next();
++        }
++      );
++    });
++
++    controller.blockWithTransformer = true;
++    await controller.finishedEditingTopic();
++
++    assert.true(
++      controller.editingTopic,
++      "transformer blocked finishedEditingTopic"
++    );
++
++    controller.blockWithTransformer = false;
++    await controller.finishedEditingTopic();
++    assert.false(
++      controller.editingTopic,
++      "transformer allowed finishedEditingTopic"
++    );
++  });
+ });
+diff --git a/frontend/discourse/tests/unit/models/topic-test.js b/frontend/discourse/tests/unit/models/topic-test.js
+index d13bd425cfc04..dc7cb58fd48d3 100644
+--- a/frontend/discourse/tests/unit/models/topic-test.js
++++ b/frontend/discourse/tests/unit/models/topic-test.js
+@@ -2,6 +2,7 @@ import { getOwner } from "@ember/owner";
+ import { setupTest } from "ember-qunit";
+ import { IMAGE_VERSION as v } from "pretty-text/emoji/version";
+ import { module, test } from "qunit";
++import { withPluginApi } from "discourse/lib/plugin-api";
+ import Category from "discourse/models/category";
+ import Topic from "discourse/models/topic";
+ import TopicDetails from "discourse/models/topic-details";
+@@ -254,4 +255,43 @@ module("Unit | Model | topic", function (hooks) {
+     assert.false(invisibleTopic.visible);
+     assert.true(invisibleTopic.invisible);
+   });
++
++  test("addTrackedTopicProperties", function (assert) {
++    withPluginApi((api) => {
++      api.addTrackedTopicProperties("plugin_property", "other_plugin_property");
++    });
++
++    const topic = this.store.createRecord("topic", { id: 1234 });
++
++    topic.plugin_property = "test value";
++    topic.other_plugin_property = "other value";
++
++    assert.strictEqual(
++      topic.plugin_property,
++      "test value",
++      "plugin tracked property can be set and read via direct assignment"
++    );
++    assert.strictEqual(
++      topic.other_plugin_property,
++      "other value",
++      "other plugin tracked property can be set and read via direct assignment"
++    );
++
++    topic.updateFromJson({
++      details: {},
++      plugin_property: "updated value",
++      other_plugin_property: "other updated value",
++    });
++
++    assert.strictEqual(
++      topic.plugin_property,
++      "updated value",
++      "plugin tracked property is updated via updateFromJson"
++    );
++    assert.strictEqual(
++      topic.other_plugin_property,
++      "other updated value",
++      "other plugin tracked property is updated via updateFromJson"
++    );
++  });
+ });
+diff --git a/lib/asset_processor.rb b/lib/asset_processor.rb
+index 06e8cadbb42fd..34b3734298dc2 100644
+--- a/lib/asset_processor.rb
++++ b/lib/asset_processor.rb
+@@ -1,11 +1,19 @@
+ # frozen_string_literal: true
+ 
+ class AssetProcessor
+-  PROCESSOR_PATH = "tmp/asset-processor.js"
++  PROCESSOR_DIR = "tmp/asset-processor"
++  LOCK_FILE = "#{PROCESSOR_DIR}/build.lock"
++
++  CACHE_DEPENDENCY_GLOBS = %w[
++    node_modules/.pnpm/lock.yaml
++    frontend/asset-processor/**/*.js
++    frontend/discourse/lib/babel-transform-module-renames.js
++    frontend/discourse/config/targets.js
++    frontend/discourse-plugins/transform-action-syntax.js
++  ]
+ 
+   @mutex = Mutex.new
+   @ctx_init = Mutex.new
+-  @processor_mutex = Mutex.new
+ 
+   class TranspileError < StandardError
+   end
+@@ -27,9 +35,60 @@ def self.build_asset_processor
+     Discourse::Utils.execute_command("pnpm", "-C=frontend/asset-processor", "node", "build.js")
+   end
+ 
+-  def self.build_production_asset_processor
+-    File.write(PROCESSOR_PATH, build_asset_processor)
+-    PROCESSOR_PATH
++  def self.inputs_digest
++    digest = Digest::MD5.new
++
++    CACHE_DEPENDENCY_GLOBS.each do |pattern|
++      files = Dir.glob(pattern).sort
++      raise "No files matched #{pattern}" if files.empty?
++
++      files.each do |file|
++        digest.update(file)
++        digest.update(File.read(file))
++      end
++    end
++
++    digest.hexdigest.to_i(16).to_s(36) # base36
++  end
++
++  def self.processor_file_path
++    "#{PROCESSOR_DIR}/asset-processor-#{inputs_digest}.js"
++  end
++
++  def self.with_file_lock(&block)
++    lock_path = "#{Rails.root}/#{LOCK_FILE}"
++    FileUtils.mkdir_p(File.dirname(lock_path))
++    File.open(lock_path, File::CREAT | File::RDWR) do |lock_file|
++      lock_file.flock(File::LOCK_EX)
++      yield
++    end
++  end
++
++  def self.cleanup_old_cache_files
++    Dir
++      .glob("#{PROCESSOR_DIR}/asset-processor-*.js")
++      .reject { it.end_with?(processor_file_path) }
++      .each { File.delete(it) }
++  end
++
++  def self.load_or_build_processor_source
++    cache_path = processor_file_path
++
++    if File.exist?(cache_path)
++      File.read(cache_path)
++    else
++      with_file_lock do
++        if File.exist?(cache_path)
++          File.read(cache_path)
++        else
++          built_source = build_asset_processor
++          FileUtils.mkdir_p(PROCESSOR_DIR)
++          File.write(cache_path, built_source)
++          cleanup_old_cache_files
++          built_source
++        end
++      end
++    end
+   end
+ 
+   def self.create_new_context
+@@ -59,12 +118,7 @@ def self.create_new_context
+       end,
+     )
+ 
+-    source =
+-      if Rails.env.production?
+-        File.read(PROCESSOR_PATH)
+-      else
+-        @processor_mutex.synchronize { build_asset_processor }
+-      end
++    source = load_or_build_processor_source
+ 
+     ctx.eval(source, filename: "asset-processor.js")
+ 
+diff --git a/lib/tasks/assets.rake b/lib/tasks/assets.rake
+index 7a62d2d63bc52..57ef1e7c5c400 100644
+--- a/lib/tasks/assets.rake
++++ b/lib/tasks/assets.rake
+@@ -152,7 +152,7 @@ task "assets:precompile:compress_js": "environment" do
+ end
+ 
+ task "assets:precompile:asset_processor": "environment" do
+-  AssetProcessor.build_production_asset_processor
++  AssetProcessor.load_or_build_processor_source
+ end
+ 
+ # Run these tasks **before** Rails' "assets:precompile" task
+diff --git a/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs b/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs
+index 5313ce65f7d44..3098900f621d7 100644
+--- a/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs
++++ b/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs
+@@ -6,6 +6,7 @@ import { LinkTo } from "@ember/routing";
+ import { service } from "@ember/service";
+ import DButton from "discourse/components/d-button";
+ import DToggleSwitch from "discourse/components/d-toggle-switch";
++import DTooltip from "discourse/float-kit/components/d-tooltip";
+ import categoryBadge from "discourse/helpers/category-badge";
+ import icon from "discourse/helpers/d-icon";
+ import replaceEmoji from "discourse/helpers/replace-emoji";
+@@ -90,6 +91,17 @@ export default class ChatRouteChannelInfoSettings extends Component {
+     return this.chatGuardian.canArchiveChannel(this.args.channel);
+   }
+ 
++  get canToggleChannelState() {
++    return this.args.channel.isClosed;
++  }
++
++  get openChannelDisabledReason() {
++    if (this.args.channel.isArchived) {
++      return i18n("chat.channel_settings.open_channel_disabled_archived");
++    }
++    return i18n("chat.channel_settings.open_channel_disabled_read_only");
++  }
++
+   get toggleChannelWideMentionsAvailable() {
+     return this.args.channel.isCategoryChannel && this.args.channel.isOpen;
+   }
+@@ -549,13 +561,30 @@ export default class ChatRouteChannelInfoSettings extends Component {
+                         @icon="lock"
+                         class="close-btn chat-form__btn btn-transparent"
+                       />
+-                    {{else}}
++                    {{else if this.canToggleChannelState}}
+                       <DButton
+                         @action={{this.onToggleChannelState}}
+                         @label="chat.channel_settings.open_channel"
+                         @icon="unlock"
+                         class="open-btn chat-form__btn btn-transparent"
+                       />
++                    {{else}}
++                      <DTooltip
++                        @identifier="channel-open-disabled"
++                        @placement="left"
++                      >
++                        <:trigger>
++                          <DButton
++                            @label="chat.channel_settings.open_channel"
++                            @icon="unlock"
++                            @disabled={{true}}
++                            class="open-btn chat-form__btn btn-transparent"
++                          />
++                        </:trigger>
++                        <:content>
++                          {{this.openChannelDisabledReason}}
++                        </:content>
++                      </DTooltip>
+                     {{/if}}
+                   </:action>
+                 </section.row>
+diff --git a/plugins/chat/config/locales/client.en.yml b/plugins/chat/config/locales/client.en.yml
+index e2832762d10de..b80d1f5a81305 100644
+--- a/plugins/chat/config/locales/client.en.yml
++++ b/plugins/chat/config/locales/client.en.yml
+@@ -95,6 +95,8 @@ en:
+         unstar_channel: "Unstar channel"
+         close_channel: "Close channel"
+         open_channel: "Open channel"
++        open_channel_disabled_archived: "Archived channels cannot be reopened."
++        open_channel_disabled_read_only: "Read-only channels cannot be reopened."
+         archive_channel: "Archive channel"
+         delete_channel: "Delete channel"
+         join_channel: "Join channel"
+diff --git a/plugins/chat/spec/system/archived_channel_settings_spec.rb b/plugins/chat/spec/system/archived_channel_settings_spec.rb
+new file mode 100644
+index 0000000000000..b9f3dc71eff55
+--- /dev/null
++++ b/plugins/chat/spec/system/archived_channel_settings_spec.rb
+@@ -0,0 +1,54 @@
++# frozen_string_literal: true
++
++RSpec.describe "Archived channel settings", type: :system do
++  fab!(:channel_1, :chat_channel)
++  fab!(:current_user, :admin)
++
++  let(:chat) { PageObjects::Pages::Chat.new }
++  let(:channel_settings) { PageObjects::Pages::ChatChannelSettings.new }
++
++  before do
++    chat_system_bootstrap
++    SiteSetting.chat_allow_archiving_channels = true
++    channel_1.add(current_user)
++    sign_in(current_user)
++  end
++
++  context "when channel is archived" do
++    before { channel_1.update!(status: :archived) }
++
++    it "shows a disabled open channel button with a tooltip" do
++      chat.visit_channel_settings(channel_1)
++
++      expect(channel_settings).to have_open_button(disabled: true)
++      expect(channel_settings).to have_no_close_button
++
++      channel_settings.hover_open_button
++      expect(page).to have_content(
++        I18n.t("js.chat.channel_settings.open_channel_disabled_archived"),
++      )
++    end
++
++    it "does not show the archive channel button" do
++      chat.visit_channel_settings(channel_1)
++
++      expect(page).to have_no_content(I18n.t("js.chat.channel_settings.archive_channel"))
++    end
++  end
++
++  context "when channel is read-only" do
++    before { channel_1.update!(status: :read_only) }
++
++    it "shows a disabled open channel button with a tooltip" do
++      chat.visit_channel_settings(channel_1)
++
++      expect(channel_settings).to have_open_button(disabled: true)
++      expect(channel_settings).to have_no_close_button
++
++      channel_settings.hover_open_button
++      expect(page).to have_content(
++        I18n.t("js.chat.channel_settings.open_channel_disabled_read_only"),
++      )
++    end
++  end
++end
+diff --git a/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb b/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb
+index 7d0373cb5e5fc..fbfa58f9d2301 100644
+--- a/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb
++++ b/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb
+@@ -18,6 +18,31 @@ def has_slug?(slug)
+       def has_name?(name)
+         page.has_css?(".c-channel-settings__name", text: name)
+       end
++
++      def has_open_button?(disabled: false)
++        if disabled
++          page.has_css?(".open-btn[disabled]")
++        else
++          page.has_css?(".open-btn:not([disabled])")
++        end
++      end
++
++      def has_no_open_button?
++        page.has_no_css?(".open-btn")
++      end
++
++      def has_close_button?
++        page.has_css?(".close-btn")
++      end
++
++      def has_no_close_button?
++        page.has_no_css?(".close-btn")
++      end
++
++      def hover_open_button
++        find(".open-btn").hover
++        self
++      end
+     end
+   end
+ end
+diff --git a/plugins/discourse-calendar/app/controllers/discourse_post_event/invitees_controller.rb b/plugins/discourse-calendar/app/controllers/discourse_post_event/invitees_controller.rb
+index fe689172c55c0..512ccf748e995 100644
+--- a/plugins/discourse-calendar/app/controllers/discourse_post_event/invitees_controller.rb
++++ b/plugins/discourse-calendar/app/controllers/discourse_post_event/invitees_controller.rb
+@@ -57,71 +57,73 @@ def index
+     end
+ 
+     def update
+-      invitee = Invitee.find_by!(id: params[:invitee_id], post_id: params[:event_id])
+-      guardian.ensure_can_act_on_invitee!(invitee)
+-      begin
+-        invitee.update_attendance!(invitee_params[:status])
+-        render json: InviteeSerializer.new(invitee)
+-      rescue Discourse::InvalidParameters => e
+-        if e.message == "max_attendees"
++      DiscoursePostEvent::UpdateInvitee.call(
++        params: {
++          status: params.dig(:invitee, :status),
++          event_id: params[:event_id],
++          invitee_id: params[:invitee_id],
++        },
++        guardian:,
++      ) do
++        on_success { |invitee:| render json: InviteeSerializer.new(invitee) }
++        on_failed_policy(:can_act_on_invitee) { raise Discourse::InvalidAccess }
++        on_failed_policy(:can_see_event) { raise Discourse::InvalidAccess }
++        on_failed_policy(:can_update_attendance) { raise Discourse::InvalidAccess }
++        on_failed_policy(:has_capacity) do
+           render_json_error(
+             I18n.t("discourse_post_event.errors.models.event.max_attendees_reached"),
+             422,
+           )
+-        else
+-          raise
+         end
++        on_model_not_found(:invitee) { raise Discourse::NotFound }
++        on_model_not_found(:event) { raise Discourse::NotFound }
++        on_failed_contract { raise Discourse::InvalidParameters }
++        on_failure { render(json: failed_json, status: :unprocessable_entity) }
+       end
+     end
+ 
+     def create
+-      event = Event.find(params[:event_id])
+-      guardian.ensure_can_see!(event.post)
+-
+-      invitee_params = invitee_params(event)
+-
+-      user = current_user
+-      if user_id = invitee_params[:user_id]
+-        user = User.find(user_id.to_i)
+-      end
+-
+-      raise Discourse::InvalidAccess if !event.can_user_update_attendance(user)
+-
+-      if current_user.id != user.id
+-        raise Discourse::InvalidAccess if !guardian.can_act_on_discourse_post_event?(event)
+-      end
+-
+-      begin
+-        invitee = Invitee.create_attendance!(user.id, params[:event_id], invitee_params[:status])
+-        render json: InviteeSerializer.new(invitee)
+-      rescue Discourse::InvalidParameters => e
+-        if e.message == "max_attendees"
++      DiscoursePostEvent::CreateInvitee.call(
++        params: {
++          status: params[:invitee][:status],
++          user_id: params[:invitee][:user_id],
++          event_id: params[:event_id],
++        },
++        guardian:,
++      ) do
++        on_success { |invitee:| render json: InviteeSerializer.new(invitee) }
++        on_failed_policy(:can_see_event) { raise Discourse::InvalidAccess }
++        on_failed_policy(:can_update_attendance) { raise Discourse::InvalidAccess }
++        on_failed_policy(:can_invite_user) { raise Discourse::InvalidAccess }
++        on_failed_policy(:has_capacity) do
+           render_json_error(
+             I18n.t("discourse_post_event.errors.models.event.max_attendees_reached"),
+             422,
+           )
+-        else
+-          raise
+         end
++        on_model_not_found(:event) { raise Discourse::NotFound }
++        on_model_not_found(:user) { raise Discourse::NotFound }
++        on_failed_contract { raise Discourse::InvalidParameters }
++        on_failure { render(json: failed_json, status: :unprocessable_entity) }
+       end
+     end
+ 
+     def destroy
+-      event = Event.find(params[:post_id])
+-      invitee = event.invitees.find(params[:id])
+-      guardian.ensure_can_act_on_invitee!(invitee)
+-      invitee.destroy!
+-      event.publish_update!
+-      render json: success_json
+-    end
+-
+-    private
+-
+-    def invitee_params(event = nil)
+-      if event && guardian.can_act_on_discourse_post_event?(event)
+-        params.require(:invitee).permit(:status, :user_id)
+-      else
+-        params.require(:invitee).permit(:status)
++      DiscoursePostEvent::DestroyInvitee.call(
++        params: {
++          post_id: params[:post_id],
++          id: params[:id],
++        },
++        guardian:,
++      ) do
++        on_success { render json: success_json }
++        on_failed_policy(:can_act_on_invitee) { raise Discourse::InvalidAccess }
++        on_failed_policy(:can_see_event) { raise Discourse::InvalidAccess }
++        on_failed_policy(:can_update_attendance) { raise Discourse::InvalidAccess }
++        on_model_not_found(:event) { raise Discourse::NotFound }
++        on_model_not_found(:invitee) { raise Discourse::NotFound }
++        on_failed_contract { raise Discourse::InvalidParameters }
++        on_failure { render(json: failed_json, status: :unprocessable_entity) }
+       end
+     end
+   end
+diff --git a/plugins/discourse-calendar/app/models/discourse_post_event/event.rb b/plugins/discourse-calendar/app/models/discourse_post_event/event.rb
+index ac087acd17942..d9a5efcd85134 100644
+--- a/plugins/discourse-calendar/app/models/discourse_post_event/event.rb
++++ b/plugins/discourse-calendar/app/models/discourse_post_event/event.rb
+@@ -305,7 +305,7 @@ def enforce_private_invitees!
+       self.invitees.where.not(user_id: fetch_users.select(:id)).delete_all
+     end
+ 
+-    def can_user_update_attendance(user)
++    def can_user_update_attendance?(user)
+       return false if self.closed || self.expired?
+       return true if self.public?
+ 
+diff --git a/plugins/discourse-calendar/app/serializers/discourse_post_event/event_serializer.rb b/plugins/discourse-calendar/app/serializers/discourse_post_event/event_serializer.rb
+index ee0a603fbbf79..ab0b5d334c5fc 100644
+--- a/plugins/discourse-calendar/app/serializers/discourse_post_event/event_serializer.rb
++++ b/plugins/discourse-calendar/app/serializers/discourse_post_event/event_serializer.rb
+@@ -90,7 +90,7 @@ def status
+     end
+ 
+     def can_update_attendance
+-      scope.current_user && object.can_user_update_attendance(scope.current_user)
++      scope.current_user && object.can_user_update_attendance?(scope.current_user)
+     end
+ 
+     def creator
+diff --git a/plugins/discourse-calendar/app/services/discourse_post_event/create_invitee.rb b/plugins/discourse-calendar/app/services/discourse_post_event/create_invitee.rb
+new file mode 100644
+index 0000000000000..50ee29ca9ecb2
+--- /dev/null
++++ b/plugins/discourse-calendar/app/services/discourse_post_event/create_invitee.rb
+@@ -0,0 +1,56 @@
++# frozen_string_literal: true
++
++module DiscoursePostEvent
++  class CreateInvitee
++    include Service::Base
++
++    params do
++      attribute :event_id, :integer
++      attribute :status, :symbol
++      attribute :user_id, :integer
++
++      validates :event_id, presence: true
++      validates :status, inclusion: { in: Invitee.statuses.keys }
++    end
++
++    model :event
++    policy :can_see_event
++    model :user
++    policy :can_update_attendance
++    policy :can_invite_user
++    policy :has_capacity
++
++    model :invitee, :create_invitee
++
++    private
++
++    def fetch_event(params:)
++      Event.find_by(id: params.event_id)
++    end
++
++    def can_see_event(guardian:, event:)
++      guardian.can_see?(event.post)
++    end
++
++    def fetch_user(params:, guardian:)
++      params.user_id ? User.find_by(id: params.user_id) : guardian.user
++    end
++
++    def can_update_attendance(event:, user:)
++      event.can_user_update_attendance?(user)
++    end
++
++    def can_invite_user(guardian:, event:, user:)
++      return true if guardian.user.id == user.id
++      guardian.can_act_on_discourse_post_event?(event)
++    end
++
++    def has_capacity(event:, params:)
++      params.status != :going || !event.at_capacity?
++    end
++
++    def create_invitee(user:, event:, params:)
++      Invitee.create_attendance!(user.id, event.id, params.status)
++    end
++  end
++end
+diff --git a/plugins/discourse-calendar/app/services/discourse_post_event/destroy_invitee.rb b/plugins/discourse-calendar/app/services/discourse_post_event/destroy_invitee.rb
+new file mode 100644
+index 0000000000000..5b2bd6c8603f0
+--- /dev/null
++++ b/plugins/discourse-calendar/app/services/discourse_post_event/destroy_invitee.rb
+@@ -0,0 +1,54 @@
++# frozen_string_literal: true
++
++module DiscoursePostEvent
++  class DestroyInvitee
++    include Service::Base
++
++    params do
++      attribute :post_id, :integer
++      attribute :id, :integer
++
++      validates :post_id, presence: true
++      validates :id, presence: true
++    end
++
++    model :event
++    model :invitee
++    policy :can_act_on_invitee
++    policy :can_see_event
++    policy :can_update_attendance
++
++    step :destroy
++    step :publish
++
++    private
++
++    def fetch_event(params:)
++      Event.find_by(id: params.post_id)
++    end
++
++    def fetch_invitee(event:, params:)
++      event.invitees.find_by(id: params.id)
++    end
++
++    def can_act_on_invitee(guardian:, invitee:)
++      guardian.can_act_on_invitee?(invitee)
++    end
++
++    def can_see_event(guardian:, event:)
++      guardian.can_see?(event.post)
++    end
++
++    def can_update_attendance(guardian:, event:)
++      event.can_user_update_attendance?(guardian.user)
++    end
++
++    def destroy(invitee:)
++      invitee.destroy!
++    end
++
++    def publish(event:)
++      event.publish_update!
++    end
++  end
++end
+diff --git a/plugins/discourse-calendar/app/services/discourse_post_event/update_invitee.rb b/plugins/discourse-calendar/app/services/discourse_post_event/update_invitee.rb
+new file mode 100644
+index 0000000000000..a62cb7e1dd651
+--- /dev/null
++++ b/plugins/discourse-calendar/app/services/discourse_post_event/update_invitee.rb
+@@ -0,0 +1,56 @@
++# frozen_string_literal: true
++
++module DiscoursePostEvent
++  class UpdateInvitee
++    include Service::Base
++
++    params do
++      attribute :event_id, :integer
++      attribute :invitee_id, :integer
++      attribute :status, :symbol
++
++      validates :event_id, presence: true
++      validates :invitee_id, presence: true
++      validates :status, inclusion: { in: Invitee.statuses.keys }
++    end
++
++    model :invitee
++    policy :can_act_on_invitee
++    model :event
++    policy :can_see_event
++    policy :can_update_attendance
++    policy :has_capacity
++
++    step :update
++
++    private
++
++    def fetch_invitee(params:)
++      Invitee.find_by(id: params.invitee_id, post_id: params.event_id)
++    end
++
++    def can_act_on_invitee(guardian:, invitee:)
++      guardian.can_act_on_invitee?(invitee)
++    end
++
++    def fetch_event(invitee:)
++      invitee.event
++    end
++
++    def can_see_event(guardian:, event:)
++      guardian.can_see?(event.post)
++    end
++
++    def can_update_attendance(guardian:, event:)
++      event.can_user_update_attendance?(guardian.user)
++    end
++
++    def has_capacity(event:, invitee:, params:)
++      params.status != :going || !event.at_capacity? || invitee.status == Invitee.statuses[:going]
++    end
++
++    def update(invitee:, params:)
++      invitee.update_attendance!(params.status)
++    end
++  end
++end
+diff --git a/plugins/discourse-calendar/spec/fabricators/event_fabricator.rb b/plugins/discourse-calendar/spec/fabricators/event_fabricator.rb
+index 83001893187fa..cbb7fa056feb4 100644
+--- a/plugins/discourse-calendar/spec/fabricators/event_fabricator.rb
++++ b/plugins/discourse-calendar/spec/fabricators/event_fabricator.rb
+@@ -26,6 +26,18 @@
+   original_ends_at { |attrs| attrs[:original_ends_at] }
+ end
+ 
++Fabricator(:private_event, from: :event) do
++  transient :group
++
++  post do |attrs|
++    group = attrs[:group] || Fabricate(:group)
++    category = Fabricate(:private_category, group:)
++    user = attrs[:user] || Fabricate(:user, admin: true, refresh_auto_groups: true)
++    topic = Fabricate(:topic, user:, category:)
++    Fabricate(:post, user:, topic:)
++  end
++end
++
+ Fabricator(:event_date, from: "DiscoursePostEvent::EventDate") do
+   event
+ 
+diff --git a/plugins/discourse-calendar/spec/requests/invitees_controller_spec.rb b/plugins/discourse-calendar/spec/requests/invitees_controller_spec.rb
+index 84c6e4f345daf..21ad5bc46e906 100644
+--- a/plugins/discourse-calendar/spec/requests/invitees_controller_spec.rb
++++ b/plugins/discourse-calendar/spec/requests/invitees_controller_spec.rb
+@@ -119,307 +119,224 @@ module DiscoursePostEvent
+       end
+     end
+ 
+-    context "when a post event exists" do
+-      context "when an invitee exists" do
+-        let(:invitee1) { Fabricate(:user) }
+-        let(:post_event_2) do
+-          pe = Fabricate(:event, post: post_1)
+-          pe.create_invitees([{ user_id: invitee1.id, status: Invitee.statuses[:going] }])
+-          pe
+-        end
++    describe "#create" do
++      let(:event) { Fabricate(:event, post: post_1) }
++
++      it "creates an invitee" do
++        post "/discourse-post-event/events/#{event.id}/invitees.json",
++             params: {
++               invitee: {
++                 status: "going",
++               },
++             }
++
++        expect(response.status).to eq(200)
++        expect(Invitee).to exist(user_id: user.id, status: Invitee.statuses[:going])
++      end
+ 
+-        describe "updating invitee" do
+-          it "updates its status" do
+-            invitee = post_event_2.invitees.first
++      it "allows staff to invite another user" do
++        other_user = Fabricate(:user)
+ 
+-            expect(invitee.status).to eq(0)
++        post "/discourse-post-event/events/#{event.id}/invitees.json",
++             params: {
++               invitee: {
++                 status: "interested",
++                 user_id: other_user.id,
++               },
++             }
+ 
+-            put "/discourse-post-event/events/#{post_event_2.id}/invitees/#{invitee.id}.json",
+-                params: {
+-                  invitee: {
+-                    status: "interested",
+-                  },
+-                }
++        expect(response.status).to eq(200)
++        expect(Invitee).to exist(user_id: other_user.id, status: Invitee.statuses[:interested])
++      end
+ 
+-            invitee.reload
++      it "returns 403 when non-staff tries to invite themselves to a private event" do
++        private_event = Fabricate(:event, post: post_1, status: "private")
++        other_user = Fabricate(:user)
++        sign_in(other_user)
+ 
+-            expect(invitee.status).to eq(1)
+-            expect(invitee.post_id).to eq(post_1.id)
+-          end
++        expect do
++          post "/discourse-post-event/events/#{private_event.id}/invitees.json",
++               params: {
++                 invitee: {
++                   status: "going",
++                 },
++               }
++        end.not_to change { Invitee.count }
+ 
+-          it "returns 404 when invitee does not exist" do
+-            put "/discourse-post-event/events/#{post_event_2.id}/invitees/999999.json",
+-                params: {
+-                  invitee: {
+-                    status: "interested",
+-                  },
+-                }
++        expect(response.status).to eq(403)
++      end
+ 
+-            expect(response.status).to eq(404)
+-          end
++      context "when event is at max capacity" do
++        fab!(:post_2) { create_post(user: Fabricate(:admin), category: Fabricate(:category)) }
++        fab!(:user_a, :user)
++        fab!(:user_b, :user)
++        fab!(:full_event) do
++          pe = Fabricate(:event, post: post_2, max_attendees: 1)
++          pe.create_invitees([{ user_id: user_a.id, status: Invitee.statuses[:going] }])
++          pe
+         end
+ 
+-        describe "destroying invitee" do
+-          context "when acting user can act on discourse event" do
+-            it "destroys the invitee" do
+-              invitee = post_event_2.invitees.first
+-              delete "/discourse-post-event/events/#{post_event_2.id}/invitees/#{invitee.id}.json"
+-              expect(Invitee.where(id: invitee.id).length).to eq(0)
+-              expect(response.status).to eq(200)
+-            end
+-          end
+-
+-          context "when acting user can act on invitee" do
+-            before { sign_in(invitee1) }
+-
+-            it "destroys the invitee" do
+-              invitee = post_event_2.invitees.first
+-              delete "/discourse-post-event/events/#{post_event_2.id}/invitees/#{invitee.id}.json"
+-              expect(Invitee.where(id: invitee.id).length).to eq(0)
+-              expect(response.status).to eq(200)
+-            end
+-          end
++        it "returns 422 when trying to join as going" do
++          sign_in(user_b)
+ 
+-          context "when acting user can't act on invitee" do
+-            let(:lurker) { Fabricate(:user) }
++          post "/discourse-post-event/events/#{full_event.id}/invitees.json",
++               params: {
++                 invitee: {
++                   status: "going",
++                 },
++               }
+ 
+-            before { sign_in(lurker) }
++          expect(response.status).to eq(422)
++          expect(response.parsed_body["errors"].join).to include("full")
++        end
+ 
+-            it "doesn't destroy the invitee" do
+-              invitee = post_event_2.invitees.first
+-              delete "/discourse-post-event/events/#{post_event_2.id}/invitees/#{invitee.id}.json"
+-              expect(Invitee.where(id: invitee.id).length).to eq(1)
+-              expect(response.status).to eq(403)
+-            end
+-          end
++        it "allows interested when full" do
++          sign_in(user_b)
+ 
+-          it "returns 404 when invitee does not exist" do
+-            delete "/discourse-post-event/events/#{post_event_2.id}/invitees/999999.json"
++          post "/discourse-post-event/events/#{full_event.id}/invitees.json",
++               params: {
++                 invitee: {
++                   status: "interested",
++                 },
++               }
+ 
+-            expect(response.status).to eq(404)
+-          end
++          expect(response.status).to eq(200)
+         end
++      end
++    end
+ 
+-        context "when changing status" do
+-          it "sets tracking of the topic" do
+-            invitee = post_event_2.invitees.first
+-
+-            expect(invitee.status).to eq(0)
++    describe "#update" do
++      let(:invitee_user) { Fabricate(:user) }
++      let(:event) do
++        pe = Fabricate(:event, post: post_1)
++        pe.create_invitees([{ user_id: invitee_user.id, status: Invitee.statuses[:going] }])
++        pe
++      end
++      let(:invitee) { event.invitees.first }
++
++      it "updates the invitee status" do
++        put "/discourse-post-event/events/#{event.id}/invitees/#{invitee.id}.json",
++            params: {
++              invitee: {
++                status: "interested",
++              },
++            }
++
++        expect(response.status).to eq(200)
++        expect(invitee.reload.status).to eq(Invitee.statuses[:interested])
++      end
+ 
+-            put "/discourse-post-event/events/#{post_event_2.id}/invitees/#{invitee.id}.json",
+-                params: {
+-                  invitee: {
+-                    status: "interested",
+-                  },
+-                }
++      it "returns 404 when invitee does not exist" do
++        put "/discourse-post-event/events/#{event.id}/invitees/999999.json",
++            params: {
++              invitee: {
++                status: "interested",
++              },
++            }
+ 
+-            tu = TopicUser.get(invitee.event.post.topic, invitee.user)
+-            expect(tu.notification_level).to eq(TopicUser.notification_levels[:tracking])
++        expect(response.status).to eq(404)
++      end
+ 
+-            put "/discourse-post-event/events/#{post_event_2.id}/invitees/#{invitee.id}.json",
+-                params: {
+-                  invitee: {
+-                    status: "going",
+-                  },
+-                }
++      it "returns 403 when user cannot act on invitee" do
++        lurker = Fabricate(:user)
++        sign_in(lurker)
+ 
+-            tu = TopicUser.get(invitee.event.post.topic, invitee.user)
+-            expect(tu.notification_level).to eq(TopicUser.notification_levels[:watching])
++        put "/discourse-post-event/events/#{event.id}/invitees/#{invitee.id}.json",
++            params: {
++              invitee: {
++                status: "interested",
++              },
++            }
+ 
+-            put "/discourse-post-event/events/#{post_event_2.id}/invitees/#{invitee.id}.json",
+-                params: {
+-                  invitee: {
+-                    status: "not_going",
+-                  },
+-                }
++        expect(response.status).to eq(403)
++      end
+ 
+-            tu = TopicUser.get(invitee.event.post.topic, invitee.user)
+-            expect(tu.notification_level).to eq(TopicUser.notification_levels[:regular])
+-          end
++      context "when event is at max capacity" do
++        fab!(:post_2) { create_post(user: Fabricate(:admin), category: Fabricate(:category)) }
++        fab!(:user_a, :user)
++        fab!(:user_b, :user)
++        fab!(:full_event) do
++          pe = Fabricate(:event, post: post_2, max_attendees: 1)
++          pe.create_invitees([{ user_id: user_a.id, status: Invitee.statuses[:going] }])
++          pe
++        end
++        fab!(:interested_invitee) do
++          Fabricate(
++            :invitee,
++            post_id: post_2.id,
++            user_id: user_b.id,
++            status: Invitee.statuses[:interested],
++          )
+         end
+-      end
+ 
+-      context "when an invitee doesn't exist" do
+-        let(:post_event_2) { Fabricate(:event, post: post_1) }
++        it "returns 422 when trying to change to going" do
++          sign_in(user_b)
+ 
+-        it "creates an invitee" do
+-          post "/discourse-post-event/events/#{post_event_2.id}/invitees.json",
+-               params: {
+-                 invitee: {
+-                   status: "not_going",
+-                 },
+-               }
++          put "/discourse-post-event/events/#{full_event.id}/invitees/#{interested_invitee.id}.json",
++              params: {
++                invitee: {
++                  status: "going",
++                },
++              }
+ 
+-          expect(Invitee).to exist(user_id: user.id, status: 2)
++          expect(response.status).to eq(422)
++          expect(response.parsed_body["errors"].join).to include("full")
+         end
+ 
+-        it "sets tracking of the topic" do
+-          post "/discourse-post-event/events/#{post_event_2.id}/invitees.json",
+-               params: {
+-                 invitee: {
+-                   status: "going",
+-                 },
+-               }
+-
+-          invitee = Invitee.find_by(user_id: user.id)
++        it "allows changing to interested" do
++          sign_in(user_b)
+ 
+-          tu = TopicUser.get(invitee.event.post.topic, user)
+-          expect(tu.notification_level).to eq(TopicUser.notification_levels[:watching])
+-        end
++          put "/discourse-post-event/events/#{full_event.id}/invitees/#{interested_invitee.id}.json",
++              params: {
++                invitee: {
++                  status: "interested",
++                },
++              }
+ 
+-        context "when someone is trying to invite themselves to a private event (creepy)" do
+-          let(:post_event_2) { Fabricate(:event, post: post_1, status: "private") }
+-          let(:other_user) { Fabricate(:user, username: "creep") }
+-
+-          before { sign_in(other_user) }
+-
+-          it "does not create an invitee" do
+-            expect do
+-              post "/discourse-post-event/events/#{post_event_2.id}/invitees.json",
+-                   params: {
+-                     invitee: {
+-                       status: "going",
+-                     },
+-                   }
+-            end.not_to change { post_event_2.invitees.count }
+-          end
++          expect(response.status).to eq(200)
+         end
++      end
++    end
+ 
+-        context "when the invitee is the event owner" do
+-          let(:post_event_2) { Fabricate(:event, post: post_1) }
+-
+-          it "allows inviting other users" do
+-            user = Fabricate(:user)
++    describe "#destroy" do
++      let(:invitee_user) { Fabricate(:user) }
++      let(:event) do
++        pe = Fabricate(:event, post: post_1)
++        pe.create_invitees([{ user_id: invitee_user.id, status: Invitee.statuses[:going] }])
++        pe
++      end
++      let(:invitee) { event.invitees.first }
+ 
+-            post "/discourse-post-event/events/#{post_event_2.id}/invitees.json",
+-                 params: {
+-                   invitee: {
+-                     status: "interested",
+-                     user_id: user.id,
+-                   },
+-                 }
++      it "destroys the invitee as staff" do
++        delete "/discourse-post-event/events/#{event.id}/invitees/#{invitee.id}.json"
+ 
+-            post_event_2.reload
++        expect(response.status).to eq(200)
++        expect(Invitee.exists?(invitee.id)).to eq(false)
++      end
+ 
+-            expect(post_event_2.invitees.length).to eq(1)
+-            invitee = post_event_2.invitees.first
+-            expect(invitee.status).to eq(1)
+-            expect(invitee.post_id).to eq(post_1.id)
+-            expect(invitee.user_id).to eq(user.id)
+-          end
++      it "destroys the invitee as the invitee owner" do
++        sign_in(invitee_user)
+ 
+-          it "creates an invitee" do
+-            expect(post_event_2.invitees.length).to eq(0)
++        delete "/discourse-post-event/events/#{event.id}/invitees/#{invitee.id}.json"
+ 
+-            post "/discourse-post-event/events/#{post_event_2.id}/invitees.json",
+-                 params: {
+-                   invitee: {
+-                     status: "interested",
+-                   },
+-                 }
++        expect(response.status).to eq(200)
++        expect(Invitee.exists?(invitee.id)).to eq(false)
++      end
+ 
+-            post_event_2.reload
++      it "returns 403 when user cannot act on invitee" do
++        lurker = Fabricate(:user)
++        sign_in(lurker)
+ 
+-            invitee = post_event_2.invitees.first
+-            expect(invitee.status).to eq(1)
+-            expect(invitee.post_id).to eq(post_1.id)
+-          end
+-        end
++        delete "/discourse-post-event/events/#{event.id}/invitees/#{invitee.id}.json"
+ 
+-        context "when event has max attendees and is full" do
+-          fab!(:post_2) { create_post(user: Fabricate(:admin), category: Fabricate(:category)) }
+-          fab!(:user_a, :user)
+-          fab!(:user_b, :user)
+-          fab!(:post_event_full) do
+-            pe = Fabricate(:event, post: post_2, max_attendees: 1)
+-            pe.create_invitees([{ user_id: user_a.id, status: Invitee.statuses[:going] }])
+-            pe
+-          end
++        expect(response.status).to eq(403)
++        expect(Invitee.exists?(invitee.id)).to eq(true)
++      end
+ 
+-          context "when updating an invitee" do
+-            fab!(:invitee) do
+-              Fabricate(
+-                :invitee,
+-                post_id: post_2.id,
+-                user_id: user_b.id,
+-                status: Invitee.statuses[:interested],
+-              )
+-            end
+-
+-            context "when invitee was interested" do
+-              it "returns 422 when trying to join as going" do
+-                sign_in(user_b)
+-
+-                put "/discourse-post-event/events/#{post_event_full.id}/invitees/#{invitee.id}.json",
+-                    params: {
+-                      invitee: {
+-                        status: "going",
+-                      },
+-                    }
+-
+-                expect(response.status).to eq(422)
+-                expect(response.parsed_body["errors"].join).to include("full")
+-              end
+-            end
+-
+-            context "when invitee was going" do
+-              it "allows upading to interested" do
+-                sign_in(user_b)
+-
+-                put "/discourse-post-event/events/#{post_event_full.id}/invitees/#{invitee.id}.json",
+-                    params: {
+-                      invitee: {
+-                        status: "interested",
+-                      },
+-                    }
+-
+-                expect(response.status).to eq(200)
+-              end
+-            end
+-          end
++      it "returns 404 when invitee does not exist" do
++        delete "/discourse-post-event/events/#{event.id}/invitees/999999.json"
+ 
+-          context "when creating an invitee" do
+-            it "returns 422 when trying to join as going" do
+-              sign_in(user_b)
+-
+-              post "/discourse-post-event/events/#{post_event_full.id}/invitees.json",
+-                   params: {
+-                     invitee: {
+-                       status: "going",
+-                     },
+-                   }
+-
+-              expect(response.status).to eq(422)
+-              expect(response.parsed_body["errors"].join).to include("full")
+-            end
+-
+-            it "allows interested when full" do
+-              sign_in(user_b)
+-
+-              post "/discourse-post-event/events/#{post_event_full.id}/invitees.json",
+-                   params: {
+-                     invitee: {
+-                       status: "interested",
+-                     },
+-                   }
+-
+-              expect(response.status).to eq(200)
+-            end
+-
+-            it "allows not_going when full" do
+-              sign_in(user_b)
+-
+-              post "/discourse-post-event/events/#{post_event_full.id}/invitees.json",
+-                   params: {
+-                     invitee: {
+-                       status: "not_going",
+-                     },
+-                   }
+-
+-              expect(response.status).to eq(200)
+-            end
+-          end
+-        end
++        expect(response.status).to eq(404)
+       end
+     end
+   end
+diff --git a/plugins/discourse-calendar/spec/services/discourse_post_event/create_invitee_spec.rb b/plugins/discourse-calendar/spec/services/discourse_post_event/create_invitee_spec.rb
+new file mode 100644
+index 0000000000000..91821cf7e8ff8
+--- /dev/null
++++ b/plugins/discourse-calendar/spec/services/discourse_post_event/create_invitee_spec.rb
+@@ -0,0 +1,129 @@
++# frozen_string_literal: true
++
++RSpec.describe(DiscoursePostEvent::CreateInvitee) do
++  describe described_class::Contract, type: :model do
++    it { is_expected.to validate_presence_of(:event_id) }
++    it do
++      is_expected.to validate_inclusion_of(:status).in_array(
++        DiscoursePostEvent::Invitee.statuses.keys.map(&:to_s),
++      )
++    end
++  end
++
++  describe ".call" do
++    subject(:result) { described_class.call(params:, **dependencies) }
++
++    fab!(:current_user) { Fabricate(:user, refresh_auto_groups: true) }
++    fab!(:topic) { Fabricate(:topic, user: current_user) }
++    fab!(:post) { Fabricate(:post, user: current_user, topic: topic) }
++    fab!(:event) { Fabricate(:event, post: post) }
++
++    let(:params) { { event_id: event.id, status: "going" } }
++    let(:dependencies) { { guardian: current_user.guardian } }
++
++    before do
++      Jobs.run_immediately!
++      SiteSetting.calendar_enabled = true
++      SiteSetting.discourse_post_event_enabled = true
++    end
++
++    context "when contract is invalid" do
++      let(:params) { { event_id: event.id, status: "invalid" } }
++
++      it { is_expected.to fail_a_contract }
++    end
++
++    context "when event does not exist" do
++      let(:params) { { event_id: -1, status: "going" } }
++
++      it { is_expected.to fail_to_find_a_model(:event) }
++    end
++
++    context "when user cannot see the event post" do
++      fab!(:private_event)
++
++      let(:params) { { event_id: private_event.id, status: "going" } }
++
++      it { is_expected.to fail_a_policy(:can_see_event) }
++    end
++
++    context "when event is closed" do
++      fab!(:closed_post) { Fabricate(:post, topic: topic) }
++      fab!(:closed_event) { Fabricate(:event, post: closed_post, closed: true) }
++
++      let(:params) { { event_id: closed_event.id, status: "going" } }
++
++      it { is_expected.to fail_a_policy(:can_update_attendance) }
++    end
++
++    context "when event is expired" do
++      fab!(:expired_post) { Fabricate(:post, topic: topic) }
++      fab!(:expired_event) do
++        Fabricate(
++          :event,
++          post: expired_post,
++          original_starts_at: 2.days.ago,
++          original_ends_at: 1.day.ago,
++        )
++      end
++
++      let(:params) { { event_id: expired_event.id, status: "going" } }
++
++      it { is_expected.to fail_a_policy(:can_update_attendance) }
++    end
++
++    context "when non-staff user tries to invite another user" do
++      fab!(:other_user, :user)
++      let(:params) { { event_id: event.id, status: "going", user_id: other_user.id } }
++
++      it { is_expected.to fail_a_policy(:can_invite_user) }
++    end
++
++    context "when event is at max capacity" do
++      fab!(:other_user, :user)
++      fab!(:full_post) { Fabricate(:post, topic: topic) }
++      fab!(:full_event) { Fabricate(:event, post: full_post, max_attendees: 1) }
++
++      before do
++        full_event.create_invitees(
++          [{ user_id: other_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++      end
++
++      let(:params) { { event_id: full_event.id, status: "going" } }
++
++      it { is_expected.to fail_a_policy(:has_capacity) }
++    end
++
++    context "when everything is valid" do
++      it { is_expected.to run_successfully }
++
++      it "creates the invitee" do
++        expect { result }.to change { DiscoursePostEvent::Invitee.count }.by(1)
++        expect(result[:invitee]).to have_attributes(
++          user_id: current_user.id,
++          post_id: event.id,
++          status: DiscoursePostEvent::Invitee.statuses[:going],
++        )
++      end
++    end
++
++    context "when staff invites another user" do
++      fab!(:admin, :admin)
++      fab!(:other_user, :user)
++
++      let(:dependencies) { { guardian: admin.guardian } }
++      let(:params) { { event_id: event.id, status: "interested", user_id: other_user.id } }
++
++      it { is_expected.to run_successfully }
++
++      it "creates the invitee for the other user" do
++        expect { result }.to change { DiscoursePostEvent::Invitee.count }.by(1)
++        expect(result[:invitee]).to have_attributes(
++          user_id: other_user.id,
++          status: DiscoursePostEvent::Invitee.statuses[:interested],
++        )
++      end
++    end
++  end
++end
+diff --git a/plugins/discourse-calendar/spec/services/discourse_post_event/destroy_invitee_spec.rb b/plugins/discourse-calendar/spec/services/discourse_post_event/destroy_invitee_spec.rb
+new file mode 100644
+index 0000000000000..9b9b8d2285096
+--- /dev/null
++++ b/plugins/discourse-calendar/spec/services/discourse_post_event/destroy_invitee_spec.rb
+@@ -0,0 +1,128 @@
++# frozen_string_literal: true
++
++RSpec.describe(DiscoursePostEvent::DestroyInvitee) do
++  describe described_class::Contract, type: :model do
++    it { is_expected.to validate_presence_of(:post_id) }
++    it { is_expected.to validate_presence_of(:id) }
++  end
++
++  describe ".call" do
++    subject(:result) { described_class.call(params:, **dependencies) }
++
++    fab!(:admin, :admin)
++    fab!(:topic) { Fabricate(:topic, user: admin) }
++    fab!(:post) { Fabricate(:post, user: admin, topic: topic) }
++    fab!(:event) { Fabricate(:event, post: post) }
++    fab!(:invitee_user) { Fabricate(:user, refresh_auto_groups: true) }
++    fab!(:invitee) do
++      event.create_invitees(
++        [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++      )
++      event.invitees.find_by(user_id: invitee_user.id)
++    end
++
++    let(:params) { { post_id: event.id, id: invitee.id } }
++    let(:dependencies) { { guardian: invitee_user.guardian } }
++
++    before do
++      Jobs.run_immediately!
++      SiteSetting.calendar_enabled = true
++      SiteSetting.discourse_post_event_enabled = true
++    end
++
++    context "when contract is invalid" do
++      let(:params) { { post_id: nil, id: nil } }
++
++      it { is_expected.to fail_a_contract }
++    end
++
++    context "when event does not exist" do
++      let(:params) { { post_id: -1, id: invitee.id } }
++
++      it { is_expected.to fail_to_find_a_model(:event) }
++    end
++
++    context "when invitee does not exist" do
++      let(:params) { { post_id: event.id, id: -1 } }
++
++      it { is_expected.to fail_to_find_a_model(:invitee) }
++    end
++
++    context "when user cannot act on invitee" do
++      fab!(:other_user, :user)
++      let(:dependencies) { { guardian: other_user.guardian } }
++
++      it { is_expected.to fail_a_policy(:can_act_on_invitee) }
++    end
++
++    context "when user cannot see the event post" do
++      fab!(:private_event)
++      fab!(:private_invitee) do
++        private_event.create_invitees(
++          [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++        private_event.invitees.find_by(user_id: invitee_user.id)
++      end
++
++      let(:params) { { post_id: private_event.id, id: private_invitee.id } }
++
++      it { is_expected.to fail_a_policy(:can_see_event) }
++    end
++
++    context "when event is closed" do
++      fab!(:closed_post) { Fabricate(:post, topic: topic) }
++      fab!(:closed_event) { Fabricate(:event, post: closed_post, closed: true) }
++      fab!(:closed_invitee) do
++        closed_event.create_invitees(
++          [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++        closed_event.invitees.find_by(user_id: invitee_user.id)
++      end
++
++      let(:params) { { post_id: closed_event.id, id: closed_invitee.id } }
++
++      it { is_expected.to fail_a_policy(:can_update_attendance) }
++    end
++
++    context "when event is expired" do
++      fab!(:expired_post) { Fabricate(:post, topic: topic) }
++      fab!(:expired_event) do
++        Fabricate(
++          :event,
++          post: expired_post,
++          original_starts_at: 2.days.ago,
++          original_ends_at: 1.day.ago,
++        )
++      end
++      fab!(:expired_invitee) do
++        expired_event.create_invitees(
++          [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++        expired_event.invitees.find_by(user_id: invitee_user.id)
++      end
++
++      let(:params) { { post_id: expired_event.id, id: expired_invitee.id } }
++
++      it { is_expected.to fail_a_policy(:can_update_attendance) }
++    end
++
++    context "when everything is valid" do
++      it { is_expected.to run_successfully }
++
++      it "destroys the invitee" do
++        expect { result }.to change { DiscoursePostEvent::Invitee.count }.by(-1)
++        expect(DiscoursePostEvent::Invitee.exists?(invitee.id)).to eq(false)
++      end
++    end
++
++    context "when staff destroys another user's invitee" do
++      let(:dependencies) { { guardian: admin.guardian } }
++
++      it { is_expected.to run_successfully }
++
++      it "destroys the invitee" do
++        expect { result }.to change { DiscoursePostEvent::Invitee.count }.by(-1)
++      end
++    end
++  end
++end
+diff --git a/plugins/discourse-calendar/spec/services/discourse_post_event/update_invitee_spec.rb b/plugins/discourse-calendar/spec/services/discourse_post_event/update_invitee_spec.rb
+new file mode 100644
+index 0000000000000..ffc1a1df3a9f5
+--- /dev/null
++++ b/plugins/discourse-calendar/spec/services/discourse_post_event/update_invitee_spec.rb
+@@ -0,0 +1,148 @@
++# frozen_string_literal: true
++
++RSpec.describe(DiscoursePostEvent::UpdateInvitee) do
++  describe described_class::Contract, type: :model do
++    it { is_expected.to validate_presence_of(:event_id) }
++    it { is_expected.to validate_presence_of(:invitee_id) }
++    it do
++      is_expected.to validate_inclusion_of(:status).in_array(
++        DiscoursePostEvent::Invitee.statuses.keys.map(&:to_s),
++      )
++    end
++  end
++
++  describe ".call" do
++    subject(:result) { described_class.call(params:, **dependencies) }
++
++    fab!(:admin, :admin)
++    fab!(:topic) { Fabricate(:topic, user: admin) }
++    fab!(:post) { Fabricate(:post, user: admin, topic: topic) }
++    fab!(:event) { Fabricate(:event, post: post) }
++    fab!(:invitee_user) { Fabricate(:user, refresh_auto_groups: true) }
++    fab!(:invitee) do
++      event.create_invitees(
++        [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++      )
++      event.invitees.find_by(user_id: invitee_user.id)
++    end
++
++    let(:params) { { event_id: event.id, invitee_id: invitee.id, status: "interested" } }
++    let(:dependencies) { { guardian: invitee_user.guardian } }
++
++    before do
++      Jobs.run_immediately!
++      SiteSetting.calendar_enabled = true
++      SiteSetting.discourse_post_event_enabled = true
++    end
++
++    context "when contract is invalid" do
++      let(:params) { { event_id: event.id, invitee_id: invitee.id, status: "invalid" } }
++
++      it { is_expected.to fail_a_contract }
++    end
++
++    context "when invitee does not exist" do
++      let(:params) { { event_id: event.id, invitee_id: -1, status: "interested" } }
++
++      it { is_expected.to fail_to_find_a_model(:invitee) }
++    end
++
++    context "when user cannot act on invitee" do
++      fab!(:other_user, :user)
++      let(:dependencies) { { guardian: other_user.guardian } }
++
++      it { is_expected.to fail_a_policy(:can_act_on_invitee) }
++    end
++
++    context "when user cannot see the event post" do
++      fab!(:private_event)
++      fab!(:private_invitee) do
++        private_event.create_invitees(
++          [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++        private_event.invitees.find_by(user_id: invitee_user.id)
++      end
++
++      let(:params) do
++        { event_id: private_event.id, invitee_id: private_invitee.id, status: "interested" }
++      end
++
++      it { is_expected.to fail_a_policy(:can_see_event) }
++    end
++
++    context "when event is closed" do
++      fab!(:closed_post) { Fabricate(:post, topic: topic) }
++      fab!(:closed_event) { Fabricate(:event, post: closed_post, closed: true) }
++      fab!(:closed_invitee) do
++        closed_event.create_invitees(
++          [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++        closed_event.invitees.find_by(user_id: invitee_user.id)
++      end
++
++      let(:params) do
++        { event_id: closed_event.id, invitee_id: closed_invitee.id, status: "not_going" }
++      end
++
++      it { is_expected.to fail_a_policy(:can_update_attendance) }
++    end
++
++    context "when event is expired" do
++      fab!(:expired_post) { Fabricate(:post, topic: topic) }
++      fab!(:expired_event) do
++        Fabricate(
++          :event,
++          post: expired_post,
++          original_starts_at: 2.days.ago,
++          original_ends_at: 1.day.ago,
++        )
++      end
++      fab!(:expired_invitee) do
++        expired_event.create_invitees(
++          [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++        expired_event.invitees.find_by(user_id: invitee_user.id)
++      end
++
++      let(:params) do
++        { event_id: expired_event.id, invitee_id: expired_invitee.id, status: "not_going" }
++      end
++
++      it { is_expected.to fail_a_policy(:can_update_attendance) }
++    end
++
++    context "when event is at max capacity" do
++      fab!(:other_user, :user)
++      fab!(:full_post) { Fabricate(:post, topic: topic) }
++      fab!(:full_event) { Fabricate(:event, post: full_post, max_attendees: 1) }
++      fab!(:going_invitee) do
++        full_event.create_invitees(
++          [{ user_id: other_user.id, status: DiscoursePostEvent::Invitee.statuses[:going] }],
++        )
++        full_event.invitees.find_by(user_id: other_user.id)
++      end
++      fab!(:interested_invitee) do
++        full_event.create_invitees(
++          [{ user_id: invitee_user.id, status: DiscoursePostEvent::Invitee.statuses[:interested] }],
++        )
++        full_event.invitees.find_by(user_id: invitee_user.id)
++      end
++
++      let(:params) do
++        { event_id: full_event.id, invitee_id: interested_invitee.id, status: "going" }
++      end
++
++      it { is_expected.to fail_a_policy(:has_capacity) }
++    end
++
++    context "when everything is valid" do
++      it { is_expected.to run_successfully }
++
++      it "updates the invitee status" do
++        expect { result }.to change { invitee.reload.status }.from(
++          DiscoursePostEvent::Invitee.statuses[:going],
++        ).to(DiscoursePostEvent::Invitee.statuses[:interested])
++      end
++    end
++  end
++end
+diff --git a/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb b/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb
+index 1a0eed654b3d8..9e84e4325a5b7 100644
+--- a/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb
++++ b/plugins/discourse-rss-polling/app/jobs/jobs/discourse_rss_polling/poll_feed.rb
+@@ -122,28 +122,65 @@ def set_image_as_thumbnail(post, image_link)
+ 
+       def topics_polled_from_feed
+         raw_feed = fetch_raw_feed
+-        return [] if raw_feed.blank?
++
++        if raw_feed.blank?
++          Rails.logger.warn("RSS Polling: Failed to fetch feed from #{feed_url}")
++          return []
++        end
+ 
+         parsed_feed = RSS::Parser.parse(raw_feed, false)
+-        return [] if parsed_feed.blank?
++
++        if parsed_feed.blank?
++          Rails.logger.warn("RSS Polling: Unable to parse feed from #{feed_url}")
++          return []
++        end
+ 
+         parsed_feed.items.map { |item| ::DiscourseRssPolling::FeedItem.new(item) }
+-      rescue RSS::NotWellFormedError, RSS::InvalidRSSError
++      rescue RSS::NotWellFormedError, RSS::InvalidRSSError => e
++        Discourse.warn_exception(e, message: "RSS Polling: Invalid RSS from #{feed_url}")
+         []
+       end
+ 
+       def fetch_raw_feed
++        url, headers = extract_api_credentials(@feed_url)
+         body = +""
+ 
+-        FinalDestination
+-          .new(@feed_url)
+-          .get do |response, chunk, uri|
+-            throw :done if uri.blank? || !response.is_a?(Net::HTTPSuccess)
+-            body << chunk
++        fd = FinalDestination.new(url, headers:)
++        response_status = nil
++
++        fd.get do |response, chunk, uri|
++          if uri.blank? || !response.is_a?(Net::HTTPSuccess)
++            response_status = response&.code
++            throw :done
+           end
++          body << chunk
++        end
++
++        if body.blank? && response_status.present?
++          Rails.logger.warn(
++            "RSS Polling: HTTP #{response_status} when fetching #{feed_url} (status: #{fd.status})",
++          )
++        end
+ 
+         body.presence
+       end
++
++      def extract_api_credentials(url)
++        uri = URI.parse(url)
++        return url, {} if uri.query.blank?
++
++        params = CGI.parse(uri.query)
++        api_key = params.delete("api_key")&.first
++        api_username = params.delete("api_username")&.first
++
++        return url, {} if api_key.blank?
++
++        headers = { "Api-Key" => api_key }
++        headers["Api-Username"] = api_username if api_username.present?
++
++        uri.query = params.empty? ? nil : URI.encode_www_form(params)
++        [uri.to_s, headers]
++      end
+     end
+   end
+ end
+diff --git a/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb b/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb
+index 0693e527c247a..89fb79b3a7bc2 100644
+--- a/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb
++++ b/plugins/discourse-rss-polling/spec/jobs/poll_feed_spec.rb
+@@ -144,15 +144,17 @@
+       }.not_to raise_error
+     end
+ 
+-    it "works with authentication in query parameters" do
++    it "sends API credentials as headers instead of query parameters" do
+       authenticated_url = "#{feed_url}?api_key=test123&api_username=testuser"
+ 
+       Discourse.redis.del("rss-polling-feed-polled:#{Digest::SHA1.hexdigest(authenticated_url)}")
+ 
+-      stub_request(:get, authenticated_url).to_return(
+-        status: 200,
+-        body: file_from_fixtures("feed.rss", "feed"),
+-      )
++      stub_request(:get, feed_url).with(
++        headers: {
++          "Api-Key" => "test123",
++          "Api-Username" => "testuser",
++        },
++      ).to_return(status: 200, body: file_from_fixtures("feed.rss", "feed"))
+ 
+       expect {
+         job.execute(feed_url: authenticated_url, author_username: author.username)
+diff --git a/plugins/discourse-solved/assets/javascripts/discourse/components/solved-accept-answer-button.gjs b/plugins/discourse-solved/assets/javascripts/discourse/components/solved-accept-answer-button.gjs
+index 782cd1006dc89..50fd5bf2d37fe 100644
+--- a/plugins/discourse-solved/assets/javascripts/discourse/components/solved-accept-answer-button.gjs
++++ b/plugins/discourse-solved/assets/javascripts/discourse/components/solved-accept-answer-button.gjs
+@@ -5,6 +5,7 @@ import { service } from "@ember/service";
+ import DButton from "discourse/components/d-button";
+ import { ajax } from "discourse/lib/ajax";
+ import { popupAjaxError } from "discourse/lib/ajax-error";
++import setAcceptedSolution from "../lib/set-accepted-solution";
+ 
+ export default class SolvedAcceptAnswerButton extends Component {
+   static hidden(args) {
+@@ -62,7 +63,7 @@ async function acceptPost(post) {
+       data: { id: post.id },
+     });
+ 
+-    topic.setAcceptedSolution(acceptedAnswer);
++    setAcceptedSolution(topic, acceptedAnswer);
+   } catch (e) {
+     popupAjaxError(e);
+   }
+diff --git a/plugins/discourse-solved/assets/javascripts/discourse/components/solved-unaccept-answer-button.gjs b/plugins/discourse-solved/assets/javascripts/discourse/components/solved-unaccept-answer-button.gjs
+index 219bb5af48d1f..44464dacf7c22 100644
+--- a/plugins/discourse-solved/assets/javascripts/discourse/components/solved-unaccept-answer-button.gjs
++++ b/plugins/discourse-solved/assets/javascripts/discourse/components/solved-unaccept-answer-button.gjs
+@@ -11,6 +11,7 @@ import { ajax } from "discourse/lib/ajax";
+ import { popupAjaxError } from "discourse/lib/ajax-error";
+ import { and } from "discourse/truth-helpers";
+ import { i18n } from "discourse-i18n";
++import setAcceptedSolution from "../lib/set-accepted-solution";
+ 
+ export default class SolvedUnacceptAnswerButton extends Component {
+   @service appEvents;
+@@ -118,7 +119,7 @@ async function unacceptPost(post) {
+       data: { id: post.id },
+     });
+ 
+-    topic.setAcceptedSolution(undefined);
++    setAcceptedSolution(topic, undefined);
+   } catch (e) {
+     popupAjaxError(e);
+   }
+diff --git a/plugins/discourse-solved/assets/javascripts/discourse/initializers/extend-for-solved-button.gjs b/plugins/discourse-solved/assets/javascripts/discourse/initializers/extend-for-solved-button.gjs
+index be566b168ed7b..146bdadd70326 100644
+--- a/plugins/discourse-solved/assets/javascripts/discourse/initializers/extend-for-solved-button.gjs
++++ b/plugins/discourse-solved/assets/javascripts/discourse/initializers/extend-for-solved-button.gjs
+@@ -1,10 +1,10 @@
+ import Component from "@glimmer/component";
+-import { tracked } from "@glimmer/tracking";
+ import { withPluginApi } from "discourse/lib/plugin-api";
+ import { i18n } from "discourse-i18n";
+ import SolvedAcceptAnswerButton from "../components/solved-accept-answer-button";
+ import SolvedAcceptedAnswer from "../components/solved-accepted-answer";
+ import SolvedUnacceptAnswerButton from "../components/solved-unaccept-answer-button";
++import setAcceptedSolution from "../lib/set-accepted-solution";
+ 
+ function initializeWithApi(api) {
+   customizePost(api);
+@@ -15,40 +15,7 @@ function initializeWithApi(api) {
+     api.addDiscoveryQueryParam("solved", { replace: true, refreshModel: true });
+   }
+ 
+-  api.modifyClass(
+-    "model:topic",
+-    (Superclass) =>
+-      class extends Superclass {
+-        @tracked accepted_answer;
+-        @tracked has_accepted_answer;
+-
+-        setAcceptedSolution(acceptedAnswer) {
+-          this.postStream?.posts?.forEach((post) => {
+-            if (!acceptedAnswer) {
+-              post.setProperties({
+-                accepted_answer: false,
+-                topic_accepted_answer: false,
+-              });
+-            } else if (post.post_number > 1) {
+-              post.setProperties(
+-                acceptedAnswer.post_number === post.post_number
+-                  ? {
+-                      accepted_answer: true,
+-                      topic_accepted_answer: true,
+-                    }
+-                  : {
+-                      accepted_answer: false,
+-                      topic_accepted_answer: true,
+-                    }
+-              );
+-            }
+-          });
+-
+-          this.accepted_answer = acceptedAnswer;
+-          this.has_accepted_answer = !!acceptedAnswer;
+-        }
+-      }
+-  );
++  api.addTrackedTopicProperties("accepted_answer", "has_accepted_answer");
+ }
+ 
+ function customizePost(api) {
+@@ -122,7 +89,7 @@ function handleMessages(api) {
+     const topic = controller.model;
+ 
+     if (topic) {
+-      topic.setAcceptedSolution(message.accepted_answer);
++      setAcceptedSolution(topic, message.accepted_answer);
+     }
+   };
+ 
+diff --git a/plugins/discourse-solved/assets/javascripts/discourse/initializers/solved-category-change-confirmation.gjs b/plugins/discourse-solved/assets/javascripts/discourse/initializers/solved-category-change-confirmation.gjs
+index c17e1284ac70a..062e633fbbd9e 100644
+--- a/plugins/discourse-solved/assets/javascripts/discourse/initializers/solved-category-change-confirmation.gjs
++++ b/plugins/discourse-solved/assets/javascripts/discourse/initializers/solved-category-change-confirmation.gjs
+@@ -1,82 +1,74 @@
+-import { action } from "@ember/object";
++import { helperContext } from "discourse/lib/helpers";
+ import { withPluginApi } from "discourse/lib/plugin-api";
+ import Category from "discourse/models/category";
+ import SolvedRemovalConfirmationModal from "../components/modal/solved-removal-confirmation";
+ 
+ const STORAGE_KEY = "discourse-solved-hide-category-change-confirmation";
+ 
+-export default {
+-  name: "solved-category-change-confirmation",
+-
+-  initialize() {
+-    withPluginApi((api) => {
+-      api.modifyClass(
+-        "controller:topic",
+-        (Superclass) =>
+-          class extends Superclass {
+-            _solvedEnabled(categoryId, tags) {
+-              if (
+-                this.siteSettings.allow_solved_on_all_topics ||
+-                Category.findById(categoryId)?.custom_fields
+-                  ?.enable_accepted_answers === "true"
+-              ) {
+-                return true;
+-              }
+-
+-              const solvedTags = this.siteSettings.enable_solved_tags
+-                .split("|")
+-                .filter(Boolean);
+-
+-              return (tags || []).some((t) => solvedTags.includes(t.name));
+-            }
+-
+-            @action
+-            async finishedEditingTopic() {
+-              if (!this.editingTopic) {
+-                return;
+-              }
++function solvedEnabled(categoryId, tags) {
++  const siteSettings = helperContext().siteSettings;
+ 
+-              const props = this.get("buffered.buffer");
+-              let solvedStateChanged = false;
++  if (
++    siteSettings.allow_solved_on_all_topics ||
++    Category.findById(categoryId)?.custom_fields?.enable_accepted_answers ===
++      "true"
++  ) {
++    return true;
++  }
+ 
+-              if ("category_id" in props || "tags" in props) {
+-                const oldCategoryId = this.model.category_id;
+-                const newCategoryId = props.category_id ?? oldCategoryId;
+-                const oldTags = this.model.tags;
+-                const newTags = props.tags ?? oldTags;
++  const solvedTags = siteSettings.enable_solved_tags.split("|").filter(Boolean);
+ 
+-                const oldAllowed = this._solvedEnabled(oldCategoryId, oldTags);
+-                const newAllowed = this._solvedEnabled(newCategoryId, newTags);
++  return (tags || []).some((t) => solvedTags.includes(t.name));
++}
+ 
+-                solvedStateChanged = oldAllowed !== newAllowed;
+-
+-                if (this.model.accepted_answer && oldAllowed && !newAllowed) {
+-                  const showConfirmation =
+-                    localStorage.getItem(STORAGE_KEY) !== "true";
+-
+-                  if (showConfirmation) {
+-                    const result = await this.modal.show(
+-                      SolvedRemovalConfirmationModal
+-                    );
++export default {
++  name: "solved-category-change-confirmation",
+ 
+-                    if (!result?.confirmed) {
+-                      return;
+-                    }
++  initialize() {
++    withPluginApi((api) => {
++      api.registerBehaviorTransformer(
++        "topic-controller:finished-editing",
++        async ({ next, context }) => {
++          const modal = api.container.lookup("service:modal");
++          const props = context.buffered;
++          const model = context.model;
++          let solvedStateChanged = false;
++
++          if ("category_id" in props || "tags" in props) {
++            const oldCategoryId = model.category_id;
++            const newCategoryId = props.category_id ?? oldCategoryId;
++            const oldTags = model.tags;
++            const newTags = props.tags ?? oldTags;
++
++            const oldAllowed = solvedEnabled(oldCategoryId, oldTags);
++            const newAllowed = solvedEnabled(newCategoryId, newTags);
++
++            solvedStateChanged = oldAllowed !== newAllowed;
++
++            if (model.accepted_answer && oldAllowed && !newAllowed) {
++              const showConfirmation =
++                localStorage.getItem(STORAGE_KEY) !== "true";
++
++              if (showConfirmation) {
++                const result = await modal.show(SolvedRemovalConfirmationModal);
++
++                if (!result?.confirmed) {
++                  return;
++                }
+ 
+-                    if (result.dontShowAgain) {
+-                      localStorage.setItem(STORAGE_KEY, "true");
+-                    }
+-                  }
++                if (result.dontShowAgain) {
++                  localStorage.setItem(STORAGE_KEY, "true");
+                 }
+               }
++            }
++          }
+ 
+-              await super.finishedEditingTopic();
++          await next();
+ 
+-              if (solvedStateChanged) {
+-                this.model.postStream.refresh({ forceLoad: true });
+-              }
+-            }
++          if (solvedStateChanged) {
++            model.postStream.refresh({ forceLoad: true });
+           }
++        }
+       );
+     });
+   },
+diff --git a/plugins/discourse-solved/assets/javascripts/discourse/lib/set-accepted-solution.js b/plugins/discourse-solved/assets/javascripts/discourse/lib/set-accepted-solution.js
+new file mode 100644
+index 0000000000000..6c29998244b89
+--- /dev/null
++++ b/plugins/discourse-solved/assets/javascripts/discourse/lib/set-accepted-solution.js
+@@ -0,0 +1,25 @@
++export default function setAcceptedSolution(topic, acceptedAnswer) {
++  topic.postStream?.posts?.forEach((post) => {
++    if (!acceptedAnswer) {
++      post.setProperties({
++        accepted_answer: false,
++        topic_accepted_answer: false,
++      });
++    } else if (post.post_number > 1) {
++      post.setProperties(
++        acceptedAnswer.post_number === post.post_number
++          ? {
++              accepted_answer: true,
++              topic_accepted_answer: true,
++            }
++          : {
++              accepted_answer: false,
++              topic_accepted_answer: true,
++            }
++      );
++    }
++  });
++
++  topic.accepted_answer = acceptedAnswer;
++  topic.has_accepted_answer = !!acceptedAnswer;
++}
+diff --git a/spec/requests/qunit_controller_spec.rb b/spec/requests/qunit_controller_spec.rb
+index 6bb2752ad3a6c..99f0073a274a8 100644
+--- a/spec/requests/qunit_controller_spec.rb
++++ b/spec/requests/qunit_controller_spec.rb
+@@ -10,11 +10,6 @@ def production_sign_in(user)
+     Rails.env.stubs(:production?).returns(true)
+   end
+ 
+-  # rubocop:disable RSpec/BeforeAfterAll
+-  before(:all) { AssetProcessor.build_production_asset_processor }
+-
+-  after(:all) { File.delete(AssetProcessor::PROCESSOR_PATH) }
+-
+   it "hides page for regular users in production" do
+     production_sign_in(Fabricate(:user))
+     get "/theme-qunit"
+diff --git a/spec/system/content_localization_language_switcher_spec.rb b/spec/system/content_localization_language_switcher_spec.rb
+index ae97d2d680ee1..168cc7c46c1d4 100644
+--- a/spec/system/content_localization_language_switcher_spec.rb
++++ b/spec/system/content_localization_language_switcher_spec.rb
+@@ -158,9 +158,11 @@
+ 
+     page.find(TOGGLE_LOCALIZE_BUTTON_SELECTOR).click
+     expect(topic_list).to have_content("Life strategies from The Art of War")
+-    expect(page.find(TOGGLE_LOCALIZE_BUTTON_SELECTOR)["title"]).to eq(
+-      I18n.t("js.content_localization.toggle_localized.not_translated"),
+-    )
++    I18n.with_locale(:ja) do
++      expect(page.find(TOGGLE_LOCALIZE_BUTTON_SELECTOR)["title"]).to eq(
++        I18n.t("js.content_localization.toggle_localized.not_translated"),
++      )
++    end
+ 
+     select_language("es")
+ 
+diff --git a/spec/system/content_localization_spec.rb b/spec/system/content_localization_spec.rb
+index c6abb6a242ef4..5b8a0978bc838 100644
+--- a/spec/system/content_localization_spec.rb
++++ b/spec/system/content_localization_spec.rb
+@@ -90,10 +90,11 @@ def scroll_to_post(post_number)
+       page.find(TOGGLE_LOCALIZE_BUTTON_SELECTOR).click
+ 
+       expect(topic_page.has_topic_title?("Life strategies from The Art of War")).to eq(true)
+-      expect(page.find(TOGGLE_LOCALIZE_BUTTON_SELECTOR)["title"]).to eq(
+-        I18n.t("js.content_localization.toggle_localized.not_translated"),
+-      )
+-
++      I18n.with_locale(:ja) do
++        expect(page.find(TOGGLE_LOCALIZE_BUTTON_SELECTOR)["title"]).to eq(
++          I18n.t("js.content_localization.toggle_localized.not_translated"),
++        )
++      end
+       visit("/")
+       topic_list.visit_topic_with_title("Life strategies from The Art of War")
+     end
+diff --git a/spec/tasks/assets_precompile_spec.rb b/spec/tasks/assets_precompile_spec.rb
+index ece49dda189bd..f2f8ddc28006e 100644
+--- a/spec/tasks/assets_precompile_spec.rb
++++ b/spec/tasks/assets_precompile_spec.rb
+@@ -3,9 +3,10 @@
+ RSpec.describe "assets:precompile" do
+   describe "assets:precompile:asset_processor" do
+     it "compiles the js processor" do
+-      path = Rake::Task["assets:precompile:asset_processor"].actions.first.call
++      FileUtils.rm_rf AssetProcessor::PROCESSOR_DIR
++      Rake::Task["assets:precompile:asset_processor"].actions.first.call
+ 
+-      expect(path).to end_with("tmp/asset-processor.js")
++      path = AssetProcessor.processor_file_path
+       expect(File.exist?(path)).to eq(true)
+     end
+   end

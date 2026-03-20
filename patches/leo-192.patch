@@ -1,109 +1,103 @@
-diff --git a/leo/errors/mod.rs b/leo/errors/mod.rs
-index bc7859ca5d..9fa3bd3d12 100644
---- a/leo/errors/mod.rs
-+++ b/leo/errors/mod.rs
-@@ -19,3 +19,6 @@ pub use self::cli::*;
+diff --git a/compiler/passes/src/code_generation/expression.rs b/compiler/passes/src/code_generation/expression.rs
+index 23e10d2d59..6b76068317 100644
+--- a/compiler/passes/src/code_generation/expression.rs
++++ b/compiler/passes/src/code_generation/expression.rs
+@@ -33,6 +33,7 @@ use leo_ast::{
+     Location,
+     LocatorExpression,
+     MemberAccess,
++    Node,
+     StructExpression,
+     TernaryExpression,
+     TupleExpression,
+@@ -315,15 +316,21 @@ impl CodeGeneratingVisitor<'_> {
  
- pub mod commands;
- pub use self::commands::*;
+     fn visit_array_access(&mut self, input: &ArrayAccess) -> (String, String) {
+         let (array_operand, _) = self.visit_expression(&input.array);
 +
-+pub mod updater;
-+pub use self::updater::*;
-diff --git a/leo/errors/updater.rs b/leo/errors/updater.rs
++        assert!(
++            matches!(self.state.type_table.get(&input.index.id()), Some(Type::Integer(_))),
++            "unexpected type for for array index. This should have been caught by the type checker."
++        );
++
+         let index_operand = match &input.index {
+-            Expression::Literal(Literal { variant: LiteralVariant::Integer(_, string), .. }) => {
+-                format!("{}u32", string)
+-            }
++            Expression::Literal(Literal {
++                variant: LiteralVariant::Integer(_, s) | LiteralVariant::Unsuffixed(s),
++                ..
++            }) => format!("{s}u32"),
+             _ => panic!("Array indices must be integer literals"),
+         };
+-        let array_access = format!("{}[{}]", array_operand, index_operand);
+ 
+-        (array_access, String::new())
++        (format!("{array_operand}[{index_operand}]"), String::new())
+     }
+ 
+     fn visit_member_access(&mut self, input: &MemberAccess) -> (String, String) {
+diff --git a/compiler/passes/src/destructuring/expression.rs b/compiler/passes/src/destructuring/expression.rs
+index b41b39b9ef..e38f81ee4e 100644
+--- a/compiler/passes/src/destructuring/expression.rs
++++ b/compiler/passes/src/destructuring/expression.rs
+@@ -50,14 +50,17 @@ impl ExpressionReconstructor for DestructuringVisitor<'_> {
+                     panic!("Type checking guarantees that all tuple accesses are declared and indices are valid.");
+                 }
+ 
+-                let expr = ArrayAccess {
+-                    array: (*identifier).into(),
+-                    index: Literal::integer(IntegerType::U32, input.index.to_string(), input.span, Default::default())
+-                        .into(),
+-                    span: input.span,
+-                    id: input.id,
+-                }
+-                .into();
++                let index = Literal::integer(
++                    IntegerType::U32,
++                    input.index.to_string(),
++                    input.span,
++                    self.state.node_builder.next_id(),
++                );
++                self.state.type_table.insert(index.id(), Type::Integer(IntegerType::U32));
++
++                let expr =
++                    ArrayAccess { array: (*identifier).into(), index: index.into(), span: input.span, id: input.id }
++                        .into();
+ 
+                 (expr, Default::default())
+             }
+diff --git a/tests/expectations/compiler/array/array_index_by_const.out b/tests/expectations/compiler/array/array_index_by_const.out
 new file mode 100644
-index 0000000000..8bfa4bdec9
+index 0000000000..79ed4fc0a4
 --- /dev/null
-+++ b/leo/errors/updater.rs
-@@ -0,0 +1,31 @@
-+// Copyright (C) 2019-2020 Aleo Systems Inc.
-+// This file is part of the Leo library.
++++ b/tests/expectations/compiler/array/array_index_by_const.out
+@@ -0,0 +1,10 @@
++program test.aleo;
 +
-+// The Leo library is free software: you can redistribute it and/or modify
-+// it under the terms of the GNU General Public License as published by
-+// the Free Software Foundation, either version 3 of the License, or
-+// (at your option) any later version.
-+
-+// The Leo library is distributed in the hope that it will be useful,
-+// but WITHOUT ANY WARRANTY; without even the implied warranty of
-+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-+// GNU General Public License for more details.
-+
-+// You should have received a copy of the GNU General Public License
-+// along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
-+
-+#[derive(Debug, Error)]
-+pub enum UpdaterError {
-+    #[error("{}: {}", _0, _1)]
-+    Crate(&'static str, String),
-+
-+    #[error("The current version {} is more recent than the release version {}", _0, _1)]
-+    OldReleaseVersion(String, String),
-+}
-+
-+impl From<self_update::errors::Error> for UpdaterError {
-+    fn from(error: self_update::errors::Error) -> Self {
-+        tracing::error!("{}\n", error);
-+        UpdaterError::Crate("self_update", error.to_string())
++function main:
++    cast 1u32 2u32 3u32 4u32 5u32 6u32 into r0 as [u32; 6u32];
++    add r0[0u32] r0[1u32] into r1;
++    add r1 r0[2u32] into r2;
++    add r2 r0[3u32] into r3;
++    add r3 r0[4u32] into r4;
++    add r4 r0[5u32] into r5;
++    output r5 as u32.private;
+diff --git a/tests/tests/compiler/array/array_index_by_const.leo b/tests/tests/compiler/array/array_index_by_const.leo
+new file mode 100644
+index 0000000000..6575d348bc
+--- /dev/null
++++ b/tests/tests/compiler/array/array_index_by_const.leo
+@@ -0,0 +1,12 @@
++program test.aleo {
++    const N1: u8 = 0;
++    const N2: u16 = 1;
++    const N3: u32 = 2;
++    const N4: u8 = 3u8;
++    const N5: u16 = 4u16;
++    const N6: u32 = 5u32;
++    transition main() -> u32 {
++        let arr: [u32; 6] = [1, 2, 3, 4, 5, 6];
++        return arr[N1] + arr[N2] + arr[N3] + arr[N4] + arr[N5] + arr[N6];
 +    }
 +}
-diff --git a/leo/updater.rs b/leo/updater.rs
-index 84f088f68f..a37ee7d184 100644
---- a/leo/updater.rs
-+++ b/leo/updater.rs
-@@ -13,7 +13,7 @@
- 
- // You should have received a copy of the GNU General Public License
- // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
--use crate::config::Config;
-+use crate::{config::Config, errors::UpdaterError};
- 
- use colored::Colorize;
- use self_update::{backends::github, version::bump_is_greater, Status};
-@@ -27,7 +27,7 @@ impl Updater {
-     const LEO_REPO_OWNER: &'static str = "AleoHQ";
- 
-     /// Show all available releases for `leo`.
--    pub fn show_available_releases() -> Result<(), self_update::errors::Error> {
-+    pub fn show_available_releases() -> Result<(), UpdaterError> {
-         let releases = github::ReleaseList::configure()
-             .repo_owner(Self::LEO_REPO_OWNER)
-             .repo_name(Self::LEO_REPO_NAME)
-@@ -42,7 +42,7 @@ impl Updater {
-     }
- 
-     /// Update `leo` to the latest release.
--    pub fn update_to_latest_release(show_output: bool) -> Result<Status, self_update::errors::Error> {
-+    pub fn update_to_latest_release(show_output: bool) -> Result<Status, UpdaterError> {
-         let status = github::Update::configure()
-             .repo_owner(Self::LEO_REPO_OWNER)
-             .repo_name(Self::LEO_REPO_NAME)
-@@ -58,7 +58,7 @@ impl Updater {
-     }
- 
-     /// Check if there is an available update for `leo` and return the newest release.
--    pub fn update_available() -> Result<Option<String>, self_update::errors::Error> {
-+    pub fn update_available() -> Result<String, UpdaterError> {
-         let updater = github::Update::configure()
-             .repo_owner(Self::LEO_REPO_OWNER)
-             .repo_name(Self::LEO_REPO_NAME)
-@@ -70,9 +70,9 @@ impl Updater {
-         let latest_release = updater.get_latest_release()?;
- 
-         if bump_is_greater(&current_version, &latest_release.version)? {
--            Ok(Some(latest_release.version))
-+            Ok(latest_release.version)
-         } else {
--            Ok(None)
-+            Err(UpdaterError::OldReleaseVersion(current_version, latest_release.version))
-         }
-     }
- 
-@@ -89,7 +89,7 @@ impl Updater {
-             }
-         } else {
-             // If the auto update configuration is off, notify the user to update leo.
--            if let Some(latest_version) = Self::update_available().unwrap() {
-+            if let Ok(latest_version) = Self::update_available() {
-                 let mut message = "🟢 A new version is available! Run".bold().green().to_string();
-                 message += &" `leo update` ".bold().white();
-                 message += &format!("to update to v{}.", latest_version).bold().green();

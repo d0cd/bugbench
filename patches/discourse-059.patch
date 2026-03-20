@@ -1,171 +1,214 @@
-diff --git a/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs b/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs
-index 5313ce65f7..3098900f62 100644
---- a/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs
-+++ b/plugins/chat/assets/javascripts/discourse/components/chat/routes/channel-info-settings.gjs
-@@ -6,6 +6,7 @@ import { LinkTo } from "@ember/routing";
- import { service } from "@ember/service";
- import DButton from "discourse/components/d-button";
- import DToggleSwitch from "discourse/components/d-toggle-switch";
-+import DTooltip from "discourse/float-kit/components/d-tooltip";
- import categoryBadge from "discourse/helpers/category-badge";
- import icon from "discourse/helpers/d-icon";
- import replaceEmoji from "discourse/helpers/replace-emoji";
-@@ -90,6 +91,17 @@ export default class ChatRouteChannelInfoSettings extends Component {
-     return this.chatGuardian.canArchiveChannel(this.args.channel);
-   }
- 
-+  get canToggleChannelState() {
-+    return this.args.channel.isClosed;
-+  }
-+
-+  get openChannelDisabledReason() {
-+    if (this.args.channel.isArchived) {
-+      return i18n("chat.channel_settings.open_channel_disabled_archived");
-+    }
-+    return i18n("chat.channel_settings.open_channel_disabled_read_only");
-+  }
-+
-   get toggleChannelWideMentionsAvailable() {
-     return this.args.channel.isCategoryChannel && this.args.channel.isOpen;
-   }
-@@ -549,13 +561,30 @@ export default class ChatRouteChannelInfoSettings extends Component {
-                         @icon="lock"
-                         class="close-btn chat-form__btn btn-transparent"
-                       />
--                    {{else}}
-+                    {{else if this.canToggleChannelState}}
-                       <DButton
-                         @action={{this.onToggleChannelState}}
-                         @label="chat.channel_settings.open_channel"
-                         @icon="unlock"
-                         class="open-btn chat-form__btn btn-transparent"
-                       />
-+                    {{else}}
-+                      <DTooltip
-+                        @identifier="channel-open-disabled"
-+                        @placement="left"
-+                      >
-+                        <:trigger>
-+                          <DButton
-+                            @label="chat.channel_settings.open_channel"
-+                            @icon="unlock"
-+                            @disabled={{true}}
-+                            class="open-btn chat-form__btn btn-transparent"
-+                          />
-+                        </:trigger>
-+                        <:content>
-+                          {{this.openChannelDisabledReason}}
-+                        </:content>
-+                      </DTooltip>
-                     {{/if}}
-                   </:action>
-                 </section.row>
-diff --git a/plugins/chat/config/locales/client.en.yml b/plugins/chat/config/locales/client.en.yml
-index e2832762d1..b80d1f5a81 100644
---- a/plugins/chat/config/locales/client.en.yml
-+++ b/plugins/chat/config/locales/client.en.yml
-@@ -95,6 +95,8 @@ en:
-         unstar_channel: "Unstar channel"
-         close_channel: "Close channel"
-         open_channel: "Open channel"
-+        open_channel_disabled_archived: "Archived channels cannot be reopened."
-+        open_channel_disabled_read_only: "Read-only channels cannot be reopened."
-         archive_channel: "Archive channel"
-         delete_channel: "Delete channel"
-         join_channel: "Join channel"
-diff --git a/plugins/chat/spec/system/archived_channel_settings_spec.rb b/plugins/chat/spec/system/archived_channel_settings_spec.rb
-new file mode 100644
-index 0000000000..b9f3dc71ef
---- /dev/null
-+++ b/plugins/chat/spec/system/archived_channel_settings_spec.rb
-@@ -0,0 +1,54 @@
-+# frozen_string_literal: true
-+
-+RSpec.describe "Archived channel settings", type: :system do
-+  fab!(:channel_1, :chat_channel)
-+  fab!(:current_user, :admin)
-+
-+  let(:chat) { PageObjects::Pages::Chat.new }
-+  let(:channel_settings) { PageObjects::Pages::ChatChannelSettings.new }
-+
-+  before do
-+    chat_system_bootstrap
-+    SiteSetting.chat_allow_archiving_channels = true
-+    channel_1.add(current_user)
-+    sign_in(current_user)
-+  end
-+
-+  context "when channel is archived" do
-+    before { channel_1.update!(status: :archived) }
-+
-+    it "shows a disabled open channel button with a tooltip" do
-+      chat.visit_channel_settings(channel_1)
-+
-+      expect(channel_settings).to have_open_button(disabled: true)
-+      expect(channel_settings).to have_no_close_button
-+
-+      channel_settings.hover_open_button
-+      expect(page).to have_content(
-+        I18n.t("js.chat.channel_settings.open_channel_disabled_archived"),
-+      )
-+    end
-+
-+    it "does not show the archive channel button" do
-+      chat.visit_channel_settings(channel_1)
-+
-+      expect(page).to have_no_content(I18n.t("js.chat.channel_settings.archive_channel"))
-+    end
-+  end
-+
-+  context "when channel is read-only" do
-+    before { channel_1.update!(status: :read_only) }
-+
-+    it "shows a disabled open channel button with a tooltip" do
-+      chat.visit_channel_settings(channel_1)
-+
-+      expect(channel_settings).to have_open_button(disabled: true)
-+      expect(channel_settings).to have_no_close_button
-+
-+      channel_settings.hover_open_button
-+      expect(page).to have_content(
-+        I18n.t("js.chat.channel_settings.open_channel_disabled_read_only"),
-+      )
-+    end
-+  end
-+end
-diff --git a/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb b/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb
-index 7d0373cb5e..fbfa58f9d2 100644
---- a/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb
-+++ b/plugins/chat/spec/system/page_objects/chat/chat_channel_settings.rb
-@@ -18,6 +18,31 @@ module PageObjects
-       def has_name?(name)
-         page.has_css?(".c-channel-settings__name", text: name)
-       end
-+
-+      def has_open_button?(disabled: false)
-+        if disabled
-+          page.has_css?(".open-btn[disabled]")
-+        else
-+          page.has_css?(".open-btn:not([disabled])")
-+        end
-+      end
-+
-+      def has_no_open_button?
-+        page.has_no_css?(".open-btn")
-+      end
-+
-+      def has_close_button?
-+        page.has_css?(".close-btn")
-+      end
-+
-+      def has_no_close_button?
-+        page.has_no_css?(".close-btn")
-+      end
-+
-+      def hover_open_button
-+        find(".open-btn").hover
-+        self
+diff --git a/app/controllers/post_actions_controller.rb b/app/controllers/post_actions_controller.rb
+index 966af4d4baec1..333f8258ea455 100644
+--- a/app/controllers/post_actions_controller.rb
++++ b/app/controllers/post_actions_controller.rb
+@@ -48,7 +48,11 @@ def destroy
+     if result.failed?
+       render_json_error(result)
+     else
+-      render_post_json(result.post, add_raw: false)
++      if !guardian.can_see_post?(result.post)
++        head :no_content
++      else
++        render_post_json(result.post, add_raw: false)
 +      end
      end
    end
- end
+ 
+diff --git a/plugins/chat/app/controllers/chat/api/search_controller.rb b/plugins/chat/app/controllers/chat/api/search_controller.rb
+index 9fd36fac4053e..a5179ac3693f7 100644
+--- a/plugins/chat/app/controllers/chat/api/search_controller.rb
++++ b/plugins/chat/app/controllers/chat/api/search_controller.rb
+@@ -18,7 +18,7 @@ def index
+       end
+       on_failure { render(json: failed_json, status: :unprocessable_entity) }
+       on_model_not_found(:channel) { raise Discourse::NotFound }
+-      on_failed_policy(:can_view_channel) { raise Discourse::InvalidAccess }
++      on_failed_policy(:can_view_channel) { raise Discourse::NotFound }
+       on_failed_contract do |contract|
+         render(json: failed_json.merge(errors: contract.errors.full_messages), status: :bad_request)
+       end
+diff --git a/plugins/chat/spec/requests/chat/api/search_controller_spec.rb b/plugins/chat/spec/requests/chat/api/search_controller_spec.rb
+new file mode 100644
+index 0000000000000..8bfbf3f0d768a
+--- /dev/null
++++ b/plugins/chat/spec/requests/chat/api/search_controller_spec.rb
+@@ -0,0 +1,146 @@
++# frozen_string_literal: true
++
++RSpec.describe Chat::Api::SearchController do
++  fab!(:current_user, :user)
++  fab!(:channel, :chat_channel)
++
++  before do
++    SiteSetting.chat_enabled = true
++    SiteSetting.chat_allowed_groups = Group::AUTO_GROUPS[:everyone]
++    channel.add(current_user)
++  end
++
++  describe "#index" do
++    context "when not logged in" do
++      it "returns a 403" do
++        get "/chat/api/search.json", params: { query: "test" }
++
++        expect(response.status).to eq(403)
++      end
++    end
++
++    context "when logged in" do
++      before { sign_in(current_user) }
++
++      context "when chat is disabled" do
++        it "returns a 404" do
++          SiteSetting.chat_enabled = false
++
++          get "/chat/api/search.json", params: { query: "test" }
++
++          expect(response.status).to eq(404)
++        end
++      end
++
++      context "when query is missing" do
++        it "returns a 400" do
++          get "/chat/api/search.json", params: {}
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when limit is invalid" do
++        it "returns a 400 when limit is 0" do
++          get "/chat/api/search.json", params: { query: "test", limit: 0 }
++
++          expect(response.status).to eq(400)
++        end
++
++        it "returns a 400 when limit exceeds maximum" do
++          get "/chat/api/search.json", params: { query: "test", limit: 41 }
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when offset is negative" do
++        it "returns a 400" do
++          get "/chat/api/search.json", params: { query: "test", offset: -1 }
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when sort is invalid" do
++        it "returns a 400" do
++          get "/chat/api/search.json", params: { query: "test", sort: "invalid" }
++
++          expect(response.status).to eq(400)
++        end
++      end
++
++      context "when channel_id refers to a non-existent channel" do
++        it "returns a 404" do
++          get "/chat/api/search.json", params: { query: "test", channel_id: -999 }
++
++          expect(response.status).to eq(404)
++        end
++      end
++
++      context "when channel_id refers to an existing channel the user cannot access" do
++        fab!(:private_channel, :private_category_channel)
++
++        it "returns a 404" do
++          get "/chat/api/search.json", params: { query: "test", channel_id: private_channel.id }
++
++          expect(response.status).to eq(404)
++        end
++      end
++
++      context "when searching with valid params" do
++        fab!(:message_1) do
++          Fabricate(:chat_message, chat_channel: channel, message: "hello world foo bar")
++        end
++
++        before { SearchIndexer.enable }
++        after { SearchIndexer.disable }
++
++        it "returns matching messages" do
++          SearchIndexer.index(message_1)
++
++          get "/chat/api/search.json", params: { query: "hello world" }
++
++          expect(response.status).to eq(200)
++          expect(response.parsed_body["messages"].map { |m| m["id"] }).to include(message_1.id)
++        end
++
++        it "returns metadata with pagination info" do
++          SearchIndexer.index(message_1)
++
++          get "/chat/api/search.json", params: { query: "hello world", limit: 5, offset: 0 }
++
++          expect(response.status).to eq(200)
++          meta = response.parsed_body["meta"]
++          expect(meta).to have_key("has_more")
++          expect(meta["limit"]).to eq(5)
++          expect(meta["offset"]).to eq(0)
++        end
++
++        it "scopes results to a specific channel" do
++          other_channel = Fabricate(:chat_channel)
++          other_channel.add(current_user)
++          other_message =
++            Fabricate(:chat_message, chat_channel: other_channel, message: "hello world baz")
++          SearchIndexer.index(message_1)
++          SearchIndexer.index(other_message)
++
++          get "/chat/api/search.json", params: { query: "hello world", channel_id: channel.id }
++
++          expect(response.status).to eq(200)
++          ids = response.parsed_body["messages"].map { |m| m["id"] }
++          expect(ids).to include(message_1.id)
++          expect(ids).not_to include(other_message.id)
++        end
++
++        it "accepts sort parameter" do
++          SearchIndexer.index(message_1)
++
++          get "/chat/api/search.json", params: { query: "hello world", sort: "latest" }
++
++          expect(response.status).to eq(200)
++        end
++      end
++    end
++  end
++end
+diff --git a/spec/requests/post_actions_controller_spec.rb b/spec/requests/post_actions_controller_spec.rb
+index d23cd4a524bdb..92e64b9a1ffa1 100644
+--- a/spec/requests/post_actions_controller_spec.rb
++++ b/spec/requests/post_actions_controller_spec.rb
+@@ -72,6 +72,27 @@
+ 
+           expect(response).to be_forbidden
+         end
++
++        it "does not return post content when the user can no longer see the post" do
++          restricted_category = Fabricate(:category, read_restricted: true)
++          post.topic.update!(category: restricted_category)
++
++          delete "/post_actions/#{post.id}.json",
++                 params: {
++                   post_action_type_id: PostActionType.types[:like],
++                 }
++
++          expect(response.status).to eq(204)
++          expect(response.body).to be_blank
++          expect(
++            PostAction.exists?(
++              user_id: user.id,
++              post_id: post.id,
++              post_action_type_id: PostActionType.types[:like],
++              deleted_at: nil,
++            ),
++          ).to eq(false)
++        end
+       end
+     end
+   end

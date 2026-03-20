@@ -1,0 +1,187 @@
+diff --git a/static/app/views/dashboards/filtersBar.spec.tsx b/static/app/views/dashboards/filtersBar.spec.tsx
+index ce59b9fd0fc870..946c5a9a9b6926 100644
+--- a/static/app/views/dashboards/filtersBar.spec.tsx
++++ b/static/app/views/dashboards/filtersBar.spec.tsx
+@@ -219,7 +219,7 @@ describe('FiltersBar', () => {
+     expect(
+       screen.getByRole('button', {name: /browser\.name.*Chrome/i})
+     ).toBeInTheDocument();
+-    expect(screen.getByRole('button', {name: 'Save'})).toBeInTheDocument();
++    expect(screen.getByRole('button', {name: 'Save for Everyone'})).toBeInTheDocument();
+     expect(screen.getByRole('button', {name: 'Cancel'})).toBeInTheDocument();
+   });
+ });
+diff --git a/static/app/views/dashboards/filtersBar.tsx b/static/app/views/dashboards/filtersBar.tsx
+index 409dae5226281f..4137ba161b1ce8 100644
+--- a/static/app/views/dashboards/filtersBar.tsx
++++ b/static/app/views/dashboards/filtersBar.tsx
+@@ -344,7 +344,7 @@ export default function FiltersBar({
+                 disabled={!hasEditAccess}
+                 busy={shouldBusySaveButton}
+               >
+-                {t('Save')}
++                {isPrebuiltDashboard ? t('Save for Everyone') : t('Save')}
+               </Button>
+               <Button
+                 data-test-id="filter-bar-cancel"
+diff --git a/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTable.tsx b/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTable.tsx
+index 124495cc5752c3..4560e7a642e159 100644
+--- a/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTable.tsx
++++ b/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTable.tsx
+@@ -5,6 +5,7 @@ import LoadingIndicator from 'sentry/components/loadingIndicator';
+ import {SimpleTable} from 'sentry/components/tables/simpleTable';
+ import {IconWarning} from 'sentry/icons';
+ import {t} from 'sentry/locale';
++import type {EventsMetaType} from 'sentry/utils/discover/eventView';
+ import {
+   TraceSamplesTableColumns,
+   TraceSamplesTableEmbeddedColumns,
+@@ -23,7 +24,10 @@ import {
+   TraceMetricKnownFieldKey,
+   type TraceMetricEventsResponseItem,
+ } from 'sentry/views/explore/metrics/types';
+-import {getMetricTableColumnType} from 'sentry/views/explore/metrics/utils';
++import {
++  getMetricTableColumnType,
++  mapMetricUnitToFieldType,
++} from 'sentry/views/explore/metrics/utils';
+ import {GenericWidgetEmptyStateWarning} from 'sentry/views/performance/landing/widgets/components/selectableList';
+ 
+ const RESULT_LIMIT = 50;
+@@ -76,6 +80,21 @@ export function MetricsSamplesTable({
+     traceIds,
+   });
+ 
++  const metaWithValueUnit = useMemo<EventsMetaType>(() => {
++    const {fieldType, unit} = mapMetricUnitToFieldType(traceMetric?.unit);
++    return {
++      ...meta,
++      fields: {
++        ...meta.fields,
++        [TraceMetricKnownFieldKey.METRIC_VALUE]: fieldType,
++      },
++      units: {
++        ...meta.units,
++        [TraceMetricKnownFieldKey.METRIC_VALUE]: unit ?? '',
++      },
++    };
++  }, [meta, traceMetric?.unit]);
++
+   return (
+     <SimpleTableWithHiddenColumns numColumns={columns.length - 1} embedded={embedded}>
+       {isFetching && <TransparentLoadingMask />}
+@@ -92,7 +111,7 @@ export function MetricsSamplesTable({
+               row={row}
+               telemetryData={telemetryData}
+               columns={columns}
+-              meta={meta}
++              meta={metaWithValueUnit}
+               embedded={embedded}
+             />
+           ))
+diff --git a/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTableRow.tsx b/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTableRow.tsx
+index 28cc36eca4feb4..541f8a25c71abd 100644
+--- a/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTableRow.tsx
++++ b/static/app/views/explore/metrics/metricInfoTabs/metricsSamplesTableRow.tsx
+@@ -242,6 +242,11 @@ export function SampleTableRow({
+   };
+ 
+   const renderDefaultCell = (field: string) => {
++    // For the metric value column, keep column.type as 'number' so that
++    // CellAction/updateQuery adds the raw numeric value to the filter
++    // instead of converting it with a duration assumption. The renderer
++    // still picks up the correct formatter via meta.fields/meta.units.
++    const isMetricValue = field === TraceMetricKnownFieldKey.METRIC_VALUE;
+     const discoverColumn: TableColumn<keyof TableDataRow> = {
+       column: {
+         field,
+@@ -250,7 +255,9 @@ export function SampleTableRow({
+       name: field,
+       key: field,
+       isSortable: true,
+-      type: (meta?.fields?.[field] as ColumnValueType) ?? FieldValueType.STRING,
++      type: isMetricValue
++        ? 'number'
++        : ((meta?.fields?.[field] as ColumnValueType) ?? FieldValueType.STRING),
+     };
+     return (
+       <FieldRenderer
+diff --git a/static/app/views/explore/metrics/utils.spec.tsx b/static/app/views/explore/metrics/utils.spec.tsx
+new file mode 100644
+index 00000000000000..84672ded011b3f
+--- /dev/null
++++ b/static/app/views/explore/metrics/utils.spec.tsx
+@@ -0,0 +1,20 @@
++import {mapMetricUnitToFieldType} from 'sentry/views/explore/metrics/utils';
++
++describe('mapMetricUnitToFieldType', () => {
++  it.each([
++    ['millisecond', {fieldType: 'duration', unit: 'millisecond'}],
++    ['nanosecond', {fieldType: 'duration', unit: 'nanosecond'}],
++    ['second', {fieldType: 'duration', unit: 'second'}],
++    ['minute', {fieldType: 'duration', unit: 'minute'}],
++    ['byte', {fieldType: 'size', unit: 'byte'}],
++    ['kibibyte', {fieldType: 'size', unit: 'kibibyte'}],
++    ['megabyte', {fieldType: 'size', unit: 'megabyte'}],
++    ['ratio', {fieldType: 'percentage', unit: 'ratio'}],
++    ['percent', {fieldType: 'percentage', unit: 'percent'}],
++    [undefined, {fieldType: 'number', unit: undefined}],
++    ['-', {fieldType: 'number', unit: undefined}],
++    ['custom_unit', {fieldType: 'number', unit: undefined}],
++  ])('maps %s to the correct field type', (unit, expected) => {
++    expect(mapMetricUnitToFieldType(unit)).toEqual(expected);
++  });
++});
+diff --git a/static/app/views/explore/metrics/utils.tsx b/static/app/views/explore/metrics/utils.tsx
+index cdfe3def090017..205781ed6b024f 100644
+--- a/static/app/views/explore/metrics/utils.tsx
++++ b/static/app/views/explore/metrics/utils.tsx
+@@ -4,7 +4,12 @@ import {MutableSearch} from 'sentry/components/searchSyntax/mutableSearch';
+ import type {PageFilters} from 'sentry/types/core';
+ import type {Organization} from 'sentry/types/organization';
+ import type {EventsMetaType, MetaType} from 'sentry/utils/discover/eventView';
+-import {RateUnit} from 'sentry/utils/discover/fields';
++import {
++  DurationUnit,
++  RateUnit,
++  SizeUnit,
++  type ColumnType,
++} from 'sentry/utils/discover/fields';
+ import {decodeSorts} from 'sentry/utils/queryString';
+ import normalizeUrl from 'sentry/utils/url/normalizeUrl';
+ import type {
+@@ -213,3 +218,34 @@ export function updateVisualizeYAxis(
+ export function isEmptyTraceMetric(traceMetric: TraceMetric): boolean {
+   return traceMetric.name === '';
+ }
++
++const DURATION_UNIT_VALUES = new Set<string>(Object.values(DurationUnit));
++const SIZE_UNIT_VALUES = new Set<string>(Object.values(SizeUnit));
++const PERCENTAGE_UNIT_VALUES = new Set<string>(['ratio', 'percent']);
++
++/**
++ * Maps a metric unit (from TraceMetric.unit) to the ColumnType and
++ * unit string that the discover FieldRenderer system expects.
++ *
++ * The backend can't infer units for the raw `value` field in events
++ * responses, so the frontend must do this mapping based on the selected
++ * metric's unit.
++ */
++export function mapMetricUnitToFieldType(metricUnit: string | undefined): {
++  fieldType: ColumnType;
++  unit: string | undefined;
++} {
++  if (!metricUnit || metricUnit === '-') {
++    return {fieldType: 'number', unit: undefined};
++  }
++  if (DURATION_UNIT_VALUES.has(metricUnit)) {
++    return {fieldType: 'duration', unit: metricUnit};
++  }
++  if (SIZE_UNIT_VALUES.has(metricUnit)) {
++    return {fieldType: 'size', unit: metricUnit};
++  }
++  if (PERCENTAGE_UNIT_VALUES.has(metricUnit)) {
++    return {fieldType: 'percentage', unit: metricUnit};
++  }
++  return {fieldType: 'number', unit: undefined};
++}

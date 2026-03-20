@@ -35,9 +35,7 @@ def make_case(**overrides: object) -> TestCase:
         "language": "rust",
         "pr_size": "small",
         "description": "A bug in foo",
-        "expected_findings": [
-            {"file": "src/foo.rs", "line": 42, "summary": "off-by-one error"}
-        ],
+        "expected_findings": [{"file": "src/foo.rs", "line": 42, "summary": "off-by-one error"}],
     }
     base.update(overrides)
     return TestCase(**base)  # type: ignore[arg-type]
@@ -101,9 +99,7 @@ class TestCheckCaseGroundedness:
                 "bugeval.groundedness._call_haiku_verify",
                 return_value={"exists": True, "confidence": 0.9, "reasoning": "found it"},
             ):
-                updated, verdict = check_case_groundedness(
-                    case, None, "test-model", dry_run=False
-                )
+                updated, verdict = check_case_groundedness(case, None, "test-model", dry_run=False)
         assert verdict is True
         assert "groundedness-failed" not in updated.quality_flags
 
@@ -114,9 +110,7 @@ class TestCheckCaseGroundedness:
                 "bugeval.groundedness._call_haiku_verify",
                 return_value={"exists": False, "confidence": 0.85, "reasoning": "not found"},
             ):
-                updated, verdict = check_case_groundedness(
-                    case, None, "test-model", dry_run=False
-                )
+                updated, verdict = check_case_groundedness(case, None, "test-model", dry_run=False)
         assert verdict is False
         assert "groundedness-failed" in updated.quality_flags
         assert updated.needs_manual_review is True
@@ -128,9 +122,7 @@ class TestCheckCaseGroundedness:
                 "bugeval.groundedness._call_haiku_verify",
                 return_value={"exists": False, "confidence": 0.5, "reasoning": "unclear"},
             ):
-                updated, verdict = check_case_groundedness(
-                    case, None, "test-model", dry_run=False
-                )
+                updated, verdict = check_case_groundedness(case, None, "test-model", dry_run=False)
         assert verdict is None
         assert "groundedness-failed" not in updated.quality_flags
 
@@ -138,9 +130,7 @@ class TestCheckCaseGroundedness:
         case = make_case()
         with patch("bugeval.groundedness._get_diff_for_case", return_value=_SAMPLE_PATCH):
             with patch("bugeval.groundedness._call_haiku_verify") as mock_haiku:
-                updated, verdict = check_case_groundedness(
-                    case, None, "test-model", dry_run=True
-                )
+                updated, verdict = check_case_groundedness(case, None, "test-model", dry_run=True)
         mock_haiku.assert_not_called()
         assert verdict is None
 
@@ -179,6 +169,7 @@ class TestGroundednessCheckCLI:
         assert result.exit_code == 0
         # The case file should not have been modified (dry-run)
         from bugeval.io import load_case as _lc
+
         loaded = _lc(repo_dir / "foo-001.yaml")
         assert "groundedness-failed" not in loaded.quality_flags
 

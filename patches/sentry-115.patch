@@ -1,0 +1,1498 @@
+diff --git a/migrations_lockfile.txt b/migrations_lockfile.txt
+index eed8ffa495b74d..6124eb2731d705 100644
+--- a/migrations_lockfile.txt
++++ b/migrations_lockfile.txt
+@@ -33,7 +33,7 @@ replays: 0007_organizationmember_replay_access
+ 
+ seer: 0002_add_default_coding_agent
+ 
+-sentry: 1034_remove_code_review_event
++sentry: 1035_delete_code_review_event
+ 
+ social_auth: 0003_social_auth_json_field
+ 
+diff --git a/rspack.config.ts b/rspack.config.ts
+index 0a103df6d02125..3fd7a212416f99 100644
+--- a/rspack.config.ts
++++ b/rspack.config.ts
+@@ -303,8 +303,11 @@ const appConfig: Configuration = {
+     rules: [
+       {
+         test: /\.(js|jsx|ts|tsx)$/,
+-        // Avoids recompiling core-js based on usage imports
+-        exclude: /node_modules[\\/]core-js/,
++        // core-js: Avoids recompiling core-js based on usage imports
++        // react-select: Ships pre-compiled ESM with emotion's keyframes already
++        // compiled via Babel. Re-processing with @swc/plugin-emotion causes
++        // "illegal escape sequence" warnings in dev mode.
++        exclude: /node_modules[\\/](core-js|react-select)/,
+         loader: 'builtin:swc-loader',
+         options: swcReactLoaderConfig,
+       },
+diff --git a/src/sentry/api/serializers/models/dashboard.py b/src/sentry/api/serializers/models/dashboard.py
+index 0cb50cf81b5382..da214ebc91b21b 100644
+--- a/src/sentry/api/serializers/models/dashboard.py
++++ b/src/sentry/api/serializers/models/dashboard.py
+@@ -100,6 +100,7 @@ class DashboardWidgetResponse(TypedDict):
+     limit: int | None
+     widgetType: str
+     layout: dict[str, int] | None
++    axisRange: str | None
+     datasetSource: str | None
+     exploreUrls: NotRequired[list[str] | None]
+     changedReason: list[WidgetChangedReasonType] | None
+@@ -341,6 +342,7 @@ def serialize(self, obj, attrs, user, **kwargs) -> DashboardWidgetResponse:
+             # Default to discover type if null
+             "widgetType": widget_type,
+             "layout": obj.detail.get("layout") if obj.detail else None,
++            "axisRange": obj.detail.get("axis_range") if obj.detail else None,
+             "datasetSource": DATASET_SOURCES[obj.dataset_source],
+             "changedReason": obj.changed_reason,
+         }
+diff --git a/src/sentry/api/serializers/rest_framework/dashboard.py b/src/sentry/api/serializers/rest_framework/dashboard.py
+index 1c6f1c3ee067c6..0badfa809bc957 100644
+--- a/src/sentry/api/serializers/rest_framework/dashboard.py
++++ b/src/sentry/api/serializers/rest_framework/dashboard.py
+@@ -319,6 +319,11 @@ class DashboardWidgetSerializer(CamelSnakeSerializer[Dashboard]):
+     )
+     limit = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+     layout = LayoutField(required=False, allow_null=True)
++    axis_range = serializers.ChoiceField(
++        choices=[("auto", "auto"), ("dataMin", "dataMin")],
++        required=False,
++        allow_null=True,
++    )
+     query_warnings: QueryWarning = {"queries": [], "columns": {}}
+     dataset_source = serializers.ChoiceField(
+         choices=DatasetSourcesTypes.as_text_choices(),
+@@ -832,7 +837,10 @@ def create_widget(self, dashboard, widget_data):
+             widget_type=widget_data.get("widget_type", DashboardWidgetTypes.ERROR_EVENTS),
+             discover_widget_split=widget_data.get("discover_widget_split", None),
+             limit=widget_data.get("limit", None),
+-            detail={"layout": widget_data.get("layout")},
++            detail={
++                "layout": widget_data.get("layout"),
++                "axis_range": widget_data.get("axis_range"),
++            },
+             dataset_source=widget_data.get("dataset_source", DatasetSourcesTypes.USER.value),
+         )
+ 
+@@ -1018,6 +1026,7 @@ def _update_or_create_field_links(
+ 
+     def update_widget(self, widget, data):
+         prev_layout = widget.detail.get("layout") if widget.detail else None
++        prev_axis_range = widget.detail.get("axis_range") if widget.detail else None
+         widget.title = data.get("title", widget.title)
+         widget.description = data.get("description", widget.description)
+         widget.thresholds = data.get("thresholds", widget.thresholds)
+@@ -1030,7 +1039,10 @@ def update_widget(self, widget, data):
+         widget.limit = data.get("limit", widget.limit)
+         new_dataset_source = data.get("dataset_source", widget.dataset_source)
+         widget.dataset_source = new_dataset_source
+-        widget.detail = {"layout": data.get("layout", prev_layout)}
++        widget.detail = {
++            "layout": data.get("layout", prev_layout),
++            "axis_range": data.get("axis_range", prev_axis_range),
++        }
+ 
+         if widget.widget_type == DashboardWidgetTypes.SPANS:
+             if new_dataset_source == DatasetSourcesTypes.USER.value:
+diff --git a/src/sentry/apidocs/examples/dashboard_examples.py b/src/sentry/apidocs/examples/dashboard_examples.py
+index 29291aac345fbd..96e0169e7659e0 100644
+--- a/src/sentry/apidocs/examples/dashboard_examples.py
++++ b/src/sentry/apidocs/examples/dashboard_examples.py
+@@ -66,6 +66,7 @@
+             "layout": {"w": 2, "y": 0, "h": 2, "minH": 2, "x": 0},
+             "exploreUrls": None,
+             "changedReason": None,
++            "axisRange": None,
+         }
+     ],
+     "projects": [1],
+diff --git a/src/sentry/discover/arithmetic.py b/src/sentry/discover/arithmetic.py
+index 759b11254810a4..9db6256686f3d8 100644
+--- a/src/sentry/discover/arithmetic.py
++++ b/src/sentry/discover/arithmetic.py
+@@ -208,6 +208,9 @@ class ArithmeticVisitor(NodeVisitor):
+         "avg_if",
+         "division_if",
+         "failure_rate_if",
++        # Mobile vitals uses these functions
++        "ttid_contribution_rate",
++        "ttfd_contribution_rate",
+     }
+ 
+     def __init__(self, max_operators: int | None, custom_measurements: set[str] | None):
+diff --git a/src/sentry/features/temporary.py b/src/sentry/features/temporary.py
+index 1f05d2a1bdb8ac..341f3ef88af016 100644
+--- a/src/sentry/features/temporary.py
++++ b/src/sentry/features/temporary.py
+@@ -138,8 +138,6 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     manager.add("organizations:gen-ai-search-agent-translate", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable GenAI consent
+     manager.add("organizations:gen-ai-consent", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+-    # Enable users to invite themselves to private console SDK GitHub repositories
+-    manager.add("organizations:github-console-sdk-self-invite", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable granular permissions for replay features
+     manager.add("organizations:granular-replay-permissions", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable increased issue_owners rate limit for auto-assignment
+diff --git a/src/sentry/integrations/perforce/client.py b/src/sentry/integrations/perforce/client.py
+index 2af04bd3bb4eeb..5527f51a65fd57 100644
+--- a/src/sentry/integrations/perforce/client.py
++++ b/src/sentry/integrations/perforce/client.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import tempfile
+ from collections.abc import Generator, Sequence
+ from contextlib import contextmanager
+ from datetime import datetime, timezone
+@@ -132,6 +133,8 @@ def _connect(self) -> Generator[P4]:
+         Context manager for P4 connections with automatic cleanup.
+ 
+         Yields a connected P4 instance and ensures disconnection on exit.
++        Uses a per-connection temporary directory for P4TRUST to avoid
++        lock contention between concurrent connections from different tenants.
+ 
+         Uses P4Python API:
+         - p4.connect(): https://www.perforce.com/manuals/p4python/Content/P4Python/python.programming.html#python.programming.connecting
+@@ -142,84 +145,91 @@ def _connect(self) -> Generator[P4]:
+             with self._connect() as p4:
+                 result = p4.run("info")
+         """
+-        p4 = P4()
+-        p4.port = self.p4port
+-        p4.user = self.user
+-        p4.password = self.password
+-
+-        if self.client_name:
+-            p4.client = self.client_name
+-
+-        p4.exception_level = 1  # Only errors raise exceptions
+-
+-        # Connect to Perforce server
+-        try:
+-            p4.connect()
+-        except P4Exception as e:
+-            error_msg = str(e)
+-            # Provide helpful error message for connection failures
+-            if "SSL" in error_msg or "trust" in error_msg.lower():
+-                raise ApiError(
+-                    f"Failed to connect to Perforce (SSL issue): {error_msg}. "
+-                    f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
+-                )
+-            raise ApiError(f"Failed to connect to Perforce: {error_msg}")
+-
+-        # Assert SSL trust after connection (if needed)
+-        # This must be done after p4.connect() but before p4.run_login()
+-        if self.ssl_fingerprint and self.p4port.startswith("ssl"):
++        # Use a temporary directory for P4TRUST and P4TICKETS to isolate each
++        # connection. Without this, all connections share ~/.p4trust and its
++        # lock file (~/.p4trust.lck), causing lock contention and failures
++        # when multiple tenants connect concurrently.
++        with tempfile.TemporaryDirectory(prefix="sentry-p4-") as tmpdir:
++            p4 = P4()
++            p4.port = self.p4port
++            p4.user = self.user
++            p4.password = self.password
++            p4.trust_file = f"{tmpdir}/.p4trust"
++            p4.ticket_file = f"{tmpdir}/.p4tickets"
++
++            if self.client_name:
++                p4.client = self.client_name
++
++            p4.exception_level = 1  # Only errors raise exceptions
++
++            # Connect to Perforce server
+             try:
+-                p4.run_trust("-i", self.ssl_fingerprint)
+-            except P4Exception as trust_error:
++                p4.connect()
++            except P4Exception as e:
++                error_msg = str(e)
++                # Provide helpful error message for connection failures
++                if "SSL" in error_msg or "trust" in error_msg.lower():
++                    raise ApiError(
++                        f"Failed to connect to Perforce (SSL issue): {error_msg}. "
++                        f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
++                    )
++                raise ApiError(f"Failed to connect to Perforce: {error_msg}")
++
++            # Assert SSL trust after connection (if needed)
++            # This must be done after p4.connect() but before p4.run_login()
++            if self.ssl_fingerprint and self.p4port.startswith("ssl"):
+                 try:
+-                    p4.disconnect()
+-                except Exception:
+-                    pass
+-                raise ApiError(
+-                    f"Failed to establish SSL trust: {trust_error}. "
+-                    f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
+-                )
++                    p4.run_trust("-i", self.ssl_fingerprint)
++                except P4Exception as trust_error:
++                    try:
++                        p4.disconnect()
++                    except Exception:
++                        pass
++                    raise ApiError(
++                        f"Failed to establish SSL trust: {trust_error}. "
++                        f"Ensure ssl_fingerprint is correct. Obtain with: p4 -p {self.p4port} trust -y"
++                    )
+ 
+-        # Authenticate based on auth_type
+-        # - password: Requires run_login() to exchange password for session ticket
+-        # - ticket: Already authenticated via p4.password, no login needed
+-        if self.password and self.auth_type == "password":
+-            try:
+-                p4.run_login()
+-            except P4Exception as login_error:
++            # Authenticate based on auth_type
++            # - password: Requires run_login() to exchange password for session ticket
++            # - ticket: Already authenticated via p4.password, no login needed
++            if self.password and self.auth_type == "password":
+                 try:
+-                    p4.disconnect()
+-                except Exception:
+-                    pass
+-                raise ApiUnauthorized(
+-                    f"Failed to authenticate with Perforce: {login_error}. "
+-                    "Verify your password is correct."
+-                )
+-        elif self.password and self.auth_type == "ticket":
+-            # Ticket authentication: p4.password is already set to the ticket
+-            # Verify ticket works by running a test command
+-            try:
+-                p4.run("info")
+-            except P4Exception as e:
++                    p4.run_login()
++                except P4Exception as login_error:
++                    try:
++                        p4.disconnect()
++                    except Exception:
++                        pass
++                    raise ApiUnauthorized(
++                        f"Failed to authenticate with Perforce: {login_error}. "
++                        "Verify your password is correct."
++                    )
++            elif self.password and self.auth_type == "ticket":
++                # Ticket authentication: p4.password is already set to the ticket
++                # Verify ticket works by running a test command
+                 try:
+-                    p4.disconnect()
+-                except Exception:
+-                    pass
+-                raise ApiUnauthorized(
+-                    f"Failed to authenticate with Perforce ticket: {e}. "
+-                    "Verify your P4 ticket is valid. Obtain a new ticket with: p4 login -p"
+-                )
++                    p4.run("info")
++                except P4Exception as e:
++                    try:
++                        p4.disconnect()
++                    except Exception:
++                        pass
++                    raise ApiUnauthorized(
++                        f"Failed to authenticate with Perforce ticket: {e}. "
++                        "Verify your P4 ticket is valid. Obtain a new ticket with: p4 login -p"
++                    )
+ 
+-        try:
+-            yield p4
+-        finally:
+-            # Ensure cleanup
+             try:
+-                if p4.connected():
+-                    p4.disconnect()
+-            except Exception as e:
+-                # Log disconnect failures as they may indicate connection leaks
+-                logger.warning("Failed to disconnect from Perforce: %s", e, exc_info=True)
++                yield p4
++            finally:
++                # Ensure cleanup
++                try:
++                    if p4.connected():
++                        p4.disconnect()
++                except Exception as e:
++                    # Log disconnect failures as they may indicate connection leaks
++                    logger.warning("Failed to disconnect from Perforce: %s", e, exc_info=True)
+ 
+     def check_file(self, repo: Repository, path: str, version: str | None) -> object | None:
+         """
+diff --git a/src/sentry/middleware/integrations/parsers/github.py b/src/sentry/middleware/integrations/parsers/github.py
+index 96c76720419f99..39c7e57499c848 100644
+--- a/src/sentry/middleware/integrations/parsers/github.py
++++ b/src/sentry/middleware/integrations/parsers/github.py
+@@ -136,9 +136,6 @@ def get_response(self) -> HttpResponseBase:
+                 self.try_forward_to_codecov(event=event)
+ 
+         github_event = self.request.META.get(GITHUB_WEBHOOK_TYPE_HEADER)
+-        mailbox_name = f"{self.provider}:{self.get_mailbox_identifier(integration, event)}"
+-        allowlist = options.get("github.webhook.drop-unprocessed-events.mailbox-allowlist") or ()
+-        mailbox_in_allowlist = any(mailbox_name == m for m in allowlist)
+ 
+         # Only drop when we have a known unprocessed event type. Missing or empty
+         # X-GitHub-Event is malformed; let the request be forwarded so the region
+@@ -147,7 +144,6 @@ def get_response(self) -> HttpResponseBase:
+             github_event
+             and github_event not in REGION_PROCESSED_GITHUB_EVENTS
+             and options.get("github.webhook.drop-unprocessed-events.enabled")
+-            and mailbox_in_allowlist
+         ):
+             metrics.incr(
+                 "github.webhook.drop_unprocessed_event",
+diff --git a/src/sentry/migrations/1035_delete_code_review_event.py b/src/sentry/migrations/1035_delete_code_review_event.py
+new file mode 100644
+index 00000000000000..6d81f0372d2bd0
+--- /dev/null
++++ b/src/sentry/migrations/1035_delete_code_review_event.py
+@@ -0,0 +1,32 @@
++# Generated by Django 5.2.11 on 2026-02-26
++
++from sentry.new_migrations.migrations import CheckedMigration
++from sentry.new_migrations.monkey.models import SafeDeleteModel
++from sentry.new_migrations.monkey.state import DeletionAction
++
++
++class Migration(CheckedMigration):
++    # This flag is used to mark that a migration shouldn't be automatically run in production.
++    # This should only be used for operations where it's safe to run the migration after your
++    # code has deployed. So this should not be used for most operations that alter the schema
++    # of a table.
++    # Here are some things that make sense to mark as post deployment:
++    # - Large data migrations. Typically we want these to be run manually so that they can be
++    #   monitored and not block the deploy for a long period of time while they run.
++    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
++    #   run this outside deployments so that we don't block them. Note that while adding an index
++    #   is a schema change, it's completely safe to run the operation after the code has deployed.
++    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
++
++    is_post_deployment = False
++
++    dependencies = [
++        ("sentry", "1034_remove_code_review_event"),
++    ]
++
++    operations = [
++        SafeDeleteModel(
++            name="CodeReviewEvent",
++            deletion_action=DeletionAction.DELETE,
++        ),
++    ]
+diff --git a/src/sentry/models/apiapplication.py b/src/sentry/models/apiapplication.py
+index 4d1854dc73e621..6ba1ca9e488022 100644
+--- a/src/sentry/models/apiapplication.py
++++ b/src/sentry/models/apiapplication.py
+@@ -1,9 +1,9 @@
+ import logging
+-import os
++import posixpath
+ import secrets
+ from enum import Enum
+ from typing import Any, ClassVar, Literal, Self, TypeIs
+-from urllib.parse import urlparse, urlunparse
++from urllib.parse import quote, unquote, urlparse, urlunparse
+ 
+ import petname
+ from django.contrib.postgres.fields.array import ArrayField
+@@ -163,12 +163,13 @@ def has_feature(self, feature: ApiApplicationFeature) -> bool:
+ 
+     def normalize_url(self, value):
+         parts = urlparse(value)
+-        normalized_path = os.path.normpath(parts.path)
++        decoded_path = unquote(parts.path)
++        normalized_path = posixpath.normpath(decoded_path)
+         if normalized_path == ".":
+             normalized_path = "/"
+         elif value.endswith("/") and not normalized_path.endswith("/"):
+             normalized_path += "/"
+-        return urlunparse(parts._replace(path=normalized_path))
++        return urlunparse(parts._replace(path=quote(normalized_path, safe="/")))
+ 
+     def is_valid_redirect_uri(self, value):
+         # Spec references:
+@@ -176,6 +177,12 @@ def is_valid_redirect_uri(self, value):
+         #     https://datatracker.ietf.org/doc/html/rfc6749#section-3.1.2.3
+         #   - Native apps loopback exception (RFC 8252 §8.4):
+         #     https://datatracker.ietf.org/doc/html/rfc8252#section-8.4
++
++        # Capture the raw path before normalization for the double-encoding
++        # guard below.  This must happen on the unprocessed input so that
++        # quote() inside normalize_url doesn't interfere with the check.
++        raw_path = urlparse(value).path
++
+         value = self.normalize_url(value)
+ 
+         # First: exact match only (spec-compliant), no logging.
+@@ -216,6 +223,12 @@ def is_valid_redirect_uri(self, value):
+ 
+         # Then: prefix-only match (legacy behavior). Log on success.
+         if not self.has_feature(ApiApplicationFeature.STRICT_REDIRECT_URI):
++            # Reject multi-layer percent-encoding by checking the raw input:
++            # decode once, then check if a second decode would change it.
++            # If so, the input was double-encoded (or deeper).
++            decoded_once = unquote(raw_path)
++            if unquote(decoded_once) != decoded_once:
++                return False
+             for ruri in normalized_ruris:
+                 if value.startswith(ruri):
+                     logger.warning(
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index 6d8767744e42b0..4ddb65cd60bf28 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -756,12 +756,6 @@
+     default=False,
+     flags=FLAG_AUTOMATOR_MODIFIABLE,
+ )
+-register(
+-    "github.webhook.drop-unprocessed-events.mailbox-allowlist",
+-    type=Sequence,
+-    default=[],
+-    flags=FLAG_ALLOW_EMPTY | FLAG_AUTOMATOR_MODIFIABLE,
+-)
+ 
+ # GitHub Console SDK App (separate app for repository invitations)
+ register("github-console-sdk-app.id", default=0, flags=FLAG_AUTOMATOR_MODIFIABLE)
+diff --git a/src/sentry/spans/buffer.py b/src/sentry/spans/buffer.py
+index 7116ccd8d410af..19cdd0d95686f1 100644
+--- a/src/sentry/spans/buffer.py
++++ b/src/sentry/spans/buffer.py
+@@ -119,6 +119,7 @@ class Span(NamedTuple):
+     payload: bytes
+     end_timestamp: float
+     is_segment_span: bool = False
++    partition: int = 0
+ 
+     def effective_parent_id(self):
+         # Note: For the case where the span's parent is in another project, we
+@@ -268,7 +269,11 @@ def process_spans(self, spans: Sequence[Span], now: int):
+                         )
+ 
+                         is_root_span_count += sum(span.is_segment_span for span in subsegment)
+-                        result_meta.append((project_and_trace, parent_span_id))
++
++                        # All spans in a subsegment share the same trace_id,
++                        # so they all came from the same Kafka partition.
++                        partition = subsegment[0].partition
++                        result_meta.append((project_and_trace, parent_span_id, partition))
+ 
+                     results.extend(p.execute())
+ 
+@@ -286,7 +291,7 @@ def process_spans(self, spans: Sequence[Span], now: int):
+ 
+             assert len(result_meta) == len(results)
+ 
+-            for (project_and_trace, parent_span_id), result in zip(result_meta, results):
++            for (project_and_trace, parent_span_id, partition), result in zip(result_meta, results):
+                 (
+                     segment_key,
+                     has_root_span,
+@@ -297,9 +302,9 @@ def process_spans(self, spans: Sequence[Span], now: int):
+ 
+                 latency_entries.append((project_and_trace, evalsha_latency_ms))
+ 
+-                shard = self.assigned_shards[
+-                    int(project_and_trace.split(":")[1], 16) % len(self.assigned_shards)
+-                ]
++                # The Kafka partition is used directly as the queue shard
++                # so that routing is stable across rebalances.
++                shard = partition
+                 queue_key = self._get_queue_key(shard)
+ 
+                 # if the currently processed span is a root span, OR the buffer
+diff --git a/src/sentry/spans/buffer_logger.py b/src/sentry/spans/buffer_logger.py
+index c0bc3b6f7d42b0..641efbd3de7c26 100644
+--- a/src/sentry/spans/buffer_logger.py
++++ b/src/sentry/spans/buffer_logger.py
+@@ -331,6 +331,10 @@ def emit_observability_metrics(
+         )
+ 
+     if oversized_count > 0:
++        logger.info(
++            "Parent span set oversized, skipping SUNIONSTORE",
++            extra={"oversized_count": oversized_count},
++        )
+         metrics.incr(
+             "spans.buffer.process_spans.parent_span_set_already_oversized.count",
+             amount=oversized_count,
+diff --git a/src/sentry/spans/consumers/process/factory.py b/src/sentry/spans/consumers/process/factory.py
+index 6cba8f491aaf12..62e3ba430f6232 100644
+--- a/src/sentry/spans/consumers/process/factory.py
++++ b/src/sentry/spans/consumers/process/factory.py
+@@ -203,6 +203,7 @@ def process_batch(
+                 payload=payload.value,
+                 end_timestamp=cast(float, val["end_timestamp"]),
+                 is_segment_span=bool(val.get("parent_span_id") is None or val.get("is_segment")),
++                partition=value.partition.index,
+             )
+ 
+             spans.append(span)
+diff --git a/src/sentry/users/api/endpoints/user_details.py b/src/sentry/users/api/endpoints/user_details.py
+index 2820d4bbc573dd..55cf05050d7b3f 100644
+--- a/src/sentry/users/api/endpoints/user_details.py
++++ b/src/sentry/users/api/endpoints/user_details.py
+@@ -357,9 +357,14 @@ def put(self, request: Request, user: User) -> Response:
+ 
+             if is_updating_superuser or is_updating_staff:
+                 if not user_can_elevate(user):
++                    # Revoke superuser/staff privileges if the user is not a member of the default organization.
++                    # Clear validated_data so only the revocation fields are persisted,
++                    # avoiding side effects from other fields in the rejected request.
++                    serializer.validated_data.clear()
++                    serializer.save(is_superuser=False, is_staff=False)
+                     return Response(
+                         {
+-                            "detail": "User must be a member to the default organization to enable SuperUser mode."
++                            "detail": "User must be a member to the default organization to enable SuperUser mode. Superuser/staff privileges have been revoked."
+                         },
+                         status=status.HTTP_403_FORBIDDEN,
+                     )
+diff --git a/static/app/components/globalModal/index.spec.tsx b/static/app/components/globalModal/index.spec.tsx
+index 3bf6c900841cc8..fc50b2290aba6e 100644
+--- a/static/app/components/globalModal/index.spec.tsx
++++ b/static/app/components/globalModal/index.spec.tsx
+@@ -6,6 +6,7 @@ import {
+   waitForElementToBeRemoved,
+ } from 'sentry-test/reactTestingLibrary';
+ 
++import {CompactSelect} from '@sentry/scraps/compactSelect';
+ import {Tooltip} from '@sentry/scraps/tooltip';
+ 
+ import {closeModal, openModal} from 'sentry/actionCreators/modal';
+@@ -191,6 +192,38 @@ describe('GlobalModal', () => {
+     await waitForModalToHide();
+   });
+ 
++  it('does not close modal when pressing escape to close a select dropdown', async () => {
++    renderGlobalModal();
++
++    act(() =>
++      openModal(({Body}) => (
++        <Body>
++          <CompactSelect
++            options={[
++              {value: 'opt1', label: 'Option One'},
++              {value: 'opt2', label: 'Option Two'},
++            ]}
++            value="opt1"
++            onChange={() => {}}
++          />
++        </Body>
++      ))
++    );
++
++    // Open the select dropdown
++    await userEvent.click(screen.getByRole('button', {name: 'Option One'}));
++    expect(screen.getByRole('option', {name: 'Option One'})).toBeInTheDocument();
++
++    // Press ESC — should close the dropdown, NOT the modal
++    await userEvent.keyboard('{Escape}');
++
++    // Dropdown should be closed
++    expect(screen.queryByRole('option', {name: 'Option One'})).not.toBeInTheDocument();
++
++    // Modal should still be open
++    expect(screen.getByRole('dialog')).toBeInTheDocument();
++  });
++
+   it('renders interactive tooltip inside the modal', async () => {
+     renderGlobalModal();
+ 
+diff --git a/static/app/components/globalModal/index.tsx b/static/app/components/globalModal/index.tsx
+index 311628b8e13bbc..743336717591a9 100644
+--- a/static/app/components/globalModal/index.tsx
++++ b/static/app/components/globalModal/index.tsx
+@@ -136,6 +136,7 @@ function GlobalModal({onClose}: Props) {
+     (e: KeyboardEvent) => {
+       if (
+         e.key !== 'Escape' ||
++        e.defaultPrevented ||
+         closeEvents === 'none' ||
+         closeEvents === 'backdrop-click'
+       ) {
+diff --git a/static/app/views/dashboards/datasetConfig/spans.tsx b/static/app/views/dashboards/datasetConfig/spans.tsx
+index bc30fc00cdb887..cca58ad92ad471 100644
+--- a/static/app/views/dashboards/datasetConfig/spans.tsx
++++ b/static/app/views/dashboards/datasetConfig/spans.tsx
+@@ -45,6 +45,7 @@ import {
+ import {combineBaseFieldsWithTags} from 'sentry/views/dashboards/datasetConfig/utils/combineBaseFieldsWithEapTags';
+ import {DisplayType, type WidgetQuery} from 'sentry/views/dashboards/types';
+ import {
++  isEventsStats,
+   isGroupedMultiSeriesEventsStats,
+   isMultiSeriesEventsStats,
+ } from 'sentry/views/dashboards/utils/isEventsStats';
+@@ -194,7 +195,16 @@ function extractSeriesMetadata<T>({
+     }
+   });
+ 
+-  if (isMultiSeriesEventsStats(data)) {
++  if (isEventsStats(data)) {
++    // Plain EventsStats: single aggregate, no grouping. Meta is at the top level.
++    if (data.meta) {
++      widgetQuery.aggregates?.forEach(aggregate => {
++        if (aggregate && !(aggregate in result)) {
++          result[aggregate] = getMetaField(data.meta, aggregate);
++        }
++      });
++    }
++  } else if (isMultiSeriesEventsStats(data)) {
+     // If there's only one aggregate and multiple groupings, series names are group names
+     // In this case, we can use the first meta value for all series
+     const firstMeta = widgetQuery.fieldMeta?.find(meta => meta !== null);
+diff --git a/static/app/views/dashboards/utils.tsx b/static/app/views/dashboards/utils.tsx
+index a0253a92862292..c3f5f39a18a44d 100644
+--- a/static/app/views/dashboards/utils.tsx
++++ b/static/app/views/dashboards/utils.tsx
+@@ -25,12 +25,14 @@ import {getUtcDateString} from 'sentry/utils/dates';
+ import EventView from 'sentry/utils/discover/eventView';
+ import {DURATION_UNITS} from 'sentry/utils/discover/fieldRenderers';
+ import {
++  ABYTE_UNITS,
+   getAggregateAlias,
+   getAggregateArg,
+   isEquation,
+   isMeasurement,
+   RATE_UNIT_MULTIPLIERS,
+   RateUnit,
++  SIZE_UNIT_MULTIPLIERS,
+   stripEquationPrefix,
+ } from 'sentry/utils/discover/fields';
+ import {DisplayModes, type SavedQueryDatasets} from 'sentry/utils/discover/types';
+@@ -110,6 +112,13 @@ export function getThresholdUnitSelectOptions(
+     }));
+   }
+ 
++  if (dataType === 'size') {
++    return Object.values(ABYTE_UNITS).map(unit => ({
++      label: unit,
++      value: unit,
++    }));
++  }
++
+   return [];
+ }
+ 
+@@ -121,7 +130,10 @@ export function normalizeUnit(value: number, unit: string, dataType: string): nu
+       : dataType === 'duration'
+         ? // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+           DURATION_UNITS[unit]
+-        : 1;
++        : dataType === 'size'
++          ? // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
++            SIZE_UNIT_MULTIPLIERS[unit]
++          : 1;
+   return value * multiplier;
+ }
+ 
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
+index 29dd3dfc0fbd68..3e9b2af3b3765b 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
+@@ -143,6 +143,36 @@ const AVG_TTFD_BIG_NUMBER_WIDGET: Widget = {
+   },
+ };
+ 
++// Uses the Sessions (Release) dataset, so most dashboard global filters (which target Spans)
++// don't apply. Still valuable as a top-level health signal alongside the span-based vitals.
++const CRASH_FREE_SESSION_RATE_BIG_NUMBER_WIDGET: Widget = {
++  id: 'crash-free-session-rate-big-number',
++  title: t('Crash Free Session Rate'),
++  description:
++    'Percentage of sessions that did not crash. Based on session data, so span filters do not apply.',
++  displayType: DisplayType.BIG_NUMBER,
++  widgetType: WidgetType.RELEASE,
++  interval: '1h',
++  thresholds: null,
++  queries: [
++    {
++      name: '',
++      fields: ['crash_free_rate(session)'],
++      aggregates: ['crash_free_rate(session)'],
++      columns: [],
++      conditions: '',
++      orderby: '',
++    },
++  ],
++  layout: {
++    h: 1,
++    x: 3,
++    y: 1,
++    w: 1,
++    minH: 1,
++  },
++};
++
+ const SLOW_FRAME_RATE_WIDGET: Widget = {
+   id: 'slow-frame-rate-big-number',
+   title: t('Slow Frame Rate'),
+@@ -182,7 +212,7 @@ const SLOW_FRAME_RATE_WIDGET: Widget = {
+     h: 1,
+     x: 0,
+     y: 1,
+-    w: 2,
++    w: 1,
+     minH: 1,
+   },
+ };
+@@ -224,9 +254,9 @@ const FROZEN_FRAME_RATE_WIDGET: Widget = {
+   ],
+   layout: {
+     h: 1,
+-    x: 2,
++    x: 1,
+     y: 1,
+-    w: 2,
++    w: 1,
+     minH: 1,
+   },
+ };
+@@ -251,9 +281,9 @@ const AVG_FRAME_DELAY_WIDGET: Widget = {
+   ],
+   layout: {
+     h: 1,
+-    x: 4,
++    x: 2,
+     y: 1,
+-    w: 2,
++    w: 1,
+     minH: 1,
+   },
+ };
+@@ -407,6 +437,7 @@ const SECOND_ROW_WIDGETS: Widget[] = [
+   SLOW_FRAME_RATE_WIDGET,
+   FROZEN_FRAME_RATE_WIDGET,
+   AVG_FRAME_DELAY_WIDGET,
++  CRASH_FREE_SESSION_RATE_BIG_NUMBER_WIDGET,
+ ];
+ 
+ export const MOBILE_VITALS_PREBUILT_CONFIG: PrebuiltDashboard = {
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+index 441488a25701db..65cdd12992fc60 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+@@ -249,14 +249,14 @@ const SPAN_OPERATIONS_TABLE: Widget = {
+       fields: [
+         SpanFields.SPAN_OP,
+         SpanFields.SPAN_DESCRIPTION,
+-        `ttid_contribution_rate()`,
+-        `ttfd_contribution_rate()`,
++        `equation|ttid_contribution_rate()`,
++        `equation|ttfd_contribution_rate()`,
+         `avg(${SpanFields.SPAN_SELF_TIME})`,
+         `sum(${SpanFields.SPAN_SELF_TIME})`,
+       ],
+       aggregates: [
+-        `ttid_contribution_rate()`,
+-        `ttfd_contribution_rate()`,
++        `equation|ttid_contribution_rate()`,
++        `equation|ttfd_contribution_rate()`,
+         `avg(${SpanFields.SPAN_SELF_TIME})`,
+         `sum(${SpanFields.SPAN_SELF_TIME})`,
+       ],
+diff --git a/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx b/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx
+index 9a993a075deb68..202860d3655f13 100644
+--- a/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx
++++ b/static/app/views/dashboards/widgetBuilder/buildSteps/thresholdsStep/thresholds.tsx
+@@ -106,9 +106,7 @@ export function Thresholds({
+   const maxOneValue = thresholdsConfig?.max_values[ThresholdMaxKeys.MAX_1] ?? '';
+   const maxTwoValue = thresholdsConfig?.max_values[ThresholdMaxKeys.MAX_2] ?? '';
+   const unit = thresholdsConfig?.unit ?? dataUnit;
+-  const unitOptions = ['duration', 'rate'].includes(dataType)
+-    ? getThresholdUnitSelectOptions(dataType)
+-    : [];
++  const unitOptions = getThresholdUnitSelectOptions(dataType);
+ 
+   const isHigherBetter = preferredPolarity === '+';
+ 
+diff --git a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+index e55226ed120659..d89a51bbf43add 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+@@ -165,6 +165,8 @@ function WidgetBuilderV2({
+     } else if (results.timeseriesResultsTypes) {
+       const keys = Object.keys(results.timeseriesResultsTypes);
+       dataType = results.timeseriesResultsTypes[keys[0]!];
++      const rawUnit = results.timeseriesResultsUnits?.[keys[0]!];
++      dataUnit = rawUnit ?? undefined;
+     }
+ 
+     setThresholdMetaState({dataType, dataUnit});
+diff --git a/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx b/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx
+index 6f238e7d754c99..bf011c637822c7 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/thresholds.tsx
+@@ -1,4 +1,4 @@
+-import {Fragment} from 'react';
++import {Fragment, useEffect, useRef} from 'react';
+ import cloneDeep from 'lodash/cloneDeep';
+ 
+ import {t, tct} from 'sentry/locale';
+@@ -25,6 +25,28 @@ function ThresholdsSection({
+   setError,
+ }: ThresholdsSectionProps) {
+   const {state, dispatch} = useWidgetBuilderContext();
++
++  const prevDataTypeRef = useRef<string | undefined>(undefined);
++  useEffect(() => {
++    const prevDataType = prevDataTypeRef.current;
++    prevDataTypeRef.current = dataType;
++    // When the data type changes and there's a stored unit, reset it so the
++    // unit selector shows the correct options for the new data type.
++    if (
++      prevDataType !== undefined &&
++      prevDataType !== dataType &&
++      state.thresholds?.unit
++    ) {
++      dispatch({
++        type: BuilderStateAction.SET_THRESHOLDS,
++        payload: {
++          ...state.thresholds,
++          unit: null,
++        },
++      });
++    }
++  }, [dataType, dispatch, state.thresholds]);
++
+   return (
+     <Fragment>
+       <SectionHeader
+diff --git a/static/app/views/dashboards/widgetCard/index.tsx b/static/app/views/dashboards/widgetCard/index.tsx
+index 3afb9888d0ab15..a1619c610ab326 100644
+--- a/static/app/views/dashboards/widgetCard/index.tsx
++++ b/static/app/views/dashboards/widgetCard/index.tsx
+@@ -20,7 +20,7 @@ import type {Series} from 'sentry/types/echarts';
+ import type {WithRouterProps} from 'sentry/types/legacyReactRouter';
+ import type {Confidence, Organization} from 'sentry/types/organization';
+ import type {TableDataWithTitle} from 'sentry/utils/discover/discoverQuery';
+-import type {AggregationOutputType, Sort} from 'sentry/utils/discover/fields';
++import type {AggregationOutputType, DataUnit, Sort} from 'sentry/utils/discover/fields';
+ import {statsPeriodToDays} from 'sentry/utils/duration/statsPeriodToDays';
+ import {getFieldDefinition} from 'sentry/utils/fields';
+ import {hasOnDemandMetricWidgetFeature} from 'sentry/utils/onDemandMetrics/features';
+@@ -63,6 +63,7 @@ import {WidgetFrame} from './widgetFrame';
+ export type OnDataFetchedParams = {
+   tableResults?: TableDataWithTitle[];
+   timeseriesResultsTypes?: Record<string, AggregationOutputType>;
++  timeseriesResultsUnits?: Record<string, DataUnit>;
+ };
+ 
+ const DAYS_TO_MS = 24 * 60 * 60 * 1000;
+@@ -133,6 +134,7 @@ type Data = {
+   tableResults?: TableDataWithTitle[];
+   timeseriesResults?: Series[];
+   timeseriesResultsTypes?: Record<string, AggregationOutputType>;
++  timeseriesResultsUnits?: Record<string, DataUnit>;
+   totalIssuesCount?: string;
+ };
+ 
+@@ -149,6 +151,7 @@ function WidgetCard(props: Props) {
+       props.onDataFetched({
+         tableResults: newData.tableResults,
+         timeseriesResultsTypes: newData.timeseriesResultsTypes,
++        timeseriesResultsUnits: newData.timeseriesResultsUnits,
+       });
+     }
+ 
+diff --git a/static/app/views/dashboards/widgetCard/visualizationWidget.tsx b/static/app/views/dashboards/widgetCard/visualizationWidget.tsx
+index 9093063f6b12ff..b49bb82d4ca672 100644
+--- a/static/app/views/dashboards/widgetCard/visualizationWidget.tsx
++++ b/static/app/views/dashboards/widgetCard/visualizationWidget.tsx
+@@ -66,6 +66,7 @@ interface VisualizationWidgetProps {
+     tableResults?: any[];
+     timeseriesResults?: Series[];
+     timeseriesResultsTypes?: Record<string, AggregationOutputType>;
++    timeseriesResultsUnits?: Record<string, DataUnit>;
+     totalIssuesCount?: string;
+   }) => void;
+   onWidgetTableResizeColumn?: (columns: TabularColumn[]) => void;
+diff --git a/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx b/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx
+index e5fac2065dd61f..a938986caa1e7a 100644
+--- a/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx
++++ b/static/app/views/dashboards/widgetCard/widgetCardDataLoader.tsx
+@@ -45,6 +45,7 @@ type Props = {
+       | 'tableResults'
+       | 'timeseriesResults'
+       | 'timeseriesResultsTypes'
++      | 'timeseriesResultsUnits'
+       | 'totalIssuesCount'
+       | 'confidence'
+       | 'sampleCount'
+diff --git a/static/app/views/insights/crons/components/upsertPlatformGuides.tsx b/static/app/views/insights/crons/components/upsertPlatformGuides.tsx
+index 873cf6b2e009c1..3f9af14888770e 100644
+--- a/static/app/views/insights/crons/components/upsertPlatformGuides.tsx
++++ b/static/app/views/insights/crons/components/upsertPlatformGuides.tsx
+@@ -1,5 +1,6 @@
+ import {Fragment} from 'react';
+ 
++import {Alert} from '@sentry/scraps/alert';
+ import {CodeBlock} from '@sentry/scraps/code';
+ import {ExternalLink} from '@sentry/scraps/link';
+ 
+@@ -614,8 +615,10 @@ module.exports = withSentryConfig(
+     // Your Next.js config
+   },
+   {
+-    automaticVercelMonitors: true, // Enable Vercel Cron Jobs monitoring
+     // ... other Sentry options
++    webpack: {
++      automaticVercelMonitors: true, // Enable Vercel Cron Jobs monitoring
++    },
+   }
+ );`;
+ 
+@@ -633,16 +636,16 @@ module.exports = withSentryConfig(
+     <Fragment>
+       <div>
+         {tct(
+-          'Use the [additionalDocs:Next.js SDK] with [automaticVercelMonitors:automaticVercelMonitors] to automatically create monitors for your Vercel Cron Jobs.',
++          'Use the [additionalDocs:Next.js SDK] with [automaticVercelMonitors:webpack.automaticVercelMonitors] to automatically create monitors for your Vercel Cron Jobs.',
+           {
+             additionalDocs: (
+-              <ExternalLink href="https://docs.sentry.io/platforms/javascript/guides/nextjs/configuration/build/" />
++              <ExternalLink href="https://docs.sentry.io/platforms/javascript/guides/nextjs/configuration/build/#webpack.automaticVercelMonitors" />
+             ),
+             automaticVercelMonitors: <code />,
+           }
+         )}
+       </div>
+-      <div>{t('Enable automaticVercelMonitors in your next.config.js:')}</div>
++      <div>{t('Enable webpack.automaticVercelMonitors in your next.config.js:')}</div>
+       <CodeBlock language="javascript">{configCode}</CodeBlock>
+       <div>{t('Configure your Vercel Cron Jobs in vercel.json:')}</div>
+       <CodeBlock language="json">{cronCode}</CodeBlock>
+@@ -651,6 +654,11 @@ module.exports = withSentryConfig(
+           'Monitors will be automatically created for each cron job in your vercel.json configuration.'
+         )}
+       </div>
++      <Alert variant="info">
++        {t(
++          'This option only works when using Webpack. If you are using Turbopack, this option will have no effect.'
++        )}
++      </Alert>
+     </Fragment>
+   );
+ }
+diff --git a/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py b/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py
+index e4ccbba6b2deda..c9fbaac43efc45 100644
+--- a/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py
++++ b/tests/sentry/dashboards/endpoints/test_organization_dashboard_details.py
+@@ -1974,6 +1974,88 @@ def test_update_widget_with_invalid_preferred_polarity(self) -> None:
+             == "Must be '+', '-', or empty string."
+         )
+ 
++    def test_update_widget_with_axis_range(self) -> None:
++        data = {
++            "title": "Dashboard",
++            "widgets": [
++                {
++                    "id": str(self.widget_1.id),
++                    "title": "Line Chart with Axis Range",
++                    "displayType": "line",
++                    "axisRange": "dataMin",
++                    "queries": [
++                        {
++                            "name": "",
++                            "fields": ["count()"],
++                            "columns": [],
++                            "aggregates": ["count()"],
++                            "conditions": "",
++                        }
++                    ],
++                },
++            ],
++        }
++        response = self.do_request("put", self.url(self.dashboard.id), data=data)
++        assert response.status_code == 200, response.data
++
++        assert response.data["widgets"][0]["axisRange"] == "dataMin"
++
++        widget = DashboardWidget.objects.get(id=self.widget_1.id)
++        assert widget.detail["axis_range"] == "dataMin"
++
++    def test_update_widget_with_invalid_axis_range(self) -> None:
++        data = {
++            "title": "Dashboard",
++            "widgets": [
++                {
++                    "id": str(self.widget_1.id),
++                    "title": "Line Chart with Invalid Axis Range",
++                    "displayType": "line",
++                    "axisRange": "invalid_value",
++                    "queries": [
++                        {
++                            "name": "",
++                            "fields": ["count()"],
++                            "columns": [],
++                            "aggregates": ["count()"],
++                            "conditions": "",
++                        }
++                    ],
++                },
++            ],
++        }
++        response = self.do_request("put", self.url(self.dashboard.id), data=data)
++        assert response.status_code == 400, response.data
++
++    def test_create_widget_with_axis_range(self) -> None:
++        data = {
++            "title": "Dashboard with Axis Range Widget",
++            "widgets": [
++                {
++                    "title": "New Line Chart",
++                    "displayType": "line",
++                    "axisRange": "dataMin",
++                    "widgetType": "error-events",
++                    "queries": [
++                        {
++                            "name": "",
++                            "fields": ["count()"],
++                            "columns": [],
++                            "aggregates": ["count()"],
++                            "conditions": "",
++                        }
++                    ],
++                },
++            ],
++        }
++        response = self.do_request("put", self.url(self.dashboard.id), data=data)
++        assert response.status_code == 200, response.data
++
++        assert response.data["widgets"][0]["axisRange"] == "dataMin"
++
++        widget = DashboardWidget.objects.get(dashboard=self.dashboard, title="New Line Chart")
++        assert widget.detail["axis_range"] == "dataMin"
++
+     def test_update_migrated_spans_widget_reset_changed_reason(self) -> None:
+         new_dashboard = Dashboard.objects.create(
+             title="New dashboard",
+diff --git a/tests/sentry/discover/test_arithmetic.py b/tests/sentry/discover/test_arithmetic.py
+index c7437704990aaf..b0476658da7b3e 100644
+--- a/tests/sentry/discover/test_arithmetic.py
++++ b/tests/sentry/discover/test_arithmetic.py
+@@ -249,6 +249,8 @@ def test_field_values(a, op, b) -> None:
+         ("p50_if(span.duration,is_transaction,equals,true)", "/", 2),
+         ("tpm()", "+", "failure_rate_if(is_transaction,equals,true)"),
+         ("avg_if(span.duration,is_transaction,equals,true)", "*", 100),
++        ("ttid_contribution_rate()", "+", "ttfd_contribution_rate()"),
++        (100, "*", "ttid_contribution_rate()"),
+         (
+             "performance_score(measurements.score.lcp)",
+             "+",
+diff --git a/tests/sentry/middleware/integrations/parsers/test_github.py b/tests/sentry/middleware/integrations/parsers/test_github.py
+index 04c1da74742d8b..aac42eff23a89d 100644
+--- a/tests/sentry/middleware/integrations/parsers/test_github.py
++++ b/tests/sentry/middleware/integrations/parsers/test_github.py
+@@ -434,16 +434,10 @@ def get_integration(self) -> Integration:
+     @override_regions(region_config)
+     @responses.activate
+     @patch("sentry.middleware.integrations.parsers.github.metrics")
+-    def test_drops_unprocessed_event_when_flag_and_allowlist(self, mock_metrics: Mock) -> None:
+-        """With flag on and mailbox in allowlist, status event is dropped and metric is incremented."""
+-        integration = self.get_integration()
+-        mailbox_name = f"github:{integration.id}"
+-        with override_options(
+-            {
+-                "github.webhook.drop-unprocessed-events.enabled": True,
+-                "github.webhook.drop-unprocessed-events.mailbox-allowlist": [mailbox_name],
+-            }
+-        ):
++    def test_drops_unprocessed_event_when_flag_enabled(self, mock_metrics: Mock) -> None:
++        """With flag on, status event is dropped and metric is incremented."""
++        self.get_integration()
++        with override_options({"github.webhook.drop-unprocessed-events.enabled": True}):
+             request = self.factory.post(
+                 self.path,
+                 data={"installation": {"id": "1"}, "repository": {"id": 123}},
+@@ -463,12 +457,7 @@ def test_drops_unprocessed_event_when_flag_and_allowlist(self, mock_metrics: Moc
+ 
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+     @override_regions(region_config)
+-    @override_options(
+-        {
+-            "github.webhook.drop-unprocessed-events.enabled": False,
+-            "github.webhook.drop-unprocessed-events.mailbox-allowlist": ["github:99999"],
+-        }
+-    )
++    @override_options({"github.webhook.drop-unprocessed-events.enabled": False})
+     @responses.activate
+     def test_does_not_drop_when_flag_off_creates_payloads(self) -> None:
+         """With flag off, unprocessed event still creates WebhookPayloads."""
+@@ -490,49 +479,13 @@ def test_does_not_drop_when_flag_off_creates_payloads(self) -> None:
+             region_names=[region.name],
+         )
+ 
+-    @override_settings(SILO_MODE=SiloMode.CONTROL)
+-    @override_regions(region_config)
+-    @override_options(
+-        {
+-            "github.webhook.drop-unprocessed-events.enabled": True,
+-            "github.webhook.drop-unprocessed-events.mailbox-allowlist": ["github:other"],
+-        }
+-    )
+-    @responses.activate
+-    def test_does_not_drop_when_mailbox_not_in_allowlist_creates_payloads(self) -> None:
+-        """With mailbox not in allowlist, unprocessed event still creates WebhookPayloads."""
+-        integration = self.get_integration()
+-        request = self.factory.post(
+-            self.path,
+-            data={"installation": {"id": "1"}, "repository": {"id": 123}},
+-            content_type="application/json",
+-            headers={"X-GITHUB-EVENT": "status"},
+-        )
+-        parser = GithubRequestParser(request=request, response_handler=self.get_response)
+-        response = parser.get_response()
+-
+-        assert isinstance(response, HttpResponse)
+-        assert response.status_code == status.HTTP_202_ACCEPTED
+-        assert_webhook_payloads_for_mailbox(
+-            request=request,
+-            mailbox_name=f"github:{integration.id}",
+-            region_names=[region.name],
+-        )
+-
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+     @override_regions(region_config)
+     @responses.activate
+-    def test_supported_event_never_dropped_even_with_flag_and_allowlist(self) -> None:
+-        """Supported event (push) is never dropped even when flag on and mailbox in allowlist."""
++    def test_supported_event_never_dropped_when_flag_enabled(self) -> None:
++        """Supported event (push) is never dropped even when flag is on."""
+         integration = self.get_integration()
+-        with override_options(
+-            {
+-                "github.webhook.drop-unprocessed-events.enabled": True,
+-                "github.webhook.drop-unprocessed-events.mailbox-allowlist": [
+-                    f"github:{integration.id}"
+-                ],
+-            }
+-        ):
++        with override_options({"github.webhook.drop-unprocessed-events.enabled": True}):
+             request = self.factory.post(
+                 self.path,
+                 data={"installation": {"id": "1"}, "repository": {"id": 123}},
+@@ -556,14 +509,7 @@ def test_supported_event_never_dropped_even_with_flag_and_allowlist(self) -> Non
+     def test_missing_x_github_event_not_dropped_forwards_to_region(self) -> None:
+         """Missing X-GitHub-Event is not dropped; request is forwarded so region returns 400."""
+         integration = self.get_integration()
+-        with override_options(
+-            {
+-                "github.webhook.drop-unprocessed-events.enabled": True,
+-                "github.webhook.drop-unprocessed-events.mailbox-allowlist": [
+-                    f"github:{integration.id}"
+-                ],
+-            }
+-        ):
++        with override_options({"github.webhook.drop-unprocessed-events.enabled": True}):
+             request = self.factory.post(
+                 self.path,
+                 data={"installation": {"id": "1"}, "repository": {"id": 123}},
+diff --git a/tests/sentry/models/test_apiapplication.py b/tests/sentry/models/test_apiapplication.py
+index bb50b2841a9a4f..356fd60c0b899e 100644
+--- a/tests/sentry/models/test_apiapplication.py
++++ b/tests/sentry/models/test_apiapplication.py
+@@ -47,6 +47,116 @@ def test_is_valid_redirect_uri(self) -> None:
+         assert not app.is_valid_redirect_uri("http://sub.example.com/path/../baz")
+         assert not app.is_valid_redirect_uri("https://sub.example.com")
+ 
++    def test_is_valid_redirect_uri_encoded_traversal(self) -> None:
++        """Percent-encoded path traversal sequences must be resolved before comparison."""
++        app = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/path/path/",
++            version=0,
++        )
++
++        # Single-encoded traversal (%2e = '.')
++        assert not app.is_valid_redirect_uri("http://example.com/path/path/%2e%2e/%2e%2e/new/path")
++        assert not app.is_valid_redirect_uri("http://example.com/path/path/%2E%2E/%2E%2E/new/path")
++
++        # Mixed case encoding
++        assert not app.is_valid_redirect_uri("http://example.com/path/path/%2e%2E/%2E%2e/new/path")
++
++        # Partial encoding (%2e mixed with literal dot)
++        assert not app.is_valid_redirect_uri("http://example.com/path/path/.%2e/.%2e/new/path")
++        assert not app.is_valid_redirect_uri("http://example.com/path/path/%2e./%2e./new/path")
++
++    def test_is_valid_redirect_uri_multi_layer_encoding(self) -> None:
++        """Multi-layer percent-encoding must be rejected by the prefix match guard."""
++        app = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/path/path/",
++            version=0,
++        )
++
++        # Double-encoded: %252e%252e → (unquote) %2e%2e → rejected (residual encoding)
++        assert not app.is_valid_redirect_uri(
++            "http://example.com/path/path/%252e%252e/%252e%252e/new/path"
++        )
++
++        # Triple-encoded: %25252e%25252e → (unquote) %252e%252e → rejected
++        assert not app.is_valid_redirect_uri(
++            "http://example.com/path/path/%25252e%25252e/%25252e%25252e/new/path"
++        )
++
++    def test_is_valid_redirect_uri_multi_layer_encoding_after_encoded_delimiters(self) -> None:
++        """Encoded path delimiters must not bypass the multi-layer encoding guard."""
++        app = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/callback/",
++            version=0,
++        )
++
++        assert not app.is_valid_redirect_uri("http://example.com/callback/%23%252e%252e/secret")
++        assert not app.is_valid_redirect_uri("http://example.com/callback/%3f%252e%252e/secret")
++
++    def test_is_valid_redirect_uri_legitimate_prefix_match_with_guard(self) -> None:
++        """Clean sub-paths must still prefix-match after the double-encoding guard."""
++        app = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/callback/",
++            version=0,
++        )
++
++        assert app.is_valid_redirect_uri("http://example.com/callback/")
++        assert app.is_valid_redirect_uri("http://example.com/callback/extra")
++        assert app.is_valid_redirect_uri("http://example.com/callback/deep/nested/path")
++        assert not app.is_valid_redirect_uri("http://example.com/other")
++
++    def test_is_valid_redirect_uri_legitimate_encoded_characters(self) -> None:
++        """URIs with legitimately encoded characters must not be rejected."""
++        # Encoded space in registered URI
++        app_space = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/my%20app/",
++            version=0,
++        )
++        assert app_space.is_valid_redirect_uri("http://example.com/my%20app/callback")
++
++        # Non-ASCII (UTF-8 encoded) in registered URI
++        app_utf8 = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/caf%C3%A9/",
++            version=0,
++        )
++        assert app_utf8.is_valid_redirect_uri("http://example.com/caf%C3%A9/callback")
++
++        # Literal percent (%25) in registered URI
++        app_pct = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/100%25done/",
++            version=0,
++        )
++        assert app_pct.is_valid_redirect_uri("http://example.com/100%25done/callback")
++
++    def test_is_valid_redirect_uri_encoded_slash_traversal(self) -> None:
++        """Encoded forward slash (%2f) in traversal sequences must be resolved."""
++        app = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/path/path/",
++            version=0,
++        )
++
++        assert not app.is_valid_redirect_uri("http://example.com/path/path/..%2f..%2fnew/path")
++
++    def test_is_valid_redirect_uri_encoded_traversal_strict(self) -> None:
++        """Encoded traversal must also be rejected in strict mode."""
++        app = ApiApplication.objects.create(
++            owner=self.user,
++            redirect_uris="http://example.com/path/path/",
++            version=1,
++        )
++
++        assert not app.is_valid_redirect_uri("http://example.com/path/path/%2e%2e/%2e%2e/new/path")
++        assert not app.is_valid_redirect_uri(
++            "http://example.com/path/path/%252e%252e/%252e%252e/new/path"
++        )
++
+     def test_is_valid_redirect_uri_strict_version(self) -> None:
+         # In strict policy version, require exact matching (no prefix, no trailing-slash equivalence).
+         app = ApiApplication.objects.create(
+diff --git a/tests/sentry/spans/test_buffer.py b/tests/sentry/spans/test_buffer.py
+index 13fc181fb4d253..dd73702d6f84d7 100644
+--- a/tests/sentry/spans/test_buffer.py
++++ b/tests/sentry/spans/test_buffer.py
+@@ -1388,3 +1388,61 @@ def test_zero_copy(emit_observability_metrics: mock.MagicMock) -> None:
+         assert any(v == 1 for v in zero_copy_values), (
+             f"Expected at least one evalsha call to use zero-copy, got {zero_copy_values}"
+         )
++
++
++def test_partition_routing_stable_across_rebalance() -> None:
++    """
++    Verify that spans are routed to the queue matching their source Kafka
++    partition, so that rebalancing (changing assigned_shards) does not cause
++    a segment to be split across queues.
++    """
++    with override_options(DEFAULT_OPTIONS):
++        buf = SpansBuffer(assigned_shards=list(range(3)))
++        buf.client.flushdb()
++
++        partition = 1
++        spans_before = [
++            Span(
++                payload=_payload("a" * 16),
++                trace_id="a" * 32,
++                span_id="a" * 16,
++                parent_span_id="b" * 16,
++                segment_id=None,
++                project_id=1,
++                end_timestamp=1700000000.0,
++                partition=partition,
++            ),
++        ]
++        buf.process_spans(spans_before, now=0)
++
++        # Simulate rebalance: consumer now owns partitions 1, 2, 3
++        buf.assigned_shards = [1, 2, 3]
++
++        spans_after = [
++            Span(
++                payload=_payload("b" * 16),
++                trace_id="a" * 32,
++                span_id="b" * 16,
++                parent_span_id=None,
++                segment_id=None,
++                project_id=1,
++                is_segment_span=True,
++                end_timestamp=1700000000.0,
++                partition=partition,
++            ),
++        ]
++        buf.process_spans(spans_after, now=1)
++
++        # Both spans should be flushed together in a single segment from
++        # the queue for partition 1, not split across different queues.
++        rv = buf.flush_segments(now=12)
++        _normalize_output(rv)
++
++        seg_key = _segment_id(1, "a" * 32, "b" * 16)
++        assert seg_key in rv
++        assert len(rv) == 1
++        assert len(rv[seg_key].spans) == 2
++        assert rv[seg_key].queue_key == b"span-buf:q:1"
++
++        buf.done_flush_segments(rv)
++        assert_clean(buf.client)
+diff --git a/tests/sentry/users/api/endpoints/test_user_details.py b/tests/sentry/users/api/endpoints/test_user_details.py
+index 58d50707796d9e..10a3eb1660e5e8 100644
+--- a/tests/sentry/users/api/endpoints/test_user_details.py
++++ b/tests/sentry/users/api/endpoints/test_user_details.py
+@@ -227,6 +227,97 @@ def test_user_cannot_elevate_when_superuser_org_not_configured(self) -> None:
+         # user_can_elevate should return False when SUPERUSER_ORG_ID is None
+         assert not user_can_elevate(self.user)
+ 
++    @override_settings(SENTRY_MODE=SentryMode.SAAS)
++    def test_superuser_and_staff_revoked_when_target_user_not_in_default_org(self) -> None:
++        """When updating superuser for a user not in the default org,
++        existing superuser and staff privileges should be revoked."""
++        self.user.update(is_superuser=True, is_staff=True)
++        UserPermission.objects.create(user=self.superuser, permission="users.admin")
++        self.login_as(user=self.superuser, superuser=True)
++
++        resp = self.get_error_response(
++            self.user.id,
++            isSuperuser="true",
++            status_code=403,
++        )
++        assert (
++            resp.data["detail"]
++            == "User must be a member to the default organization to enable SuperUser mode. Superuser/staff privileges have been revoked."
++        )
++
++        user = User.objects.get(id=self.user.id)
++        assert not user.is_superuser
++        assert not user.is_staff
++
++    @override_settings(SENTRY_MODE=SentryMode.SAAS)
++    def test_superuser_and_staff_revoked_when_updating_staff_and_target_not_in_default_org(
++        self,
++    ) -> None:
++        """When updating staff for a user not in the default org,
++        existing superuser and staff should both be revoked."""
++        self.user.update(is_superuser=True, is_staff=True)
++        UserPermission.objects.create(user=self.superuser, permission="users.admin")
++        self.login_as(user=self.superuser, superuser=True)
++
++        resp = self.get_error_response(
++            self.user.id,
++            isStaff="true",
++            status_code=403,
++        )
++        assert (
++            resp.data["detail"]
++            == "User must be a member to the default organization to enable SuperUser mode. Superuser/staff privileges have been revoked."
++        )
++
++        user = User.objects.get(id=self.user.id)
++        assert not user.is_superuser
++        assert not user.is_staff
++
++    @override_settings(SENTRY_MODE=SentryMode.SAAS)
++    @override_options({"staff.ga-rollout": True})
++    def test_staff_actor_revokes_privileges_when_target_not_in_default_org(self) -> None:
++        """When a staff user updates superuser for a user not in the default org,
++        existing privileges should be revoked."""
++        self.user.update(is_superuser=True, is_staff=True)
++        UserPermission.objects.create(user=self.staff_user, permission="users.admin")
++        self.login_as(user=self.staff_user, staff=True)
++
++        resp = self.get_error_response(
++            self.user.id,
++            isSuperuser="true",
++            status_code=403,
++        )
++        assert (
++            resp.data["detail"]
++            == "User must be a member to the default organization to enable SuperUser mode. Superuser/staff privileges have been revoked."
++        )
++
++        user = User.objects.get(id=self.user.id)
++        assert not user.is_superuser
++        assert not user.is_staff
++
++    @override_settings(SENTRY_MODE=SentryMode.SAAS)
++    def test_revocation_does_not_persist_other_fields_from_rejected_request(self) -> None:
++        """A 403 revocation must only update is_superuser/is_staff. Other fields
++        in the request (e.g. isActive) must not be written to the database."""
++        self.user.update(is_superuser=True, is_staff=True, is_active=True)
++        UserPermission.objects.create(user=self.superuser, permission="users.admin")
++        self.login_as(user=self.superuser, superuser=True)
++
++        resp = self.get_error_response(
++            self.user.id,
++            isSuperuser="true",
++            isActive="false",
++            status_code=403,
++        )
++        assert resp.status_code == 403
++
++        user = User.objects.get(id=self.user.id)
++        assert not user.is_superuser
++        assert not user.is_staff
++        # is_active must remain unchanged — the request was rejected
++        assert user.is_active
++
+ 
+ @control_silo_test
+ @override_options({"staff.ga-rollout": False})
+@@ -355,7 +446,7 @@ def test_superuser_with_permission_cannot_add_superuser_without_org_1_membership
+         )
+         assert (
+             resp.data["detail"]
+-            == "User must be a member to the default organization to enable SuperUser mode."
++            == "User must be a member to the default organization to enable SuperUser mode. Superuser/staff privileges have been revoked."
+         )
+ 
+         user = User.objects.get(id=self.user.id)
+@@ -692,7 +783,7 @@ def test_staff_with_permission_cannot_add_superuser_without_default_organization
+         )
+         assert (
+             resp.data["detail"]
+-            == "User must be a member to the default organization to enable SuperUser mode."
++            == "User must be a member to the default organization to enable SuperUser mode. Superuser/staff privileges have been revoked."
+         )
+ 
+         user = User.objects.get(id=self.user.id)

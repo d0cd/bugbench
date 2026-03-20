@@ -1,13 +1,153 @@
-diff --git a/docs/sources/as-code/observability-as-code/git-sync/usage-limits.md b/docs/sources/as-code/observability-as-code/git-sync/usage-limits.md
-index 1fd1b2648b7..4a4eaf83d8b 100644
---- a/docs/sources/as-code/observability-as-code/git-sync/usage-limits.md
-+++ b/docs/sources/as-code/observability-as-code/git-sync/usage-limits.md
-@@ -90,7 +90,7 @@ A resource can be:
+diff --git a/.github/workflows/externalized-datasources-reminder.yml b/.github/workflows/externalized-datasources-reminder.yml
+index f90fd22dde44d..86f8e147bbd78 100644
+--- a/.github/workflows/externalized-datasources-reminder.yml
++++ b/.github/workflows/externalized-datasources-reminder.yml
+@@ -6,8 +6,10 @@ on:
+     paths:
+       - "public/app/plugins/datasource/elasticsearch/**"
+       - "public/app/plugins/datasource/cloudwatch/**"
++      - "public/app/plugins/datasource/cloud-monitoring/**"
+       - "pkg/tsdb/elasticsearch/**"
+       - "pkg/tsdb/cloudwatch/**"
++      - "pkg/tsdb/cloud-monitoring/**"
  
- ### Synced resources
+ jobs:
+   add-comment:
+diff --git a/pkg/services/ngalert/remote/alertmanager_test.go b/pkg/services/ngalert/remote/alertmanager_test.go
+index dbef9c32b0775..9baca088c9c23 100644
+--- a/pkg/services/ngalert/remote/alertmanager_test.go
++++ b/pkg/services/ngalert/remote/alertmanager_test.go
+@@ -430,17 +430,28 @@ func TestCompareAndSendConfiguration(t *testing.T) {
+ 	secretsService := secretsManager.SetupTestService(t, database.ProvideSecretsStore(db.InitTestDB(t)))
  
--- You can only sync dashboards and folders. Refer to [Supported resources](https://grafana.com/docs/grafana/<GRAFANA_VERSION>/as-code/observability-as-code/git-sync/#resource-support-and-compatibility) for more information.
-+- You can only sync dashboards and folders. Refer to [Supported resources](#resource-support-and-compatibility) for more information.
- - If you're using Git Sync in Grafana OSS and Grafana Enterprise, some resources might be in an incompatible data format and won't be synced.
- - Full-instance sync is not available in Grafana Cloud and is experimental in Grafana OSS and Grafana Enterprise.
- - When migrating to full instance sync, during the synchronization process your resources will be temporarily unavailable. No one will be able to create, edit, or delete resources during this process.
+ 	var got string
++	var gotCnt int
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		require.Equal(t, tenantID, r.Header.Get(client.MimirTenantHeader))
+-		w.Header().Add("content-type", "application/json")
+ 
+-		b, err := io.ReadAll(r.Body)
+-		require.NoError(t, err)
+-		require.NoError(t, r.Body.Close())
+-		got = string(b)
++		if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/config") {
++			b, err := io.ReadAll(r.Body)
++			require.NoError(t, err)
++			require.NoError(t, r.Body.Close())
++			got = string(b)
++		} else if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/config") {
++			w.Header().Add("content-type", "application/json")
++			configSent := client.UserGrafanaConfig{}
++			if got != "" {
++				require.NoError(t, json.Unmarshal([]byte(got), &configSent))
++			}
+ 
+-		_, err = w.Write([]byte(`{"status": "success"}`))
+-		require.NoError(t, err)
++			require.NoError(t, json.NewEncoder(w).Encode(configSent))
++			return
++		}
++
++		w.Header().Add("content-type", "application/json")
++		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"status": "success"}))
+ 	}))
+ 
+ 	cfg := AlertmanagerConfig{
+@@ -746,13 +757,13 @@ func TestCompareAndSendConfiguration(t *testing.T) {
+ 						v0mimir.ProxyConfig{},
+ 						common_config.ProxyConfig{})))
+ 
+-				got1 := got
++				gotCnt1 := gotCnt
+ 				got = ""
+ 				err = moa.ApplyConfig(ctx, 1, dbConfig)
+ 				require.NoError(t, err)
+ 
+-				got2 := got
+-				require.Equalf(t, got1, got2, "Configuration is not idempotent")
++				gotCnt2 := gotCnt
++				require.Equal(t, gotCnt1, gotCnt2, "Configuration is not idempotent, should not have updated config")
+ 				return
+ 			}
+ 			for _, expErr := range test.expErrContains {
+diff --git a/pkg/storage/unified/migrations/service.go b/pkg/storage/unified/migrations/service.go
+index 0bcb636147b27..76b01ec973736 100644
+--- a/pkg/storage/unified/migrations/service.go
++++ b/pkg/storage/unified/migrations/service.go
+@@ -56,10 +56,10 @@ func ProvideUnifiedStorageMigrationService(
+ }
+ 
+ func (p *UnifiedStorageMigrationServiceImpl) Run(ctx context.Context) error {
+-	// skip migrations if disabled in config
+-	if p.cfg.DisableDataMigrations {
++	// skip migrations if disabled in config or storage type is not "unified"
++	if p.cfg.DisableDataMigrations || p.cfg.UnifiedStorageType() != "unified" {
+ 		metrics.MUnifiedStorageMigrationStatus.Set(1)
+-		logger.Info("Data migrations are disabled, skipping")
++		logger.Info("Data migrations are disabled, skipping", "disableDataMigrations", p.cfg.DisableDataMigrations, "unifiedStorageType", p.cfg.UnifiedStorageType())
+ 		return nil
+ 	}
+ 
+diff --git a/pkg/storage/unified/migrations/service_test.go b/pkg/storage/unified/migrations/service_test.go
+new file mode 100644
+index 0000000000000..0a6191fbd56cb
+--- /dev/null
++++ b/pkg/storage/unified/migrations/service_test.go
+@@ -0,0 +1,57 @@
++package migrations
++
++import (
++	"context"
++	"testing"
++
++	"github.com/prometheus/client_golang/prometheus/testutil"
++	"github.com/stretchr/testify/require"
++
++	"github.com/grafana/grafana/pkg/infra/metrics"
++	"github.com/grafana/grafana/pkg/setting"
++)
++
++func TestUnifiedStorageMigrationServiceImpl_Run_SkipsMigrations(t *testing.T) {
++	tests := []struct {
++		name    string
++		cfgFunc func(cfg *setting.Cfg)
++	}{
++		{
++			name: "storage type is unified-grpc",
++			cfgFunc: func(cfg *setting.Cfg) {
++				cfg.Raw.Section("grafana-apiserver").Key("storage_type").SetValue("unified-grpc")
++			},
++		},
++		{
++			name: "storage type is unified-kv-grpc",
++			cfgFunc: func(cfg *setting.Cfg) {
++				cfg.Raw.Section("grafana-apiserver").Key("storage_type").SetValue("unified-kv-grpc")
++			},
++		},
++		{
++			name: "data migrations disabled",
++			cfgFunc: func(cfg *setting.Cfg) {
++				cfg.DisableDataMigrations = true
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			cfg := setting.NewCfg()
++			tt.cfgFunc(cfg)
++
++			migrator := NewMockUnifiedMigrator(t)
++
++			svc := &UnifiedStorageMigrationServiceImpl{
++				cfg:      cfg,
++				migrator: migrator,
++			}
++
++			err := svc.Run(context.Background())
++			require.NoError(t, err)
++			require.Equal(t, float64(1), testutil.ToFloat64(metrics.MUnifiedStorageMigrationStatus))
++			migrator.AssertNotCalled(t, "Migrate")
++		})
++	}
++}

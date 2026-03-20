@@ -205,6 +205,47 @@ def find_introducing_commit(
     return None
 
 
+def find_introducing_commit_via_blame(
+    fix_sha: str, expected_findings: list[ExpectedFinding], cwd: Path
+) -> str | None:
+    """Find the commit that introduced the bug using git blame on expected finding lines.
+
+    For each expected finding, runs ``git blame -L line,line fix_sha^ -- file``
+    to identify which commit last touched that line before the fix. Returns the
+    most common SHA across findings (majority vote), or None if blame fails.
+    """
+    if not expected_findings:
+        return None
+
+    _sha_re = re.compile(r"^([0-9a-f]{40})\b")
+    sha_counts: dict[str, int] = {}
+
+    for f in expected_findings:
+        try:
+            output = run_git(
+                "blame", "-L", f"{f.line},{f.line}", "--porcelain",
+                f"{fix_sha}^", "--", f.file,
+                cwd=cwd,
+            )
+        except GitError:
+            continue
+
+        for line in output.splitlines():
+            m = _sha_re.match(line)
+            if m:
+                sha = m.group(1)
+                # Skip the null commit (initial commit placeholder)
+                if sha != "0" * 40:
+                    sha_counts[sha] = sha_counts.get(sha, 0) + 1
+                break
+
+    if not sha_counts:
+        return None
+
+    # Return the most common SHA (majority vote)
+    return max(sha_counts, key=sha_counts.get)  # type: ignore[arg-type]
+
+
 def build_git_candidates(repo: str, commits: list[dict[str, Any]], cwd: Path) -> list[Candidate]:
     """Assemble Candidate objects from scored commit dicts."""
     candidates: list[Candidate] = []

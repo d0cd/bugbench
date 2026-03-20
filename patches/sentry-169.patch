@@ -1,0 +1,1354 @@
+diff --git a/migrations_lockfile.txt b/migrations_lockfile.txt
+index 962270ca2aa637..b557f713f3a57d 100644
+--- a/migrations_lockfile.txt
++++ b/migrations_lockfile.txt
+@@ -33,7 +33,7 @@ replays: 0007_organizationmember_replay_access
+ 
+ seer: 0002_add_default_coding_agent
+ 
+-sentry: 1040_drop_fk_projecttemplate
++sentry: 1041_projectkeymapping
+ 
+ social_auth: 0003_social_auth_json_field
+ 
+diff --git a/src/sentry/incidents/endpoints/bases.py b/src/sentry/incidents/endpoints/bases.py
+index b0dd96fe03f98c..e8c1fcd1d6778f 100644
+--- a/src/sentry/incidents/endpoints/bases.py
++++ b/src/sentry/incidents/endpoints/bases.py
+@@ -8,9 +8,12 @@
+ from sentry.api.bases.organization import OrganizationAlertRulePermission, OrganizationEndpoint
+ from sentry.api.bases.project import ProjectAlertRulePermission, ProjectEndpoint
+ from sentry.api.exceptions import ResourceDoesNotExist
++from sentry.incidents.endpoints.serializers.utils import get_object_id_from_fake_id
+ from sentry.incidents.models.alert_rule import AlertRule
+ from sentry.models.organization import Organization
+ from sentry.workflow_engine.endpoints.utils.ids import to_valid_int_id
++from sentry.workflow_engine.models.alertrule_detector import AlertRuleDetector
++from sentry.workflow_engine.models.detector import Detector
+ 
+ 
+ class OrganizationAlertRuleBaseEndpoint(OrganizationEndpoint):
+@@ -101,3 +104,49 @@ def convert_args(
+             raise ResourceDoesNotExist
+ 
+         return args, kwargs
++
++
++class WorkflowEngineOrganizationAlertRuleEndpoint(OrganizationAlertRuleEndpoint):
++    def convert_args(
++        self, request: Request, alert_rule_id: int, *args: Any, **kwargs: Any
++    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
++        args, kwargs = super(OrganizationAlertRuleEndpoint, self).convert_args(
++            request, *args, **kwargs
++        )
++        organization = kwargs["organization"]
++        validated_alert_rule_id = to_valid_int_id("alert_rule_id", alert_rule_id, raise_404=True)
++
++        # Allow orgs that have downgraded plans to delete metric alerts
++        if request.method != "DELETE" and not features.has(
++            "organizations:incidents", organization, actor=request.user
++        ):
++            raise ResourceDoesNotExist
++
++        if features.has("organizations:workflow-engine-rule-serializers", organization):
++            try:
++                ard = AlertRuleDetector.objects.get(
++                    alert_rule_id=validated_alert_rule_id,
++                    detector__project__organization=organization,
++                )
++                kwargs["alert_rule"] = ard.detector
++            except AlertRuleDetector.DoesNotExist:
++                # XXX: this means the detector was single written and has no ARD or related AlertRule object
++                try:
++                    detector_id = get_object_id_from_fake_id(validated_alert_rule_id)
++                    kwargs["alert_rule"] = Detector.objects.get(
++                        id=detector_id,
++                        project__organization=organization,
++                    )
++                except Detector.DoesNotExist:
++                    raise ResourceDoesNotExist
++
++            return args, kwargs
++
++        try:
++            kwargs["alert_rule"] = AlertRule.objects.get(
++                organization=organization, id=validated_alert_rule_id
++            )
++        except AlertRule.DoesNotExist:
++            raise ResourceDoesNotExist
++
++        return args, kwargs
+diff --git a/src/sentry/incidents/endpoints/organization_alert_rule_details.py b/src/sentry/incidents/endpoints/organization_alert_rule_details.py
+index 9a5f69ec0f0c23..e941daf39dc578 100644
+--- a/src/sentry/incidents/endpoints/organization_alert_rule_details.py
++++ b/src/sentry/incidents/endpoints/organization_alert_rule_details.py
+@@ -10,7 +10,6 @@
+ from rest_framework.request import Request
+ from rest_framework.response import Response
+ 
+-from sentry import features
+ from sentry.api.api_owners import ApiOwner
+ from sentry.api.api_publish_status import ApiPublishStatus
+ from sentry.api.base import region_silo_endpoint
+@@ -25,14 +24,11 @@
+ )
+ from sentry.apidocs.examples.metric_alert_examples import MetricAlertExamples
+ from sentry.apidocs.parameters import GlobalParams, MetricAlertParams
+-from sentry.incidents.endpoints.bases import OrganizationAlertRuleEndpoint
++from sentry.incidents.endpoints.bases import WorkflowEngineOrganizationAlertRuleEndpoint
+ from sentry.incidents.endpoints.serializers.alert_rule import (
+     AlertRuleSerializer,
+     DetailedAlertRuleSerializer,
+ )
+-from sentry.incidents.endpoints.serializers.workflow_engine_detector import (
+-    WorkflowEngineDetectorSerializer,
+-)
+ from sentry.incidents.logic import (
+     AlreadyDeletedError,
+     delete_alert_rule,
+@@ -50,8 +46,9 @@
+ from sentry.sentry_apps.services.app import app_service
+ from sentry.sentry_apps.utils.errors import SentryAppBaseError
+ from sentry.users.services.user.service import user_service
++from sentry.workflow_engine.endpoints.organization_detector_details import remove_detector
+ from sentry.workflow_engine.migration_helpers.alert_rule import dual_delete_migrated_alert_rule
+-from sentry.workflow_engine.models import Detector
++from sentry.workflow_engine.models import AlertRuleDetector, Detector
+ from sentry.workflow_engine.utils.legacy_metric_tracking import track_alert_endpoint_execution
+ 
+ logger = logging.getLogger(__name__)
+@@ -62,26 +59,16 @@ def _anon_to_None[T](u: T | AnonymousUser) -> T | None:
+ 
+ 
+ def fetch_alert_rule(
+-    request: Request, organization: Organization, alert_rule: AlertRule
++    request: Request, organization: Organization, alert_rule: AlertRule | Detector
+ ) -> Response:
++    if isinstance(alert_rule, Detector):
++        return Response(
++            {"alert_rule": ["Passing a detector through this endpoint is not yet supported"]},
++            status=status.HTTP_400_BAD_REQUEST,
++        )
+     # Serialize Alert Rule
+     expand = request.GET.getlist("expand", [])
+ 
+-    if features.has("organizations:workflow-engine-rule-serializers", organization):
+-        try:
+-            detector = Detector.objects.with_type_filters().get(
+-                alertruledetector__alert_rule_id=alert_rule.id
+-            )
+-            return Response(
+-                serialize(
+-                    detector,
+-                    request.user,
+-                    WorkflowEngineDetectorSerializer(expand=expand, prepare_component_fields=True),
+-                )
+-            )
+-        except Detector.DoesNotExist:
+-            return Response(status=status.HTTP_404_NOT_FOUND)
+-
+     serialized_rule = serialize(
+         alert_rule,
+         request.user,
+@@ -106,8 +93,13 @@ def fetch_alert_rule(
+ 
+ 
+ def update_alert_rule(
+-    request: Request, organization: Organization, alert_rule: AlertRule
++    request: Request, organization: Organization, alert_rule: AlertRule | Detector
+ ) -> Response:
++    if isinstance(alert_rule, Detector):
++        return Response(
++            {"alert_rule": ["Passing a detector through this endpoint is not yet supported"]},
++            status=status.HTTP_400_BAD_REQUEST,
++        )
+     data = request.data
+     current_owner = alert_rule.owner
+     validator = DrfAlertRuleSerializer(
+@@ -145,37 +137,41 @@ def update_alert_rule(
+             # The user has requested a new Slack channel and we tell the client to check again in a bit
+             return Response({"uuid": client.uuid}, status=202)
+         else:
+-            if features.has("organizations:workflow-engine-rule-serializers", organization):
+-                validator.save()
+-                try:
+-                    detector = Detector.objects.with_type_filters().get(
+-                        alertruledetector__alert_rule_id=alert_rule.id
+-                    )
+-                    return Response(
+-                        serialize(
+-                            detector,
+-                            request.user,
+-                            WorkflowEngineDetectorSerializer(),
+-                        ),
+-                        status=status.HTTP_200_OK,
+-                    )
+-                except Detector.DoesNotExist:
+-                    return Response(status=status.HTTP_404_NOT_FOUND)
+             return Response(serialize(validator.save(), request.user), status=status.HTTP_200_OK)
+ 
+     return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
+ 
+ 
+ def remove_alert_rule(
+-    request: Request, organization: Organization, alert_rule: AlertRule
++    request: Request, organization: Organization, target: AlertRule | Detector
+ ) -> Response:
++    if isinstance(target, Detector):
++        try:
++            remove_detector(request, organization, target)
++            try:
++                ard = AlertRuleDetector.objects.get(detector_id=target.id)
++                target = AlertRule.objects.get(id=ard.alert_rule_id, organization=organization)
++                delete_alert_rule(
++                    target,
++                    user=_anon_to_None(request.user),
++                    ip_address=request.META.get("REMOTE_ADDR"),
++                )
++            except (AlertRuleDetector.DoesNotExist, AlertRule.DoesNotExist):
++                return Response(status=status.HTTP_204_NO_CONTENT)
++
++            return Response(status=status.HTTP_204_NO_CONTENT)
++        except AlreadyDeletedError:
++            return Response(
++                "This rule has already been deleted", status=status.HTTP_400_BAD_REQUEST
++            )
++
+     try:
+         # NOTE: we want to run the dual delete regardless of whether the user is flagged into dual writes:
+         # the user could be removed from the dual write flag for whatever reason, and we need to make sure
+         # that the extra table data is deleted. If the rows don't exist, we'll exit early.
+         with transaction.atomic(router.db_for_write(AlertRule)):
+             try:
+-                dual_delete_migrated_alert_rule(alert_rule=alert_rule)
++                dual_delete_migrated_alert_rule(alert_rule=target)
+             except Exception as e:
+                 logger.exception(
+                     "Error when dual deleting alert rule",
+@@ -186,7 +182,7 @@ def remove_alert_rule(
+                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                 )
+             delete_alert_rule(
+-                alert_rule,
++                target,
+                 user=_anon_to_None(request.user),
+                 ip_address=request.META.get("REMOTE_ADDR"),
+             )
+@@ -300,17 +296,20 @@ class OrganizationAlertRuleDetailsPutSerializer(serializers.Serializer):
+ 
+ 
+ def _check_project_access[T](
+-    func: Callable[[T, Request, Organization, AlertRule], Response],
+-) -> Callable[[T, Request, Organization, AlertRule], Response]:
++    func: Callable[[T, Request, Organization, AlertRule | Detector], Response],
++) -> Callable[[T, Request, Organization, AlertRule | Detector], Response]:
+     @functools.wraps(func)
+     def wrapper(
+-        self, request: Request, organization: Organization, alert_rule: AlertRule
++        self, request: Request, organization: Organization, alert_rule: AlertRule | Detector
+     ) -> Response:
+         project = None
+ 
+         try:
+-            # check to see if there's a project associated with the alert rule
+-            project = alert_rule.projects.get()
++            if isinstance(alert_rule, Detector):
++                project = alert_rule.project
++            else:
++                # check to see if there's a project associated with the alert rule
++                project = alert_rule.projects.get()
+         except Exception:
+             pass
+ 
+@@ -327,7 +326,7 @@ def wrapper(
+ 
+ @extend_schema(tags=["Alerts"])
+ @region_silo_endpoint
+-class OrganizationAlertRuleDetailsEndpoint(OrganizationAlertRuleEndpoint):
++class OrganizationAlertRuleDetailsEndpoint(WorkflowEngineOrganizationAlertRuleEndpoint):
+     owner = ApiOwner.ISSUES
+     publish_status = {
+         "DELETE": ApiPublishStatus.PUBLIC,
+@@ -348,7 +347,9 @@ class OrganizationAlertRuleDetailsEndpoint(OrganizationAlertRuleEndpoint):
+     )
+     @track_alert_endpoint_execution("GET", "sentry-api-0-organization-alert-rule-details")
+     @_check_project_access
+-    def get(self, request: Request, organization: Organization, alert_rule: AlertRule) -> Response:
++    def get(
++        self, request: Request, organization: Organization, alert_rule: AlertRule | Detector
++    ) -> Response:
+         """
+         ## Deprecated
+         🚧 Use [Fetch a Monitor](/api/monitors/fetch-a-monitor) and [Fetch an Alert](/api/monitors/fetch-an-alert) instead.
+@@ -379,7 +380,9 @@ def get(self, request: Request, organization: Organization, alert_rule: AlertRul
+     )
+     @track_alert_endpoint_execution("PUT", "sentry-api-0-organization-alert-rule-details")
+     @_check_project_access
+-    def put(self, request: Request, organization: Organization, alert_rule: AlertRule) -> Response:
++    def put(
++        self, request: Request, organization: Organization, alert_rule: AlertRule | Detector
++    ) -> Response:
+         """
+         ## Deprecated
+         🚧 Use [Update a Monitor by ID](/api/monitors/update-a-monitor-by-id) and [Update an Alert by ID](/api/monitors/update-an-alert-by-id) instead.
+@@ -414,7 +417,7 @@ def put(self, request: Request, organization: Organization, alert_rule: AlertRul
+     @track_alert_endpoint_execution("DELETE", "sentry-api-0-organization-alert-rule-details")
+     @_check_project_access
+     def delete(
+-        self, request: Request, organization: Organization, alert_rule: AlertRule
++        self, request: Request, organization: Organization, alert_rule: AlertRule | Detector
+     ) -> Response:
+         """
+         ## Deprecated
+diff --git a/src/sentry/migrations/1041_projectkeymapping.py b/src/sentry/migrations/1041_projectkeymapping.py
+new file mode 100644
+index 00000000000000..a1900fecb6dace
+--- /dev/null
++++ b/src/sentry/migrations/1041_projectkeymapping.py
+@@ -0,0 +1,69 @@
++# Generated by Django 5.2.11 on 2026-03-04 20:20
++
++import django.db.models.functions.datetime
++import sentry.db.models.fields.bounded
++import sentry.db.models.indexes
++from django.db import migrations, models
++
++from sentry.new_migrations.migrations import CheckedMigration
++
++
++class Migration(CheckedMigration):
++    # This flag is used to mark that a migration shouldn't be automatically run in production.
++    # This should only be used for operations where it's safe to run the migration after your
++    # code has deployed. So this should not be used for most operations that alter the schema
++    # of a table.
++    # Here are some things that make sense to mark as post deployment:
++    # - Large data migrations. Typically we want these to be run manually so that they can be
++    #   monitored and not block the deploy for a long period of time while they run.
++    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
++    #   run this outside deployments so that we don't block them. Note that while adding an index
++    #   is a schema change, it's completely safe to run the operation after the code has deployed.
++    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
++
++    is_post_deployment = False
++
++    dependencies = [
++        ("sentry", "1040_drop_fk_projecttemplate"),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name="ProjectKeyMapping",
++            fields=[
++                (
++                    "id",
++                    sentry.db.models.fields.bounded.BoundedBigAutoField(
++                        primary_key=True, serialize=False
++                    ),
++                ),
++                (
++                    "project_key_id",
++                    sentry.db.models.fields.bounded.BoundedBigIntegerField(db_index=True),
++                ),
++                (
++                    "public_key",
++                    models.CharField(db_index=True, max_length=32, unique=True),
++                ),
++                ("cell_name", models.CharField(max_length=48)),
++                (
++                    "date_updated",
++                    models.DateTimeField(
++                        auto_now=True,
++                        db_default=django.db.models.functions.datetime.Now(),
++                    ),
++                ),
++            ],
++            options={
++                "db_table": "sentry_projectkeymapping",
++                "indexes": [
++                    sentry.db.models.indexes.IndexWithPostgresNameLimits(
++                        models.F("cell_name"),
++                        django.db.models.functions.datetime.TruncSecond("date_updated"),
++                        models.F("id"),
++                        name="sentry_projkeymapping_cell_name_date_updated_id_idx",
++                    )
++                ],
++            },
++        ),
++    ]
+diff --git a/src/sentry/models/__init__.py b/src/sentry/models/__init__.py
+index 3130022870f3e7..a05cd4759ca371 100644
+--- a/src/sentry/models/__init__.py
++++ b/src/sentry/models/__init__.py
+@@ -85,6 +85,7 @@
+ from .projectbookmark import *  # NOQA
+ from .projectcodeowners import *  # NOQA
+ from .projectkey import *  # NOQA
++from .projectkeymapping import *  # NOQA
+ from .projectownership import *  # NOQA
+ from .projectplatform import *  # NOQA
+ from .projectredirect import *  # NOQA
+diff --git a/src/sentry/models/projectkeymapping.py b/src/sentry/models/projectkeymapping.py
+new file mode 100644
+index 00000000000000..a7fb2a3a737333
+--- /dev/null
++++ b/src/sentry/models/projectkeymapping.py
+@@ -0,0 +1,42 @@
++from __future__ import annotations
++
++from django.db import models
++from django.db.models.functions import Now, TruncSecond
++
++from sentry.backup.scopes import RelocationScope
++from sentry.db.models import BoundedBigIntegerField, sane_repr
++from sentry.db.models.base import Model, control_silo_model
++from sentry.db.models.indexes import IndexWithPostgresNameLimits
++from sentry.hybridcloud.rpc import REGION_NAME_LENGTH
++
++
++@control_silo_model
++class ProjectKeyMapping(Model):
++    """
++    Maps a ProjectKey public_key to its region, enabling global uniqueness enforcement
++    and routing from the control silo.
++
++    This model is autocreated via an outbox write from the regional ProjectKey it
++    references, so there is no need to explicitly include it in the export.
++    """
++
++    __relocation_scope__ = RelocationScope.Excluded
++
++    project_key_id = BoundedBigIntegerField(db_index=True)
++    public_key = models.CharField(max_length=32, unique=True, db_index=True)
++    cell_name = models.CharField(max_length=REGION_NAME_LENGTH)
++    date_updated = models.DateTimeField(db_default=Now(), auto_now=True)
++
++    class Meta:
++        app_label = "sentry"
++        db_table = "sentry_projectkeymapping"
++        indexes = [
++            IndexWithPostgresNameLimits(
++                "cell_name",
++                TruncSecond("date_updated"),
++                "id",
++                name="sentry_projkeymapping_cell_name_date_updated_id_idx",
++            ),
++        ]
++
++    __repr__ = sane_repr("public_key", "cell_name")
+diff --git a/src/sentry/workflow_engine/endpoints/organization_detector_details.py b/src/sentry/workflow_engine/endpoints/organization_detector_details.py
+index a9328f6ddd4dc2..bceab0898d924c 100644
+--- a/src/sentry/workflow_engine/endpoints/organization_detector_details.py
++++ b/src/sentry/workflow_engine/endpoints/organization_detector_details.py
+@@ -42,6 +42,30 @@
+ from sentry.workflow_engine.models import Detector
+ 
+ 
++def remove_detector(request: Request, organization: Organization, detector: Detector) -> Response:
++    """
++    Delete a given detector. This method is used by the OrganizationAlertRuleDetailsEndpoint DELETE method
++    for backwards compatibility and can be moved back under DELETE after API deprecation.
++    """
++    if not can_delete_detector(detector, request):
++        raise PermissionDenied
++
++    validator = get_detector_validator(request, detector.project, detector.type, instance=detector)
++    validator.delete()
++
++    if detector.type == MetricIssue.slug:
++        schedule_update_project_config(detector)
++
++    create_audit_entry(
++        request=request,
++        organization=detector.project.organization,
++        target_object=detector.id,
++        event=audit_log.get_event_id("DETECTOR_REMOVE"),
++        data=detector.get_audit_log_data(),
++    )
++    return Response(status=204)
++
++
+ def get_detector_validator(
+     request: Request,
+     project: Project,
+@@ -208,22 +232,4 @@ def delete(self, request: Request, organization: Organization, detector: Detecto
+ 
+         Delete a monitor
+         """
+-        if not can_delete_detector(detector, request):
+-            raise PermissionDenied
+-
+-        validator = get_detector_validator(
+-            request, detector.project, detector.type, instance=detector
+-        )
+-        validator.delete()
+-
+-        if detector.type == MetricIssue.slug:
+-            schedule_update_project_config(detector)
+-
+-        create_audit_entry(
+-            request=request,
+-            organization=detector.project.organization,
+-            target_object=detector.id,
+-            event=audit_log.get_event_id("DETECTOR_REMOVE"),
+-            data=detector.get_audit_log_data(),
+-        )
+-        return Response(status=204)
++        return remove_detector(request, organization, detector)
+diff --git a/static/app/components/modals/widgetViewerModal.tsx b/static/app/components/modals/widgetViewerModal.tsx
+index 92a195521847c3..c3f2bbcbd0a108 100644
+--- a/static/app/components/modals/widgetViewerModal.tsx
++++ b/static/app/components/modals/widgetViewerModal.tsx
+@@ -103,6 +103,7 @@ import ReleaseWidgetQueries from 'sentry/views/dashboards/widgetCard/releaseWidg
+ import {WidgetCardChartContainer} from 'sentry/views/dashboards/widgetCard/widgetCardChartContainer';
+ import WidgetQueries from 'sentry/views/dashboards/widgetCard/widgetQueries';
+ import type WidgetLegendSelectionState from 'sentry/views/dashboards/widgetLegendSelectionState';
++import {AgentsTracesTableWidgetVisualization} from 'sentry/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization';
+ import {ALLOWED_CELL_ACTIONS} from 'sentry/views/dashboards/widgets/common/settings';
+ import {TableWidgetVisualization} from 'sentry/views/dashboards/widgets/tableWidget/tableWidgetVisualization';
+ import {
+@@ -519,6 +520,14 @@ function WidgetViewerModal(props: Props) {
+   };
+ 
+   function renderWidgetViewerTable() {
++    if (widget.displayType === DisplayType.AGENTS_TRACES_TABLE) {
++      return (
++        <AgentsTracesTableWidgetVisualization
++          limit={FULL_TABLE_ITEM_LIMIT}
++          tableWidths={widget.tableWidths}
++        />
++      );
++    }
+     switch (widget.widgetType) {
+       case WidgetType.ISSUE:
+         return (
+@@ -590,11 +599,15 @@ function WidgetViewerModal(props: Props) {
+     dashboardCreator
+   );
+ 
++  const shouldRenderChartVisualization =
++    widget.displayType !== DisplayType.TABLE &&
++    widget.displayType !== DisplayType.AGENTS_TRACES_TABLE;
++
+   function renderWidgetViewer() {
+     return (
+       <Fragment>
+         {hasSessionDuration && SESSION_DURATION_ALERT}
+-        {widget.displayType !== DisplayType.TABLE && (
++        {shouldRenderChartVisualization && (
+           <Container
+             height={
+               widget.displayType === DisplayType.BIG_NUMBER
+diff --git a/static/app/utils/api/knownGetsentryApiUrls.ts b/static/app/utils/api/knownGetsentryApiUrls.ts
+index 3b2d0b5aaf5f82..735bb97606f713 100644
+--- a/static/app/utils/api/knownGetsentryApiUrls.ts
++++ b/static/app/utils/api/knownGetsentryApiUrls.ts
+@@ -20,6 +20,7 @@ export type KnownGetsentryApiUrls =
+   | '/copilot/'
+   | '/copilot/webhook/'
+   | '/customers/'
++  | '/_admin/customers/$organizationIdOrSlug/contract/'
+   | '/customers/$organizationIdOrSlug/'
+   | '/customers/$organizationIdOrSlug/balancechanges/'
+   | '/customers/$organizationIdOrSlug/billing-config/'
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
+index 79457a12376ad1..ac829cabeb7877 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
+@@ -21,6 +21,8 @@ const DEFAULT_GLOBAL_FILTERS = [
+   },
+ ];
+ 
++export const DEFAULT_TRACES_TABLE_WIDTHS = [110, 600, 140, 110, 110, 110, 120, 110, 110];
++
+ const FIRST_ROW_WIDGETS = spaceWidgetsEquallyOnRow(
+   [
+     {
+@@ -161,9 +163,8 @@ const AGENTS_TRACES_TABLE = {
+   id: 'ai-agents-traces-table',
+   title: t('Traces'),
+   displayType: DisplayType.AGENTS_TRACES_TABLE,
+-  widgetType: WidgetType.SPANS,
+   interval: '1h',
+-  tableWidths: [110, 600, -1, -1, -1, -1, -1, -1, -1],
++  tableWidths: DEFAULT_TRACES_TABLE_WIDTHS,
+   limit: 20,
+   queries: [
+     {
+diff --git a/static/app/views/dashboards/widgetCard/chart.tsx b/static/app/views/dashboards/widgetCard/chart.tsx
+index 2e8163ef5ff998..b613aedd53ad82 100644
+--- a/static/app/views/dashboards/widgetCard/chart.tsx
++++ b/static/app/views/dashboards/widgetCard/chart.tsx
+@@ -262,6 +262,7 @@ function WidgetCardChart(props: WidgetCardChartProps) {
+         <AgentsTracesTableWidgetVisualization
+           limit={widget.limit}
+           tableWidths={widget.tableWidths}
++          frameless
+         />
+       </TableWrapper>
+     );
+diff --git a/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx b/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx
+index c1bea189209a95..a72ef2ed3ff585 100644
+--- a/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx
++++ b/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx
+@@ -1,14 +1,17 @@
++import {DEFAULT_TRACES_TABLE_WIDTHS} from 'sentry/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview';
+ import {useTraceViewDrawer} from 'sentry/views/insights/pages/agents/components/drawer';
+ import {TracesTable} from 'sentry/views/insights/pages/agents/components/tracesTable';
+ 
+ interface AgentsTracesTableWidgetVisualizationProps {
++  frameless?: boolean;
+   limit?: number;
+   tableWidths?: number[];
+ }
+ 
+ export function AgentsTracesTableWidgetVisualization({
+   limit,
+-  tableWidths,
++  tableWidths = DEFAULT_TRACES_TABLE_WIDTHS,
++  frameless,
+ }: AgentsTracesTableWidgetVisualizationProps) {
+   const {openTraceViewDrawer} = useTraceViewDrawer();
+ 
+@@ -17,7 +20,7 @@ export function AgentsTracesTableWidgetVisualization({
+       openTraceViewDrawer={openTraceViewDrawer}
+       limit={limit}
+       tableWidths={tableWidths}
+-      frameless
++      frameless={frameless}
+     />
+   );
+ }
+diff --git a/static/gsAdmin/routes.tsx b/static/gsAdmin/routes.tsx
+index c9c0dac54ae752..9bd34510fd6498 100644
+--- a/static/gsAdmin/routes.tsx
++++ b/static/gsAdmin/routes.tsx
+@@ -7,6 +7,7 @@ import BillingAdmins from 'admin/views/billingAdmins';
+ import BillingPlans from 'admin/views/billingPlans';
+ import BroadcastDetails from 'admin/views/broadcastDetails';
+ import Broadcasts from 'admin/views/broadcasts';
++import CustomerContractDetails from 'admin/views/customerContractDetails';
+ import CustomerDetails from 'admin/views/customerDetails';
+ import Customers from 'admin/views/customers';
+ import CustomerUpgradeRequest from 'admin/views/customerUpgradeRequest';
+@@ -93,6 +94,10 @@ function buildRoutes() {
+                 path: 'upgrade-request/',
+                 component: CustomerUpgradeRequest,
+               },
++              {
++                path: 'contract/',
++                component: CustomerContractDetails,
++              },
+               {
+                 path: 'projects/:projectId/',
+                 component: ProjectDetails,
+diff --git a/static/gsAdmin/types/index.tsx b/static/gsAdmin/types/index.tsx
+index 87ed26b0e4ebf2..08713ee9805948 100644
+--- a/static/gsAdmin/types/index.tsx
++++ b/static/gsAdmin/types/index.tsx
+@@ -79,3 +79,66 @@ export type Relocation = {
+   wantOrgSlugs: string[];
+   wantUsernames: string[];
+ };
++
++export type ContractDate = {
++  day?: number;
++  month?: number;
++  year?: number;
++};
++
++type ContractPricingTier = {
++  end?: string;
++  ratePerUnitCpe?: string;
++  start?: string;
++};
++
++export type ContractTieredPricingRate = {
++  tiers?: ContractPricingTier[];
++};
++
++export type ContractSKUConfig = {
++  basePriceCents?: string;
++  paygBudgetCents?: string;
++  paygRate?: ContractTieredPricingRate;
++  reservedRate?: ContractTieredPricingRate;
++  reservedVolume?: string;
++  sku?: string;
++};
++
++export type ContractSharedSKUBudget = {
++  paygBudgetCents?: string;
++  reservedBudgetCents?: string;
++  skus?: string[];
++};
++
++export type ContractMetadata = {
++  id?: string;
++  organizationId?: string;
++};
++
++type ContractAddress = {
++  countryCode?: string;
++};
++
++export type ContractBillingConfig = {
++  address?: ContractAddress;
++  billingType?: string;
++  channel?: string;
++  contractEndDate?: ContractDate;
++  contractStartDate?: ContractDate;
++};
++
++export type ContractPricingConfig = {
++  basePriceCents?: string;
++  billingPeriodEndDate?: ContractDate;
++  billingPeriodStartDate?: ContractDate;
++  maxSpendCents?: string;
++  sharedSkuBudgets?: ContractSharedSKUBudget[];
++  skuConfigs?: ContractSKUConfig[];
++};
++
++export type Contract = {
++  billingConfig?: ContractBillingConfig;
++  metadata?: ContractMetadata;
++  pricingConfig?: ContractPricingConfig;
++};
+diff --git a/static/gsAdmin/views/customerContractDetails.spec.tsx b/static/gsAdmin/views/customerContractDetails.spec.tsx
+new file mode 100644
+index 00000000000000..6d43ae3eeec8c3
+--- /dev/null
++++ b/static/gsAdmin/views/customerContractDetails.spec.tsx
+@@ -0,0 +1,142 @@
++import {render, screen} from 'sentry-test/reactTestingLibrary';
++
++import CustomerContractDetails from 'admin/views/customerContractDetails';
++
++const MOCK_CONTRACT = {
++  metadata: {id: 'contract-123', organizationId: 'org-456'},
++  billingConfig: {
++    billingType: 'BILLING_TYPE_CREDIT_CARD',
++    channel: 'CHANNEL_SALES',
++    address: {countryCode: 'US'},
++    contractStartDate: {year: 2024, month: 1, day: 1},
++    contractEndDate: {year: 2025, month: 1, day: 1},
++  },
++  pricingConfig: {
++    skuConfigs: [
++      {
++        sku: 'SKU_ERRORS',
++        basePriceCents: '10000',
++        paygBudgetCents: '5000',
++        reservedVolume: '100000',
++        reservedRate: {tiers: [{ratePerUnitCpe: '100'}]},
++        paygRate: {tiers: [{ratePerUnitCpe: '200'}]},
++      },
++    ],
++    sharedSkuBudgets: [],
++    billingPeriodStartDate: {year: 2024, month: 1, day: 1},
++    billingPeriodEndDate: {year: 2024, month: 2, day: 1},
++    maxSpendCents: '50000',
++    basePriceCents: '10000',
++  },
++};
++
++const ROUTER_CONFIG = {
++  location: {pathname: '/_admin/customers/test-org/contract/'},
++  route: '/_admin/customers/:orgId/contract/',
++};
++
++describe('CustomerContractDetails', () => {
++  beforeEach(() => {
++    MockApiClient.clearMockResponses();
++  });
++
++  it('renders contract data', async () => {
++    MockApiClient.addMockResponse({
++      url: '/_admin/customers/test-org/contract/',
++      body: MOCK_CONTRACT,
++    });
++
++    render(<CustomerContractDetails />, {
++      initialRouterConfig: ROUTER_CONFIG,
++    });
++
++    expect(await screen.findByText('Contract Overview')).toBeInTheDocument();
++
++    expect(screen.getByText('Billing Period:')).toBeInTheDocument();
++    expect(screen.getByText('Contract Period:')).toBeInTheDocument();
++    expect(screen.getAllByText('Base Price:').length).toBeGreaterThan(0);
++    expect(screen.getByText('Max Spend:')).toBeInTheDocument();
++    expect(screen.getByText('Contract ID:')).toBeInTheDocument();
++    expect(screen.getByText('Type:')).toBeInTheDocument();
++    expect(screen.getByText('Channel:')).toBeInTheDocument();
++    expect(screen.getByText('Billing Country:')).toBeInTheDocument();
++
++    expect(screen.getByText('contract-123')).toBeInTheDocument();
++    expect(screen.getByText('Credit Card')).toBeInTheDocument();
++    expect(screen.getByText('Sales')).toBeInTheDocument();
++    expect(screen.getByText('United States')).toBeInTheDocument();
++
++    expect(screen.getByText('SKU Pricing')).toBeInTheDocument();
++    expect(screen.getByText('Errors')).toBeInTheDocument();
++    expect(screen.getByText('Reserved Volume:')).toBeInTheDocument();
++    expect(screen.getByText('100,000')).toBeInTheDocument();
++    expect(screen.getByText('$0.00000100')).toBeInTheDocument();
++    expect(screen.getByText('$0.00000200')).toBeInTheDocument();
++  });
++
++  it('renders error state', async () => {
++    MockApiClient.addMockResponse({
++      url: '/_admin/customers/test-org/contract/',
++      body: {detail: 'Not found'},
++      statusCode: 404,
++    });
++
++    render(<CustomerContractDetails />, {
++      initialRouterConfig: ROUTER_CONFIG,
++    });
++
++    expect(
++      await screen.findByText('There was an error loading data.')
++    ).toBeInTheDocument();
++  });
++
++  it('renders shared budgets when present', async () => {
++    const contractWithBudgets = {
++      ...MOCK_CONTRACT,
++      pricingConfig: {
++        ...MOCK_CONTRACT.pricingConfig,
++        sharedSkuBudgets: [
++          {
++            skus: ['SKU_ERRORS', 'SKU_TRANSACTIONS'],
++            reservedBudgetCents: '20000',
++            paygBudgetCents: '10000',
++          },
++        ],
++      },
++    };
++
++    MockApiClient.addMockResponse({
++      url: '/_admin/customers/test-org/contract/',
++      body: contractWithBudgets,
++    });
++
++    render(<CustomerContractDetails />, {
++      initialRouterConfig: ROUTER_CONFIG,
++    });
++
++    expect(await screen.findByText('Shared Budgets')).toBeInTheDocument();
++    expect(screen.getByText('Errors, Transactions')).toBeInTheDocument();
++    expect(screen.getByText('Reserved Budget:')).toBeInTheDocument();
++    expect(screen.getAllByText('PAYG Budget:').length).toBeGreaterThan(0);
++  });
++
++  it('handles missing optional fields gracefully', async () => {
++    const minimalContract = {
++      metadata: {},
++      billingConfig: {},
++      pricingConfig: {},
++    };
++
++    MockApiClient.addMockResponse({
++      url: '/_admin/customers/test-org/contract/',
++      body: minimalContract,
++    });
++
++    render(<CustomerContractDetails />, {
++      initialRouterConfig: ROUTER_CONFIG,
++    });
++
++    expect(await screen.findByText('Contract Overview')).toBeInTheDocument();
++    expect(screen.getAllByText('N/A').length).toBeGreaterThan(0);
++  });
++});
+diff --git a/static/gsAdmin/views/customerContractDetails.tsx b/static/gsAdmin/views/customerContractDetails.tsx
+new file mode 100644
+index 00000000000000..86d4345317f99b
+--- /dev/null
++++ b/static/gsAdmin/views/customerContractDetails.tsx
+@@ -0,0 +1,287 @@
++import {Fragment} from 'react';
++import styled from '@emotion/styled';
++import moment from 'moment-timezone';
++
++import {CodeBlock} from '@sentry/scraps/code';
++import {Disclosure} from '@sentry/scraps/disclosure';
++import {Grid} from '@sentry/scraps/layout';
++import {Text} from '@sentry/scraps/text';
++
++import LoadingError from 'sentry/components/loadingError';
++import LoadingIndicator from 'sentry/components/loadingIndicator';
++import Panel from 'sentry/components/panels/panel';
++import PanelBody from 'sentry/components/panels/panelBody';
++import PanelHeader from 'sentry/components/panels/panelHeader';
++import getApiUrl from 'sentry/utils/api/getApiUrl';
++import {useApiQuery} from 'sentry/utils/queryClient';
++import {useParams} from 'sentry/utils/useParams';
++
++import DetailLabel from 'admin/components/detailLabel';
++import DetailList from 'admin/components/detailList';
++import DetailsContainer from 'admin/components/detailsContainer';
++import PageHeader from 'admin/components/pageHeader';
++import type {
++  Contract,
++  ContractDate,
++  ContractSharedSKUBudget as SharedSKUBudget,
++  ContractSKUConfig as SKUConfig,
++} from 'admin/types';
++import {CPE_MULTIPLIER_TO_CENTS, UNLIMITED} from 'getsentry/constants';
++import {isUnlimitedReserved} from 'getsentry/utils/billing';
++import {getCountryByCode} from 'getsentry/utils/ISO3166codes';
++import {displayPriceWithCents} from 'getsentry/views/amCheckout/utils';
++
++function parseCents(value?: string): number {
++  if (!value) {
++    return 0;
++  }
++  const n = parseInt(value, 10);
++  return Number.isNaN(n) ? 0 : n;
++}
++
++function parseCpeToCents(value?: string): number {
++  if (!value) {
++    return 0;
++  }
++  const n = Number(value);
++  return Number.isNaN(n) ? 0 : n * CPE_MULTIPLIER_TO_CENTS;
++}
++
++function formatContractDate(d?: ContractDate): string {
++  if (!d?.year || !d?.month || !d?.day) {
++    return 'N/A';
++  }
++  return moment({year: d.year, month: d.month - 1, day: d.day}).format('ll');
++}
++
++function formatEnumLabel(enumStr: string | undefined, prefix: string): string {
++  if (!enumStr) {
++    return 'N/A';
++  }
++  const stripped = enumStr.startsWith(prefix) ? enumStr.slice(prefix.length) : enumStr;
++  return stripped
++    .toLowerCase()
++    .split('_')
++    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
++    .join(' ');
++}
++
++function formatPrice(cents: number): string {
++  return displayPriceWithCents({cents});
++}
++
++function formatPricePrecise(cents: number): string {
++  return displayPriceWithCents({
++    cents,
++    minimumFractionDigits: 8,
++    maximumFractionDigits: 8,
++  });
++}
++
++function ContractOverview({data}: {data: Contract}) {
++  const {metadata, billingConfig, pricingConfig} = data;
++  const maxSpend = parseCents(pricingConfig?.maxSpendCents);
++
++  return (
++    <Panel>
++      <PanelHeader>Contract Overview</PanelHeader>
++      <PanelBody withPadding>
++        <DetailsContainer>
++          <div>
++            <DetailList>
++              <DetailLabel title="Billing Period">
++                {`${formatContractDate(pricingConfig?.billingPeriodStartDate)} › ${formatContractDate(pricingConfig?.billingPeriodEndDate)}`}
++              </DetailLabel>
++              <DetailLabel title="Contract Period">
++                {`${formatContractDate(billingConfig?.contractStartDate)} › ${formatContractDate(billingConfig?.contractEndDate)}`}
++              </DetailLabel>
++              <DetailLabel title="Base Price">
++                {formatPrice(parseCents(pricingConfig?.basePriceCents))}
++              </DetailLabel>
++              <DetailLabel title="Max Spend">
++                {maxSpend > 0 ? formatPrice(maxSpend) : 'None'}
++              </DetailLabel>
++            </DetailList>
++          </div>
++          <div>
++            <DetailList>
++              <DetailLabel title="Contract ID">{metadata?.id || 'N/A'}</DetailLabel>
++              <DetailLabel title="Type">
++                {formatEnumLabel(billingConfig?.billingType, 'BILLING_TYPE_')}
++              </DetailLabel>
++              <DetailLabel title="Channel">
++                {formatEnumLabel(billingConfig?.channel, 'CHANNEL_')}
++              </DetailLabel>
++              <DetailLabel title="Billing Country">
++                {billingConfig?.address?.countryCode
++                  ? (getCountryByCode(billingConfig.address.countryCode)?.name ??
++                    billingConfig.address.countryCode)
++                  : 'N/A'}
++              </DetailLabel>
++            </DetailList>
++          </div>
++        </DetailsContainer>
++      </PanelBody>
++    </Panel>
++  );
++}
++
++function SKUPricing({skuConfigs}: {skuConfigs: SKUConfig[]}) {
++  if (skuConfigs.length === 0) {
++    return null;
++  }
++
++  return (
++    <Panel>
++      <PanelHeader>SKU Pricing</PanelHeader>
++      <PanelBody withPadding>
++        {skuConfigs.map((skuConfig, idx) => {
++          const reservedTier = skuConfig.reservedRate?.tiers?.[0];
++          const paygTiers = skuConfig.paygRate?.tiers ?? [];
++          const paygBudget = parseCents(skuConfig.paygBudgetCents);
++
++          return (
++            <SKUPricingSection key={skuConfig.sku ?? idx}>
++              <h6>{formatEnumLabel(skuConfig.sku, 'SKU_')}</h6>
++              <DetailList>
++                <DetailLabel title="Reserved Volume">
++                  {parseInt(skuConfig.reservedVolume ?? '0', 10).toLocaleString()}
++                </DetailLabel>
++                <DetailLabel title="Base Price">
++                  {formatPrice(parseCents(skuConfig.basePriceCents))}
++                </DetailLabel>
++                <DetailLabel title="PAYG Budget">
++                  {paygBudget > 0 ? formatPrice(paygBudget) : 'None'}
++                </DetailLabel>
++                <DetailLabel title="Reserved CPE">
++                  {reservedTier?.ratePerUnitCpe
++                    ? formatPricePrecise(parseCpeToCents(reservedTier.ratePerUnitCpe))
++                    : 'N/A'}
++                </DetailLabel>
++                <DetailLabel title="PAYG Rate">
++                  {paygTiers.length > 0 ? (
++                    <Grid columns="1fr 1fr 1fr" gap="xs">
++                      <Text as="span" bold>
++                        Start
++                      </Text>
++                      <Text as="span" bold>
++                        End
++                      </Text>
++                      <Text as="span" bold>
++                        CPE
++                      </Text>
++                      {paygTiers.map((tier, tierIndex) => (
++                        <Fragment key={tierIndex}>
++                          <Text as="span">{tier.start ?? '0'}</Text>
++                          <Text as="span">
++                            {isUnlimitedReserved(Number(tier.end)) ? UNLIMITED : tier.end}
++                          </Text>
++                          <Text as="span">
++                            {tier.ratePerUnitCpe
++                              ? formatPricePrecise(parseCpeToCents(tier.ratePerUnitCpe))
++                              : 'N/A'}
++                          </Text>
++                        </Fragment>
++                      ))}
++                    </Grid>
++                  ) : (
++                    'N/A'
++                  )}
++                </DetailLabel>
++              </DetailList>
++            </SKUPricingSection>
++          );
++        })}
++      </PanelBody>
++    </Panel>
++  );
++}
++
++const SKUPricingSection = styled('section')`
++  & + & {
++    margin-top: ${p => p.theme.space.lg};
++    padding-top: ${p => p.theme.space.lg};
++    border-top: 1px solid ${p => p.theme.tokens.border.secondary};
++  }
++`;
++
++function SharedBudgets({budgets}: {budgets: SharedSKUBudget[]}) {
++  if (budgets.length === 0) {
++    return null;
++  }
++
++  return (
++    <Panel>
++      <PanelHeader>Shared Budgets</PanelHeader>
++      <PanelBody withPadding>
++        {budgets.map((budget, idx) => {
++          const skuNames = (budget.skus ?? [])
++            .map(sku => formatEnumLabel(sku, 'SKU_'))
++            .join(', ');
++
++          return (
++            <Fragment key={idx}>
++              <h6>{skuNames || 'Unknown SKUs'}</h6>
++              <DetailList>
++                <DetailLabel title="Reserved Budget">
++                  {formatPrice(parseCents(budget.reservedBudgetCents))}
++                </DetailLabel>
++                <DetailLabel title="PAYG Budget">
++                  {formatPrice(parseCents(budget.paygBudgetCents))}
++                </DetailLabel>
++              </DetailList>
++            </Fragment>
++          );
++        })}
++      </PanelBody>
++    </Panel>
++  );
++}
++
++export default function CustomerContractDetails() {
++  const {orgId} = useParams<{orgId: string}>();
++  const {data, isPending, isError, refetch} = useApiQuery<Contract>(
++    [
++      getApiUrl(`/_admin/customers/$organizationIdOrSlug/contract/`, {
++        path: {organizationIdOrSlug: orgId},
++      }),
++    ],
++    {
++      staleTime: 0,
++    }
++  );
++
++  if (isPending) {
++    return <LoadingIndicator />;
++  }
++
++  if (isError) {
++    return <LoadingError onRetry={refetch} />;
++  }
++
++  if (!data) {
++    return null;
++  }
++
++  const skuConfigs = data.pricingConfig?.skuConfigs ?? [];
++  const sharedBudgets = data.pricingConfig?.sharedSkuBudgets ?? [];
++
++  return (
++    <Fragment>
++      <PageHeader title="Customers" breadcrumbs={[orgId, 'Contract']} />
++      <ContractOverview data={data} />
++      <SKUPricing skuConfigs={skuConfigs} />
++      <SharedBudgets budgets={sharedBudgets} />
++      <Panel>
++        <PanelBody withPadding>
++          <Disclosure>
++            <Disclosure.Title>Raw Contract Response</Disclosure.Title>
++            <Disclosure.Content>
++              <CodeBlock language="json">{JSON.stringify(data, null, 2)}</CodeBlock>
++            </Disclosure.Content>
++          </Disclosure>
++        </PanelBody>
++      </Panel>
++    </Fragment>
++  );
++}
+diff --git a/static/gsAdmin/views/customerDetails.tsx b/static/gsAdmin/views/customerDetails.tsx
+index 3c7fc4d6360bfe..6bf683edb1198d 100644
+--- a/static/gsAdmin/views/customerDetails.tsx
++++ b/static/gsAdmin/views/customerDetails.tsx
+@@ -3,6 +3,8 @@ import cloneDeep from 'lodash/cloneDeep';
+ import some from 'lodash/some';
+ import scrollToElement from 'scroll-to-element';
+ 
++import {Link} from '@sentry/scraps/link';
++
+ import {
+   addErrorMessage,
+   addLoadingMessage,
+@@ -924,6 +926,14 @@ export default function CustomerDetails() {
+             noPanel: true,
+             content: <CustomerPolicies orgId={orgId} />,
+           },
++          {
++            name: 'Contract',
++            content: (
++              <Link to={`/_admin/customers/${orgId}/contract/`}>
++                View Contract Details
++              </Link>
++            ),
++          },
+         ]}
+       />
+     </ErrorBoundary>
+diff --git a/tests/flagpole/test_evaluation_context.py b/tests/flagpole/test_evaluation_context.py
+index c8f5b9f36bef68..c23de144ed19b2 100644
+--- a/tests/flagpole/test_evaluation_context.py
++++ b/tests/flagpole/test_evaluation_context.py
+@@ -13,24 +13,29 @@ class TestEvaluationContext:
+     def test_adds_identity_fields(self) -> None:
+         eval_context = EvaluationContext({}, set())
+         assert eval_context.id == 1245845410931227995499360226027473197403882391305
++        assert eval_context.id % 100 == 5, "bucket should be correct"
+ 
+         eval_context = EvaluationContext({"foo": "bar", "baz": "barfoo"}, {"foo"})
+         expected_id = 484477975355580460928302712356218993825269143262
+         assert eval_context.id == expected_id
++        assert eval_context.id % 100 == 62, "bucket should be correct"
+ 
+         # Assert that we skip the missing field but still generate the same
+         # context ID.
+         eval_context = EvaluationContext({"foo": "bar", "baz": "barfoo"}, {"foo", "whoops"})
+         assert eval_context.id == expected_id
++        assert eval_context.id % 100 == 62, "bucket should be correct"
+ 
+         eval_context = EvaluationContext({"foo": "bar", "baz": "barfoo"}, {"foo", "baz"})
+         expected_id = 1249805218608667754842212156585681631068251083301
+         assert eval_context.id == expected_id
++        assert eval_context.id % 100 == 1, "bucket should be correct"
+ 
+         # Assert that we use all properties to generate the context when all
+         # identity fields are missing.
+         eval_context = EvaluationContext({"foo": "bar", "baz": "barfoo"}, {"whoops", "test"})
+         assert eval_context.id == expected_id
++        assert eval_context.id % 100 == 1, "bucket should be correct"
+ 
+     def test_no_identity_fields_included(self) -> None:
+         eval_context = EvaluationContext({})
+diff --git a/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py b/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py
+index 83548a89169294..94d49aaa8a8eef 100644
+--- a/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py
++++ b/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py
+@@ -25,9 +25,8 @@
+ from sentry.conf.server import SEER_ANOMALY_DETECTION_STORE_DATA_URL
+ from sentry.deletions.tasks.scheduled import run_scheduled_deletions
+ from sentry.incidents.endpoints.serializers.alert_rule import DetailedAlertRuleSerializer
+-from sentry.incidents.endpoints.serializers.workflow_engine_detector import (
+-    WorkflowEngineDetectorSerializer,
+-)
++from sentry.incidents.endpoints.serializers.utils import get_fake_id_from_object_id
++from sentry.incidents.grouptype import MetricIssue
+ from sentry.incidents.logic import INVALID_TIME_WINDOW
+ from sentry.incidents.models.alert_rule import (
+     AlertRule,
+@@ -59,7 +58,7 @@
+ from sentry.testutils.outbox import outbox_runner
+ from sentry.testutils.silo import assume_test_silo_mode
+ from sentry.testutils.skips import requires_snuba
+-from sentry.workflow_engine.models import Detector
++from sentry.workflow_engine.models import DataSource, DataSourceDetector, Detector
+ from sentry.workflow_engine.models.alertrule_detector import AlertRuleDetector
+ from tests.sentry.incidents.endpoints.test_organization_alert_rule_index import AlertRuleBase
+ from tests.sentry.workflow_engine.migration_helpers.test_migrate_alert_rule import (
+@@ -222,20 +221,17 @@ def test_simple(self) -> None:
+ 
+         assert resp.data == serialize(self.alert_rule, serializer=DetailedAlertRuleSerializer())
+ 
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    @with_feature("organizations:incidents")
+     def test_workflow_engine_serializer(self) -> None:
+         self.create_team(organization=self.organization, members=[self.user])
+         self.login_as(self.user)
+ 
+         ard = AlertRuleDetector.objects.get(alert_rule_id=self.alert_rule.id)
+         self.detector = Detector.objects.get(id=ard.detector_id)
++        fake_detector_id = get_fake_id_from_object_id(self.detector.id)
+ 
+-        with (
+-            self.feature("organizations:incidents"),
+-            self.feature("organizations:workflow-engine-rule-serializers"),
+-        ):
+-            resp = self.get_success_response(self.organization.slug, self.alert_rule.id)
+-
+-        assert resp.data == serialize(self.detector, serializer=WorkflowEngineDetectorSerializer())
++        self.get_error_response(self.organization.slug, fake_detector_id, status_code=400)
+ 
+     def test_aggregate_translation(self) -> None:
+         self.create_team(organization=self.organization, members=[self.user])
+@@ -786,33 +782,18 @@ def test_update_non_aggregate_field_preserves_transparency_on_upsampled_project(
+         alert_rule.refresh_from_db()
+         assert alert_rule.snuba_query.aggregate == original_aggregate  # Still upsampled_count()
+ 
++    @with_feature("organizations:incidents")
++    @with_feature("organizations:workflow-engine-rule-serializers")
+     def test_workflow_engine_serializer(self) -> None:
+         self.create_team(organization=self.organization, members=[self.user])
+         self.login_as(self.user)
+ 
+         ard = AlertRuleDetector.objects.get(alert_rule_id=self.alert_rule.id)
+         self.detector = Detector.objects.get(id=ard.detector_id)
++        fake_detector_id = get_fake_id_from_object_id(self.detector.id)
+ 
+-        alert_rule = self.alert_rule
+-        # We need the IDs to force update instead of create, so we just get the rule using our own API. Like frontend would.
+-        serialized_alert_rule = self.get_serialized_alert_rule()
+-        serialized_alert_rule["name"] = "what"
+-
+-        with (
+-            self.feature("organizations:incidents"),
+-            self.feature("organizations:workflow-engine-rule-serializers"),
+-            outbox_runner(),
+-        ):
+-            resp = self.get_success_response(
+-                self.organization.slug, alert_rule.id, **serialized_alert_rule
+-            )
+-
+-        alert_rule.name = "what"
+-        alert_rule.date_modified = resp.data["dateModified"]
+-        detector = Detector.objects.get(alertruledetector__alert_rule_id=alert_rule.id)
+-        assert resp.data == serialize(detector, serializer=WorkflowEngineDetectorSerializer())
+-        assert resp.data["name"] == "what"
+-        assert resp.data["dateModified"] > serialized_alert_rule["dateModified"]
++        with outbox_runner():
++            self.get_error_response(self.organization.slug, fake_detector_id, status_code=400)
+ 
+     def test_not_updated_fields(self) -> None:
+         self.create_member(
+@@ -2414,3 +2395,47 @@ def test_project_permission(self) -> None:
+ 
+         with self.feature("organizations:incidents"):
+             self.get_success_response(self.organization.slug, other_alert_rule.id, status_code=204)
++
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    def test_workflow_engine_detector_deleted(self) -> None:
++        self.create_member(
++            user=self.user, organization=self.organization, role="owner", teams=[self.team]
++        )
++        self.login_as(self.user)
++
++        detector = self.create_detector(project=self.project, type=MetricIssue.slug)
++        data_source = self.create_data_source()
++        data_source_detector = self.create_data_source_detector(data_source, detector)
++        fake_detector_id = get_fake_id_from_object_id(detector.id)
++        self.get_success_response(self.organization.slug, fake_detector_id, status_code=204)
++
++        # Detector.objects excludes PENDING_DELETION, so the detector not appearing here confirms
++        # it was scheduled for deletion.
++        assert not Detector.objects.filter(id=detector.id).exists()
++
++        with self.tasks():
++            run_scheduled_deletions()
++
++        assert not Detector.objects.filter(id=detector.id).exists()
++        assert not DataSource.objects.filter(id=data_source.id).exists()
++        assert not DataSourceDetector.objects.filter(id=data_source_detector.id).exists()
++
++    @with_feature("organizations:workflow-engine-rule-serializers")
++    def test_dual_delete_detector_id_passed(self) -> None:
++        self.create_member(
++            user=self.user, organization=self.organization, role="owner", teams=[self.team]
++        )
++        self.login_as(self.user)
++
++        ard = AlertRuleDetector.objects.get(alert_rule_id=self.alert_rule.id)
++        fake_detector_id = get_fake_id_from_object_id(ard.detector_id)
++
++        with self.feature("organizations:incidents"), outbox_runner():
++            self.get_success_response(self.organization.slug, fake_detector_id, status_code=204)
++
++        with self.tasks():
++            run_scheduled_deletions()
++
++        assert not AlertRule.objects_with_snapshots.filter(name=self.alert_rule.name).exists()
++        assert not AlertRule.objects_with_snapshots.filter(id=self.alert_rule.id).exists()
++        assert not Detector.objects.filter(id=ard.detector_id).exists()

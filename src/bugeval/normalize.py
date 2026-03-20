@@ -154,13 +154,27 @@ _KNOWN_TOOLS = [
 ]
 
 
+_KNOWN_CONTEXT_LEVELS = {"diff-only", "diff+repo", "diff+repo+domain"}
+
+
 def _parse_raw_dir_name(name: str) -> tuple[str, str]:
-    """Parse '{case-id}-{tool}' from a raw dir name. Returns (case_id, tool).
+    """Parse '{case-id}-{tool}[-{context_level}]' from a raw dir name. Returns (case_id, tool).
+
+    Strips a trailing context level suffix (e.g. '-diff-only', '-diff+repo') before parsing,
+    so both old-format ('leo-001-claude-cli-sonnet') and new-format
+    ('leo-001-claude-cli-sonnet-diff-only') directories are handled.
 
     Strategy 1: match against known tool names (handles hyphenated tools correctly).
     Strategy 2: split at digit-to-alpha boundary (e.g. 'repo-042-toolname').
     Strategy 3: last-hyphen fallback.
     """
+    # Strip known context level suffixes first.
+    for ctx in sorted(_KNOWN_CONTEXT_LEVELS, key=len, reverse=True):
+        suffix = f"-{ctx}"
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+
     # Strategy 1: known tool suffix match
     for tool in _KNOWN_TOOLS:
         suffix = f"-{tool}"
@@ -238,7 +252,8 @@ def normalize(run_dir: str, config_path: str, context_level: str, dry_run: bool)
                 click.echo(f"[skip] {raw_dir.name}: unknown tool type for '{tool_name}'")
                 continue
 
-            out_path = resolved / f"{case_id}-{tool_name}.yaml"
+            ctx_suffix = f"-{result.context_level}" if result.context_level else ""
+            out_path = resolved / f"{case_id}-{tool_name}{ctx_suffix}.yaml"
             if dry_run:
                 click.echo(f"[dry-run] would write {out_path.name}")
             else:

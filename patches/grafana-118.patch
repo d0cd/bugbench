@@ -1,0 +1,383 @@
+diff --git a/packages/grafana-data/src/types/featureToggles.gen.ts b/packages/grafana-data/src/types/featureToggles.gen.ts
+index bfe2f5a880a75..f730c534e5a03 100644
+--- a/packages/grafana-data/src/types/featureToggles.gen.ts
++++ b/packages/grafana-data/src/types/featureToggles.gen.ts
+@@ -1233,6 +1233,11 @@ export interface FeatureToggles {
+   */
+   alertEnrichmentConditional?: boolean;
+   /**
++  * Enable alert enrichment preview (notification-history-based) in view and edit drawers.
++  * @default false
++  */
++  alertEnrichmentPreview?: boolean;
++  /**
+   * Enables the API to import Alertmanager configuration
+   * @default false
+   */
+diff --git a/pkg/registry/apis/provisioning/jobs.go b/pkg/registry/apis/provisioning/jobs.go
+index 4fef8e6affeb6..5d40514bc5963 100644
+--- a/pkg/registry/apis/provisioning/jobs.go
++++ b/pkg/registry/apis/provisioning/jobs.go
+@@ -238,8 +238,11 @@ var (
+ 
+ // authorizeJob dispatches pre-flight validation and authorization checks based on the job action.
+ func (c *jobsConnector) authorizeJob(ctx context.Context, repo repository.Repository, cfg *provisioning.Repository, spec provisioning.JobSpec) error {
+-	if err := validateJobAction(spec, cfg); err != nil {
+-		return err
++	if spec.Action == provisioning.JobActionPullRequest {
++		return apierrors.NewBadRequest("pull request jobs cannot be created via the API; they are triggered by webhooks")
++	}
++	if spec.Action == provisioning.JobActionFixFolderMetadata && !c.folderMetadataEnabled {
++		return apierrors.NewBadRequest("fixFolderMetadata jobs require the provisioningFolderMetadata feature flag")
+ 	}
+ 
+ 	switch spec.Action {
+@@ -255,7 +258,7 @@ func (c *jobsConnector) authorizeJob(ctx context.Context, repo repository.Reposi
+ 		}
+ 	case provisioning.JobActionPull, provisioning.JobActionPullRequest, provisioning.JobActionFixFolderMetadata:
+ 		// Read-only operations don't require pre-flight resource authorization.
+-		// Pull is authorized inline in Connect; PullRequest is rejected by validateJobAction above.
++		// Pull is authorized inline in Connect.
+ 	}
+ 	return nil
+ }
+@@ -326,16 +329,6 @@ func (c *jobsConnector) authorizeAdminJob(ctx context.Context, cfg *provisioning
+ 	}, "")
+ }
+ 
+-// validateJobAction checks that the job action is allowed to be created via the API.
+-// Some job types are only triggered internally (e.g., by webhooks) and should not be
+-// user-creatable.
+-func validateJobAction(spec provisioning.JobSpec, _ *provisioning.Repository) error {
+-	if spec.Action == provisioning.JobActionPullRequest {
+-		return apierrors.NewBadRequest("pull request jobs cannot be created via the API; they are triggered by webhooks")
+-	}
+-	return nil
+-}
+-
+ // authorizeResourceJob checks that the requesting user has the required permissions
+ // for operations that read and write all supported resource types (export and migrate).
+ // This runs at job creation time while the user's identity is still in the request
+diff --git a/pkg/registry/apis/provisioning/jobs_test.go b/pkg/registry/apis/provisioning/jobs_test.go
+index 03aa17b1b3144..2b03d24ab07bf 100644
+--- a/pkg/registry/apis/provisioning/jobs_test.go
++++ b/pkg/registry/apis/provisioning/jobs_test.go
+@@ -49,6 +49,7 @@ func newTestRepo(name, namespace string) *provisioning.Repository {
+ 
+ func TestPullRequestJobRejected(t *testing.T) {
+ 	cfg := newTestRepo("my-repo", "default")
++	c := &jobsConnector{}
+ 
+ 	t.Run("PullRequest action returns bad request", func(t *testing.T) {
+ 		spec := provisioning.JobSpec{
+@@ -59,7 +60,7 @@ func TestPullRequestJobRejected(t *testing.T) {
+ 			},
+ 		}
+ 
+-		err := validateJobAction(spec, cfg)
++		err := c.authorizeJob(context.Background(), nil, cfg, spec)
+ 		require.Error(t, err)
+ 		assert.True(t, apierrors.IsBadRequest(err))
+ 		assert.Contains(t, err.Error(), "pull request jobs cannot be created via the API")
+@@ -71,7 +72,33 @@ func TestPullRequestJobRejected(t *testing.T) {
+ 			Pull:   &provisioning.SyncJobOptions{},
+ 		}
+ 
+-		err := validateJobAction(spec, cfg)
++		err := c.authorizeJob(context.Background(), nil, cfg, spec)
++		require.NoError(t, err)
++	})
++}
++
++func TestFixFolderMetadataFeatureGate(t *testing.T) {
++	cfg := newTestRepo("my-repo", "default")
++
++	t.Run("rejected when flag is disabled", func(t *testing.T) {
++		c := &jobsConnector{folderMetadataEnabled: false}
++		spec := provisioning.JobSpec{
++			Action: provisioning.JobActionFixFolderMetadata,
++		}
++
++		err := c.authorizeJob(context.Background(), nil, cfg, spec)
++		require.Error(t, err)
++		assert.True(t, apierrors.IsBadRequest(err))
++		assert.Contains(t, err.Error(), "provisioningFolderMetadata feature flag")
++	})
++
++	t.Run("allowed when flag is enabled", func(t *testing.T) {
++		c := &jobsConnector{folderMetadataEnabled: true}
++		spec := provisioning.JobSpec{
++			Action: provisioning.JobActionFixFolderMetadata,
++		}
++
++		err := c.authorizeJob(context.Background(), nil, cfg, spec)
+ 		require.NoError(t, err)
+ 	})
+ }
+diff --git a/pkg/services/featuremgmt/registry.go b/pkg/services/featuremgmt/registry.go
+index b935e26504db6..079929e8d08c6 100644
+--- a/pkg/services/featuremgmt/registry.go
++++ b/pkg/services/featuremgmt/registry.go
+@@ -1936,6 +1936,14 @@ var (
+ 			HideFromDocs: true,
+ 			Expression:   "false",
+ 		},
++		{
++			Name:         "alertEnrichmentPreview",
++			Description:  "Enable alert enrichment preview (notification-history-based) in view and edit drawers.",
++			Stage:        FeatureStageExperimental,
++			Owner:        grafanaAlertingSquad,
++			HideFromDocs: true,
++			Expression:   "false",
++		},
+ 		{
+ 			Name:         "alertingImportAlertmanagerAPI",
+ 			Description:  "Enables the API to import Alertmanager configuration",
+diff --git a/pkg/services/featuremgmt/toggles_gen.csv b/pkg/services/featuremgmt/toggles_gen.csv
+index abf242b54ae75..10f2389ecefa7 100644
+--- a/pkg/services/featuremgmt/toggles_gen.csv
++++ b/pkg/services/featuremgmt/toggles_gen.csv
+@@ -241,6 +241,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-06-06,alertEnrichment,experimental,@grafana/alerting-squad,false,false,false
+ 2025-07-31,alertEnrichmentMultiStep,experimental,@grafana/alerting-squad,false,false,false
+ 2025-07-31,alertEnrichmentConditional,experimental,@grafana/alerting-squad,false,false,false
++2026-03-05,alertEnrichmentPreview,experimental,@grafana/alerting-squad,false,false,false
+ 2025-06-10,alertingImportAlertmanagerAPI,experimental,@grafana/alerting-squad,false,false,false
+ 2025-07-31,alertingImportAlertmanagerUI,experimental,@grafana/alerting-squad,false,false,false
+ 2026-02-18,alertingDisableDMAinUI,experimental,@grafana/alerting-squad,false,false,false
+diff --git a/pkg/services/featuremgmt/toggles_gen.go b/pkg/services/featuremgmt/toggles_gen.go
+index 3cb34dcbc06ff..8467f158bfecc 100644
+--- a/pkg/services/featuremgmt/toggles_gen.go
++++ b/pkg/services/featuremgmt/toggles_gen.go
+@@ -686,6 +686,10 @@ const (
+ 	// Enable conditional alert enrichment steps.
+ 	FlagAlertEnrichmentConditional = "alertEnrichmentConditional"
+ 
++	// FlagAlertEnrichmentPreview
++	// Enable alert enrichment preview (notification-history-based) in view and edit drawers.
++	FlagAlertEnrichmentPreview = "alertEnrichmentPreview"
++
+ 	// FlagAlertingImportAlertmanagerAPI
+ 	// Enables the API to import Alertmanager configuration
+ 	FlagAlertingImportAlertmanagerAPI = "alertingImportAlertmanagerAPI"
+diff --git a/pkg/services/featuremgmt/toggles_gen.json b/pkg/services/featuremgmt/toggles_gen.json
+index f5505c066d03c..db757ea763586 100644
+--- a/pkg/services/featuremgmt/toggles_gen.json
++++ b/pkg/services/featuremgmt/toggles_gen.json
+@@ -89,6 +89,20 @@
+         "expression": "false"
+       }
+     },
++    {
++      "metadata": {
++        "name": "alertEnrichmentPreview",
++        "resourceVersion": "1772750000943",
++        "creationTimestamp": "2026-03-05T22:33:20Z"
++      },
++      "spec": {
++        "description": "Enable alert enrichment preview (notification-history-based) in view and edit drawers.",
++        "stage": "experimental",
++        "codeowner": "@grafana/alerting-squad",
++        "hideFromDocs": true,
++        "expression": "false"
++      }
++    },
+     {
+       "metadata": {
+         "name": "alertRuleRestore",
+diff --git a/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_auth_test.go b/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_auth_test.go
+new file mode 100644
+index 0000000000000..40c0bf150be22
+--- /dev/null
++++ b/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_auth_test.go
+@@ -0,0 +1,128 @@
++package jobs
++
++import (
++	"context"
++	"net/http"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++
++	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
++	"github.com/grafana/grafana/pkg/services/featuremgmt"
++	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
++	testinfra "github.com/grafana/grafana/pkg/tests/testinfra"
++	"github.com/grafana/grafana/pkg/util/testutil"
++)
++
++func withProvisioningFolderMetadata(opts *testinfra.GrafanaOpts) {
++	opts.EnableFeatureToggles = append(opts.EnableFeatureToggles, featuremgmt.FlagProvisioningFolderMetadata)
++}
++
++func TestIntegrationProvisioning_FixFolderMetadataJobAuthorization(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	helper := common.RunGrafana(t, withProvisioningFolderMetadata)
++	ctx := context.Background()
++
++	const repo = "fixfoldermetadata-auth-test"
++	testRepo := common.TestRepo{
++		Name:               repo,
++		Target:             "folder",
++		Copies:             map[string]string{},
++		ExpectedDashboards: 0,
++		ExpectedFolders:    1,
++	}
++	helper.CreateRepo(t, testRepo)
++
++	body := common.AsJSON(provisioning.JobSpec{
++		Action: provisioning.JobActionFixFolderMetadata,
++	})
++
++	t.Run("admin can create fixFolderMetadata job", func(t *testing.T) {
++		var statusCode int
++		result := helper.AdminREST.Post().
++			Namespace("default").
++			Resource("repositories").
++			Name(repo).
++			SubResource("jobs").
++			Body(body).
++			SetHeader("Content-Type", "application/json").
++			Do(ctx).StatusCode(&statusCode)
++
++		require.NoError(t, result.Error(), "admin should be able to create fixFolderMetadata job")
++		require.Equal(t, http.StatusAccepted, statusCode, "should return 202 Accepted")
++
++		helper.AwaitJobs(t, repo)
++	})
++
++	t.Run("editor can create fixFolderMetadata job", func(t *testing.T) {
++		var statusCode int
++		result := helper.EditorREST.Post().
++			Namespace("default").
++			Resource("repositories").
++			Name(repo).
++			SubResource("jobs").
++			Body(body).
++			SetHeader("Content-Type", "application/json").
++			Do(ctx).StatusCode(&statusCode)
++
++		require.NoError(t, result.Error(), "editor should be able to create fixFolderMetadata job")
++		require.Equal(t, http.StatusAccepted, statusCode, "should return 202 Accepted")
++
++		helper.AwaitJobs(t, repo)
++	})
++
++	t.Run("viewer cannot create fixFolderMetadata job", func(t *testing.T) {
++		var statusCode int
++		result := helper.ViewerREST.Post().
++			Namespace("default").
++			Resource("repositories").
++			Name(repo).
++			SubResource("jobs").
++			Body(body).
++			SetHeader("Content-Type", "application/json").
++			Do(ctx).StatusCode(&statusCode)
++
++		require.Error(t, result.Error(), "viewer should not be able to create fixFolderMetadata job")
++		require.Equal(t, http.StatusForbidden, statusCode, "should return 403 Forbidden")
++		require.True(t, apierrors.IsForbidden(result.Error()), "error should be forbidden")
++	})
++}
++
++func TestIntegrationProvisioning_FixFolderMetadataJobFlagDisabled(t *testing.T) {
++	testutil.SkipIntegrationTestInShortMode(t)
++
++	helper := common.RunGrafana(t)
++	ctx := context.Background()
++
++	const repo = "fixfoldermeta-flag-disabled"
++	testRepo := common.TestRepo{
++		Name:               repo,
++		Target:             "folder",
++		Copies:             map[string]string{},
++		ExpectedDashboards: 0,
++		ExpectedFolders:    1,
++	}
++	helper.CreateRepo(t, testRepo)
++
++	body := common.AsJSON(provisioning.JobSpec{
++		Action: provisioning.JobActionFixFolderMetadata,
++	})
++
++	t.Run("admin cannot create fixFolderMetadata job when flag is disabled", func(t *testing.T) {
++		var statusCode int
++		result := helper.AdminREST.Post().
++			Namespace("default").
++			Resource("repositories").
++			Name(repo).
++			SubResource("jobs").
++			Body(body).
++			SetHeader("Content-Type", "application/json").
++			Do(ctx).StatusCode(&statusCode)
++
++		require.Error(t, result.Error(), "should fail when flag is disabled")
++		require.Equal(t, http.StatusBadRequest, statusCode, "should return 400 Bad Request")
++		require.True(t, apierrors.IsBadRequest(result.Error()), "error should be bad request")
++	})
++}
+diff --git a/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go b/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go
+index a9f4cc069dc0b..f9929fa6c73e2 100644
+--- a/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go
++++ b/pkg/tests/apis/provisioning/jobs/fixfoldermetadatajob_test.go
+@@ -13,7 +13,7 @@ import (
+ func TestIntegrationProvisioning_FixFolderMetadataJob(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+-	helper := common.RunGrafana(t)
++	helper := common.RunGrafana(t, withProvisioningFolderMetadata)
+ 
+ 	const repo = "fix-folder-metadata-test-repo"
+ 	testRepo := common.TestRepo{
+diff --git a/pkg/tests/apis/provisioning/jobs/jobs_auth_test.go b/pkg/tests/apis/provisioning/jobs/jobs_auth_test.go
+index 7e1feb4542c3f..e5910d033bab9 100644
+--- a/pkg/tests/apis/provisioning/jobs/jobs_auth_test.go
++++ b/pkg/tests/apis/provisioning/jobs/jobs_auth_test.go
+@@ -9,14 +9,20 @@ import (
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 
+ 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
++	"github.com/grafana/grafana/pkg/services/featuremgmt"
+ 	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
++	testinfra "github.com/grafana/grafana/pkg/tests/testinfra"
+ 	"github.com/grafana/grafana/pkg/util/testutil"
+ )
+ 
++func withJobsAuthFolderMetadata(opts *testinfra.GrafanaOpts) {
++	opts.EnableFeatureToggles = append(opts.EnableFeatureToggles, featuremgmt.FlagProvisioningFolderMetadata)
++}
++
+ func TestIntegrationProvisioning_JobsAuthorization(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+-	helper := common.RunGrafana(t)
++	helper := common.RunGrafana(t, withJobsAuthFolderMetadata)
+ 	ctx := context.Background()
+ 
+ 	const repo = "jobs-auth-test"
+diff --git a/pkg/tests/apis/provisioning/repository/repository_test.go b/pkg/tests/apis/provisioning/repository/repository_test.go
+index 3848f97a66d25..7a0a18b67964d 100644
+--- a/pkg/tests/apis/provisioning/repository/repository_test.go
++++ b/pkg/tests/apis/provisioning/repository/repository_test.go
+@@ -32,6 +32,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/extensions"
+ 	"github.com/grafana/grafana/pkg/infra/usagestats"
+ 	provisioningAPIServer "github.com/grafana/grafana/pkg/registry/apis/provisioning"
++	"github.com/grafana/grafana/pkg/services/featuremgmt"
+ 	"github.com/grafana/grafana/pkg/tests/apis"
+ 	"github.com/grafana/grafana/pkg/tests/apis/provisioning/common"
+ 	"github.com/grafana/grafana/pkg/tests/testinfra"
+@@ -1697,7 +1698,9 @@ func TestIntegrationProvisioning_DeleteRepositoryAndCleanupClassicDashboards(t *
+ func TestIntegrationProvisioning_JobPermissions(t *testing.T) {
+ 	testutil.SkipIntegrationTestInShortMode(t)
+ 
+-	helper := common.RunGrafana(t)
++	helper := common.RunGrafana(t, func(opts *testinfra.GrafanaOpts) {
++		opts.EnableFeatureToggles = append(opts.EnableFeatureToggles, featuremgmt.FlagProvisioningFolderMetadata)
++	})
+ 	ctx := context.Background()
+ 
+ 	const repo = "job-permissions-test"

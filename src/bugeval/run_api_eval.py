@@ -20,9 +20,11 @@ from bugeval.pr_eval_models import (
     CaseToolState,
     CaseToolStatus,
     EvalConfig,
-    RunState,
     ToolDef,
+    is_case_done,
     load_eval_config,
+    parse_case_ids,
+    write_error_marker,
 )
 from bugeval.run_pr_eval import load_cases, make_run_id
 
@@ -61,7 +63,7 @@ def process_case_tool_api(
         elapsed = time.monotonic() - t0
 
         state.status = CaseToolStatus.collecting
-        out_dir = run_dir / "raw" / f"{case.id}-{tool.name}"
+        out_dir = run_dir / "raw" / f"{case.id}-{tool.name}-{context_level}"
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "findings.json").write_text(json.dumps(findings, indent=2))
         (out_dir / "metadata.json").write_text(json.dumps({"time_seconds": round(elapsed, 2)}))
@@ -83,8 +85,6 @@ async def _eval_api_tool(
     patches_dir: Path,
     run_dir: Path,
     context_level: str,
-    run_state: RunState,
-    checkpoint_path: Path,
     dry_run: bool,
     semaphore: asyncio.Semaphore,
     fail_after: int = 5,
@@ -92,8 +92,7 @@ async def _eval_api_tool(
     """Evaluate all cases against one API tool, sequentially."""
     consecutive_failures = 0
     for case in cases:
-        existing = run_state.get(case.id, tool.name)
-        if existing.status == CaseToolStatus.done:
+        if is_case_done(run_dir, case.id, tool.name, context_level):
             click.echo(f"[skip] {case.id} x {tool.name} (already done)")
             continue
 
@@ -101,16 +100,8 @@ async def _eval_api_tool(
         try:
             patch_content = patch_path.read_text()
         except FileNotFoundError:
-            state = CaseToolState(
-                case_id=case.id,
-                tool=tool.name,
-                status=CaseToolStatus.failed,
-                error=f"patch not found: {patch_path}",
-                started_at=datetime.now(tz=UTC).isoformat(),
-                completed_at=datetime.now(tz=UTC).isoformat(),
-            )
-            run_state.set(state)
-            run_state.save(checkpoint_path)
+            error_msg = f"patch not found: {patch_path}"
+            write_error_marker(run_dir, case.id, tool.name, error_msg, context_level)
             click.echo(f"[failed] {case.id} x {tool.name}: patch not found")
             consecutive_failures += 1
             if fail_after > 0 and consecutive_failures >= fail_after:
@@ -128,11 +119,13 @@ async def _eval_api_tool(
                 context_level,
                 dry_run,
             )
-        run_state.set(final_state)
-        run_state.save(checkpoint_path)
         click.echo(f"[{final_state.status}] {case.id} x {tool.name}")
 
         if final_state.status == CaseToolStatus.failed:
+            if not is_case_done(run_dir, case.id, tool.name, context_level):
+                write_error_marker(
+                    run_dir, case.id, tool.name, final_state.error or "unknown", context_level
+                )
             consecutive_failures += 1
             if fail_after > 0 and consecutive_failures >= fail_after:
                 click.echo(f"[abort] {tool.name}: {fail_after} consecutive failures, aborting")
@@ -202,6 +195,15 @@ async def _eval_api_tool(
     type=int,
     help="Max simultaneous API calls (overrides config max_concurrent; default: 1).",
 )
+@click.option(
+    "--case-ids",
+    "case_ids_raw",
+    default=None,
+    help=(
+        "Filter to specific case IDs. Comma-separated: 'leo-001,leo-002'. "
+        "Or a file (one ID per line, # comments): '@pilot-step1.txt'."
+    ),
+)
 def run_api_eval(
     config_path: str,
     cases_dir: str,
@@ -213,6 +215,7 @@ def run_api_eval(
     limit: int,
     fail_after: int,
     max_concurrent: int | None,
+    case_ids_raw: str | None,
 ) -> None:
     """Async orchestrator: run API-mode evaluation across all (case × tool) pairs."""
     config: EvalConfig = load_eval_config(Path(config_path))
@@ -221,13 +224,17 @@ def run_api_eval(
     resolved_run_dir = Path(run_dir) if run_dir else Path("results") / run_id
     resolved_run_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = resolved_run_dir / "checkpoint.yaml"
-    run_state = RunState.load(checkpoint_path)
-
     cases = load_cases(Path(cases_dir))
     if not cases:
         click.echo(f"No cases found in {cases_dir}")
         return
+
+    if case_ids_raw:
+        allowed_ids = set(parse_case_ids(case_ids_raw))
+        cases = [c for c in cases if c.id in allowed_ids]
+        if not cases:
+            click.echo("No cases matched --case-ids filter")
+            return
 
     if limit > 0:
         cases = cases[:limit]
@@ -263,8 +270,6 @@ def run_api_eval(
                     resolved_patches_dir,
                     resolved_run_dir,
                     context_level,
-                    run_state,
-                    checkpoint_path,
                     dry_run,
                     semaphore,
                     fail_after,

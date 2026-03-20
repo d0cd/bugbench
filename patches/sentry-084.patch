@@ -1,0 +1,3930 @@
+diff --git a/src/sentry/api/event_search.py b/src/sentry/api/event_search.py
+index 78d3fc25e9b354..aefc3ff9e0e787 100644
+--- a/src/sentry/api/event_search.py
++++ b/src/sentry/api/event_search.py
+@@ -76,6 +76,7 @@
+        / aggregate_size_filter
+        / aggregate_date_filter
+        / aggregate_rel_date_filter
++       / has_in_filter
+        / has_filter
+        / is_filter
+        / text_in_filter
+@@ -123,8 +124,11 @@
+ # aggregate for relative dates
+ aggregate_rel_date_filter = negation? aggregate_key sep operator? rel_date_format
+ 
++# has filter for not null type checks (single or comma-separated keys)
++has_in_filter = negation? &"has:" search_key sep has_in_list
++
+ # has filter for not null type checks
+-has_filter = negation? &"has:" search_key sep (text_key / search_value)
++has_filter = negation? &"has:" search_key sep has_item
+ 
+ # is filter. Specific to issue search
+ is_filter = negation? &"is:" search_key sep search_value
+@@ -168,6 +172,10 @@
+ boolean_value          = ~r"(true|1|false|0)"i &end_value
+ text_in_list           = open_bracket text_in_value (spaces comma spaces !comma text_in_value?)* closed_bracket &end_value
+ numeric_in_list        = open_bracket numeric_value (spaces comma spaces !comma numeric_value?)* closed_bracket &end_value
++
++has_item               = text_key / search_value
++has_in_list            = open_bracket has_item (spaces comma spaces !comma has_item?)* closed_bracket &end_value
++
+ # NOTE: These wildcard operators are internal implementation details and
+ # should not be included in product docs. Users should use `*` instead.
+ wildcard_op            = wildcard_unicode (contains / starts_with / ends_with) wildcard_unicode
+@@ -1330,34 +1338,45 @@ def visit_has_filter(
+         self,
+         node: Node,
+         children: tuple[
+-            Node | tuple[Node],  # ! if present
+-            Node,  # has: lookahead
+-            SearchKey,  # SearchKey('has')
+-            Node,  # :
+-            tuple[SearchKey],
++            Node | tuple[Node],
++            Node,
++            SearchKey,
++            Node,
++            SearchKey,
+         ],
+     ) -> SearchFilter:
+         # the key is has here, which we don't need
+-        negation, _, _, _, (search_key,) = children
++        negation, _, _, _, search_key = children
++        (search_key,) = self._validate_has_search_keys(negation, [search_key])
++
++        operator = "=" if is_negated(negation) else "!="
++        return SearchFilter(search_key, operator, SearchValue(""))
++
++    def _validate_has_search_keys(
++        self, negation: Node | tuple[Node], search_keys: Sequence[SearchKey]
++    ) -> list[SearchKey]:
++        validated_search_keys = []
++        for search_key in search_keys:
++            if isinstance(search_key, SearchValue):
++                raise InvalidSearchQuery(
++                    'Invalid format for "has" search: was expecting a field or tag instead'
++                )
++            validated_search_keys.append(search_key)
+ 
+         # Some datasets do not support the !has filter, but we allow
+         # team_key_transaction because we control that field and special
+-        # case the way it's processed in search
++        # case the way it's processed in search.
+         if (
+             not self.config.allow_not_has_filter
+             and is_negated(negation)
+-            and search_key.name != TEAM_KEY_TRANSACTION_ALIAS
++            and not (
++                len(validated_search_keys) == 1
++                and validated_search_keys[0].name == TEAM_KEY_TRANSACTION_ALIAS
++            )
+         ):
+             raise IncompatibleMetricsQuery(NOT_HAS_FILTER_ERROR_MESSAGE)
+ 
+-        # if it matched search value instead, it's not a valid key
+-        if isinstance(search_key, SearchValue):
+-            raise InvalidSearchQuery(
+-                'Invalid format for "has" search: was expecting a field or tag instead'
+-            )
+-
+-        operator = "=" if is_negated(negation) else "!="
+-        return SearchFilter(search_key, operator, SearchValue(""))
++        return validated_search_keys
+ 
+     def visit_is_filter(
+         self,
+@@ -1744,6 +1763,9 @@ def visit_numeric_in_list(
+     ) -> list[tuple[str, str]]:
+         return process_list(children[1], children[2])
+ 
++    def visit_has_item(self, node: Node, children: tuple[SearchKey]) -> SearchKey:
++        return children[0]
++
+     def visit_iso_8601_date_format(self, node: Node, children: object) -> str:
+         return node.text
+ 
+@@ -1800,6 +1822,46 @@ def visit_comma(self, node: Node, children: object) -> Node:
+     def visit_spaces(self, node: Node, children: object) -> str:
+         return " "
+ 
++    def visit_has_in_list(
++        self,
++        node: Node,
++        children: tuple[
++            str,
++            SearchKey,
++            tuple[tuple[str, Node, str, Node, tuple[SearchKey]], ...],
++            str,
++            Node,
++        ],
++    ) -> list[SearchKey]:
++        return process_list(children[1], children[2])
++
++    def visit_has_in_filter(
++        self,
++        node: Node,
++        children: tuple[
++            Node | tuple[Node],
++            Node,
++            SearchKey,
++            Node,
++            list[SearchKey],
++        ],
++    ) -> ParenExpression:
++        (negation, _, _, _, search_keys) = children
++        search_keys = self._validate_has_search_keys(negation, search_keys)
++
++        operator = "=" if is_negated(negation) else "!="
++        joining_operator: QueryOp = "AND" if is_negated(negation) else "OR"
++        search_value = SearchValue("")
++        all_filters = [
++            SearchFilter(search_key, operator, search_value) for search_key in search_keys
++        ]
++        tokens: list[QueryToken] = []
++        for index, search_filter in enumerate(all_filters):
++            tokens.append(search_filter)
++            if index != len(all_filters) - 1:
++                tokens.append(joining_operator)
++        return ParenExpression(tokens)
++
+     def generic_visit(self, node: Node, children: Sequence[Any]) -> Any:
+         return children or node
+ 
+diff --git a/src/sentry/api/serializers/rest_framework/dashboard.py b/src/sentry/api/serializers/rest_framework/dashboard.py
+index 093e1379ab111f..b82a39f63e3b26 100644
+--- a/src/sentry/api/serializers/rest_framework/dashboard.py
++++ b/src/sentry/api/serializers/rest_framework/dashboard.py
+@@ -318,6 +318,7 @@ class DashboardWidgetSerializer(CamelSnakeSerializer[Dashboard]):
+         choices=DatasetSourcesTypes.as_text_choices(),
+         required=False,
+         help_text="A widgets's unique id.",
++        error_messages={"invalid_choice": "Invalid dataset source"},
+     )
+ 
+     def validate_display_type(self, display_type):
+@@ -386,7 +387,10 @@ def _validate_text_widget(self, data):
+ 
+         dataset_source = data.get("dataset_source")
+         if dataset_source is not None:
+-            data["dataset_source"] = DATASET_SOURCE_MAP[dataset_source]
++            try:
++                data["dataset_source"] = DATASET_SOURCE_MAP[dataset_source]
++            except KeyError:
++                raise serializers.ValidationError({"dataset_source": "Invalid dataset source"})
+ 
+         return data
+ 
+@@ -621,7 +625,10 @@ def validate(self, data):
+ 
+         dataset_source = data.get("dataset_source")
+         if dataset_source is not None:
+-            data["dataset_source"] = DATASET_SOURCE_MAP[dataset_source]
++            try:
++                data["dataset_source"] = DATASET_SOURCE_MAP[dataset_source]
++            except KeyError:
++                raise serializers.ValidationError({"dataset_source": "Invalid dataset source"})
+ 
+         return data
+ 
+diff --git a/src/sentry/models/group.py b/src/sentry/models/group.py
+index 415ac847d57962..78d3bd1cdf571c 100644
+--- a/src/sentry/models/group.py
++++ b/src/sentry/models/group.py
+@@ -34,6 +34,7 @@
+ )
+ from sentry.db.models.fields.jsonfield import LegacyTextJSONField
+ from sentry.db.models.manager.base import BaseManager
++from sentry.db.models.manager.base_query_set import BaseQuerySet
+ from sentry.issues.grouptype import GroupCategory, get_group_type_by_type_id
+ from sentry.issues.priority import (
+     PRIORITY_TO_GROUP_HISTORY_STATUS,
+@@ -95,23 +96,30 @@ def looks_like_short_id(value):
+     return _short_id_re.match((value or "").strip()) is not None
+ 
+ 
+-def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organization=None):
++def get_group_with_redirect(
++    id_or_qualified_short_id: int | str,
++    queryset: BaseQuerySet[Group, Group] | None = None,
++    organization: Organization | None = None,
++) -> tuple[Group, bool]:
+     """
+     Retrieve a group by ID, checking the redirect table if the requested group
+     does not exist. Returns a two-tuple of ``(object, redirected)``.
+     """
+     if queryset is None:
+         if organization:
+-            queryset = Group.objects.filter(project__organization=organization)
+-            getter = queryset.get
++            updated_qs = Group.objects.filter(project__organization=organization)
++            getter = updated_qs.get
+         else:
+-            queryset = Group.objects.all()
++            updated_qs = Group.objects.all()
+             # When not passing a queryset, we want to read from cache
+             getter = Group.objects.get_from_cache
+     else:
+         if organization:
+-            queryset = queryset.filter(project__organization=organization)
+-        getter = queryset.get
++            updated_qs = queryset.filter(project__organization=organization)
++        else:
++            # No updates!
++            updated_qs = queryset
++        getter = updated_qs.get
+ 
+     if not (isinstance(id_or_qualified_short_id, int) or id_or_qualified_short_id.isdigit()):
+         short_id = parse_short_id(id_or_qualified_short_id)
+@@ -137,6 +145,8 @@ def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organizatio
+         from sentry.models.groupredirect import GroupRedirect
+ 
+         if short_id:
++            # Known because we only set short_id in a path that raises if org is None
++            assert organization is not None
+             params = {
+                 "id__in": GroupRedirect.objects.filter(
+                     organization_id=organization.id,
+@@ -152,7 +162,7 @@ def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organizatio
+             }
+ 
+         try:
+-            return queryset.get(**params), True
++            return updated_qs.get(**params), True
+         except Group.DoesNotExist:
+             raise error  # raise original `DoesNotExist`
+ 
+diff --git a/src/sentry/seer/code_review/models.py b/src/sentry/seer/code_review/models.py
+index 4c092123203d96..8d36e4a83ed742 100644
+--- a/src/sentry/seer/code_review/models.py
++++ b/src/sentry/seer/code_review/models.py
+@@ -86,6 +86,7 @@ class SeerCodeReviewRepoDefinition(BaseModel):
+     # Optional in base, overridden in subclasses based on request type
+     organization_id: int | None = None
+     integration_id: str | None = None
++    is_private: bool | None = None
+ 
+ 
+ class SeerCodeReviewRepoForPrReview(SeerCodeReviewRepoDefinition):
+diff --git a/src/sentry/seer/code_review/utils.py b/src/sentry/seer/code_review/utils.py
+index d57d58a599864a..e097f70bca5940 100644
+--- a/src/sentry/seer/code_review/utils.py
++++ b/src/sentry/seer/code_review/utils.py
+@@ -246,9 +246,10 @@ def _common_codegen_request_payload(
+     repo: Repository,
+     target_commit_sha: str,
+     organization: Organization,
++    event_payload: Mapping[str, Any],
+ ) -> dict[str, Any]:
+     data: dict[str, Any] = {
+-        "repo": _build_repo_definition(repo, target_commit_sha),
++        "repo": _build_repo_definition(repo, target_commit_sha, event_payload),
+         "bug_prediction_specific_information": {
+             "organization_id": organization.id,
+             "organization_slug": organization.slug,
+@@ -287,6 +288,7 @@ def transform_issue_comment_to_codegen_request(
+         repo=repo,
+         target_commit_sha=target_commit_sha,
+         organization=organization,
++        event_payload=event_payload,
+     )
+     payload["data"]["pr_id"] = event_payload["issue"]["number"]
+     config = payload["data"]["config"]
+@@ -325,6 +327,7 @@ def transform_pull_request_to_codegen_request(
+         repo=repo,
+         target_commit_sha=target_commit_sha,
+         organization=organization,
++        event_payload=event_payload,
+     )
+     pull_request = event_payload.get("pull_request", {})
+     payload["data"]["pr_id"] = pull_request.get("number")
+@@ -343,7 +346,11 @@ def transform_pull_request_to_codegen_request(
+     return payload
+ 
+ 
+-def _build_repo_definition(repo: Repository, target_commit_sha: str) -> dict[str, Any]:
++def _build_repo_definition(
++    repo: Repository,
++    target_commit_sha: str,
++    event_payload: Mapping[str, Any],
++) -> dict[str, Any]:
+     """
+     Build the repository definition for code review requests.
+     """
+@@ -359,6 +366,7 @@ def _build_repo_definition(repo: Repository, target_commit_sha: str) -> dict[str
+         "external_id": repo.external_id,
+         "base_commit_sha": target_commit_sha,
+         "organization_id": repo.organization_id,
++        "is_private": event_payload.get("repository", {}).get("private"),
+     }
+ 
+     # add integration_id which is used in pr_closed_step for product metrics dashboarding only
+@@ -425,6 +433,7 @@ def get_tags(
+             - scm_owner: The repository owner/organization name
+             - scm_provider: Always "github"
+             - scm_repo_full_name: The repository full name (owner/repo)
++            - scm_repo_is_private: Whether the repo is private (if available)
+             - scm_repo_name: The repository name
+             - sentry_integration_id: The Sentry integration ID
+             - sentry_organization_id: Sentry organization ID (if available)
+@@ -448,6 +457,8 @@ def get_tags(
+             result["scm_repo_name"] = repo_name
+         if owner_repo_name := repository.get("full_name"):
+             result["scm_repo_full_name"] = owner_repo_name
++        if (repo_private := repository.get("private")) is not None:
++            result["scm_repo_is_private"] = str(repo_private)
+ 
+     github_event_action = event.get("action")
+     if github_event_action:
+diff --git a/src/sentry/seer/models/seer_api_models.py b/src/sentry/seer/models/seer_api_models.py
+index 1e53fd3d952ac1..734dbec63684c5 100644
+--- a/src/sentry/seer/models/seer_api_models.py
++++ b/src/sentry/seer/models/seer_api_models.py
+@@ -36,6 +36,7 @@ class SeerRepoDefinition(BaseModel):
+     owner: str
+     name: str
+     external_id: str
++    is_private: bool | None = None
+     branch_name: str | None = Field(
+         default=None,
+         description="The branch that will be used, otherwise the default branch will be used.",
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+index 371a5dcca08600..9f90e1f4728e28 100644
+--- a/src/sentry/tasks/merge.py
++++ b/src/sentry/tasks/merge.py
+@@ -7,6 +7,7 @@
+ from django.db.models import F
+ 
+ from sentry import eventstream, similarity, tsdb
++from sentry.models.group import Group
+ from sentry.silo.base import SiloMode
+ from sentry.tasks.base import instrumented_task, track_group_async_operation
+ from sentry.tasks.post_process import fetch_buffered_group_stats
+@@ -27,17 +28,16 @@
+ @track_group_async_operation
+ def merge_groups(
+     from_object_ids: list[int] | None = None,
+-    to_object_id: list[int] | None = None,
++    to_object_id: int | str | None = None,
+     transaction_id: int | None = None,
+     recursed: bool = False,
+     eventstream_state: Mapping[str, Any] | None = None,
+-    **kwargs,
+ ):
+     # TODO(mattrobenolt): Write tests for all of this
+     from sentry.models.activity import Activity
+     from sentry.models.environment import Environment
+     from sentry.models.eventattachment import EventAttachment
+-    from sentry.models.group import Group, get_group_with_redirect
++    from sentry.models.group import get_group_with_redirect
+     from sentry.models.groupassignee import GroupAssignee
+     from sentry.models.groupenvironment import GroupEnvironment
+     from sentry.models.grouphash import GroupHash
+@@ -207,7 +207,14 @@ def merge_groups(
+         eventstream.backend.end_merge(eventstream_state)
+ 
+ 
+-def merge_objects(models, group, new_group, limit=1000, logger=None, transaction_id=None):
++def merge_objects(
++    models,
++    group: Group,
++    new_group: Group,
++    limit: int = 1000,
++    logger: logging.Logger | None = None,
++    transaction_id: int | None = None,
++):
+     has_more = False
+     for model in models:
+         all_fields = [f.name for f in model._meta.get_fields()]
+diff --git a/src/sentry/web/frontend/group_event_json.py b/src/sentry/web/frontend/group_event_json.py
+index 88f7f58a8cb111..c1d0b4b9c0a728 100644
+--- a/src/sentry/web/frontend/group_event_json.py
++++ b/src/sentry/web/frontend/group_event_json.py
+@@ -3,6 +3,7 @@
+ from sentry.models.group import Group, get_group_with_redirect
+ from sentry.models.groupmeta import GroupMeta
+ from sentry.services import eventstore
++from sentry.services.eventstore.models import Event, GroupEvent
+ from sentry.utils import json
+ from sentry.web.frontend.base import OrganizationView, region_silo_view
+ 
+@@ -19,6 +20,7 @@ def get(self, request: HttpRequest, organization, group_id, event_id_or_latest)
+         except Group.DoesNotExist:
+             raise Http404
+ 
++        event: Event | GroupEvent | None
+         if event_id_or_latest == "latest":
+             event = group.get_latest_event()
+         else:
+diff --git a/static/app/components/core/compactSelect/compactSelect.tsx b/static/app/components/core/compactSelect/compactSelect.tsx
+index f2524f86ae7016..eeac04be3ee455 100644
+--- a/static/app/components/core/compactSelect/compactSelect.tsx
++++ b/static/app/components/core/compactSelect/compactSelect.tsx
+@@ -123,7 +123,7 @@ export function CompactSelect<Value extends SelectKey>({
+   const [measuredMenuWidth, setMeasuredMenuWidth] = useState<number>();
+   const [hasMeasured, setHasMeasured] = useState(false);
+   const needsMeasuring =
+-    !menuWidth && !grid && !hasMeasured && shouldVirtualize(options, virtualizeThreshold);
++    !menuWidth && !hasMeasured && shouldVirtualize(options, virtualizeThreshold);
+ 
+   const menuRef = useCallback(
+     (element: HTMLDivElement | null) => {
+diff --git a/static/app/components/core/compactSelect/gridList/index.tsx b/static/app/components/core/compactSelect/gridList/index.tsx
+index 3722e6023d4f96..c7569eca663818 100644
+--- a/static/app/components/core/compactSelect/gridList/index.tsx
++++ b/static/app/components/core/compactSelect/gridList/index.tsx
+@@ -12,9 +12,11 @@ import {
+   ListWrap,
+   SelectFilterContext,
+   SizeLimitMessage,
++  useVirtualizedItems,
+   type SelectKey,
+   type SelectSection,
+ } from '@sentry/scraps/compactSelect';
++import {Container} from '@sentry/scraps/layout';
+ 
+ import {t} from 'sentry/locale';
+ 
+@@ -63,6 +65,10 @@ interface GridListProps
+    * Message to be displayed when some options are hidden due to `sizeLimit`.
+    */
+   sizeLimitMessage?: string;
++  /**
++   * If true, virtualization will be enabled for the list.
++   */
++  virtualized?: boolean;
+ }
+ 
+ /**
+@@ -82,6 +88,7 @@ function GridList({
+   onSectionToggle,
+   sizeLimitMessage,
+   keyDownHandler,
++  virtualized,
+   ...props
+ }: GridListProps) {
+   const ref = useRef<HTMLUListElement>(null);
+@@ -114,41 +121,61 @@ function GridList({
+     [listState.collection, hiddenOptions]
+   );
+ 
++  const virtualizer = useVirtualizedItems({
++    listItems,
++    virtualized,
++    size,
++  });
++
++  const mergedProps = mergeProps(gridProps, props);
++
+   return (
+     <Fragment>
+       {listItems.length !== 0 && <ListSeparator role="separator" />}
+       {listItems.length !== 0 && label && <ListLabel id={labelId}>{label}</ListLabel>}
+       {overlayIsOpen && (
+-        <ListWrap {...mergeProps(gridProps, props)} onKeyDown={onKeyDown} ref={ref}>
+-          {listItems.map(item => {
+-            if (item.type === 'section') {
+-              return (
+-                <GridListSection
+-                  key={item.key}
+-                  node={item}
+-                  listState={listState}
+-                  onToggle={onSectionToggle}
+-                  size={size}
+-                />
+-              );
+-            }
++        <Container ref={virtualizer.scrollElementRef} height="100%" overflowY="auto">
++          <Container {...virtualizer.wrapperProps}>
++            <ListWrap
++              {...mergedProps}
++              style={{...mergedProps.style, ...virtualizer.listWrapStyle}}
++              onKeyDown={onKeyDown}
++              ref={ref}
++            >
++              {virtualizer.items.map(row => {
++                const item = listItems[row.index]!;
++                if (item.type === 'section') {
++                  return (
++                    <GridListSection
++                      {...virtualizer.itemProps(row.index)}
++                      key={item.key}
++                      node={item}
++                      listState={listState}
++                      onToggle={onSectionToggle}
++                      size={size}
++                    />
++                  );
++                }
+ 
+-            return (
+-              <GridListOption
+-                key={item.key}
+-                node={item}
+-                listState={listState}
+-                size={size}
+-              />
+-            );
+-          })}
++                return (
++                  <GridListOption
++                    key={item.key}
++                    {...virtualizer.itemProps(row.index)}
++                    node={item}
++                    listState={listState}
++                    size={size}
++                  />
++                );
++              })}
+ 
+-          {!searchable && hiddenOptions.size > 0 && (
+-            <SizeLimitMessage>
+-              {sizeLimitMessage ?? t('Use search to find more options…')}
+-            </SizeLimitMessage>
+-          )}
+-        </ListWrap>
++              {!searchable && hiddenOptions.size > 0 && (
++                <SizeLimitMessage>
++                  {sizeLimitMessage ?? t('Use search to find more options…')}
++                </SizeLimitMessage>
++              )}
++            </ListWrap>
++          </Container>
++        </Container>
+       )}
+     </Fragment>
+   );
+diff --git a/static/app/components/core/compactSelect/index.tsx b/static/app/components/core/compactSelect/index.tsx
+index 75fc3f238e7cf9..410c6f2d219df2 100644
+--- a/static/app/components/core/compactSelect/index.tsx
++++ b/static/app/components/core/compactSelect/index.tsx
+@@ -44,6 +44,8 @@ export {
+   getEscapedKey,
+ } from './utils';
+ 
++export {useVirtualizedItems} from './useVirtualizedItems';
++
+ export {SelectFilterContext} from './list';
+ export {TriggerLabel} from './control';
+ 
+diff --git a/static/app/components/core/compactSelect/useVirtualizedItems.tsx b/static/app/components/core/compactSelect/useVirtualizedItems.tsx
+new file mode 100644
+index 00000000000000..a6f0ce07c4f28e
+--- /dev/null
++++ b/static/app/components/core/compactSelect/useVirtualizedItems.tsx
+@@ -0,0 +1,78 @@
++import {useRef} from 'react';
++import type {Node} from '@react-types/shared';
++import {useVirtualizer} from '@tanstack/react-virtual';
++
++import type {FormSize} from 'sentry/utils/theme';
++
++const heightEstimations = {
++  sm: {regular: 32, large: 49},
++  md: {regular: 36, large: 53},
++  xs: {regular: 25, large: 42},
++} as const satisfies Record<FormSize, {large: number; regular: number}>;
++
++// explicitly using object here because Record<PropertyKey, unknown> requires an index signature
++// eslint-disable-next-line @typescript-eslint/no-restricted-types
++type ObjectLike = object;
++
++export function useVirtualizedItems<T extends ObjectLike>({
++  listItems,
++  virtualized = false,
++  size,
++}: {
++  listItems: Array<Node<T>>;
++  size: FormSize;
++  virtualized: boolean | undefined;
++}) {
++  const scrollElementRef = useRef<HTMLDivElement>(null);
++  const heightEstimation = heightEstimations[size];
++
++  const virtualizer = useVirtualizer({
++    count: listItems.length,
++    getScrollElement: () => scrollElementRef?.current,
++    estimateSize: index => {
++      const item = listItems[index];
++      if (item?.value && 'details' in item.value) {
++        return heightEstimation.large;
++      }
++      return heightEstimation.regular;
++    },
++    enabled: virtualized,
++  });
++
++  if (virtualized) {
++    const virtualizedItems = virtualizer.getVirtualItems();
++    return {
++      items: virtualizedItems,
++      scrollElementRef,
++      itemProps: (index: number) => ({
++        ref: virtualizer.measureElement,
++        'data-index': index,
++      }),
++      wrapperProps: {
++        'data-is-virtualized': true,
++        style: {
++          height: virtualizer.getTotalSize(),
++          width: '100%',
++          position: 'relative',
++        },
++      },
++      listWrapStyle: {
++        position: 'absolute',
++        top: 0,
++        left: 0,
++        width: '100%',
++        transform: `translateY(${virtualizedItems[0]?.start ?? 0}px)`,
++      },
++    } as const;
++  }
++
++  return {
++    items: listItems.map((_, index) => ({index, start: 0})),
++    scrollElementRef: undefined,
++    itemProps: () => undefined,
++    wrapperProps: {
++      'data-is-virtualized': false,
++    },
++    listWrapStyle: {},
++  } as const;
++}
+diff --git a/static/app/components/pageFilters/environment/environmentPageFilter.tsx b/static/app/components/pageFilters/environment/environmentPageFilter.tsx
+index 5b1cc5692507f5..7137b2f102f47b 100644
+--- a/static/app/components/pageFilters/environment/environmentPageFilter.tsx
++++ b/static/app/components/pageFilters/environment/environmentPageFilter.tsx
+@@ -259,11 +259,11 @@ export function EnvironmentPageFilter({
+           <Flex gap="md" align="center" justify="end">
+             <MenuComponents.CancelButton
+               disabled={!hasStagedChanges}
+-              onClick={() => dispatch({type: 'remove staged'})}
++              onClick={() => stagedSelect.dispatch({type: 'remove staged'})}
+             />
+             <MenuComponents.ApplyButton
+               onClick={() => {
+-                dispatch({type: 'remove staged'});
++                stagedSelect.dispatch({type: 'remove staged'});
+                 handleChange(stagedSelect.value);
+               }}
+             />
+diff --git a/static/app/components/pageFilters/project/projectPageFilter.spec.tsx b/static/app/components/pageFilters/project/projectPageFilter.spec.tsx
+index 738b4eae5fbab9..5142abcfc02bbb 100644
+--- a/static/app/components/pageFilters/project/projectPageFilter.spec.tsx
++++ b/static/app/components/pageFilters/project/projectPageFilter.spec.tsx
+@@ -52,10 +52,6 @@ describe('ProjectPageFilter', () => {
+     // Open menu
+     await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+ 
+-    // There are 2 option groups
+-    expect(screen.getByRole('rowgroup', {name: 'My Projects'})).toBeInTheDocument();
+-    expect(screen.getByRole('rowgroup', {name: 'Other'})).toBeInTheDocument();
+-
+     // Select only project-1
+     await userEvent.click(screen.getByRole('row', {name: 'project-1'}));
+ 
+@@ -86,7 +82,9 @@ describe('ProjectPageFilter', () => {
+     await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
+ 
+     // Trigger button & router are updated
+-    expect(screen.getByRole('button', {name: 'project-3'})).toBeInTheDocument();
++    await waitFor(() => {
++      expect(screen.getByRole('button', {name: 'project-3'})).toBeInTheDocument();
++    });
+     expect(router.location.query).toEqual({project: '3'});
+   });
+ 
+@@ -109,7 +107,9 @@ describe('ProjectPageFilter', () => {
+       expect(screen.getByPlaceholderText('Search…')).toHaveFocus();
+     });
+ 
+-    // Move focus to Option One
++    // Move focus past the two special items ("All Projects", "My Projects") to project-1
++    await userEvent.keyboard('{ArrowDown}');
++    await userEvent.keyboard('{ArrowDown}');
+     await userEvent.keyboard('{ArrowDown}');
+     const optionOne = screen.getByRole('row', {name: 'project-1'});
+     expect(optionOne).toHaveFocus();
+@@ -206,6 +206,367 @@ describe('ProjectPageFilter', () => {
+     expect(await screen.findByRole('button', {name: 'project-2'})).toBeInTheDocument();
+   });
+ 
++  it('clicking My Projects when All Projects is active selects only non-member projects', async () => {
++    // Start with All Projects active from URL
++    PageFiltersStore.onInitializeUrlState({
++      projects: [-1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {project: '-1'}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
++
++    // Click "My Projects" while All Projects is active
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
++
++    // Both sentinels should be unchecked
++    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
++    // Member projects should be unchecked
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
++    // Non-member project should be checked
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeChecked();
++  });
++
++  it('clicking My Projects while All Projects is staged selects only non-member projects', async () => {
++    // Start with a single project selected
++    PageFiltersStore.onInitializeUrlState({
++      projects: [1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
++
++    // Stage All Projects first
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
++
++    // Now click My Projects — should subtract member projects
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
++
++    // Both sentinels should be unchecked
++    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
++    // Member projects should be unchecked
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
++    // Non-member project should be checked
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeChecked();
++  });
++
++  it('All Projects toggles all projects on; clicking again deselects everything', async () => {
++    // Start with a single project selected
++    PageFiltersStore.onInitializeUrlState({
++      projects: [1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
++
++    // Click "All Projects" — should check all projects
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
++
++    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeChecked();
++
++    // Click "All Projects" again — should deselect everything
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
++
++    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
++  });
++
++  it('unchecking all project checkboxes from All Projects leaves everything unchecked', async () => {
++    // Start with All Projects active from URL
++    PageFiltersStore.onInitializeUrlState({
++      projects: [-1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {project: '-1'}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
++
++    // Uncheck every project explicitly
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-1'}));
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-2'}));
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-3'}));
++
++    // Sentinels and project checkboxes should all be unchecked in staged state
++    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
++  });
++
++  it('My Projects toggles member projects on; clicking again deselects everything', async () => {
++    // Start with a single project selected
++    PageFiltersStore.onInitializeUrlState({
++      projects: [1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
++
++    // Click "My Projects" — should check member projects only
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
++
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
++
++    // Click "My Projects" again — should deselect everything
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
++
++    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
++  });
++
++  it('does not show All Projects separator when My Projects is visible', async () => {
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
++
++    const allProjectsRow = screen.getByRole('row', {name: /All Projects/i});
++    expect(
++      within(allProjectsRow).queryByRole('separator', {hidden: true})
++    ).not.toBeInTheDocument();
++  });
++
++  it('hides special project options when search is active', async () => {
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
++    await userEvent.type(screen.getByPlaceholderText('Search…'), 'project-1');
++
++    expect(
++      screen.queryByRole('checkbox', {name: 'Select All Projects'})
++    ).not.toBeInTheDocument();
++    expect(
++      screen.queryByRole('checkbox', {name: 'Select My Projects'})
++    ).not.toBeInTheDocument();
++    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeInTheDocument();
++  });
++
++  it('does not show All Projects or My Projects options when only one project exists', async () => {
++    const singleProject = [ProjectFixture({id: '3', slug: 'project-3', isMember: false})];
++    ProjectsStore.loadInitialData(singleProject);
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {}},
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
++
++    expect(
++      screen.queryByRole('checkbox', {name: 'Select All Projects'})
++    ).not.toBeInTheDocument();
++    expect(
++      screen.queryByRole('checkbox', {name: 'Select My Projects'})
++    ).not.toBeInTheDocument();
++    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeInTheDocument();
++  });
++
++  it('shows selection limit warning when all projects are selected explicitly', async () => {
++    const manyProjects = Array.from({length: 52}, (_, index) =>
++      ProjectFixture({
++        id: String(index + 1),
++        slug: `project-${index + 1}`,
++        isMember: true,
++      })
++    );
++    ProjectsStore.loadInitialData(manyProjects);
++
++    PageFiltersStore.onInitializeUrlState({
++      projects: Array.from({length: 51}, (_, index) => index + 1),
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {
++          pathname: '/organizations/org-slug/issues/',
++          query: {project: Array.from({length: 51}, (_, index) => String(index + 1))},
++        },
++      },
++    });
++
++    await userEvent.click(
++      screen.getByRole('button', {name: /project-1, project-2 \+49/i})
++    );
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-52'}));
++
++    expect(
++      screen.getByText(/only up to 50 can be selected at a time/i)
++    ).toBeInTheDocument();
++    expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
++  });
++
++  it('does not show selection limit warning when loaded with All Projects sentinel', async () => {
++    const manyProjects = Array.from({length: 52}, (_, index) =>
++      ProjectFixture({
++        id: String(index + 1),
++        slug: `project-${index + 1}`,
++        isMember: true,
++      })
++    );
++    ProjectsStore.loadInitialData(manyProjects);
++
++    PageFiltersStore.onInitializeUrlState({
++      projects: [-1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {
++          pathname: '/organizations/org-slug/issues/',
++          query: {project: '-1'},
++        },
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
++
++    expect(
++      screen.queryByText(/only up to 50 can be selected at a time/i)
++    ).not.toBeInTheDocument();
++    expect(screen.queryByRole('button', {name: 'Apply'})).not.toBeInTheDocument();
++  });
++
++  it('keeps All Projects sentinel in URL when opening and closing the menu', async () => {
++    const manyProjects = Array.from({length: 52}, (_, index) =>
++      ProjectFixture({
++        id: String(index + 1),
++        slug: `project-${index + 1}`,
++        isMember: true,
++      })
++    );
++    ProjectsStore.loadInitialData(manyProjects);
++
++    PageFiltersStore.onInitializeUrlState({
++      projects: [-1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    const {router} = render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {
++          pathname: '/organizations/org-slug/issues/',
++          query: {project: '-1'},
++        },
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
++    await userEvent.click(document.body);
++
++    await waitFor(() => {
++      expect(router.location.query).toEqual({project: '-1'});
++    });
++  });
++
++  it('shows selection limit warning after editing All Projects sentinel selection', async () => {
++    const manyProjects = Array.from({length: 52}, (_, index) =>
++      ProjectFixture({
++        id: String(index + 1),
++        slug: `project-${index + 1}`,
++        isMember: true,
++      })
++    );
++    ProjectsStore.loadInitialData(manyProjects);
++
++    PageFiltersStore.onInitializeUrlState({
++      projects: [-1],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {
++          pathname: '/organizations/org-slug/issues/',
++          query: {project: '-1'},
++        },
++      },
++    });
++
++    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-52'}));
++
++    expect(
++      screen.getByText(/only up to 50 can be selected at a time/i)
++    ).toBeInTheDocument();
++    expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
++  });
++
+   it('sorts projects with bookmarked appearing before non-bookmarked', async () => {
+     // Set up projects with different bookmark states
+     const projectsWithBookmarks = [
+@@ -239,7 +600,7 @@ describe('ProjectPageFilter', () => {
+     // Open menu
+     await userEvent.click(screen.getByRole('button', {name: 'selected-project'}));
+ 
+-    // Get all project rows (they're in a flat list when all are member projects)
++    // All projects are members so no special items are shown
+     const projectRows = screen.getAllByRole('row');
+ 
+     // Verify sort order:
+@@ -291,7 +652,7 @@ describe('ProjectPageFilter', () => {
+     // Open menu
+     await userEvent.click(screen.getByRole('button', {name: 'selected-project'}));
+ 
+-    // Verify initial sort order
++    // All projects are members so no special items are shown
+     let projectRows = screen.getAllByRole('row');
+     expect(projectRows).toHaveLength(4);
+     expect(within(projectRows[0]!).getByText('selected-project')).toBeInTheDocument();
+@@ -359,6 +720,125 @@ describe('ProjectPageFilter', () => {
+     MockApiClient.clearMockResponses();
+   });
+ 
++  it('deselecting My Projects does not select All Projects in the URL', async () => {
++    // Start with default empty URL = "My Projects" state
++    const {router} = render(<ProjectPageFilter />, {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/organizations/org-slug/issues/', query: {}},
++      },
++    });
++
++    // Open the menu; "My Projects" should be checked
++    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).toBeChecked();
++
++    // Deselect "My Projects"
++    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
++    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
++
++    // Apply the (empty) selection
++    await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
++
++    // URL must NOT become project=-1 (All Projects); the user did not select All Projects
++    await waitFor(() => {
++      expect(router.location.query.project).not.toBe('-1');
++    });
++  });
++
++  describe('closed-membership org defaults', () => {
++    let closedOrg: ReturnType<typeof OrganizationFixture>;
++
++    beforeEach(() => {
++      // Org without open-membership; user is a regular member
++      closedOrg = OrganizationFixture({features: [], orgRole: 'member'});
++      OrganizationStore.onUpdate(closedOrg, {replace: true});
++    });
++
++    it('shows My Projects (not All Projects) as the default in closed orgs', async () => {
++      render(<ProjectPageFilter />, {
++        organization: closedOrg,
++        initialRouterConfig: {
++          location: {pathname: '/organizations/org-slug/issues/', query: {}},
++        },
++      });
++
++      // The trigger button should say "My Projects", not "All Projects"
++      expect(
++        await screen.findByRole('button', {name: 'My Projects'})
++      ).toBeInTheDocument();
++    });
++
++    it('correctly round-trips My Projects selection in closed orgs', async () => {
++      const {router} = render(<ProjectPageFilter />, {
++        organization: closedOrg,
++        initialRouterConfig: {
++          location: {pathname: '/organizations/org-slug/issues/', query: {}},
++        },
++      });
++
++      // Open menu and confirm My Projects checkbox is checked
++      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
++      expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).toBeChecked();
++
++      // Toggle My Projects off and back on to create staged changes, making Apply available
++      await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
++      await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
++
++      // Apply My Projects — should use compact [] encoding, not explicit IDs
++      await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
++
++      // URL should use the compact [] encoding (no project param), not explicit IDs
++      await waitFor(() => {
++        expect(router.location.query.project).toBeUndefined();
++      });
++    });
++
++    it('selecting All Projects in a closed org writes project=-1 to the URL', async () => {
++      const {router} = render(<ProjectPageFilter />, {
++        organization: closedOrg,
++        initialRouterConfig: {
++          location: {pathname: '/organizations/org-slug/issues/', query: {}},
++        },
++      });
++
++      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
++      await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
++      await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
++
++      await waitFor(() => {
++        expect(router.location.query.project).toBe('-1');
++      });
++    });
++
++    it('resetting in a closed org navigates to My Projects (no project param)', async () => {
++      PageFiltersStore.onInitializeUrlState({
++        projects: [1],
++        environments: [],
++        datetime: {start: null, end: null, period: '14d', utc: null},
++      });
++
++      const {router} = render(<ProjectPageFilter />, {
++        organization: closedOrg,
++        initialRouterConfig: {
++          location: {
++            pathname: '/organizations/org-slug/issues/',
++            query: {project: '1'},
++          },
++        },
++      });
++
++      // Open menu and click Reset
++      await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
++      await userEvent.click(screen.getByRole('button', {name: 'Reset'}));
++
++      // Reset should land on My Projects (compact [] URL = no project param)
++      await waitFor(() => {
++        expect(router.location.query.project).toBeUndefined();
++      });
++    });
++  });
++
+   describe('single-project org label', () => {
+     it('shows the project name when the org has one member project auto-selected', async () => {
+       const singleProject = ProjectFixture({
+diff --git a/static/app/components/pageFilters/project/projectPageFilter.tsx b/static/app/components/pageFilters/project/projectPageFilter.tsx
+index 2297810ca83997..47ce403ff9d7ea 100644
+--- a/static/app/components/pageFilters/project/projectPageFilter.tsx
++++ b/static/app/components/pageFilters/project/projectPageFilter.tsx
+@@ -1,21 +1,14 @@
+ import {Fragment, useCallback, useMemo, useRef, useState} from 'react';
+ import {isAppleDevice} from '@react-aria/utils';
+-import isEqual from 'lodash/isEqual';
+-import partition from 'lodash/partition';
+ import sortBy from 'lodash/sortBy';
+ import xor from 'lodash/xor';
+ 
+ import {LinkButton} from '@sentry/scraps/button';
+ import {CompactSelect, MenuComponents} from '@sentry/scraps/compactSelect';
+-import type {
+-  MultipleSelectProps,
+-  SelectKey,
+-  SelectOption,
+-  SelectOptionOrSection,
+-  SelectSection,
+-} from '@sentry/scraps/compactSelect';
++import type {MultipleSelectProps, SelectOption} from '@sentry/scraps/compactSelect';
+ import {InfoTip} from '@sentry/scraps/info';
+ import {Flex, Stack} from '@sentry/scraps/layout';
++import {Separator} from '@sentry/scraps/separator';
+ import {Text} from '@sentry/scraps/text';
+ 
+ import ProjectBadge from 'sentry/components/idBadge/projectBadge';
+@@ -25,7 +18,13 @@ import {ProjectPageFilterTrigger} from 'sentry/components/pageFilters/project/pr
+ import usePageFilters from 'sentry/components/pageFilters/usePageFilters';
+ import {useStagedCompactSelect} from 'sentry/components/pageFilters/useStagedCompactSelect';
+ import {BookmarkStar} from 'sentry/components/projects/bookmarkStar';
+-import {IconAdd, IconOpen, IconSettings} from 'sentry/icons';
++import {
++  IconAdd,
++  IconAllProjects,
++  IconMyProjects,
++  IconOpen,
++  IconSettings,
++} from 'sentry/icons';
+ import {t, tct} from 'sentry/locale';
+ import type {Project} from 'sentry/types/project';
+ import {trackAnalytics} from 'sentry/utils/analytics';
+@@ -34,11 +33,16 @@ import useOrganization from 'sentry/utils/useOrganization';
+ import useProjects from 'sentry/utils/useProjects';
+ import useRouter from 'sentry/utils/useRouter';
+ import {useRoutes} from 'sentry/utils/useRoutes';
+-import {useUser} from 'sentry/utils/useUser';
+ import {makeProjectsPathname} from 'sentry/views/projects/pathname';
+ 
++/**
++ * Maximum number of projects that can be selected at a time (due to server limits). This
++ * does not apply to special values like "My Projects" and "All Projects".
++ */
++const SELECTION_COUNT_LIMIT = 50;
++
+ export interface ProjectPageFilterProps extends Partial<
+-  Omit<MultipleSelectProps<number>, 'onChange'>
++  Omit<MultipleSelectProps<number>, 'onChange' | 'sizeLimit' | 'trigger' | 'emptyMessage'>
+ > {
+   /**
+    * Called when the selection changes
+@@ -59,35 +63,35 @@ export interface ProjectPageFilterProps extends Partial<
+   storageNamespace?: string;
+ }
+ 
+-/**
+- * Maximum number of projects that can be selected at a time (due to server limits). This
+- * does not apply to special values like "My Projects" and "All Projects".
+- */
+-const SELECTION_COUNT_LIMIT = 50;
+-
+ export function ProjectPageFilter({
+   onChange,
+   onReset,
+   disabled,
+-  sizeLimit,
+-  emptyMessage,
+   menuTitle,
+   menuWidth,
+-  trigger,
+   resetParamsOnChange,
+   storageNamespace,
+   ...selectProps
+ }: ProjectPageFilterProps) {
+-  const user = useUser();
++  // External context/state
+   const router = useRouter();
+   const routes = useRoutes();
+   const organization = useOrganization();
+-
++  // Project data s
+   const {projects, initiallyLoaded: projectsLoaded} = useProjects();
++  const {
++    selection: {projects: urlProjectSelection},
++    isReady: pageFilterIsReady,
++  } = usePageFilters();
+ 
+-  // Ref to break the circular dependency: options need toggleOption, but toggleOption
+-  // comes from useStagedCompactSelect which depends on options.
+-  const toggleOptionRef = useRef<((val: number) => void) | undefined>(undefined);
++  const committedSelectionIntent = useMemo(
++    () =>
++      urlSelectionToIntent({
++        projects,
++        urlSelection: urlProjectSelection,
++      }),
++    [urlProjectSelection, projects]
++  );
+ 
+   // Track optimistically bookmarked projects to prevent star from disappearing
+   // during API call when user bookmarks and quickly moves focus
+@@ -95,173 +99,22 @@ export function ProjectPageFilter({
+     useState<Set<string>>(
+       () => new Set(projects.filter(p => p.isBookmarked).map(p => p.id))
+     );
++  const bookmarkedSnapshotRef = useRef(new Set(optimisticallyBookmarkedProjects));
+ 
+-  // Snapshot of bookmarked projects when menu opens - used for sorting to prevent
+-  // re-sorting while menu is open
+-  const bookmarkedSnapshotRef = useRef<Set<string> | undefined>(undefined);
+-
+-  if (!bookmarkedSnapshotRef.current) {
+-    bookmarkedSnapshotRef.current = new Set(optimisticallyBookmarkedProjects);
+-  }
+-
+-  const [memberProjects, otherProjects] = useMemo(
+-    () => partition(projects, project => project.isMember),
+-    [projects]
+-  );
+-
+-  const showNonMemberProjects = useMemo(() => {
+-    const isOrgAdminOrManager =
+-      organization.orgRole === 'owner' || organization.orgRole === 'manager';
+-    const isOpenMembership = organization.features.includes('open-membership');
+-
+-    return user.isSuperuser || isOrgAdminOrManager || isOpenMembership;
+-  }, [user, organization.orgRole, organization.features]);
+-
+-  const nonMemberProjects = useMemo(
+-    () => (showNonMemberProjects ? otherProjects : []),
+-    [otherProjects, showNonMemberProjects]
+-  );
+-
+-  const {
+-    selection: {projects: pageFilterValue},
+-    isReady: pageFilterIsReady,
+-  } = usePageFilters();
+-
+-  /**
+-   * Transforms a plain array of project IDs into values that can be used as page filter
+-   * URL parameters. This is necessary because some configurations have special URL
+-   * values: "My Projects" = [] and "All Projects" = [-1].
+-   */
+-  const mapNormalValueToURLValue = useCallback(
+-    (val: number[]) => {
+-      const memberProjectsSelected = memberProjects.every(p =>
+-        val.includes(parseInt(p.id, 10))
+-      );
+-
+-      // "All Projects"
+-      if (!val.length) {
+-        return [ALL_ACCESS_PROJECTS];
+-      }
+-
+-      // "My Projects"
+-      if (
+-        showNonMemberProjects &&
+-        memberProjectsSelected &&
+-        val.length === memberProjects.length
+-      ) {
+-        return [];
+-      }
+-
+-      return val;
+-    },
+-    [memberProjects, showNonMemberProjects]
+-  );
+-
+-  /**
+-   * Transforms an array of page filter URL parameters into a plain array of project
+-   * IDs. This is necessary because some URL values denote special configurations: [] =
+-   * "My Projects" and [-1] = "All Projects".
+-   */
+-  const mapURLValueToNormalValue = useCallback(
+-    (val: number[]) => {
+-      // "All Projects"
+-      if (val.includes(ALL_ACCESS_PROJECTS)) {
+-        return [];
+-      }
+-
+-      // "My Projects"
+-      if (!val.length) {
+-        return memberProjects.map(p => parseInt(p.id, 10));
+-      }
+-
+-      return val;
+-    },
+-    [memberProjects]
+-  );
+-
+-  const value = useMemo<number[]>(
+-    () => mapURLValueToNormalValue(pageFilterValue),
+-    [mapURLValueToNormalValue, pageFilterValue]
+-  );
+-
+-  const defaultValue = useMemo<number[]>(
+-    () => mapURLValueToNormalValue([]),
+-    [mapURLValueToNormalValue]
+-  );
+-
+-  const [stagedValue, setStagedValue] = useState<number[]>(value);
+-
+-  const handleChange = useCallback(
+-    async (newValue: number[]) => {
+-      if (isEqual(newValue, value)) {
+-        return;
+-      }
+-
+-      onChange?.(newValue);
+-
+-      trackAnalytics('projectselector.update', {
+-        count: newValue.length,
+-        path: getRouteStringFromRoutes(routes),
+-        organization,
+-        multi: newValue.length > 1,
+-      });
+-
+-      // Wait for the menu to close before calling onChange
+-      await new Promise(resolve => setTimeout(resolve, 0));
+-
+-      updateProjects(mapNormalValueToURLValue(newValue), router, {
+-        save: true,
+-        resetParams: resetParamsOnChange,
+-        environments: [], // Clear environments when switching projects
+-        storageNamespace,
+-      });
+-    },
+-    [
+-      value,
+-      resetParamsOnChange,
+-      router,
+-      organization,
+-      routes,
+-      onChange,
+-      mapNormalValueToURLValue,
+-      storageNamespace,
+-    ]
+-  );
++  // Staged select bridge and menu-local state
++  // Ref to break the circular dependency: options need toggleOption/dispatch, but those
++  // come from useStagedCompactSelect which depends on options.
++  const toggleOptionRef = useRef<((val: number) => void) | undefined>(undefined);
++  const dispatchRef = useRef<React.Dispatch<any> | undefined>(undefined);
+ 
+-  const onToggle = useCallback(
+-    (newValue: number[]) => {
+-      trackAnalytics('projectselector.toggle', {
+-        action: newValue.length > stagedValue.length ? 'added' : 'removed',
+-        path: getRouteStringFromRoutes(routes),
+-        organization,
+-      });
+-    },
+-    [stagedValue, routes, organization]
+-  );
++  // We need to backpropagate the staged value to the options so that we can update the UI.
++  const [stagedValue, setStagedValue] = useState<number[]>(committedSelectionIntent.ids);
+ 
+-  const onReplace = useCallback(() => {
+-    trackAnalytics('projectselector.direct_selection', {
+-      path: getRouteStringFromRoutes(routes),
+-      organization,
++  const options = useMemo<Array<SelectOption<number>>>(() => {
++    const optionSelectionIntent = selectionToIntent({
++      projects,
++      selection: stagedValue,
+     });
+-  }, [routes, organization]);
+-
+-  const handleSectionToggle = useCallback(
+-    (section: SelectSection<SelectKey>) => {
+-      trackAnalytics('projectselector.multi_button_clicked', {
+-        button_type: section.key === 'my-projects' ? 'my' : 'all',
+-        path: getRouteStringFromRoutes(routes),
+-        organization,
+-      });
+-    },
+-    [routes, organization]
+-  );
+-
+-  const options = useMemo<Array<SelectOptionOrSection<number>>>(() => {
+-    const hasProjects = !!memberProjects.length || !!nonMemberProjects.length;
+-    if (!hasProjects) {
+-      return [];
+-    }
+ 
+     const getProjectItem = (project: Project) => {
+       return {
+@@ -269,7 +122,12 @@ export function ProjectPageFilter({
+         textValue: project.slug,
+         leadingItems: ({isSelected}) => (
+           <MenuComponents.Checkbox
+-            checked={isSelected}
++            checked={
++              optionSelectionIntent.kind === 'all' ||
++              (optionSelectionIntent.kind === 'my' && project.isMember)
++                ? true
++                : isSelected
++            }
+             onChange={() => toggleOptionRef.current?.(parseInt(project.id, 10))}
+             aria-label={t('Select %s', project.slug)}
+             tabIndex={-1}
+@@ -338,134 +196,359 @@ export function ProjectPageFilter({
+             </Flex>
+           );
+         },
+-      } satisfies SelectOptionOrSection<number>;
++      } satisfies SelectOption<number>;
+     };
+ 
+-    const lastSelected = mapURLValueToNormalValue(pageFilterValue);
++    const memberProjectList = memberProjects(projects);
++    const nonMemberProjectList = nonMemberProjects(projects);
++
++    const specialItems = [
++      ...(projects.length > 1 && nonMemberProjectList.length > 0
++        ? [
++            {
++              value: ALL_ACCESS_PROJECTS,
++              label: (
++                <Flex align="center" justify="between" width="100%">
++                  <Text>{t('All Projects')}</Text>
++                  <Text size="xs" variant="muted">
++                    ({projects.length})
++                  </Text>
++                  {/* Show separator if we are not displaying My Projects */}
++                  {memberProjectList.length > 0 ? null : (
++                    <Separator
++                      orientation="horizontal"
++                      aria-hidden
++                      style={{
++                        position: 'absolute',
++                        bottom: '-8px',
++                        left: '-48px',
++                        right: 0,
++                        width: 'calc(100% + 48px)',
++                        pointerEvents: 'none',
++                      }}
++                    />
++                  )}
++                </Flex>
++              ),
++              textValue: t('All Projects'),
++              leadingItems: () => (
++                <Fragment>
++                  <MenuComponents.Checkbox
++                    checked={optionSelectionIntent.kind === 'all'}
++                    onChange={() => {
++                      dispatchRef.current?.({
++                        type: 'set staged',
++                        value:
++                          // The inverse of All Projects is an empty array
++                          optionSelectionIntent.kind === 'all'
++                            ? []
++                            : [ALL_ACCESS_PROJECTS],
++                      });
++                    }}
++                    aria-label={t('Select All Projects')}
++                    tabIndex={-1}
++                  />
++                  <IconAllProjects size="sm" variant="muted" />
++                </Fragment>
++              ),
++            } satisfies SelectOption<number>,
++          ]
++        : []),
++      ...(memberProjectList.length > 0 && memberProjectList.length < projects.length
++        ? [
++            {
++              value: MY_PROJECTS_VALUE,
++              label: (
++                <Flex align="center" justify="between" width="100%">
++                  <Text>{t('My Projects')}</Text>
++                  <Text size="xs" variant="muted">
++                    ({memberProjectList.length})
++                  </Text>
++                  <Separator
++                    orientation="horizontal"
++                    aria-hidden
++                    style={{
++                      position: 'absolute',
++                      bottom: '-8px',
++                      left: '-48px',
++                      right: 0,
++                      width: 'calc(100% + 48px)',
++                      pointerEvents: 'none',
++                    }}
++                  />
++                </Flex>
++              ),
++              textValue: t('My Projects'),
++              leadingItems: () => (
++                <Fragment>
++                  <MenuComponents.Checkbox
++                    checked={
++                      optionSelectionIntent.kind === 'all' ||
++                      optionSelectionIntent.kind === 'my'
++                    }
++                    onChange={() => {
++                      if (optionSelectionIntent.kind === 'all') {
++                        // Remove member projects from the "all" selection
++                        dispatchRef.current?.({
++                          type: 'set staged',
++                          value: nonMemberProjectIds(projects),
++                        });
++                        return;
++                      }
++                      if (optionSelectionIntent.kind === 'my') {
++                        // Deselect My Projects
++                        dispatchRef.current?.({
++                          type: 'set staged',
++                          value: [],
++                        });
++                        return;
++                      }
++                      // For 'custom' or 'none': select My Projects
++                      dispatchRef.current?.({
++                        type: 'set staged',
++                        value: [MY_PROJECTS_VALUE],
++                      });
++                    }}
++                    aria-label={t('Select My Projects')}
++                    tabIndex={-1}
++                  />
++                  <IconMyProjects size="sm" variant="muted" />
++                </Fragment>
++              ),
++            } satisfies SelectOption<number>,
++          ]
++        : []),
++    ];
++
++    // Expand the URL selection to real IDs: empty URL = My Projects = all member IDs.
++    const lastSelected = urlProjectSelection.includes(ALL_ACCESS_PROJECTS)
++      ? []
++      : urlProjectSelection.length === 0
++        ? memberProjectIds(projects)
++        : urlProjectSelection;
++
+     const listSort = (project: Project) =>
+       bookmarkedSnapshotRef.current
+         ? [
+             !lastSelected.includes(parseInt(project.id, 10)),
++            !project.isMember,
+             !bookmarkedSnapshotRef.current.has(project.id),
+             project.slug,
+           ]
+-        : [!lastSelected.includes(parseInt(project.id, 10)), project.slug];
+-
+-    return nonMemberProjects.length > 0
+-      ? [
+-          {
+-            key: 'my-projects',
+-            label: t('My Projects'),
+-            options: sortBy(memberProjects, listSort).map(getProjectItem),
+-            showToggleAllButton: true,
+-          },
+-          {
+-            key: 'no-membership-header',
+-            label:
+-              memberProjects.length > 0 ? t('Other') : t("Projects I Don't Belong To"),
+-            options: sortBy(nonMemberProjects, listSort).map(getProjectItem),
+-          },
+-        ]
+-      : sortBy(memberProjects, listSort).map(getProjectItem);
++        : [
++            !lastSelected.includes(parseInt(project.id, 10)),
++            !project.isMember,
++            project.slug,
++          ];
++
++    const projectItems = sortBy(
++      [...memberProjectList, ...nonMemberProjectList],
++      listSort
++    ).map(getProjectItem);
++
++    return [...specialItems, ...projectItems];
+   }, [
+-    organization,
+-    memberProjects,
+-    nonMemberProjects,
+-    mapURLValueToNormalValue,
++    projects,
++    stagedValue,
++    urlProjectSelection,
+     optimisticallyBookmarkedProjects,
+-    pageFilterValue,
++    organization,
+   ]);
+ 
+-  const defaultMenuWidth = useMemo(() => {
+-    const flatOptions: Array<SelectOption<number>> = options.flatMap(item =>
+-      'options' in item ? item.options : [item]
++  const routePath = useMemo(() => getRouteStringFromRoutes(routes), [routes]);
++
++  // Selection staging and commit behavior
++  const selectionLimitExceeded = useMemo(() => {
++    const stagedSelectionIntent = selectionToIntent({
++      projects,
++      selection: stagedValue,
++    });
++
++    if (stagedSelectionIntent.kind === 'my') {
++      return false;
++    }
++
++    if (stagedValue.includes(ALL_ACCESS_PROJECTS)) {
++      return false;
++    }
++    if (
++      urlProjectSelection.includes(ALL_ACCESS_PROJECTS) &&
++      stagedSelectionIntent.kind === 'all'
++    ) {
++      return false;
++    }
++
++    const realStagedValue = stagedValue.filter(
++      v => v !== ALL_ACCESS_PROJECTS && v !== MY_PROJECTS_VALUE
+     );
++    return realStagedValue.length > SELECTION_COUNT_LIMIT;
++  }, [stagedValue, urlProjectSelection, projects]);
+ 
+-    // ProjectPageFilter will try to expand to accommodate the longest project slug
+-    const longestSlugLength = flatOptions.slice(0, 25).reduce((acc, cur) => {
+-      const length = cur.textValue?.length ?? 0;
+-      return length > acc ? length : acc;
+-    }, 0);
++  const onToggle = (newValue: number[]) => {
++    trackAnalytics('projectselector.toggle', {
++      action: newValue.length > stagedValue.length ? 'added' : 'removed',
++      path: routePath,
++      organization,
++    });
++  };
++
++  const onReplace = () => {
++    trackAnalytics('projectselector.direct_selection', {
++      path: routePath,
++      organization,
++    });
++  };
++
++  const commitSelection = (newValue: number[]) => {
++    // Translate sentinel values to their actual project ID lists
++    let resolvedValue = newValue;
++    if (newValue.includes(ALL_ACCESS_PROJECTS)) {
++      resolvedValue = [];
++    } else if (newValue.includes(MY_PROJECTS_VALUE)) {
++      resolvedValue = memberProjectIds(projects);
++    }
+ 
+-    // Calculate an appropriate width for the menu. It should be between 22  and 28em.
+-    // Within that range, the width is a function of the length of the longest slug.
+-    // The project slugs take up to (longestSlugLength * 0.6)em of horizontal space
+-    // (each character occupies roughly 0.6em).
+-    // We also need to add 12em to account for padding, trailing buttons, and the checkbox.
+-    const minWidthEm = 22;
+-    return `${Math.max(minWidthEm, Math.min(28, longestSlugLength * 0.6 + 12))}em`;
+-  }, [options]);
++    onChange?.(resolvedValue);
+ 
+-  const selectionLimitExceeded = useMemo(() => {
+-    const mappedValue = mapNormalValueToURLValue(stagedValue);
+-    return mappedValue.length > SELECTION_COUNT_LIMIT;
+-  }, [stagedValue, mapNormalValueToURLValue]);
++    trackAnalytics('projectselector.update', {
++      count: resolvedValue.length,
++      path: routePath,
++      organization,
++      multi: resolvedValue.length > 1,
++    });
++
++    updateProjects(
++      toURLSelection({
++        projects,
++        // Preserve the ALL_ACCESS_PROJECTS sentinel before it gets expanded to []
++        // so toURLSelection can distinguish "All Projects selected" from "nothing selected".
++        value: newValue.includes(ALL_ACCESS_PROJECTS) ? newValue : resolvedValue,
++      }),
++      router,
++      {
++        save: true,
++        resetParams: resetParamsOnChange,
++        // Why are we clearing the environments when switching projects?
++        environments: [],
++        storageNamespace,
++      }
++    );
++  };
++
++  const filterOptionsOnSearch = useCallback(
++    (option: SelectOption<number>) =>
++      option.value !== ALL_ACCESS_PROJECTS && option.value !== MY_PROJECTS_VALUE,
++    []
++  );
+ 
+   const stagedSelect = useStagedCompactSelect({
+-    value,
++    value: committedSelectionIntent.ids,
+     options,
+-    onChange: handleChange,
++    onChange: commitSelection,
+     onStagedValueChange: setStagedValue,
+     onToggle,
+     onReplace,
+-    onSectionToggle: handleSectionToggle,
++    filterOptionsOnSearch,
+     multiple: true,
+     disableCommit: selectionLimitExceeded,
+   });
+ 
+-  // Wire up toggleOptionRef after stagedSelect is created to break the circular
+-  // dependency between options (which need toggleOption) and useStagedCompactSelect
+-  // (which needs options).
++  // Wire up refs after stagedSelect is created to break the circular dependency between
++  // options (which need toggleOption/dispatch) and useStagedCompactSelect (which needs options).
+   toggleOptionRef.current = stagedSelect.toggleOption;
++  dispatchRef.current = stagedSelect.dispatch;
+ 
+-  const {dispatch} = stagedSelect;
++  // Derived intent and UI actions
++  const clearDraftSelectionState = () => {
++    stagedSelect.dispatch({type: 'remove staged'});
++  };
+ 
+   // Merge the hook's onOpenChange (resets shift-click anchor) with the local
+   // snapshot logic (freezes the bookmark sort order while the menu is open).
+-  const handleOpenChange = useCallback(
+-    (open: boolean) => {
+-      if (open) {
+-        bookmarkedSnapshotRef.current = new Set(optimisticallyBookmarkedProjects);
+-        dispatch({type: 'reset anchor'});
+-      }
+-    },
+-    [dispatch, optimisticallyBookmarkedProjects]
+-  );
++  const handleOpenChange = (open: boolean) => {
++    if (open) {
++      bookmarkedSnapshotRef.current = new Set(optimisticallyBookmarkedProjects);
++      stagedSelect.dispatch({type: 'reset anchor'});
++    }
++  };
+ 
+-  const handleReset = useCallback(() => {
+-    dispatch({type: 'remove staged'});
+-    handleChange(defaultValue);
++  const handleReset = () => {
++    clearDraftSelectionState();
++    commitSelection(memberProjectIds(projects));
+     onReset?.();
+ 
+     trackAnalytics('projectselector.clear', {
+-      path: getRouteStringFromRoutes(routes),
++      path: routePath,
+       organization,
+     });
+-  }, [dispatch, handleChange, defaultValue, onReset, routes, organization]);
++  };
+ 
+-  const handleCancel = useCallback(() => {
++  const handleCancel = () => {
+     trackAnalytics('projectselector.cancel', {
+-      path: getRouteStringFromRoutes(routes),
++      path: routePath,
+       organization,
+     });
+-    dispatch({type: 'remove staged'});
+-  }, [dispatch, routes, organization]);
++    clearDraftSelectionState();
++  };
+ 
+-  const handleApply = useCallback(() => {
++  const handleApply = () => {
+     trackAnalytics('projectselector.apply', {
+-      count: stagedValue.length,
+-      multi: stagedValue.length > 1,
+-      path: getRouteStringFromRoutes(routes),
++      count: stagedSelect.value.length,
++      multi: stagedSelect.value.length > 1,
++      path: routePath,
+       organization,
+     });
+-    dispatch({type: 'remove staged'});
+-    handleChange(stagedSelect.value);
+-  }, [dispatch, handleChange, routes, organization, stagedSelect.value, stagedValue]);
+-
+-  const hasStagedChanges = xor(stagedSelect.value, value).length > 0;
+-  const shouldShowReset = xor(stagedSelect.value, defaultValue).length > 0;
+-
+-  const hasProjectWrite = organization.access.includes('project:write');
++    // Committing the selection immediately causes the UI to block th thread (we update QS which rerenders the entire app)
++    // This is a workaround to ensure the UI is responsive and that the menu closes immediately after a user action
++    setTimeout(() => {
++      clearDraftSelectionState();
++      commitSelection(stagedSelect.value);
++    }, 0);
++  };
++
++  const defaultMenuWidth = useMemo(() => computeMenuWidth(options), [options]);
++
++  const canWrite = organization.access.includes('project:write');
++
++  const hasUnstaggedChanges =
++    xor(stagedSelect.value, committedSelectionIntent.ids).length > 0;
++
++  const menuFooterContent =
++    selectionLimitExceeded || canWrite || hasUnstaggedChanges ? (
++      <Stack gap="md" direction="column">
++        {selectionLimitExceeded && (
++          <MenuComponents.Alert variant="warning">
++            {tct(
++              `You've selected [count] projects, but only up to [limit] can be selected at a time. Select All Projects to view all projects.`,
++              {
++                limit: SELECTION_COUNT_LIMIT,
++                count: stagedSelect.value.length,
++              }
++            )}
++          </MenuComponents.Alert>
++        )}
++        <Flex gap="md" align="center" justify={canWrite ? 'between' : 'end'}>
++          {canWrite ? (
++            <MenuComponents.CTALinkButton
++              icon={<IconAdd />}
++              to={makeProjectsPathname({path: '/new/', organization})}
++              onClick={handleApply}
++            >
++              {t('Create Project')}
++            </MenuComponents.CTALinkButton>
++          ) : undefined}
++          {hasUnstaggedChanges ? (
++            <Flex gap="md" align="center" justify="end">
++              <MenuComponents.CancelButton onClick={handleCancel} />
++              <MenuComponents.ApplyButton
++                disabled={selectionLimitExceeded}
++                onClick={handleApply}
++              />
++            </Flex>
++          ) : null}
++        </Flex>
++      </Stack>
++    ) : null;
+ 
+   return (
+     <CompactSelect
+@@ -474,8 +557,7 @@ export function ProjectPageFilter({
+       {...selectProps}
+       {...stagedSelect.compactSelectProps}
+       disabled={disabled ?? (!projectsLoaded || !pageFilterIsReady)}
+-      sizeLimit={sizeLimit ?? 25}
+-      emptyMessage={emptyMessage ?? t('No projects found')}
++      emptyMessage={t('No projects found')}
+       menuTitle={
+         menuTitle ?? (
+           <Flex gap="xs" align="center">
+@@ -494,69 +576,192 @@ export function ProjectPageFilter({
+         )
+       }
+       menuWidth={menuWidth ?? defaultMenuWidth}
++      onInteractOutside={
++        hasUnstaggedChanges
++          ? stagedSelect.compactSelectProps.onInteractOutside
++          : clearDraftSelectionState
++      }
+       onOpenChange={handleOpenChange}
+       menuHeaderTrailingItems={
+-        shouldShowReset ? <MenuComponents.ResetButton onClick={handleReset} /> : null
+-      }
+-      menuFooter={
+-        selectionLimitExceeded || hasProjectWrite || hasStagedChanges ? (
+-          <Stack gap="md" direction="column">
+-            {selectionLimitExceeded && (
+-              <MenuComponents.Alert variant="warning">
+-                {tct(
+-                  `You've selected [count] projects, but only up to [limit] can be selected at a time. Clear your selection to view all projects.`,
+-                  {
+-                    limit: SELECTION_COUNT_LIMIT,
+-                    count: stagedValue.length,
+-                  }
+-                )}
+-              </MenuComponents.Alert>
+-            )}
+-            <Flex gap="md" align="center" justify={hasProjectWrite ? 'between' : 'end'}>
+-              {hasProjectWrite ? (
+-                <MenuComponents.CTALinkButton
+-                  icon={<IconAdd />}
+-                  to={makeProjectsPathname({path: '/new/', organization})}
+-                  onClick={handleApply}
+-                >
+-                  {t('Create Project')}
+-                </MenuComponents.CTALinkButton>
+-              ) : undefined}
+-              {hasStagedChanges ? (
+-                <Flex gap="md" align="center" justify="end">
+-                  <MenuComponents.CancelButton onClick={handleCancel} />
+-                  <MenuComponents.ApplyButton
+-                    disabled={selectionLimitExceeded}
+-                    onClick={handleApply}
+-                  />
+-                </Flex>
+-              ) : null}
+-            </Flex>
+-          </Stack>
++        xor(stagedSelect.value, memberProjectIds(projects)).length > 0 ? (
++          <MenuComponents.ResetButton onClick={handleReset} />
+         ) : null
+       }
+-      trigger={
+-        trigger ??
+-        (triggerProps => (
+-          <ProjectPageFilterTrigger
+-            {...triggerProps}
+-            value={value}
+-            memberProjects={memberProjects}
+-            nonMemberProjects={nonMemberProjects}
+-            ready={projectsLoaded && pageFilterIsReady}
+-          />
+-        ))
+-      }
+-      shouldCloseOnInteractOutside={shouldCloseOnInteractOutside}
++      menuFooter={menuFooterContent}
++      trigger={triggerProps => (
++        <ProjectPageFilterTrigger
++          {...triggerProps}
++          value={committedSelectionIntent.ids}
++          memberProjects={memberProjects(projects)}
++          nonMemberProjects={nonMemberProjects(projects)}
++          ready={projectsLoaded && pageFilterIsReady}
++        />
++      )}
++      shouldCloseOnInteractOutside={target => {
++        // Don't close select menu when clicking on power hovercard ("Requires Business Plan") or disabled feature hovercard
++        const powerHovercard = target.closest('[data-test-id="power-hovercard"]');
++        const disabledFeatureHovercard = target.closest(
++          '[data-test-id="disabled-feature-hovercard"]'
++        );
++        return !powerHovercard && !disabledFeatureHovercard;
++      }}
+     />
+   );
+ }
+ 
+-function shouldCloseOnInteractOutside(target: Element) {
+-  // Don't close select menu when clicking on power hovercard ("Requires Business Plan") or disabled feature hovercard
+-  const powerHovercard = target.closest('[data-test-id="power-hovercard"]');
+-  const disabledFeatureHovercard = target.closest(
+-    '[data-test-id="disabled-feature-hovercard"]'
++/**
++ * Sentinel value for the "My Projects" quick-select option. Must be negative to avoid
++ * collision with real project IDs. ALL_ACCESS_PROJECTS (-1) is already used for
++ * "All Projects".
++ */
++const MY_PROJECTS_VALUE = -2;
++type SelectionIntentKind = 'all' | 'my' | 'custom' | 'none';
++interface SelectionIntent {
++  ids: number[];
++  kind: SelectionIntentKind;
++}
++
++/**
++ * Converts a URL project selection to a SelectionIntent.
++ *
++ * The URL uses a compact encoding: an empty array means "My Projects" (not "none"),
++ * and [-1] means "All Projects". This function decodes that encoding and delegates
++ * to selectionToIntent for non-empty, non-sentinel selections.
++ */
++function urlSelectionToIntent({
++  projects,
++  urlSelection,
++}: {
++  projects: Project[];
++  urlSelection: number[];
++}): SelectionIntent {
++  if (urlSelection.includes(ALL_ACCESS_PROJECTS)) {
++    return {kind: 'all', ids: allProjectIds(projects)};
++  }
++
++  // Empty URL = "My Projects" (not "none" — that would be no selection at all).
++  // This holds regardless of showNonMemberProjects: in closed orgs the user's member
++  // projects are their accessible projects, so the default is still "My Projects".
++  if (urlSelection.length === 0) {
++    return {kind: 'my', ids: memberProjectIds(projects)};
++  }
++
++  return selectionToIntent({
++    projects,
++    selection: urlSelection,
++  });
++}
++
++/**
++ * Converts an array of project IDs (which may contain sentinel values -1 or -2)
++ * to a SelectionIntent. Unlike urlSelectionToIntent, an empty array means "none"
++ * (no projects selected), not "My Projects".
++ */
++function selectionToIntent({
++  projects,
++  selection,
++}: {
++  projects: Project[];
++  selection: number[];
++}): SelectionIntent {
++  if (selection.length === 0) {
++    return {kind: 'none', ids: []};
++  }
++
++  if (selection.includes(ALL_ACCESS_PROJECTS)) {
++    return {kind: 'all', ids: allProjectIds(projects)};
++  }
++  if (selection.includes(MY_PROJECTS_VALUE)) {
++    return {kind: 'my', ids: memberProjectIds(projects)};
++  }
++
++  // If the user manually selected all projects
++  if (hasSameValues(selection, allProjectIds(projects))) {
++    return {kind: 'all', ids: allProjectIds(projects)};
++  }
++
++  // If the user manually selected my projects — applies regardless of showNonMemberProjects
++  // so closed-org users see the "My Projects" checkbox checked when appropriate.
++  if (hasSameValues(selection, memberProjectIds(projects))) {
++    return {kind: 'my', ids: memberProjectIds(projects)};
++  }
++
++  return {kind: 'custom', ids: selection};
++}
++
++/**
++ * Converts an internal project selection (expanded IDs) to the URL encoding.
++ * Detects when the selection equals "all projects" or "my projects" and collapses
++ * it to the compact URL representations (-1 and [] respectively).
++ */
++function toURLSelection({
++  projects,
++  value,
++}: {
++  projects: Project[];
++  value: number[];
++}): number[] {
++  if (value.includes(ALL_ACCESS_PROJECTS)) {
++    return [ALL_ACCESS_PROJECTS];
++  }
++
++  if (hasSameValues(value, allProjectIds(projects))) {
++    return [ALL_ACCESS_PROJECTS];
++  }
++
++  const memberProjectsSelected = memberProjectIds(projects).every(project =>
++    value.includes(project)
+   );
+-  return !powerHovercard && !disabledFeatureHovercard;
++
++  // "My Projects" — applies regardless of showNonMemberProjects so closed-org
++  // selections round-trip correctly through the compact [] URL encoding.
++  if (value.length === memberProjectIds(projects).length && memberProjectsSelected) {
++    return [];
++  }
++
++  return value;
++}
++
++function computeMenuWidth(options: Array<SelectOption<number>>): string {
++  // ProjectPageFilter will try to expand to accommodate the longest project slug
++  const longestSlugLength = options.reduce((acc, cur) => {
++    const length = cur.textValue?.length ?? 0;
++    return length > acc ? length : acc;
++  }, 0);
++
++  // Calculate an appropriate width for the menu. It should be between 22  and 28em.
++  // Within that range, the width is a function of the length of the longest slug.
++  // The project slugs take up to (longestSlugLength * 0.6)em of horizontal space
++  // (each character occupies roughly 0.6em).
++  // We also need to add 12em to account for padding, trailing buttons, and the checkbox.
++  return `${Math.max(22, Math.min(28, longestSlugLength * 0.6 + 12))}em`;
++}
++
++// Helper functions for data selection
++function memberProjects(projects: Project[]): Project[] {
++  return projects.filter(project => project.isMember);
++}
++
++function memberProjectIds(projects: Project[]): number[] {
++  return memberProjects(projects).map(project => parseInt(project.id, 10));
++}
++
++function nonMemberProjects(projects: Project[]): Project[] {
++  return projects.filter(project => !project.isMember);
++}
++
++function nonMemberProjectIds(projects: Project[]): number[] {
++  return nonMemberProjects(projects).map(project => parseInt(project.id, 10));
++}
++
++function allProjectIds(projects: Project[]): number[] {
++  return projects.map(project => parseInt(project.id, 10));
++}
++
++function hasSameValues(left: number[], right: number[]): boolean {
++  if (left.length !== right.length) {
++    return false;
++  }
++  const rightValues = new Set(right);
++  return left.every(value => rightValues.has(value));
+ }
+diff --git a/static/app/components/pageFilters/useStagedCompactSelect.tsx b/static/app/components/pageFilters/useStagedCompactSelect.tsx
+index ac132dcf43a9b2..b137b21386f5f6 100644
+--- a/static/app/components/pageFilters/useStagedCompactSelect.tsx
++++ b/static/app/components/pageFilters/useStagedCompactSelect.tsx
+@@ -30,7 +30,8 @@ type StagedSelectAction<Value extends SelectKey> =
+   | {type: 'remove staged'}
+   | {type: 'clear anchor'}
+   | {search: string; type: 'set search'}
+-  | {type: 'reset anchor'};
++  | {type: 'reset anchor'}
++  | {type: 'set staged'; value: Value[]};
+ 
+ function getFlatOptions<Value extends SelectKey>(
+   opts: Array<SelectOptionOrSection<Value>>
+@@ -115,6 +116,8 @@ function stagingReducer<Value extends SelectKey>(
+     }
+     case 'remove staged':
+       return {...state, stagedValue: null};
++    case 'set staged':
++      return {...state, stagedValue: action.value, lastSelected: null};
+     case 'clear anchor':
+       return {...state, lastSelected: null};
+     case 'set search':
+@@ -131,6 +134,7 @@ interface UseStagedCompactSelectOptions<Value extends SelectKey> {
+   options: Array<SelectOptionOrSection<Value>>;
+   value: Value[];
+   disableCommit?: boolean;
++  filterOptionsOnSearch?: (option: SelectOption<Value>, search: string) => boolean;
+   hasExternalChanges?: boolean;
+   multiple?: boolean;
+   onReplace?: (selected: Value) => void;
+@@ -169,6 +173,7 @@ export function useStagedCompactSelect<Value extends SelectKey>({
+   options,
+   onStagedValueChange,
+   onToggle,
++  filterOptionsOnSearch,
+   onReplace,
+   onSectionToggle,
+   multiple,
+@@ -327,6 +332,14 @@ export function useStagedCompactSelect<Value extends SelectKey>({
+   );
+ 
+   const mappedOptions = useMemo<Array<SelectOptionOrSection<Value>>>(() => {
++    const searchIsActive = state.currentSearch.trim().length > 0;
++    const shouldIncludeOption = (option: SelectOption<Value>) => {
++      if (!searchIsActive || !filterOptionsOnSearch) {
++        return true;
++      }
++      return filterOptionsOnSearch(option, state.currentSearch);
++    };
++
+     const mapOption = (option: SelectOption<Value>): SelectOption<Value> => ({
+       ...option,
+       hideCheck: true,
+@@ -371,12 +384,24 @@ export function useStagedCompactSelect<Value extends SelectKey>({
+       },
+     });
+ 
+-    return options.map(item =>
+-      'options' in item
+-        ? {...item, options: item.options.map(mapOption)}
+-        : mapOption(item)
+-    );
+-  }, [options]);
++    return options.flatMap<SelectOptionOrSection<Value>>(item => {
++      if ('options' in item) {
++        const mappedSectionOptions = item.options
++          .filter(shouldIncludeOption)
++          .map(mapOption);
++        if (mappedSectionOptions.length === 0) {
++          return [];
++        }
++        return [{...item, options: mappedSectionOptions}];
++      }
++
++      if (!shouldIncludeOption(item)) {
++        return [];
++      }
++
++      return [mapOption(item)];
++    });
++  }, [filterOptionsOnSearch, options, state.currentSearch]);
+ 
+   const [modifierActive, setModifierActive] = useState(false);
+ 
+diff --git a/static/app/components/repositoryRow.tsx b/static/app/components/repositoryRow.tsx
+index b996df34ed2873..07b1e7c774c10f 100644
+--- a/static/app/components/repositoryRow.tsx
++++ b/static/app/components/repositoryRow.tsx
+@@ -113,7 +113,8 @@ export default function RepositoryRow({
+                 }
+                 onConfirm={deleteRepo}
+                 message={t(
+-                  'Are you sure you want to remove this repository? All associated commit data will be removed in addition to the repository.'
++                  'Are you sure you want to remove %s? All associated commit data will be removed in addition to the repository.',
++                  <code>{repository.name}</code>
+                 )}
+               >
+                 <Button
+diff --git a/static/app/router/routes.tsx b/static/app/router/routes.tsx
+index e624f74041db62..3392e8a883ac41 100644
+--- a/static/app/router/routes.tsx
++++ b/static/app/router/routes.tsx
+@@ -1183,6 +1183,11 @@ function buildRoutes(): RouteObject[] {
+           // eslint-disable-next-line boundaries/element-types -- TODO: move to getsentry routes
+           component: make(() => import('getsentry/views/seerAutomation/seerAutomation')),
+         },
++        {
++          path: 'scm/',
++          // eslint-disable-next-line boundaries/element-types -- TODO: move to getsentry routes
++          component: make(() => import('getsentry/views/seerAutomation/scm')),
++        },
+         {
+           path: 'projects/',
+           // eslint-disable-next-line boundaries/element-types -- TODO: move to getsentry routes
+diff --git a/static/app/views/issueDetails/actions/index.tsx b/static/app/views/issueDetails/actions/index.tsx
+index 116fa5f57510e3..d20edf1c15748e 100644
+--- a/static/app/views/issueDetails/actions/index.tsx
++++ b/static/app/views/issueDetails/actions/index.tsx
+@@ -428,7 +428,22 @@ export function GroupActions({group, project, disabled, event}: GroupActionsProp
+             </ResolvedWrapper>
+ 
+             <Divider />
+-            {resolveCap.enabled && (
++            {resolveCap.enabled && isResolved && (
++              <Button
++                size="sm"
++                disabled={disabled || isAutoResolved}
++                onClick={() =>
++                  onUpdate({
++                    status: GroupStatus.UNRESOLVED,
++                    statusDetails: {},
++                    substatus: GroupSubstatus.ONGOING,
++                  })
++                }
++              >
++                {t('Unresolve')}
++              </Button>
++            )}
++            {isIgnored && (
+               <Button
+                 size="sm"
+                 disabled={disabled || isAutoResolved}
+@@ -440,7 +455,7 @@ export function GroupActions({group, project, disabled, event}: GroupActionsProp
+                   })
+                 }
+               >
+-                {isResolved ? t('Unresolve') : t('Unarchive')}
++                {t('Unarchive')}
+               </Button>
+             )}
+           </Flex>
+diff --git a/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTree.tsx b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTree.tsx
+new file mode 100644
+index 00000000000000..c2d86c42aed46b
+--- /dev/null
++++ b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTree.tsx
+@@ -0,0 +1,308 @@
++import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
++import styled from '@emotion/styled';
++import {useVirtualizer} from '@tanstack/react-virtual';
++
++import {LinkButton} from '@sentry/scraps/button';
++import {Flex} from '@sentry/scraps/layout';
++import {Text} from '@sentry/scraps/text';
++
++import {addSuccessMessage} from 'sentry/actionCreators/indicator';
++import {addRepository, hideRepository} from 'sentry/actionCreators/integrations';
++import LoadingError from 'sentry/components/loadingError';
++import LoadingIndicator from 'sentry/components/loadingIndicator';
++import Panel from 'sentry/components/panels/panel';
++import {t} from 'sentry/locale';
++import type {
++  Integration,
++  IntegrationRepository,
++  Repository,
++} from 'sentry/types/integrations';
++import type {InfiniteData} from 'sentry/utils/queryClient';
++import {useQueryClient} from 'sentry/utils/queryClient';
++import useApi from 'sentry/utils/useApi';
++import useOrganization from 'sentry/utils/useOrganization';
++
++import {buildIntegrationTreeNodes} from 'getsentry/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeNodes';
++import {ScmIntegrationTreeRow} from 'getsentry/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeRow';
++import {useScmIntegrationTreeData} from 'getsentry/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData';
++import type {
++  ProviderFilter,
++  RepoFilter,
++  TreeNode,
++} from 'getsentry/views/seerAutomation/types';
++
++const ROW_HEIGHT = 56;
++const BOTTOM_PADDING = 24;
++
++type Props = {
++  providerFilter: ProviderFilter;
++  repoFilter: RepoFilter;
++  search: string;
++};
++
++export function ScmIntegrationTree({search, repoFilter, providerFilter}: Props) {
++  const api = useApi();
++  const organization = useOrganization();
++  const queryClient = useQueryClient();
++  const scrollBodyRef = useRef<HTMLDivElement>(null);
++
++  const {
++    scmProviders,
++    scmIntegrations,
++    connectedIdentifiers,
++    reposByIntegrationId,
++    reposPendingByIntegrationId,
++    reposQueryKey,
++    isPending,
++    isError,
++  } = useScmIntegrationTreeData();
++
++  // Expansion state
++  const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
++  const [expandedIntegrations, setExpandedIntegrations] = useState<Set<string>>(
++    new Set()
++  );
++
++  // Expand all providers once data first loads
++  const providersInitialized = useRef(false);
++  useEffect(() => {
++    if (!providersInitialized.current && scmProviders.length > 0) {
++      providersInitialized.current = true;
++      setExpandedProviders(new Set(scmProviders.map(p => p.key)));
++    }
++  }, [scmProviders]);
++
++  // In-flight toggle state to disable checkboxes during mutation
++  const [togglingRepos, setTogglingRepos] = useState<Set<string>>(new Set());
++
++  const toggleProvider = useCallback((providerKey: string) => {
++    setExpandedProviders(prev => {
++      const next = new Set(prev);
++      if (next.has(providerKey)) {
++        next.delete(providerKey);
++      } else {
++        next.add(providerKey);
++      }
++      return next;
++    });
++  }, []);
++
++  const toggleIntegration = useCallback((integrationId: string) => {
++    setExpandedIntegrations(prev => {
++      const next = new Set(prev);
++      if (next.has(integrationId)) {
++        next.delete(integrationId);
++      } else {
++        next.add(integrationId);
++      }
++      return next;
++    });
++  }, []);
++
++  // Flatten the tree into a list based on current expansion state
++  const flatNodes = useMemo<TreeNode[]>(
++    () =>
++      buildIntegrationTreeNodes({
++        scmProviders,
++        scmIntegrations,
++        reposByIntegrationId,
++        reposPendingByIntegrationId,
++        connectedIdentifiers,
++        expandedProviders,
++        expandedIntegrations,
++        togglingRepos,
++        search,
++        repoFilter,
++        providerFilter,
++      }),
++    [
++      scmProviders,
++      scmIntegrations,
++      reposByIntegrationId,
++      reposPendingByIntegrationId,
++      connectedIdentifiers,
++      expandedProviders,
++      expandedIntegrations,
++      togglingRepos,
++      search,
++      repoFilter,
++      providerFilter,
++    ]
++  );
++
++  const virtualizer = useVirtualizer({
++    count: flatNodes.length,
++    getScrollElement: () => scrollBodyRef.current,
++    estimateSize: () => ROW_HEIGHT,
++    getItemKey: i => {
++      const node = flatNodes[i]!;
++      if (node.type === 'provider') return `provider:${node.provider.key}`;
++      if (node.type === 'integration') return `integration:${node.integration.id}`;
++      if (node.type === 'add-config') return `add-config:${node.provider.key}`;
++      if (node.type === 'no-match') return `no-match:${node.integrationId}`;
++      return `repo:${node.repo.identifier}`;
++    },
++  });
++
++  const handleToggleRepo = useCallback(
++    async (
++      repo: IntegrationRepository,
++      integration: Integration,
++      isConnected: boolean
++    ) => {
++      setTogglingRepos(prev => new Set(prev).add(repo.identifier));
++
++      try {
++        if (isConnected) {
++          // Find the connected Repository to get its id for the API call
++          const connectedRepo = queryClient
++            .getQueryData<InfiniteData<{json: Repository[]}>>(reposQueryKey as any)
++            ?.pages.flatMap(p => p.json)
++            .find(r => r.name === repo.identifier);
++
++          if (!connectedRepo) {
++            return;
++          }
++
++          const updated = await hideRepository(api, organization.slug, connectedRepo.id);
++          queryClient.setQueryData(
++            reposQueryKey as any,
++            (old: InfiniteData<{json: Repository[]}> | undefined) => {
++              if (!old) return old;
++              return {
++                ...old,
++                pages: old.pages.map(page => ({
++                  ...page,
++                  json: page.json.map(r => (r.id === updated.id ? updated : r)),
++                })),
++              };
++            }
++          );
++          addSuccessMessage(t('Removed %s', repo.name));
++        } else {
++          const newRepo = await addRepository(
++            api,
++            organization.slug,
++            repo.identifier,
++            integration
++          );
++          queryClient.setQueryData(
++            reposQueryKey as any,
++            (old: InfiniteData<{json: Repository[]}> | undefined) => {
++              if (!old) return old;
++              return {
++                ...old,
++                pages: [
++                  {...old.pages[0]!, json: [newRepo, ...(old.pages[0]?.json ?? [])]},
++                  ...old.pages.slice(1),
++                ],
++              };
++            }
++          );
++          addSuccessMessage(t('Added %s', repo.name));
++        }
++      } finally {
++        setTogglingRepos(prev => {
++          const next = new Set(prev);
++          next.delete(repo.identifier);
++          return next;
++        });
++      }
++    },
++    [api, organization.slug, queryClient, reposQueryKey]
++  );
++
++  // Dynamic height: fill remaining viewport
++  const [scrollBodyHeight, setScrollBodyHeight] = useState<number | undefined>(undefined);
++  const setScrollBodyRef = useCallback((el: HTMLDivElement | null) => {
++    scrollBodyRef.current = el;
++    if (el) {
++      requestAnimationFrame(() => {
++        const top = el.getBoundingClientRect().top;
++        setScrollBodyHeight(Math.round(top + BOTTOM_PADDING));
++      });
++    }
++  }, []);
++
++  if (isPending) {
++    return (
++      <Flex justify="center" align="center" padding="xl" style={{minHeight: 200}}>
++        <LoadingIndicator />
++      </Flex>
++    );
++  }
++
++  if (isError) {
++    return (
++      <Flex justify="center" align="center" padding="xl" style={{minHeight: 200}}>
++        <LoadingError />
++      </Flex>
++    );
++  }
++
++  if (scmProviders.length === 0) {
++    return (
++      <Flex direction="column" align="center" gap="md" padding="xl" minHeight={200}>
++        <Text size="md" variant="muted">
++          {t('No source code management integrations found.')}
++        </Text>
++        <LinkButton
++          priority="primary"
++          to={`/settings/${organization.slug}/integrations/?category=source+code+management`}
++        >
++          {t('Connect an Integration')}
++        </LinkButton>
++      </Flex>
++    );
++  }
++
++  return (
++    <TreePanel>
++      <ScrollableBody
++        ref={setScrollBodyRef}
++        style={{
++          maxHeight: scrollBodyHeight ? `calc(100vh - ${scrollBodyHeight}px)` : undefined,
++        }}
++      >
++        <VirtualInner style={{height: virtualizer.getTotalSize()}}>
++          {virtualizer.getVirtualItems().map(virtualItem => {
++            const node = flatNodes[virtualItem.index];
++            if (!node) return null;
++
++            return (
++              <ScmIntegrationTreeRow
++                key={virtualItem.key}
++                node={node}
++                style={{
++                  transform: `translateY(${virtualItem.start}px)`,
++                  height: virtualItem.size,
++                }}
++                orgSlug={organization.slug}
++                onToggleProvider={toggleProvider}
++                onToggleIntegration={toggleIntegration}
++                onToggleRepo={handleToggleRepo}
++              />
++            );
++          })}
++        </VirtualInner>
++      </ScrollableBody>
++    </TreePanel>
++  );
++}
++
++const TreePanel = styled(Panel)`
++  margin: 0;
++  width: 100%;
++  overflow: hidden;
++`;
++
++const ScrollableBody = styled('div')`
++  position: relative;
++  overflow-y: auto;
++  min-height: 0;
++`;
++
++const VirtualInner = styled('div')`
++  position: relative;
++  width: 100%;
++`;
+diff --git a/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeNodes.ts b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeNodes.ts
+new file mode 100644
+index 00000000000000..8379cd949104e5
+--- /dev/null
++++ b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeNodes.ts
+@@ -0,0 +1,116 @@
++import {isSupportedAutofixProvider} from 'sentry/components/events/autofix/utils';
++import type {
++  Integration,
++  IntegrationProvider,
++  IntegrationRepository,
++} from 'sentry/types/integrations';
++
++import type {
++  ProviderFilter,
++  RepoFilter,
++  TreeNode,
++} from 'getsentry/views/seerAutomation/types';
++
++type Props = {
++  connectedIdentifiers: Set<string>;
++  expandedIntegrations: Set<string>;
++  expandedProviders: Set<string>;
++  providerFilter: ProviderFilter;
++  repoFilter: RepoFilter;
++  reposByIntegrationId: Record<string, IntegrationRepository[]>;
++  reposPendingByIntegrationId: Record<string, boolean>;
++  scmIntegrations: Integration[];
++  scmProviders: IntegrationProvider[];
++  search: string;
++  togglingRepos: Set<string>;
++};
++
++export function buildIntegrationTreeNodes({
++  scmProviders,
++  scmIntegrations,
++  reposByIntegrationId,
++  reposPendingByIntegrationId,
++  connectedIdentifiers,
++  expandedProviders,
++  expandedIntegrations,
++  togglingRepos,
++  search,
++  repoFilter,
++  providerFilter,
++}: Props): TreeNode[] {
++  const nodes: TreeNode[] = [];
++  const query = search.trim().toLowerCase();
++
++  const visibleProviders =
++    providerFilter === 'seer-supported'
++      ? scmProviders.filter(p => isSupportedAutofixProvider({id: p.key, name: p.name}))
++      : scmProviders;
++
++  for (const provider of visibleProviders) {
++    const providerIntegrations = scmIntegrations.filter(
++      i => i.provider.key === provider.key
++    );
++
++    nodes.push({
++      type: 'provider',
++      provider,
++      isExpanded: expandedProviders.has(provider.key),
++      integrationCount: providerIntegrations.length,
++    });
++
++    if (expandedProviders.has(provider.key)) {
++      for (const integration of providerIntegrations) {
++        const repos = reposByIntegrationId[integration.id] ?? [];
++
++        nodes.push({
++          type: 'integration',
++          integration,
++          isExpanded: expandedIntegrations.has(integration.id),
++          isReposPending: reposPendingByIntegrationId[integration.id] ?? false,
++          repoCount: repos.length,
++          connectedRepoCount: repos.filter(r => connectedIdentifiers.has(r.identifier))
++            .length,
++        });
++
++        if (expandedIntegrations.has(integration.id)) {
++          let visibleRepos = query
++            ? repos.filter(r => r.name.toLowerCase().includes(query))
++            : repos;
++
++          if (repoFilter === 'connected') {
++            visibleRepos = visibleRepos.filter(r =>
++              connectedIdentifiers.has(r.identifier)
++            );
++          } else if (repoFilter === 'not-connected') {
++            visibleRepos = visibleRepos.filter(
++              r => !connectedIdentifiers.has(r.identifier)
++            );
++          }
++
++          if (visibleRepos.length === 0 && (query || repoFilter !== 'all')) {
++            nodes.push({
++              type: 'no-match',
++              integrationId: integration.id,
++              search: query,
++              repoFilter,
++            });
++          } else {
++            for (const repo of visibleRepos) {
++              nodes.push({
++                type: 'repo',
++                repo,
++                integration,
++                isConnected: connectedIdentifiers.has(repo.identifier),
++                isToggling: togglingRepos.has(repo.identifier),
++              });
++            }
++          }
++        }
++      }
++
++      // nodes.push({type: 'add-config', provider});
++    }
++  }
++
++  return nodes;
++}
+diff --git a/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeRow.tsx b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeRow.tsx
+new file mode 100644
+index 00000000000000..83ebf32f8bd794
+--- /dev/null
++++ b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTreeRow.tsx
+@@ -0,0 +1,360 @@
++import {useEffect, useState, type CSSProperties, type ReactNode} from 'react';
++import styled from '@emotion/styled';
++
++import {Badge} from '@sentry/scraps/badge';
++import {Button, LinkButton} from '@sentry/scraps/button';
++import InteractionStateLayer from '@sentry/scraps/interactionStateLayer';
++import {Flex} from '@sentry/scraps/layout';
++import {ExternalLink} from '@sentry/scraps/link';
++import {Text} from '@sentry/scraps/text';
++import {Tooltip} from '@sentry/scraps/tooltip';
++
++import {hasEveryAccess} from 'sentry/components/acl/access';
++import Confirm from 'sentry/components/confirm';
++import LoadingIndicator from 'sentry/components/loadingIndicator';
++import {IconAdd, IconChevron, IconDelete, IconOpen} from 'sentry/icons';
++import {t, tct} from 'sentry/locale';
++import type {Integration, IntegrationRepository} from 'sentry/types/integrations';
++import {isActiveSuperuser} from 'sentry/utils/isActiveSuperuser';
++import useOrganization from 'sentry/utils/useOrganization';
++import useTimeout from 'sentry/utils/useTimeout';
++
++import RepoProviderIcon from 'getsentry/views/seerAutomation/components/repoProviderIcon';
++import type {TreeNode} from 'getsentry/views/seerAutomation/types';
++
++// ---------------------------------------------------------------------------
++// Row component
++// ---------------------------------------------------------------------------
++
++type Props = {
++  node: TreeNode;
++  onToggleIntegration: (integrationId: string) => void;
++  onToggleProvider: (providerKey: string) => void;
++  onToggleRepo: (
++    repo: IntegrationRepository,
++    integration: Integration,
++    isConnected: boolean
++  ) => void;
++  orgSlug: string;
++  style: CSSProperties;
++};
++
++export function ScmIntegrationTreeRow({
++  node,
++  onToggleProvider,
++  onToggleIntegration,
++  onToggleRepo,
++  orgSlug,
++  style,
++}: Props) {
++  const organization = useOrganization();
++  const canAccess =
++    hasEveryAccess(['org:integrations'], {organization}) || isActiveSuperuser();
++
++  if (node.type === 'provider') {
++    if (node.integrationCount === 0) {
++      return (
++        <RowContainer style={style} role="row" aria-level={1}>
++          <Flex
++            align="center"
++            gap="lg"
++            flex={1}
++            height="100%"
++            paddingLeft="3xl"
++            paddingRight="lg"
++          >
++            <Flex align="center" gap="sm" flex={1} justify="between">
++              <Flex align="center" gap="sm">
++                <RepoProviderIcon
++                  provider={`integrations:${node.provider.key}`}
++                  size="sm"
++                />
++                <Text bold size="md">
++                  {node.provider.name}
++                </Text>
++              </Flex>
++
++              <Tooltip
++                disabled={canAccess}
++                position="left"
++                title={t(
++                  'You must be an organization owner, manager or admin to configure'
++                )}
++              >
++                <LinkButton
++                  size="xs"
++                  icon={<IconAdd />}
++                  to={`/settings/${orgSlug}/integrations/${node.provider.slug}/`}
++                  disabled={!canAccess}
++                >
++                  {t('Install Config')}
++                </LinkButton>
++              </Tooltip>
++            </Flex>
++          </Flex>
++        </RowContainer>
++      );
++    }
++    return (
++      <RowContainer style={style} role="row" aria-level={1}>
++        <RowButton
++          onClick={() => onToggleProvider(node.provider.key)}
++          aria-expanded={node.isExpanded}
++          aria-label={node.provider.name}
++        >
++          <InteractionStateLayer hasSelectedBackground={false} />
++          <Flex align="center" gap="lg" flex={1}>
++            <IconChevron direction={node.isExpanded ? 'down' : 'right'} size="xs" />
++            <Flex align="center" gap="sm" flex={1} justify="between">
++              <Flex align="center" gap="sm">
++                <RepoProviderIcon
++                  provider={`integrations:${node.provider.key}`}
++                  size="sm"
++                />
++                <Text bold size="md">
++                  {node.provider.name}
++                </Text>
++              </Flex>
++
++              <Flex align="center" gap="lg">
++                <Badge variant="muted">{t('%s configs', node.integrationCount)}</Badge>
++                <Tooltip
++                  disabled={canAccess}
++                  position="left"
++                  title={t(
++                    'You must be an organization owner, manager or admin to configure'
++                  )}
++                >
++                  <LinkButton
++                    size="xs"
++                    icon={<IconAdd />}
++                    to={`/settings/${orgSlug}/integrations/${node.provider.slug}/`}
++                    disabled={!canAccess}
++                  >
++                    {t('Install Config')}
++                  </LinkButton>
++                </Tooltip>
++              </Flex>
++            </Flex>
++          </Flex>
++        </RowButton>
++      </RowContainer>
++    );
++  }
++
++  if (node.type === 'integration') {
++    return (
++      <RowContainer style={style} role="row" aria-level={2}>
++        <RowButton
++          onClick={() => onToggleIntegration(node.integration.id)}
++          aria-expanded={node.isExpanded}
++          aria-label={node.integration.name}
++        >
++          <InteractionStateLayer hasSelectedBackground={false} />
++          <Flex align="center" gap="lg" flex={1} height="100%" paddingLeft="2xl">
++            <IconChevron direction={node.isExpanded ? 'down' : 'right'} size="xs" />
++            <Flex align="center" gap="sm" flex={1} height="100%" justify="between">
++              <Flex align="center" gap="sm">
++                {node.integration.icon && (
++                  <img
++                    src={node.integration.icon}
++                    alt={node.integration.name}
++                    width={16}
++                    height={16}
++                  />
++                )}
++                <Text size="md">
++                  {node.integration.name}
++                  {node.integration.domainName && (
++                    <Text variant="muted"> &mdash; {node.integration.domainName}</Text>
++                  )}
++                </Text>
++              </Flex>
++              {node.isReposPending ? (
++                <LoadingReposMessage />
++              ) : (
++                <Badge variant="muted">
++                  {t('%s/%s repos connected', node.connectedRepoCount, node.repoCount)}
++                </Badge>
++              )}
++            </Flex>
++          </Flex>
++        </RowButton>
++      </RowContainer>
++    );
++  }
++
++  if (node.type === 'no-match') {
++    let noMatchMessage: ReactNode;
++    if (node.search && node.repoFilter !== 'all') {
++      noMatchMessage =
++        node.repoFilter === 'connected'
++          ? tct('No added repos matching "[search]"', {search: node.search})
++          : tct('No unconnected repos matching "[search]"', {search: node.search});
++    } else if (node.search) {
++      noMatchMessage = tct('No repos matching "[search]"', {search: node.search});
++    } else {
++      noMatchMessage =
++        node.repoFilter === 'connected'
++          ? t('No repos have been added yet')
++          : t('All repos have been added');
++    }
++    return (
++      <RowContainer style={style} role="row" aria-level={3}>
++        <Flex align="center" gap="sm" height="100%" padding="0 lg 0 3xl">
++          <Text size="md" variant="muted">
++            {noMatchMessage}
++          </Text>
++        </Flex>
++      </RowContainer>
++    );
++  }
++
++  if (node.type === 'add-config') {
++    return (
++      <RowContainer style={style} role="row" aria-level={3}>
++        <Flex align="center" gap="sm" height="100%" justify="end" padding="0 lg 0 3xl">
++          <Tooltip
++            disabled={canAccess}
++            position="left"
++            title={t('You must be an organization owner, manager or admin to configure')}
++          >
++            <LinkButton
++              size="xs"
++              icon={<IconAdd />}
++              to={`/settings/${orgSlug}/integrations/${node.provider.slug}/`}
++              disabled={!canAccess}
++            >
++              {t('Add %s Config', node.provider.name)}
++            </LinkButton>
++          </Tooltip>
++        </Flex>
++      </RowContainer>
++    );
++  }
++
++  // node.type === 'repo'
++  return (
++    <RowContainer style={style} role="row" aria-level={3}>
++      <Flex align="center" gap="sm" height="100%" paddingRight="lg">
++        <Flex
++          flex={1}
++          align="center"
++          gap="sm"
++          height="100%"
++          marginLeft="2xl"
++          paddingLeft="3xl"
++        >
++          {node.integration.domainName ? (
++            <ExternalLink
++              href={`https://${node.integration.domainName}/${node.repo.name}`}
++            >
++              <Flex align="center" gap="sm">
++                {node.integration.domainName}/{node.repo.name}
++                <IconOpen size="xs" />
++              </Flex>
++            </ExternalLink>
++          ) : (
++            <Text size="md">{node.repo.name}</Text>
++          )}
++          {node.repo.isInstalled && !node.isConnected && (
++            <Text size="sm" variant="muted">
++              {t('Already added elsewhere')}
++            </Text>
++          )}
++        </Flex>
++        {node.isConnected ? (
++          <Tooltip
++            disabled={canAccess}
++            title={t('You must be an organization owner, manager or admin to uninstall')}
++          >
++            <Confirm
++              onConfirm={() => onToggleRepo(node.repo, node.integration, true)}
++              disabled={!canAccess || node.isToggling}
++              message={t(
++                'Are you sure you want to remove %s? All associated commit data will be removed in addition to the repository.',
++                <code>{node.repo.name}</code>
++              )}
++            >
++              <Button
++                size="xs"
++                icon={<IconDelete />}
++                disabled={!canAccess || node.isToggling}
++                aria-label={t('Remove %s', node.repo.name)}
++              >
++                {t('Remove')}
++              </Button>
++            </Confirm>
++          </Tooltip>
++        ) : (
++          <Tooltip
++            disabled={canAccess}
++            title={t('You must be an organization owner, manager or admin to configure')}
++          >
++            <Button
++              size="xs"
++              icon={<IconAdd />}
++              disabled={!canAccess || node.isToggling}
++              onClick={() => onToggleRepo(node.repo, node.integration, false)}
++              aria-label={t('Add %s', <code>{node.repo.name}</code>)}
++            >
++              {t('Add')}
++            </Button>
++          </Tooltip>
++        )}
++      </Flex>
++    </RowContainer>
++  );
++}
++
++function LoadingReposMessage() {
++  const [messageIndex, setMessageIndex] = useState(0);
++  const {start} = useTimeout({
++    timeMs: 5000,
++    onTimeout: () => {
++      setMessageIndex(prev => prev + 1);
++      start();
++    },
++  });
++  useEffect(start, [start]);
++
++  const messages = [
++    t('Loading repos...'),
++    t('Loading a few repos...'),
++    t('Loading a lot more repos...'),
++    t('This is getting interesting...'),
++    t('Almost done...'),
++    t('Just kidding, still loading...'),
++  ];
++
++  return (
++    <Flex align="center" gap="sm">
++      <Text size="sm" variant="muted">
++        {messages[messageIndex]}
++      </Text>
++      <LoadingIndicator size={16} />
++    </Flex>
++  );
++}
++
++const RowContainer = styled('div')`
++  position: absolute;
++  top: 0;
++  left: 0;
++  width: 100%;
++  border-bottom: 1px solid ${p => p.theme.tokens.border.neutral.muted};
++  &:last-child {
++    border-bottom: none;
++  }
++`;
++
++const RowButton = styled('button')`
++  display: flex;
++  width: 100%;
++  height: 100%;
++  background: none;
++  padding: 0 ${p => p.theme.space.lg} 0 ${p => p.theme.space.md};
++  border: none;
++  cursor: pointer;
++  position: relative;
++`;
+diff --git a/static/gsApp/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData.ts b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData.ts
+new file mode 100644
+index 00000000000000..a8f6686a796c7b
+--- /dev/null
++++ b/static/gsApp/views/seerAutomation/components/scmIntegrationTree/useScmIntegrationTreeData.ts
+@@ -0,0 +1,145 @@
++import {useEffect, useMemo} from 'react';
++
++import {organizationRepositoriesInfiniteOptions} from 'sentry/components/events/autofix/preferences/hooks/useOrganizationRepositories';
++import type {
++  Integration,
++  IntegrationProvider,
++  IntegrationRepository,
++  Repository,
++} from 'sentry/types/integrations';
++import {apiOptions} from 'sentry/utils/api/apiOptions';
++import {useInfiniteQuery, useQueries, useQuery} from 'sentry/utils/queryClient';
++import useOrganization from 'sentry/utils/useOrganization';
++
++type ScmIntegrationTreeData = {
++  connectedIdentifiers: Set<string>;
++  connectedRepos: Repository[];
++  isError: boolean;
++  isPending: boolean;
++  reposByIntegrationId: Record<string, IntegrationRepository[]>;
++  reposPendingByIntegrationId: Record<string, boolean>;
++  reposQueryKey: unknown;
++  scmIntegrations: Integration[];
++  scmProviders: IntegrationProvider[];
++};
++
++export function useScmIntegrationTreeData(): ScmIntegrationTreeData {
++  const organization = useOrganization();
++
++  // 1. Fetch all integration providers and filter to SCM
++  const providersQuery = useQuery(
++    apiOptions.as<{providers: IntegrationProvider[]}>()(
++      '/organizations/$organizationIdOrSlug/config/integrations/',
++      {
++        path: {organizationIdOrSlug: organization.slug},
++        staleTime: 60_000,
++      }
++    )
++  );
++
++  const scmProviders = useMemo(
++    () =>
++      (providersQuery.data?.providers ?? [])
++        .filter(p => p.metadata.features.some(f => f.featureGate.includes('commits')))
++        .sort((a, b) => a.name.localeCompare(b.name)),
++    [providersQuery.data]
++  );
++
++  const scmProviderKeys = useMemo(
++    () => new Set(scmProviders.map(p => p.key)),
++    [scmProviders]
++  );
++
++  // 2. Fetch installed integrations and filter to SCM providers
++  const integrationsQuery = useQuery(
++    apiOptions.as<Integration[]>()('/organizations/$organizationIdOrSlug/integrations/', {
++      path: {organizationIdOrSlug: organization.slug},
++      staleTime: 0,
++    })
++  );
++
++  const scmIntegrations = useMemo(
++    () => (integrationsQuery.data ?? []).filter(i => scmProviderKeys.has(i.provider.key)),
++    [integrationsQuery.data, scmProviderKeys]
++  );
++
++  // 3. Fetch already-connected repos, auto-paginate to get all
++  const reposQueryOptions = organizationRepositoriesInfiniteOptions({organization});
++  const {
++    data: reposPages,
++    hasNextPage: reposHasNextPage,
++    isFetchingNextPage: reposIsFetchingNextPage,
++    fetchNextPage: reposFetchNextPage,
++    isError: reposIsError,
++  } = useInfiniteQuery(reposQueryOptions);
++
++  useEffect(() => {
++    if (!reposIsFetchingNextPage && reposHasNextPage) {
++      reposFetchNextPage();
++    }
++  }, [reposHasNextPage, reposIsFetchingNextPage, reposFetchNextPage]);
++
++  const connectedRepos = useMemo(
++    () => reposPages?.pages.flatMap(page => page.json) ?? [],
++    [reposPages]
++  );
++
++  // Use repo.name for matching, not externalSlug. For GitLab, externalSlug is a
++  // numeric project ID which never matches IntegrationRepository.identifier.
++  // repo.name is consistently "owner/repo" format across all SCM providers.
++  const connectedIdentifiers = useMemo(
++    () => new Set(connectedRepos.map(r => r.name)),
++    [connectedRepos]
++  );
++
++  // 4. Fetch available repos for each SCM integration in parallel.
++  // Use `combine` to derive a stable Record directly from useQueries,
++  // avoiding the unstable array reference in a useMemo dependency.
++  const {reposByIntegrationId, reposPendingByIntegrationId} = useQueries({
++    queries: scmIntegrations.map(integration =>
++      apiOptions.as<{repos: IntegrationRepository[]; searchable: boolean}>()(
++        '/organizations/$organizationIdOrSlug/integrations/$integrationId/repos/',
++        {
++          path: {
++            organizationIdOrSlug: organization.slug,
++            integrationId: integration.id,
++          },
++          staleTime: 0,
++        }
++      )
++    ),
++    combine: results => ({
++      reposByIntegrationId: Object.fromEntries(
++        scmIntegrations.map((integration, i) => [
++          integration.id,
++          results[i]?.data?.repos ?? [],
++        ])
++      ),
++      reposPendingByIntegrationId: Object.fromEntries(
++        scmIntegrations.map((integration, i) => [
++          integration.id,
++          results[i]?.isPending ?? false,
++        ])
++      ),
++    }),
++  });
++
++  const isPending =
++    providersQuery.isPending ||
++    integrationsQuery.isPending ||
++    (reposPages === undefined && !reposIsError);
++
++  const isError = providersQuery.isError || integrationsQuery.isError || reposIsError;
++
++  return {
++    scmProviders,
++    scmIntegrations,
++    connectedRepos,
++    connectedIdentifiers,
++    reposByIntegrationId,
++    reposPendingByIntegrationId,
++    reposQueryKey: reposQueryOptions.queryKey,
++    isPending,
++    isError,
++  };
++}
+diff --git a/static/gsApp/views/seerAutomation/components/settingsPageTabs.tsx b/static/gsApp/views/seerAutomation/components/settingsPageTabs.tsx
+index 2c7165ed6bf1ca..c46be5d5565919 100644
+--- a/static/gsApp/views/seerAutomation/components/settingsPageTabs.tsx
++++ b/static/gsApp/views/seerAutomation/components/settingsPageTabs.tsx
+@@ -14,6 +14,7 @@ export default function SettingsPageTabs() {
+ 
+   const tabs: Array<[string, Path]> = [
+     [t('Settings'), `/settings/${organization.slug}/seer/`],
++    [t('SCM Config'), `/settings/${organization.slug}/seer/scm/`],
+     [t('Issue Autofix'), `/settings/${organization.slug}/seer/projects/`],
+     [t('Code Review'), `/settings/${organization.slug}/seer/repos/`],
+   ];
+diff --git a/static/gsApp/views/seerAutomation/scm.tsx b/static/gsApp/views/seerAutomation/scm.tsx
+new file mode 100644
+index 00000000000000..5e8b4de1b95e6a
+--- /dev/null
++++ b/static/gsApp/views/seerAutomation/scm.tsx
+@@ -0,0 +1,91 @@
++import {parseAsString, parseAsStringLiteral, useQueryState} from 'nuqs';
++
++import {CompactSelect, type SelectOption} from '@sentry/scraps/compactSelect';
++import {Input} from '@sentry/scraps/input';
++import {Flex} from '@sentry/scraps/layout';
++import {ExternalLink} from '@sentry/scraps/link';
++
++import AnalyticsArea from 'sentry/components/analyticsArea';
++import {t, tct} from 'sentry/locale';
++import SettingsPageHeader from 'sentry/views/settings/components/settingsPageHeader';
++
++import {ScmIntegrationTree} from 'getsentry/views/seerAutomation/components/scmIntegrationTree/scmIntegrationTree';
++import SeerSettingsPageContent from 'getsentry/views/seerAutomation/components/seerSettingsPageContent';
++import SeerSettingsPageWrapper from 'getsentry/views/seerAutomation/components/seerSettingsPageWrapper';
++import type {ProviderFilter, RepoFilter} from 'getsentry/views/seerAutomation/types';
++
++const REPO_FILTER_OPTIONS: Array<SelectOption<RepoFilter>> = [
++  {value: 'all' as const, label: t('All repos')},
++  {value: 'connected' as const, label: t('Connected Repos')},
++  {value: 'not-connected' as const, label: t('Disconnected Repos')},
++];
++
++const PROVIDER_FILTER_OPTIONS: Array<SelectOption<ProviderFilter>> = [
++  {value: 'seer-supported' as const, label: t('Supported by Seer')},
++  {value: 'all' as const, label: t('All providers')},
++];
++
++const providerParser = parseAsStringLiteral(
++  PROVIDER_FILTER_OPTIONS.map(option => option.value)
++).withDefault('seer-supported');
++const repoParser = parseAsStringLiteral(
++  REPO_FILTER_OPTIONS.map(option => option.value)
++).withDefault('all');
++
++export default function SeerAutomationSCM() {
++  const [searchTerm, setSearchTerm] = useQueryState(
++    'search',
++    parseAsString.withDefault('')
++  );
++  const [providerFilter, setProviderFilter] = useQueryState('provider', providerParser);
++  const [repoFilter, setRepoFilter] = useQueryState('repo', repoParser);
++
++  return (
++    <AnalyticsArea name="scm">
++      <SeerSettingsPageWrapper>
++        <SettingsPageHeader
++          title={t('Seer SCM Config')}
++          subtitle={tct(
++            `Install an SCM Integration to connect your source code to Seer. Seer needs read access to your source code to perform code review, and analyze your issues. [read_the_docs:Read the docs] and our [privacy:AI Privacy Principles] to learn more.`,
++            {
++              privacy: (
++                <ExternalLink href="https://docs.sentry.io/product/ai-in-sentry/ai-privacy-and-security/" />
++              ),
++              read_the_docs: (
++                <ExternalLink href="https://docs.sentry.io/product/ai-in-sentry/seer/#seer-capabilities" />
++              ),
++            }
++          )}
++        />
++        <SeerSettingsPageContent>
++          <Flex align="center" gap="md">
++            <CompactSelect
++              value={providerFilter}
++              onChange={(opt: SelectOption<ProviderFilter>) =>
++                setProviderFilter(opt.value)
++              }
++              options={PROVIDER_FILTER_OPTIONS}
++            />
++            <CompactSelect
++              value={repoFilter}
++              onChange={(opt: SelectOption<RepoFilter>) => setRepoFilter(opt.value)}
++              options={REPO_FILTER_OPTIONS}
++            />
++            <Input
++              value={searchTerm}
++              onChange={e => setSearchTerm(e.target.value)}
++              placeholder={t('Search repos\u2026')}
++              style={{flex: 1}}
++            />
++          </Flex>
++
++          <ScmIntegrationTree
++            providerFilter={providerFilter}
++            repoFilter={repoFilter}
++            search={searchTerm}
++          />
++        </SeerSettingsPageContent>
++      </SeerSettingsPageWrapper>
++    </AnalyticsArea>
++  );
++}
+diff --git a/static/gsApp/views/seerAutomation/types.ts b/static/gsApp/views/seerAutomation/types.ts
+new file mode 100644
+index 00000000000000..95a229168e43c2
+--- /dev/null
++++ b/static/gsApp/views/seerAutomation/types.ts
+@@ -0,0 +1,55 @@
++import type {
++  Integration,
++  IntegrationProvider,
++  IntegrationRepository,
++} from 'sentry/types/integrations';
++
++export type ProviderNode = {
++  integrationCount: number;
++  isExpanded: boolean;
++  provider: IntegrationProvider;
++  type: 'provider';
++};
++
++export type IntegrationNode = {
++  connectedRepoCount: number;
++  integration: Integration;
++  isExpanded: boolean;
++  isReposPending: boolean;
++  repoCount: number;
++  type: 'integration';
++};
++
++export type RepoNode = {
++  integration: Integration;
++  isConnected: boolean;
++  isToggling: boolean;
++  repo: IntegrationRepository;
++  type: 'repo';
++};
++
++export type AddConfigNode = {
++  provider: IntegrationProvider;
++  type: 'add-config';
++};
++
++export type NoMatchNode = {
++  integrationId: string;
++  repoFilter: RepoFilter;
++  search: string;
++  type: 'no-match';
++};
++
++export type TreeNode =
++  | ProviderNode
++  | IntegrationNode
++  | RepoNode
++  | AddConfigNode
++  | NoMatchNode;
++
++// ---------------------------------------------------------------------------
++// Builder
++// ---------------------------------------------------------------------------
++
++export type RepoFilter = 'all' | 'connected' | 'not-connected';
++export type ProviderFilter = 'seer-supported' | 'all';
+diff --git a/tests/js/setup.ts b/tests/js/setup.ts
+index 2a489cbe70b28b..0f9d13f2ca9247 100644
+--- a/tests/js/setup.ts
++++ b/tests/js/setup.ts
+@@ -240,6 +240,7 @@ jest.mock('@sentry/react', function sentryReact() {
+     withScope: jest.spyOn(SentryReact, 'withScope'),
+     withProfiler: SentryReact.withProfiler,
+     metrics: {
++      count: jest.fn(),
+       increment: jest.fn(),
+       gauge: jest.fn(),
+       set: jest.fn(),
+diff --git a/tests/sentry/api/test_event_search.py b/tests/sentry/api/test_event_search.py
+index caf9d1fcf15703..c5f846d16f72d0 100644
+--- a/tests/sentry/api/test_event_search.py
++++ b/tests/sentry/api/test_event_search.py
+@@ -25,8 +25,12 @@
+     translate_wildcard_as_clickhouse_pattern,
+ )
+ from sentry.constants import MODULE_ROOT
+-from sentry.exceptions import InvalidSearchQuery
+-from sentry.search.events.constants import WILDCARD_OPERATOR_MAP, WILDCARD_UNICODE
++from sentry.exceptions import IncompatibleMetricsQuery, InvalidSearchQuery
++from sentry.search.events.constants import (
++    TEAM_KEY_TRANSACTION_ALIAS,
++    WILDCARD_OPERATOR_MAP,
++    WILDCARD_UNICODE,
++)
+ from sentry.search.utils import parse_datetime_string, parse_duration, parse_numeric_value
+ from sentry.testutils.helpers.datetime import freeze_time
+ from sentry.utils import json
+@@ -987,6 +991,114 @@ def test_escaping_quotes(self) -> None:
+         assert isinstance(search_filter, SearchFilter)
+         assert search_filter.value.value == 'a"b'
+ 
++    def test_has_in_filter(self):
++        assert parse_search_query("release:['some_text', 'some_other_text']") == [
++            SearchFilter(
++                key=SearchKey(name="release"),
++                operator="IN",
++                value=SearchValue(
++                    [
++                        "'some_text'",
++                        "'some_other_text'",
++                    ]
++                ),
++            )
++        ]
++
++        # normal has filter
++        assert parse_search_query('has:"hi:there"') == [
++            SearchFilter(
++                key=SearchKey(name="hi:there"), operator="!=", value=SearchValue(raw_value="")
++            )
++        ]
++
++        # actual expression simplified
++        assert parse_search_query("has:release OR has:zoo") == [
++            SearchFilter(
++                key=SearchKey(name="release"),
++                operator="!=",
++                value=SearchValue(raw_value="", use_raw_value=False),
++            ),
++            "OR",
++            SearchFilter(
++                key=SearchKey(name="zoo"),
++                operator="!=",
++                value=SearchValue(raw_value="", use_raw_value=False),
++            ),
++        ]
++
++        # actual expression in parentheses
++        assert parse_search_query("(has:release OR has:zoo)") == [
++            ParenExpression(
++                children=[
++                    SearchFilter(
++                        key=SearchKey(name="release"),
++                        operator="!=",
++                        value=SearchValue(raw_value="", use_raw_value=False),
++                    ),
++                    "OR",
++                    SearchFilter(
++                        key=SearchKey(name="zoo"),
++                        operator="!=",
++                        value=SearchValue(raw_value="", use_raw_value=False),
++                    ),
++                ]
++            ),
++        ]
++
++        # same expression with has in filter:
++        assert parse_search_query("has:[release,zoo]") == [
++            ParenExpression(
++                children=[
++                    SearchFilter(
++                        key=SearchKey(name="release"),
++                        operator="!=",
++                        value=SearchValue(raw_value="", use_raw_value=False),
++                    ),
++                    "OR",
++                    SearchFilter(
++                        key=SearchKey(name="zoo"),
++                        operator="!=",
++                        value=SearchValue(raw_value="", use_raw_value=False),
++                    ),
++                ]
++            ),
++        ]
++        # malformed key
++        with pytest.raises(InvalidSearchQuery):
++            parse_search_query('has:"hi there"')
++
++    def test_not_has_team_key_transaction_allowed_when_disabled(self) -> None:
++        config = SearchConfig.create_from(default_config, allow_not_has_filter=False)
++
++        assert parse_search_query(f"!has:{TEAM_KEY_TRANSACTION_ALIAS}", config=config) == [
++            SearchFilter(
++                key=SearchKey(name=TEAM_KEY_TRANSACTION_ALIAS),
++                operator="=",
++                value=SearchValue(raw_value="", use_raw_value=False),
++            )
++        ]
++        assert parse_search_query(f"!has:[{TEAM_KEY_TRANSACTION_ALIAS}]", config=config) == [
++            ParenExpression(
++                children=[
++                    SearchFilter(
++                        key=SearchKey(name=TEAM_KEY_TRANSACTION_ALIAS),
++                        operator="=",
++                        value=SearchValue(raw_value="", use_raw_value=False),
++                    )
++                ]
++            )
++        ]
++
++    def test_not_has_raises_when_disabled(self) -> None:
++        config = SearchConfig.create_from(default_config, allow_not_has_filter=False)
++
++        with pytest.raises(IncompatibleMetricsQuery):
++            parse_search_query("!has:release", config=config)
++
++        with pytest.raises(IncompatibleMetricsQuery):
++            parse_search_query("!has:[release]", config=config)
++
+ 
+ @pytest.mark.parametrize(
+     "raw,result",
+diff --git a/tests/sentry/dashboards/endpoints/test_organization_dashboard_widget_details.py b/tests/sentry/dashboards/endpoints/test_organization_dashboard_widget_details.py
+index e9e115e445736d..d5721d77c6175a 100644
+--- a/tests/sentry/dashboards/endpoints/test_organization_dashboard_widget_details.py
++++ b/tests/sentry/dashboards/endpoints/test_organization_dashboard_widget_details.py
+@@ -1488,3 +1488,28 @@ def test_text_widget_requires_title(self) -> None:
+             )
+             assert response.status_code == 400, response.data
+             assert "title" in response.data, response.data
++
++    def test_widget_with_invalid_dataset_source(self) -> None:
++        data = {
++            "title": "Errors over time",
++            "displayType": "line",
++            "queries": [
++                {
++                    "name": "errors",
++                    "conditions": "is:unresolved",
++                    "fields": ["count()"],
++                    "columns": [],
++                    "aggregates": ["count()"],
++                },
++            ],
++            "widgetType": "error-events",
++            "datasetSource": "invalid",
++        }
++        response = self.do_request(
++            "post",
++            self.url(),
++            data=data,
++        )
++        assert response.status_code == 400, response.data
++        assert "datasetSource" in response.data, response.data
++        assert response.data["datasetSource"][0] == "Invalid dataset source"
+diff --git a/tests/sentry/search/eap/test_spans.py b/tests/sentry/search/eap/test_spans.py
+index 8e57f67182a965..215070f8774429 100644
+--- a/tests/sentry/search/eap/test_spans.py
++++ b/tests/sentry/search/eap/test_spans.py
+@@ -21,6 +21,8 @@
+ from sentry_protos.snuba.v1.trace_item_filter_pb2 import (
+     AndFilter,
+     ComparisonFilter,
++    ExistsFilter,
++    NotFilter,
+     OrFilter,
+     TraceItemFilter,
+ )
+@@ -200,6 +202,108 @@ def test_query_with_or(self) -> None:
+         )
+         assert having is None
+ 
++    def test_has_in_filter_multi_key(self) -> None:
++        """Multi-key has:[key1,key2] (event_search has_in_filter) resolves to OR of (exists + != '')."""
++        where, having, _ = self.resolver.resolve_query("has:[span.description,span.op]")
++        desc_key = AttributeKey(name="sentry.raw_description", type=AttributeKey.Type.TYPE_STRING)
++        op_key = AttributeKey(name="sentry.op", type=AttributeKey.Type.TYPE_STRING)
++        assert where == TraceItemFilter(
++            or_filter=OrFilter(
++                filters=[
++                    TraceItemFilter(
++                        and_filter=AndFilter(
++                            filters=[
++                                TraceItemFilter(
++                                    exists_filter=ExistsFilter(key=desc_key),
++                                ),
++                                TraceItemFilter(
++                                    comparison_filter=ComparisonFilter(
++                                        key=desc_key,
++                                        op=ComparisonFilter.OP_NOT_EQUALS,
++                                        value=AttributeValue(val_str=""),
++                                    )
++                                ),
++                            ]
++                        )
++                    ),
++                    TraceItemFilter(
++                        and_filter=AndFilter(
++                            filters=[
++                                TraceItemFilter(
++                                    exists_filter=ExistsFilter(key=op_key),
++                                ),
++                                TraceItemFilter(
++                                    comparison_filter=ComparisonFilter(
++                                        key=op_key,
++                                        op=ComparisonFilter.OP_NOT_EQUALS,
++                                        value=AttributeValue(val_str=""),
++                                    )
++                                ),
++                            ]
++                        )
++                    ),
++                ]
++            )
++        )
++        assert having is None
++
++    def test_not_has_in_filter_multi_key(self) -> None:
++        """Negated multi-key !has:[key1,key2] resolves to AND of (not-exists OR = '')."""
++        where, having, _ = self.resolver.resolve_query("!has:[span.description,span.op]")
++        desc_key = AttributeKey(name="sentry.raw_description", type=AttributeKey.Type.TYPE_STRING)
++        op_key = AttributeKey(name="sentry.op", type=AttributeKey.Type.TYPE_STRING)
++        assert where == TraceItemFilter(
++            and_filter=AndFilter(
++                filters=[
++                    TraceItemFilter(
++                        or_filter=OrFilter(
++                            filters=[
++                                TraceItemFilter(
++                                    not_filter=NotFilter(
++                                        filters=[
++                                            TraceItemFilter(
++                                                exists_filter=ExistsFilter(key=desc_key),
++                                            )
++                                        ]
++                                    )
++                                ),
++                                TraceItemFilter(
++                                    comparison_filter=ComparisonFilter(
++                                        key=desc_key,
++                                        op=ComparisonFilter.OP_EQUALS,
++                                        value=AttributeValue(val_str=""),
++                                    )
++                                ),
++                            ]
++                        )
++                    ),
++                    TraceItemFilter(
++                        or_filter=OrFilter(
++                            filters=[
++                                TraceItemFilter(
++                                    not_filter=NotFilter(
++                                        filters=[
++                                            TraceItemFilter(
++                                                exists_filter=ExistsFilter(key=op_key),
++                                            )
++                                        ]
++                                    )
++                                ),
++                                TraceItemFilter(
++                                    comparison_filter=ComparisonFilter(
++                                        key=op_key,
++                                        op=ComparisonFilter.OP_EQUALS,
++                                        value=AttributeValue(val_str=""),
++                                    )
++                                ),
++                            ]
++                        )
++                    ),
++                ]
++            )
++        )
++        assert having is None
++
+     def test_query_with_or_and_brackets(self) -> None:
+         where, having, _ = self.resolver.resolve_query(
+             "(span.description:123 and span.op:345) or (span.description:foo and span.op:bar)"
+diff --git a/tests/snuba/api/endpoints/test_organization_events.py b/tests/snuba/api/endpoints/test_organization_events.py
+index 98e8316f1903a5..bf521f0b6342b0 100644
+--- a/tests/snuba/api/endpoints/test_organization_events.py
++++ b/tests/snuba/api/endpoints/test_organization_events.py
+@@ -3124,6 +3124,50 @@ def test_not_has_transaction_status(self) -> None:
+             assert len(data) == 1
+             assert data[0]["count(id)"] == 0
+ 
++    def test_has_and_has_in_filter(self) -> None:
++        """Legacy path: single-key has: and multi-key has:[...] on discover dataset."""
++        self.store_event(
++            data={
++                "event_id": "a" * 32,
++                "timestamp": self.ten_mins_ago_iso,
++                "tags": {"tag_a": "1"},
++            },
++            project_id=self.project.id,
++        )
++        self.store_event(
++            data={
++                "event_id": "b" * 32,
++                "timestamp": self.ten_mins_ago_iso,
++                "tags": {"tag_b": "2"},
++            },
++            project_id=self.project.id,
++        )
++        self.store_event(
++            data={
++                "event_id": "c" * 32,
++                "timestamp": self.ten_mins_ago_iso,
++                "tags": {"tag_a": "3", "tag_c": "4"},
++            },
++            project_id=self.project.id,
++        )
++        features = {"organizations:discover-basic": True}
++        # Multi-key has:[...] (events that have tag_a OR tag_b)
++        response2 = self.do_request(
++            {
++                "field": ["id", "tag_a", "tag_b"],
++                "query": "has:[tag_a,tag_c]",
++                "sort": "id",
++                "statsPeriod": "24h",
++                "dataset": "discover",
++            },
++            features=features,
++        )
++        assert response2.status_code == 200, response2.content
++        data2 = response2.data["data"]
++        assert len(data2) == 2
++        ids2 = {r["id"] for r in data2}
++        assert ids2 == {"a" * 32, "c" * 32}
++
+     def test_tag_that_looks_like_aggregation(self) -> None:
+         data = {
+             "message": "Failure state",
+diff --git a/tests/snuba/api/endpoints/test_organization_events_span_indexed.py b/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
+index d415ee2e7b77ba..97c8cf9561eb11 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
++++ b/tests/snuba/api/endpoints/test_organization_events_span_indexed.py
+@@ -7230,3 +7230,59 @@ def test_equation_with_literal_0(self):
+                 "equation|0 * count(span.duration)": 0,
+             }
+         ]
++
++    def test_has_in_filter(self) -> None:
++        self.store_spans(
++            [
++                self.create_span(
++                    {
++                        "description": "foo",
++                        "sentry_tags": {
++                            "ttid": "ttid",
++                            "os.name": "Android",
++                        },
++                    },
++                    start_ts=self.ten_mins_ago,
++                ),
++                self.create_span(
++                    {
++                        "description": "foo",
++                        "sentry_tags": {
++                            "app_start_type": "warm",
++                            "os.name": "iOS",
++                        },
++                    },
++                    start_ts=self.ten_mins_ago,
++                ),
++                self.create_span(
++                    {
++                        "description": "foo",
++                        "sentry_tags": {"os.name": "Windows"},
++                    },
++                    start_ts=self.ten_mins_ago,
++                ),
++            ],
++        )
++        response = self.do_request(
++            {
++                "field": ["app_start_type", "ttid", "os.name"],
++                "query": "has:[ttid,app_start_type]",
++                "orderby": "app_start_type",
++                "project": self.project.id,
++                "dataset": "spans",
++            }
++        )
++
++        assert response.status_code == 200, response.content
++        data = response.data["data"]
++        meta = response.data["meta"]
++        assert len(data) == 2
++
++        ttid_row = next((r for r in data if r.get("ttid") == "ttid"), None)
++        app_start_row = next((r for r in data if r.get("app_start_type") == "warm"), None)
++        assert ttid_row is not None
++        assert ttid_row["os.name"] == "Android"
++        assert app_start_row is not None
++        assert app_start_row["os.name"] == "iOS"
++
++        assert meta["dataset"] == "spans"

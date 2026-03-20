@@ -1,92 +1,1558 @@
-diff --git a/e2e-playwright/smoke-tests-suite/panels.spec.ts b/e2e-playwright/smoke-tests-suite/panels.spec.ts
-index d502afe4f77..ef2037dcdf7 100644
---- a/e2e-playwright/smoke-tests-suite/panels.spec.ts
-+++ b/e2e-playwright/smoke-tests-suite/panels.spec.ts
-@@ -32,11 +32,11 @@ test.describe(
-       });
- 
-       const vizPicker = dashboardPage.getByGrafanaSelector(selectors.components.PanelEditor.toggleVizPicker);
--      await expect(
--        vizPicker.filter({ hasText: 'Back' }),
--        'we should be viewing the viz picker already since this is a new panel'
--      ).toBeVisible();
--      await vizPicker.click({ force: true });
+diff --git a/.github/actions/change-detection/action.yml b/.github/actions/change-detection/action.yml
+index a040c37af560f..73071e86c986f 100644
+--- a/.github/actions/change-detection/action.yml
++++ b/.github/actions/change-detection/action.yml
+@@ -78,6 +78,7 @@ runs:
+             - '.github/actions/change-detection/**'
+             - '**.cue'
+             - 'devenv/docker/blocks/*_tests/**'
++            - 'scripts/ci/backend-tests/**'
+             - 'kindsv2/**'
+             - '${{ inputs.self }}'
+           frontend:
+diff --git a/apps/dashvalidator/go.mod b/apps/dashvalidator/go.mod
+index 11e30659ce6cf..558aedafc3b19 100644
+--- a/apps/dashvalidator/go.mod
++++ b/apps/dashvalidator/go.mod
+@@ -10,6 +10,7 @@ require (
+ 	github.com/grafana/grafana/pkg/apimachinery v0.0.0
+ 	github.com/prometheus/prometheus v0.303.1
+ 	github.com/stretchr/testify v1.11.1
++	golang.org/x/sync v0.19.0
+ 	k8s.io/apimachinery v0.35.1
+ 	k8s.io/kube-openapi v0.0.0-20260127142750-a19766b6e2d4
+ )
+@@ -268,7 +269,6 @@ require (
+ 	golang.org/x/mod v0.33.0 // indirect
+ 	golang.org/x/net v0.51.0 // indirect
+ 	golang.org/x/oauth2 v0.35.0 // indirect
+-	golang.org/x/sync v0.19.0 // indirect
+ 	golang.org/x/sys v0.41.0 // indirect
+ 	golang.org/x/telemetry v0.0.0-20260209163413-e7419c687ee4 // indirect
+ 	golang.org/x/term v0.40.0 // indirect
+diff --git a/apps/dashvalidator/pkg/cache/cache.go b/apps/dashvalidator/pkg/cache/cache.go
+index 7923c46d3dbb0..dc5999ad0d814 100644
+--- a/apps/dashvalidator/pkg/cache/cache.go
++++ b/apps/dashvalidator/pkg/cache/cache.go
+@@ -6,6 +6,8 @@ import (
+ 	"net/http"
+ 	"sync"
+ 	"time"
 +
-+      // when newVizSuggestions=true the viz picker may be auto-opened
-+      if (await vizPicker.filter({ hasText: 'Back' }).isVisible()) {
-+        await vizPicker.click({ force: true });
-+      }
++	"golang.org/x/sync/singleflight"
+ )
  
-       // Loop through every panel type and ensure no crash
-       for (const [_, panel] of Object.entries(panelTypes)) {
-diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts b/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts
-index 836d6e2a2f2..a209b9a930e 100644
---- a/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts
-+++ b/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts
-@@ -21,6 +21,7 @@ import * as libAPI from 'app/features/library-panels/state/api';
+ const (
+@@ -17,9 +19,12 @@ const (
+ )
  
- import { DashboardScene } from '../scene/DashboardScene';
- import { LibraryPanelBehavior } from '../scene/LibraryPanelBehavior';
-+import { UNCONFIGURED_PANEL_PLUGIN_ID } from '../scene/UnconfiguredPanel';
- import { DashboardGridItem } from '../scene/layout-default/DashboardGridItem';
- import { DefaultGridLayoutManager } from '../scene/layout-default/DefaultGridLayoutManager';
- import { vizPanelToPanel } from '../serialization/transformSceneToSaveModel';
-@@ -374,10 +375,26 @@ describe('PanelEditor', () => {
-       });
-     });
-   });
-+  describe('isVizPickerOpen', () => {
-+    it('should not auto-open viz picker for new panels when newVizSuggestions=false', async () => {
-+      config.featureToggles.newVizSuggestions = false;
-+      const { panelEditor } = await setup({ isNewPanel: true });
-+      const optionsPane = panelEditor.state.optionsPane;
-+      expect(optionsPane?.state.isVizPickerOpen).toBe(false);
-+    });
-+
-+    it('should auto-open viz picker for new panels when newVizSuggestions=true', async () => {
-+      config.featureToggles.newVizSuggestions = true;
-+      const { panelEditor } = await setup({ isNewPanel: true, pluginId: UNCONFIGURED_PANEL_PLUGIN_ID });
-+      const optionsPane = panelEditor.state.optionsPane;
-+      expect(optionsPane?.state.isVizPickerOpen).toBe(true);
-+    });
-+  });
- });
- 
- interface SetupOptions {
-   isNewPanel?: boolean;
-+  pluginId?: string;
-   pluginSkipDataQuery?: boolean;
-   repeatByVariable?: string;
-   skipWait?: boolean;
-@@ -385,7 +402,8 @@ interface SetupOptions {
+ // cacheEntry represents a cached metrics list with expiration time.
++// The metricsSet is built eagerly alongside the slice to avoid repeated
++// []string → map[string]bool conversions on every validation call.
+ type cacheEntry struct {
+-	metrics   []string
+-	expiresAt time.Time
++	metrics    []string
++	metricsSet map[string]bool
++	expiresAt  time.Time
  }
  
- async function setup(options: SetupOptions = {}) {
--  const pluginToLoad = getPanelPlugin({ id: 'text', skipDataQuery: options.pluginSkipDataQuery });
-+  const panelPluginId = options.pluginId ?? 'text';
-+  const pluginToLoad = getPanelPlugin({ id: panelPluginId, skipDataQuery: options.pluginSkipDataQuery });
-   let pluginResolve = (plugin: PanelPlugin) => {};
+ // MetricsCache provides TTL-based caching for metrics fetched from datasources.
+@@ -31,6 +36,7 @@ type MetricsCache struct {
+ 	mu        sync.RWMutex
+ 	entries   map[string]*cacheEntry     // key: datasourceUID
+ 	providers map[string]MetricsProvider // key: datasource type (e.g., "prometheus")
++	sf        singleflight.Group         // coalesces concurrent fetches for the same datasourceUID
+ }
  
-   pluginPromise = new Promise<PanelPlugin>((resolve) => {
-@@ -394,7 +412,7 @@ async function setup(options: SetupOptions = {}) {
+ // NewMetricsCache creates a new MetricsCache.
+@@ -92,23 +98,84 @@ func (c *MetricsCache) GetMetrics(ctx context.Context, dsType, datasourceUID, da
+ 		return nil, fmt.Errorf("no metrics provider registered for datasource type: %s", dsType)
+ 	}
  
-   const panel = new VizPanel({
-     key: 'panel-1',
--    pluginId: 'text',
-+    pluginId: panelPluginId,
-     title: 'original title',
-     $data: new SceneDataTransformer({
-       transformations: [],
-diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx
-index 8d9c405b937..532f40a07de 100644
---- a/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx
-+++ b/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx
-@@ -238,7 +238,7 @@ export class PanelEditor extends SceneObjectBase<PanelEditorState> {
-         panelRef: this.state.panelRef,
-         searchQuery: '',
-         listMode: OptionFilter.All,
--        isVizPickerOpen: this.state.isNewPanel,
-+        isVizPickerOpen: panel.state.pluginId === UNCONFIGURED_PANEL_PLUGIN_ID,
-         isNewPanel: this.state.isNewPanel,
+-	// Cache miss or expired - fetch from provider
+-	result, err := provider.GetMetrics(ctx, datasourceUID, datasourceURL, client)
++	// Cache miss or expired — use singleflight to coalesce concurrent fetches
++	v, err, _ := c.sf.Do(datasourceUID, func() (any, error) {
++		// Re-check cache: another goroutine may have populated it while we waited
++		c.mu.RLock()
++		cached, exists := c.entries[datasourceUID]
++		c.mu.RUnlock()
++		if exists && time.Now().Before(cached.expiresAt) {
++			return cached.metrics, nil
++		}
++
++		result, err := provider.GetMetrics(ctx, datasourceUID, datasourceURL, client)
++		if err != nil {
++			return nil, err
++		}
++
++		// Don't cache results with zero TTL
++		if result.TTL > 0 {
++			c.mu.Lock()
++			c.entries[datasourceUID] = &cacheEntry{
++				metrics:    result.Metrics,
++				metricsSet: toMetricsSet(result.Metrics),
++				expiresAt:  time.Now().Add(result.TTL),
++			}
++			c.mu.Unlock()
++		}
++
++		return result.Metrics, nil
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	// Don't cache results with zero TTL
+-	if result.TTL > 0 {
+-		c.mu.Lock()
+-		c.entries[datasourceUID] = &cacheEntry{
+-			metrics:   result.Metrics,
+-			expiresAt: time.Now().Add(result.TTL),
+-		}
+-		c.mu.Unlock()
++	return v.([]string), nil
++}
++
++// GetMetricsSet returns the cached metrics as a set (map[string]bool) for O(1) lookup.
++// This avoids rebuilding the set from []string on every call — critical when the
++// metrics list is large (100K+ entries, ~28MB per map rebuild).
++//
++// NOTE: This method delegates to GetMetrics for fetching/caching logic.
++// If GetMetrics' caching behavior changes, this method must be updated in lockstep.
++func (c *MetricsCache) GetMetricsSet(ctx context.Context, dsType, datasourceUID, datasourceURL string,
++	client *http.Client) (map[string]bool, error) {
++	// Check cache — return the pre-built set on hit
++	c.mu.RLock()
++	cached, exists := c.entries[datasourceUID]
++	c.mu.RUnlock()
++
++	if exists && time.Now().Before(cached.expiresAt) {
++		return cached.metricsSet, nil
++	}
++
++	// Delegate to GetMetrics to handle provider lookup, fetching, and caching
++	metrics, err := c.GetMetrics(ctx, dsType, datasourceUID, datasourceURL, client)
++	if err != nil {
++		return nil, err
++	}
++
++	// Re-check cache — GetMetrics will have stored the entry (with metricsSet) if TTL > 0
++	c.mu.RLock()
++	cached, exists = c.entries[datasourceUID]
++	c.mu.RUnlock()
++
++	if exists && time.Now().Before(cached.expiresAt) {
++		return cached.metricsSet, nil
+ 	}
+ 
+-	return result.Metrics, nil
++	// Fallback: provider returned TTL=0 (explicitly opted out of caching), build set on the fly
++	return toMetricsSet(metrics), nil
++}
++
++// toMetricsSet converts a slice of metric names to a set for O(1) lookup.
++func toMetricsSet(metrics []string) map[string]bool {
++	set := make(map[string]bool, len(metrics))
++	for _, m := range metrics {
++		set[m] = true
++	}
++	return set
+ }
+ 
+ // cleanupExpired removes expired entries from the cache.
+diff --git a/apps/dashvalidator/pkg/cache/cache_test.go b/apps/dashvalidator/pkg/cache/cache_test.go
+index f07a3f0d5b4fa..dcb17f72d8fb9 100644
+--- a/apps/dashvalidator/pkg/cache/cache_test.go
++++ b/apps/dashvalidator/pkg/cache/cache_test.go
+@@ -323,3 +323,161 @@ func TestMetricsCache_RegisterProvider_DuplicateType_Panics(t *testing.T) {
+ 		cache.RegisterProvider("duplicate", mockProv)
+ 	})
+ }
++
++// ============================================================================
++// Category 7: GetMetricsSet Behavior
++// ============================================================================
++
++func TestMetricsCache_GetMetricsSet_CacheMiss_ReturnsSet(t *testing.T) {
++	mockProv := &mockProvider{
++		metrics: []string{"metric_a", "metric_b"},
++		ttl:     5 * time.Minute,
++	}
++	cache := setupTest(mockProv)
++
++	set, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++
++	require.NoError(t, err)
++	require.Len(t, set, 2)
++	require.True(t, set["metric_a"])
++	require.True(t, set["metric_b"])
++	require.False(t, set["nonexistent"])
++	require.Equal(t, 1, mockProv.getCallCount())
++}
++
++func TestMetricsCache_GetMetricsSet_CacheHit_ReturnsCachedSet(t *testing.T) {
++	mockProv := &mockProvider{
++		metrics: []string{"metric_a", "metric_b"},
++		ttl:     5 * time.Minute,
++	}
++	cache := setupTest(mockProv)
++
++	// First call - cache miss
++	set1, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.Equal(t, 1, mockProv.getCallCount())
++
++	// Second call - cache hit
++	set2, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.Equal(t, 1, mockProv.getCallCount()) // Still 1, no new call
++	require.Equal(t, set1, set2)
++}
++
++func TestMetricsCache_GetMetricsSet_ZeroTTL_BuildsSetOnTheFly(t *testing.T) {
++	mockProv := &mockProvider{
++		metrics: []string{"metric_a", "metric_b"},
++		ttl:     0, // Zero TTL - don't cache
++	}
++	cache := setupTest(mockProv)
++
++	// First call - provider returns TTL=0, so GetMetrics skips caching.
++	// GetMetricsSet falls through to toMetricsSet() on the returned slice.
++	set, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.Len(t, set, 2)
++	require.True(t, set["metric_a"])
++	require.True(t, set["metric_b"])
++	require.Equal(t, 1, mockProv.getCallCount())
++
++	// Second call - no cache entry exists, so provider is called again
++	set2, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.Len(t, set2, 2)
++	require.True(t, set2["metric_a"])
++	require.Equal(t, 2, mockProv.getCallCount())
++}
++
++func TestMetricsCache_GetMetricsSet_ProviderError_ReturnsError(t *testing.T) {
++	providerErr := errors.New("connection refused")
++	mockProv := &mockProvider{
++		err: providerErr,
++	}
++	cache := setupTest(mockProv)
++
++	set, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++
++	require.Error(t, err)
++	require.ErrorIs(t, err, providerErr)
++	require.Nil(t, set)
++}
++
++func TestMetricsCache_GetMetricsSet_ExpiredEntry_FetchesAgain(t *testing.T) {
++	mockProv := &mockProvider{
++		metrics: []string{"metric_a"},
++		ttl:     10 * time.Millisecond, // Very short TTL
++	}
++	cache := setupTest(mockProv)
++
++	// First call
++	set1, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.True(t, set1["metric_a"])
++	require.Equal(t, 1, mockProv.getCallCount())
++
++	// Wait for TTL to expire
++	time.Sleep(20 * time.Millisecond)
++
++	// Second call after expiration
++	set2, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.True(t, set2["metric_a"])
++	require.Equal(t, 2, mockProv.getCallCount())
++}
++
++func TestMetricsCache_GetMetricsSet_AfterGetMetrics_UsesCachedSet(t *testing.T) {
++	mockProv := &mockProvider{
++		metrics: []string{"metric_a", "metric_b"},
++		ttl:     5 * time.Minute,
++	}
++	cache := setupTest(mockProv)
++
++	// Populate cache via GetMetrics (builds metricsSet eagerly)
++	_, err := cache.GetMetrics(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.Equal(t, 1, mockProv.getCallCount())
++
++	// GetMetricsSet should return the pre-built set without calling the provider
++	set, err := cache.GetMetricsSet(context.Background(), "test", "ds-uid-1", "http://prom:9090", nil)
++	require.NoError(t, err)
++	require.Len(t, set, 2)
++	require.True(t, set["metric_a"])
++	require.True(t, set["metric_b"])
++	require.Equal(t, 1, mockProv.getCallCount()) // No additional provider call
++}
++
++func TestMetricsCache_GetMetricsSet_ConcurrentAccess_ThreadSafe(t *testing.T) {
++	mockProv := &mockProvider{
++		metrics: []string{"metric_a", "metric_b"},
++		ttl:     5 * time.Minute,
++	}
++	cache := setupTest(mockProv)
++
++	var wg sync.WaitGroup
++	errCount := atomic.Int32{}
++
++	for i := range 100 {
++		wg.Add(1)
++		go func(idx int) {
++			defer wg.Done()
++			uid := "ds-uid-1"
++			if idx%2 == 0 {
++				uid = "ds-uid-2"
++			}
++			set, err := cache.GetMetricsSet(context.Background(), "test", uid, "http://prom:9090", nil)
++			if err != nil {
++				errCount.Add(1)
++				return
++			}
++			if len(set) != 2 || !set["metric_a"] || !set["metric_b"] {
++				errCount.Add(1)
++			}
++		}(i)
++	}
++
++	wg.Wait()
++	require.Equal(t, int32(0), errCount.Load())
++	callCount := mockProv.getCallCount()
++	require.GreaterOrEqual(t, callCount, 2, "should have at least 2 calls (one per UID)")
++	require.LessOrEqual(t, callCount, 10, "should have at most 10 calls (cache should help)")
++}
+diff --git a/apps/dashvalidator/pkg/validator/benchmark_test.go b/apps/dashvalidator/pkg/validator/benchmark_test.go
+new file mode 100644
+index 0000000000000..1841799e74e5b
+--- /dev/null
++++ b/apps/dashvalidator/pkg/validator/benchmark_test.go
+@@ -0,0 +1,321 @@
++package validator
++
++import (
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++)
++
++// promQLPool contains realistic PromQL expressions sourced from real Grafana dashboards.
++// Used by buildDashboardJSON to generate realistic benchmark fixtures.
++// Queries are selected round-robin (deterministic, no randomness in benchmarks).
++var promQLPool = []string{
++	`up{job="api"}`,
++	`rate(http_requests_total{job="api", method="GET"}[$__rate_interval])`,
++	`sum(rate(container_cpu_usage_seconds_total{namespace="default"}[5m])) by (pod)`,
++	`histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))`,
++	`node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes`,
++	`process_cpu_seconds_total`,
++	`sum by (instance) (irate(node_cpu_seconds_total{mode!="idle"}[$__rate_interval]))`,
++	`increase(http_requests_total{status=~"5.."}[5m])`,
++	`avg_over_time(probe_duration_seconds[5m])`,
++	`rate(prometheus_tsdb_head_samples_appended_total[$__rate_interval])`,
++	`(node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} - node_filesystem_free_bytes{fstype!~"tmpfs|overlay"}) / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}`,
++	`sum(rate(grpc_server_handled_total{grpc_code!="OK"}[5m])) / sum(rate(grpc_server_handled_total[5m]))`,
++	`kube_pod_container_status_restarts_total`,
++	`container_memory_working_set_bytes{container!=""}`,
++	`kubelet_running_pods`,
++	`coredns_dns_request_duration_seconds_count`,
++	`etcd_server_has_leader`,
++	`scheduler_e2e_scheduling_duration_seconds_count`,
++	`apiserver_request_total{code=~"2.."}`,
++	`workqueue_depth{name="resource_quota"}`,
++}
++
++// concreteUID is the datasource UID used for most panels (post-interpolation).
++const concreteUID = "eexrapfb04hz4d"
++
++// buildDashboardJSON creates a realistic v1 Grafana dashboard with flat panels only.
++// Uses buildPanel for panel construction. For dashboards with collapsed rows, use
++// buildDashboardJSONWithRows instead.
++func buildDashboardJSON(panelCount, queriesPerPanel int) map[string]any {
++	panels := make([]any, 0, panelCount)
++	queryIndex := 0
++
++	for p := range panelCount {
++		dsUID := concreteUID
++		if p%10 == 9 {
++			dsUID = "$datasource"
++		}
++		panels = append(panels, buildPanel(p+1, dsUID, queriesPerPanel, &queryIndex))
++	}
++
++	return map[string]any{
++		"annotations": map[string]any{
++			"list": []any{},
++		},
++		"editable":      true,
++		"panels":        panels,
++		"schemaVersion": 39,
++		"tags":          []any{"benchmark"},
++		"templating": map[string]any{
++			"list": []any{},
++		},
++		"time": map[string]any{
++			"from": "now-1h",
++			"to":   "now",
++		},
++		"title":   fmt.Sprintf("Benchmark Dashboard (%d panels)", panelCount),
++		"uid":     "benchmark-uid",
++		"version": 1,
++	}
++}
++
++// buildPanel creates a single timeseries panel with the given queries.
++// Shared by both buildDashboardJSON and buildDashboardJSONWithRows.
++func buildPanel(id int, dsUID string, queriesPerPanel int, queryIndex *int) map[string]any {
++	targets := make([]any, 0, queriesPerPanel)
++	for q := range queriesPerPanel {
++		refID := string(rune('A' + q))
++		targets = append(targets, map[string]any{
++			"datasource": map[string]any{
++				"type": "prometheus",
++				"uid":  dsUID,
++			},
++			"expr":         promQLPool[*queryIndex%len(promQLPool)],
++			"format":       "time_series",
++			"hide":         false,
++			"interval":     "30s",
++			"legendFormat": fmt.Sprintf("{{instance}} panel %d query %s", id, refID),
++			"refId":        refID,
++		})
++		*queryIndex++
++	}
++
++	return map[string]any{
++		"datasource": map[string]any{
++			"type": "prometheus",
++			"uid":  dsUID,
++		},
++		"fieldConfig": map[string]any{
++			"defaults": map[string]any{
++				"color": map[string]any{
++					"mode": "palette-classic",
++				},
++				"custom": map[string]any{
++					"drawStyle":   "line",
++					"fillOpacity": 10,
++					"lineWidth":   1,
++				},
++				"thresholds": map[string]any{
++					"mode": "absolute",
++					"steps": []any{
++						map[string]any{"color": "green"},
++						map[string]any{"color": "red", "value": 80},
++					},
++				},
++			},
++			"overrides": []any{},
++		},
++		"gridPos": map[string]any{
++			"h": 8,
++			"w": 12,
++			"x": ((id - 1) % 2) * 12,
++			"y": ((id - 1) / 2) * 8,
++		},
++		"id":            id,
++		"options":       map[string]any{},
++		"pluginVersion": "10.0.0",
++		"targets":       targets,
++		"title":         fmt.Sprintf("Panel %d", id),
++		"type":          "timeseries",
++	}
++}
++
++// buildDashboardJSONWithRows creates a dashboard that mixes flat panels and collapsed rows
++// with nested panels, mirroring the structure of real dashboards like Node Exporter Full
++// (grafana.com/dashboards/1860). In that dashboard, ~77% of panels are inside collapsed rows.
++//
++// Parameters:
++//   - flatPanels: number of top-level panels (not inside rows)
++//   - rows: number of collapsed row panels
++//   - panelsPerRow: number of nested panels inside each row
++//   - queriesPerPanel: queries per panel (both flat and nested)
++func buildDashboardJSONWithRows(flatPanels, rows, panelsPerRow, queriesPerPanel int) map[string]any {
++	panels := make([]any, 0, flatPanels+rows)
++	queryIndex := 0
++	panelID := 1
++
++	// Flat panels (not inside rows)
++	for range flatPanels {
++		dsUID := concreteUID
++		if panelID%10 == 0 {
++			dsUID = "$datasource"
++		}
++		panels = append(panels, buildPanel(panelID, dsUID, queriesPerPanel, &queryIndex))
++		panelID++
++	}
++
++	// Collapsed rows with nested panels
++	for r := range rows {
++		nested := make([]any, 0, panelsPerRow)
++		for range panelsPerRow {
++			dsUID := concreteUID
++			if panelID%10 == 0 {
++				dsUID = "$datasource"
++			}
++			nested = append(nested, buildPanel(panelID, dsUID, queriesPerPanel, &queryIndex))
++			panelID++
++		}
++
++		row := map[string]any{
++			"type":      "row",
++			"title":     fmt.Sprintf("Row %d", r+1),
++			"collapsed": true,
++			"panels":    nested,
++			"id":        panelID,
++			"gridPos":   map[string]any{"h": 1, "w": 24, "x": 0, "y": 0},
++		}
++		panels = append(panels, row)
++		panelID++
++	}
++
++	totalPanels := flatPanels + rows*panelsPerRow
++	return map[string]any{
++		"annotations": map[string]any{
++			"list": []any{},
++		},
++		"editable":      true,
++		"panels":        panels,
++		"schemaVersion": 39,
++		"tags":          []any{"benchmark"},
++		"templating": map[string]any{
++			"list": []any{},
++		},
++		"time": map[string]any{
++			"from": "now-1h",
++			"to":   "now",
++		},
++		"title":   fmt.Sprintf("Benchmark Dashboard (%d panels, %d rows)", totalPanels, rows),
++		"uid":     "benchmark-rows-uid",
++		"version": 1,
++	}
++}
++
++// TestPerformanceBaseline_ExtractQueries asserts that query extraction for a large
++// dashboard completes within a generous threshold. Uses 5ms to account for slow CI
++// machines, GC pauses, and noisy neighbors. Our benchmarks show ~94µs for 800 queries
++// on fast hardware — this test only catches catastrophic regressions (e.g., O(n²)).
++// For precise measurements, use the benchmarks with `go test -bench=`.
++func TestPerformanceBaseline_ExtractQueries(t *testing.T) {
++	dashboard := buildDashboardJSON(200, 4)
++
++	start := time.Now()
++	queries, err := extractQueriesFromDashboard(dashboard)
++	elapsed := time.Since(start)
++
++	assert.NoError(t, err)
++	assert.Len(t, queries, 800)
++	assert.Less(t, elapsed, 5*time.Millisecond,
++		"extractQueriesFromDashboard took %v, expected < 5ms", elapsed)
++}
++
++// TestPerformanceBaseline_GroupQueries asserts that query grouping completes within
++// a generous threshold. Same rationale as TestPerformanceBaseline_ExtractQueries.
++func TestPerformanceBaseline_GroupQueries(t *testing.T) {
++	dashboard := buildDashboardJSON(100, 4)
++	queries, err := extractQueriesFromDashboard(dashboard)
++	assert.NoError(t, err)
++
++	start := time.Now()
++	grouped := groupQueriesByDatasource(queries, concreteUID, dashboard)
++	elapsed := time.Since(start)
++
++	assert.NotEmpty(t, grouped)
++	assert.Less(t, elapsed, 5*time.Millisecond,
++		"groupQueriesByDatasource took %v, expected < 5ms", elapsed)
++}
++
++// BenchmarkGroupQueriesByDatasource measures the second pipeline stage:
++// grouping extracted queries by datasource UID with template variable resolution.
++func BenchmarkGroupQueriesByDatasource(b *testing.B) {
++	cases := []struct {
++		panels          int
++		queriesPerPanel int
++	}{
++		{10, 1},
++		{50, 2},
++		{100, 2},
++		{100, 4},
++	}
++
++	for _, tc := range cases {
++		dashboard := buildDashboardJSON(tc.panels, tc.queriesPerPanel)
++		name := fmt.Sprintf("panels=%d/qpp=%d", tc.panels, tc.queriesPerPanel)
++		// extract queries first
++		queries, _ := extractQueriesFromDashboard(dashboard)
++		b.Run(name, func(b *testing.B) {
++			b.ReportAllocs()
++			for b.Loop() {
++				_ = groupQueriesByDatasource(queries, concreteUID, dashboard)
++			}
++		})
++	}
++}
++
++// BenchmarkExtractQueriesFromDashboard measures how long it takes to extract
++// queries from dashboards of various sizes. This is the first stage of the
++// /check pipeline: JSON parsing → query extraction.
++// Includes both flat and row-based (nested) dashboard layouts.
++func BenchmarkExtractQueriesFromDashboard(b *testing.B) {
++	// Flat dashboard cases
++	flatCases := []struct {
++		panels          int
++		queriesPerPanel int
++	}{
++		{10, 1},
++		{50, 2},
++		{100, 2},
++		{100, 4},
++	}
++
++	for _, tc := range flatCases {
++		dashboard := buildDashboardJSON(tc.panels, tc.queriesPerPanel)
++		name := fmt.Sprintf("flat/panels=%d/qpp=%d", tc.panels, tc.queriesPerPanel)
++
++		b.Run(name, func(b *testing.B) {
++			b.ReportAllocs()
++			for b.Loop() {
++				_, _ = extractQueriesFromDashboard(dashboard)
++			}
++		})
++	}
++
++	// Row-based dashboard cases (collapsed rows with nested panels)
++	// Modeled after Node Exporter Full (1860): ~20% flat, ~80% in collapsed rows
++	rowCases := []struct {
++		flatPanels      int
++		rows            int
++		panelsPerRow    int
++		queriesPerPanel int
++	}{
++		{5, 5, 5, 2},    // Small: 30 panels, 60 queries
++		{15, 14, 8, 2},  // Node Exporter-like: 127 panels, 254 queries
++		{20, 20, 10, 3}, // Large: 220 panels, 660 queries
++	}
++
++	for _, tc := range rowCases {
++		dashboard := buildDashboardJSONWithRows(tc.flatPanels, tc.rows, tc.panelsPerRow, tc.queriesPerPanel)
++		totalPanels := tc.flatPanels + tc.rows*tc.panelsPerRow
++		name := fmt.Sprintf("rows/panels=%d/rows=%d/qpp=%d", totalPanels, tc.rows, tc.queriesPerPanel)
++
++		b.Run(name, func(b *testing.B) {
++			b.ReportAllocs()
++			for b.Loop() {
++				_, _ = extractQueriesFromDashboard(dashboard)
++			}
++		})
++	}
++}
+diff --git a/apps/dashvalidator/pkg/validator/prometheus/benchmark_test.go b/apps/dashvalidator/pkg/validator/prometheus/benchmark_test.go
+new file mode 100644
+index 0000000000000..efefee844b924
+--- /dev/null
++++ b/apps/dashvalidator/pkg/validator/prometheus/benchmark_test.go
+@@ -0,0 +1,238 @@
++package prometheus
++
++import (
++	"context"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/grafana/grafana/apps/dashvalidator/pkg/cache"
++	"github.com/grafana/grafana/apps/dashvalidator/pkg/validator"
++)
++
++// availableMetrics simulates the metric names a real Prometheus instance would expose.
++// Includes all metrics referenced by promQLPool in the validator benchmark, plus extras
++// to simulate a realistic available-metrics set (typically thousands in production).
++var availableMetrics = []string{
++	"up",
++	"http_requests_total",
++	"container_cpu_usage_seconds_total",
++	"http_request_duration_seconds_bucket",
++	"node_memory_MemTotal_bytes",
++	"node_memory_MemAvailable_bytes",
++	"process_cpu_seconds_total",
++	"node_cpu_seconds_total",
++	"probe_duration_seconds",
++	"prometheus_tsdb_head_samples_appended_total",
++	"node_filesystem_size_bytes",
++	"node_filesystem_free_bytes",
++	"grpc_server_handled_total",
++	"kube_pod_container_status_restarts_total",
++	"container_memory_working_set_bytes",
++	"kubelet_running_pods",
++	"coredns_dns_request_duration_seconds_count",
++	"etcd_server_has_leader",
++	"scheduler_e2e_scheduling_duration_seconds_count",
++	"apiserver_request_total",
++	"workqueue_depth",
++}
++
++// promQLPool mirrors the pool from validator/benchmark_test.go.
++// Duplicated here because benchmark_test.go is in the validator package (test-only, not exported).
++var promQLPool = []string{
++	`up{job="api"}`,
++	`rate(http_requests_total{job="api", method="GET"}[$__rate_interval])`,
++	`sum(rate(container_cpu_usage_seconds_total{namespace="default"}[5m])) by (pod)`,
++	`histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))`,
++	`node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes`,
++	`process_cpu_seconds_total`,
++	`sum by (instance) (irate(node_cpu_seconds_total{mode!="idle"}[$__rate_interval]))`,
++	`increase(http_requests_total{status=~"5.."}[5m])`,
++	`avg_over_time(probe_duration_seconds[5m])`,
++	`rate(prometheus_tsdb_head_samples_appended_total[$__rate_interval])`,
++	`(node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} - node_filesystem_free_bytes{fstype!~"tmpfs|overlay"}) / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}`,
++	`sum(rate(grpc_server_handled_total{grpc_code!="OK"}[5m])) / sum(rate(grpc_server_handled_total[5m]))`,
++	`kube_pod_container_status_restarts_total`,
++	`container_memory_working_set_bytes{container!=""}`,
++	`kubelet_running_pods`,
++	`coredns_dns_request_duration_seconds_count`,
++	`etcd_server_has_leader`,
++	`scheduler_e2e_scheduling_duration_seconds_count`,
++	`apiserver_request_total{code=~"2.."}`,
++	`workqueue_depth{name="resource_quota"}`,
++}
++
++// buildQueries creates a slice of validator.Query with realistic PromQL expressions.
++// Queries are selected round-robin from promQLPool (deterministic, no randomness).
++func buildQueries(count int) []validator.Query {
++	queries := make([]validator.Query, count)
++	for i := range count {
++		queries[i] = validator.Query{
++			RefID:      string(rune('A' + i%26)),
++			QueryText:  promQLPool[i%len(promQLPool)],
++			PanelTitle: fmt.Sprintf("Panel %d", i/4+1),
++			PanelID:    i/4 + 1,
++		}
++	}
++	return queries
++}
++
++// newBenchmarkValidator creates a Validator with the real PromQL parser
++// and a mock provider that returns availableMetrics instantly.
++func newBenchmarkValidator() *Validator {
++	mockProv := &mockProvider{
++		metricsToReturn: availableMetrics,
++		ttl:             5 * time.Minute,
++	}
++	metricsCache := cache.NewMetricsCache()
++	metricsCache.RegisterProvider("prometheus", mockProv)
++	return &Validator{
++		parser: NewParser(),
++		cache:  metricsCache,
++	}
++}
++
++// buildLargeMetricsList generates a realistic metric name list of the given size.
++// Metric names follow Prometheus naming conventions (e.g., "namespace_subsystem_name_unit").
++// The first len(availableMetrics) entries are real metric names so dashboard queries
++// will find matches; the rest are generated filler metrics.
++func buildLargeMetricsList(count int) []string {
++	metrics := make([]string, count)
++	// Start with real metrics so queries find matches
++	copy(metrics, availableMetrics)
++	// Fill the rest with realistic-looking generated names
++	for i := len(availableMetrics); i < count; i++ {
++		metrics[i] = fmt.Sprintf("app_%d_http_requests_total", i)
++	}
++	return metrics
++}
++
++// newBenchmarkValidatorWithMetrics creates a Validator with the real PromQL parser
++// and a mock provider that returns the given metrics list.
++func newBenchmarkValidatorWithMetrics(metrics []string) *Validator {
++	mockProv := &mockProvider{
++		metricsToReturn: metrics,
++		ttl:             5 * time.Minute,
++	}
++	metricsCache := cache.NewMetricsCache()
++	metricsCache.RegisterProvider("prometheus", mockProv)
++	return &Validator{
++		parser: NewParser(),
++		cache:  metricsCache,
++	}
++}
++
++// BenchmarkValidateQueries_LargeMetricsList measures memory and latency when the
++// Prometheus instance exposes a large number of metrics. This simulates real-world
++// scenarios where Prometheus/Mimir instances have 10K-500K metric names.
++//
++// Before the GetMetricsSet optimization, fetchAvailableMetrics rebuilt a map[string]bool
++// on every call (~28MB for 500K metrics). This benchmark validates that the cached-set
++// approach eliminates that per-call overhead — memory should be flat regardless of
++// metrics list size.
++func BenchmarkValidateQueries_LargeMetricsList(b *testing.B) {
++	cases := []struct {
++		metricsCount int
++	}{
++		{1_000},   // Small Prometheus
++		{10_000},  // Medium Prometheus
++		{100_000}, // Large Prometheus / Cortex
++		{500_000}, // Very large Mimir cluster
++	}
++
++	queries := buildQueries(100) // Fixed 100 queries, vary the metrics list size
++	ds := validator.Datasource{
++		UID:  "bench-prom",
++		Type: "prometheus",
++		Name: "Benchmark Prometheus",
++		URL:  "http://localhost:9090",
++	}
++
++	for _, tc := range cases {
++		metrics := buildLargeMetricsList(tc.metricsCount)
++		name := fmt.Sprintf("metrics=%dk", tc.metricsCount/1000)
++
++		b.Run(name, func(b *testing.B) {
++			v := newBenchmarkValidatorWithMetrics(metrics)
++			ctx := context.Background()
++			b.ReportAllocs()
++			b.ResetTimer()
++			for b.Loop() {
++				_, _ = v.ValidateQueries(ctx, queries, ds)
++			}
++		})
++	}
++}
++
++// BenchmarkValidateQueries_Parallel measures throughput under concurrent load.
++// All goroutines share a single Validator instance (same as production).
++// Compares against BenchmarkValidateQueries to reveal lock contention or scaling issues.
++func BenchmarkValidateQueries_Parallel(b *testing.B) {
++	cases := []struct {
++		queryCount int
++	}{
++		{10},
++		{100},
++		{400},
++	}
++
++	ds := validator.Datasource{
++		UID:  "bench-prom",
++		Type: "prometheus",
++		Name: "Benchmark Prometheus",
++		URL:  "http://localhost:9090",
++	}
++
++	for _, tc := range cases {
++		queries := buildQueries(tc.queryCount)
++		name := fmt.Sprintf("queries=%d", tc.queryCount)
++
++		b.Run(name, func(b *testing.B) {
++			v := newBenchmarkValidator()
++			ctx := context.Background()
++			b.ReportAllocs()
++			b.ResetTimer()
++			b.RunParallel(func(pb *testing.PB) {
++				for pb.Next() {
++					_, _ = v.ValidateQueries(ctx, queries, ds)
++				}
++			})
++		})
++	}
++}
++
++// BenchmarkValidateQueries measures the full Prometheus validation stage:
++// PromQL parsing → metric extraction → metric comparison → scoring.
++// Uses the real PromQL parser (actual AST walking), mock metrics provider.
++func BenchmarkValidateQueries(b *testing.B) {
++	cases := []struct {
++		queryCount int
++	}{
++		{10},
++		{50},
++		{100},
++		{400},
++	}
++
++	ds := validator.Datasource{
++		UID:  "bench-prom",
++		Type: "prometheus",
++		Name: "Benchmark Prometheus",
++		URL:  "http://localhost:9090",
++	}
++
++	for _, tc := range cases {
++		queries := buildQueries(tc.queryCount)
++		name := fmt.Sprintf("queries=%d", tc.queryCount)
++
++		b.Run(name, func(b *testing.B) {
++			v := newBenchmarkValidator()
++			ctx := context.Background()
++			b.ReportAllocs()
++			b.ResetTimer()
++			for b.Loop() {
++				_, _ = v.ValidateQueries(ctx, queries, ds)
++			}
++		})
++	}
++}
+diff --git a/apps/dashvalidator/pkg/validator/prometheus/validator.go b/apps/dashvalidator/pkg/validator/prometheus/validator.go
+index 248da1e854286..31f83fdd6bdc1 100644
+--- a/apps/dashvalidator/pkg/validator/prometheus/validator.go
++++ b/apps/dashvalidator/pkg/validator/prometheus/validator.go
+@@ -57,18 +57,14 @@ func (v *Validator) ValidateQueries(ctx context.Context, queries []validator.Que
+ 
+ // fetchAvailableMetrics retrieves available metrics from the datasource via cache
+ // and returns them as a set for O(1) lookup.
+-// This is a thin wrapper that delegates to the cache layer.
++// Uses GetMetricsSet to return the cached set directly, avoiding a per-call
++// []string → map[string]bool conversion (28MB for 500K metrics).
+ func fetchAvailableMetrics(ctx context.Context, metricsCache *cache.MetricsCache, datasource validator.Datasource) (map[string]bool, error) {
+-	availableMetrics, err := metricsCache.GetMetrics(ctx, datasources.DS_PROMETHEUS, datasource.UID, datasource.URL, datasource.HTTPClient)
++	availableSet, err := metricsCache.GetMetricsSet(ctx, datasources.DS_PROMETHEUS, datasource.UID, datasource.URL, datasource.HTTPClient)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to fetch metrics from Prometheus: %w", err)
+ 	}
+ 
+-	availableSet := make(map[string]bool, len(availableMetrics))
+-	for _, metric := range availableMetrics {
+-		availableSet[metric] = true
+-	}
+-
+ 	return availableSet, nil
+ }
+ 
+diff --git a/apps/dashvalidator/pkg/validator/prometheus/validator_test.go b/apps/dashvalidator/pkg/validator/prometheus/validator_test.go
+index b0a1480b05a33..4119a9064df89 100644
+--- a/apps/dashvalidator/pkg/validator/prometheus/validator_test.go
++++ b/apps/dashvalidator/pkg/validator/prometheus/validator_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -41,12 +42,12 @@ type mockProvider struct {
+ 	metricsToReturn []string
+ 	ttl             time.Duration
+ 	errorToReturn   error
+-	callCount       int
++	callCount       atomic.Int32
+ }
+ 
+ func (m *mockProvider) GetMetrics(ctx context.Context, datasourceUID, datasourceURL string,
+ 	client *http.Client) (*cache.MetricsResult, error) {
+-	m.callCount++
++	m.callCount.Add(1)
+ 	if m.errorToReturn != nil {
+ 		return nil, m.errorToReturn
+ 	}
+@@ -116,7 +117,7 @@ func TestValidateQueries_SingleQuerySingleMetric_AllFound(t *testing.T) {
+ 	require.Empty(t, result.MissingMetrics)
+ 	require.InDelta(t, 1.0, result.CompatibilityScore, 0.001)
+ 	require.Len(t, result.QueryBreakdown, 1)
+-	require.Equal(t, 1, mockProv.callCount)
++	require.Equal(t, int32(1), mockProv.callCount.Load())
+ 
+ 	// Verify query breakdown
+ 	qr := result.QueryBreakdown[0]
+@@ -974,12 +975,12 @@ func TestValidateQueries_CacheHit_NoProviderCallOnSecondValidation(t *testing.T)
+ 	// First validation - cache miss
+ 	_, err := v.ValidateQueries(context.Background(), queries, datasource)
+ 	require.NoError(t, err)
+-	require.Equal(t, 1, mockProv.callCount) // Provider called once
++	require.Equal(t, int32(1), mockProv.callCount.Load()) // Provider called once
+ 
+ 	// Second validation - cache hit
+ 	_, err = v.ValidateQueries(context.Background(), queries, datasource)
+ 	require.NoError(t, err)
+-	require.Equal(t, 1, mockProv.callCount) // Provider NOT called again
++	require.Equal(t, int32(1), mockProv.callCount.Load()) // Provider NOT called again
+ }
+ 
+ // ============================================================================
+diff --git a/docs/sources/alerting/configure-notifications/inhibition-rules.md b/docs/sources/alerting/configure-notifications/inhibition-rules.md
+index 21a58e7216a44..ec8d7eaf9766a 100644
+--- a/docs/sources/alerting/configure-notifications/inhibition-rules.md
++++ b/docs/sources/alerting/configure-notifications/inhibition-rules.md
+@@ -31,6 +31,11 @@ refs:
+       destination: /docs/grafana/<GRAFANA_VERSION>/alerting/configure-notifications/#alertmanager-architecture
+     - pattern: /docs/grafana-cloud/
+       destination: /docs/grafana-cloud/alerting-and-irm/alerting/configure-notifications/#alertmanager-architecture
++  mute-timings:
++    - pattern: /docs/grafana/
++      destination: /docs/grafana/<GRAFANA_VERSION>/alerting/configure-notifications/mute-timings/
++    - pattern: /docs/grafana-cloud/
++      destination: /docs/grafana-cloud/alerting-and-irm/alerting/configure-notifications/mute-timings/
+ ---
+ 
+ # Configure inhibition rules
+@@ -47,6 +52,12 @@ For example, if a node is down (the **source**), you can inhibit all alerts for
+ Inhibition rules are assigned to a [specific Alertmanager](ref:alertmanager-architecture) and only suppress notifications for alerts managed by that Alertmanager.
+ {{< /admonition >}}
+ 
++{{< admonition type="caution" >}}
++Inhibition rules are intended for compatibility with configurations imported from Prometheus Alertmanager or Mimir. They have no dedicated management UI in Grafana by design.
++
++If not carefully configured, inhibition rules can silently suppress alerts and make issues harder to detect. Consider [silences](ref:shared-silences) or [mute timings](ref:mute-timings) for most suppression use cases.
++{{< /admonition >}}
++
+ ## Inhibition rules vs silences
+ 
+ Both inhibition rules and [silences](ref:shared-silences) suppress alert notifications. The key difference is that inhibition rules suppress alerts automatically based on the presence of another alert, while silences suppress alerts for a fixed time window regardless of other alerts.
+diff --git a/pkg/registry/apis/provisioning/controller/connection.go b/pkg/registry/apis/provisioning/controller/connection.go
+index dfde247254a40..bb3cbc068def9 100644
+--- a/pkg/registry/apis/provisioning/controller/connection.go
++++ b/pkg/registry/apis/provisioning/controller/connection.go
+@@ -132,7 +132,8 @@ func (cc *ConnectionController) processNextWorkItem(ctx context.Context) bool {
+ 	}
+ 	defer cc.queue.Done(item)
+ 
+-	logger := logging.FromContext(ctx).With("work_key", item.key)
++	namespace, name, _ := cache.SplitMetaNamespaceKey(item.key)
++	logger := logging.FromContext(ctx).With("work_key", item.key, "namespace", namespace, "connection", name)
+ 	logger.Info("ConnectionController processing key")
+ 
+ 	err := cc.process(ctx, item)
+@@ -183,7 +184,8 @@ func (cc *ConnectionController) process(ctx context.Context, item *connectionQue
+ 		return err
+ 	}
+ 
+-	logger = logger.With("connection", conn.Name, "namespace", conn.Namespace)
++	logger = logger.With("namespace", namespace, "connection", name)
++	ctx = logging.Context(ctx, logger)
+ 
+ 	// Skip if being deleted
+ 	if conn.DeletionTimestamp != nil {
+diff --git a/pkg/registry/apis/provisioning/controller/connection_health.go b/pkg/registry/apis/provisioning/controller/connection_health.go
+index c9dc16e73390a..01c38887a8309 100644
+--- a/pkg/registry/apis/provisioning/controller/connection_health.go
++++ b/pkg/registry/apis/provisioning/controller/connection_health.go
+@@ -163,7 +163,7 @@ func (hc *ConnectionHealthChecker) RefreshHealthWithPatchOps(ctx context.Context
+ // refreshHealth performs a comprehensive health check
+ // Returns test results, health status, and any error
+ func (hc *ConnectionHealthChecker) refreshHealth(ctx context.Context, conn *provisioning.Connection, existingStatus provisioning.HealthStatus) (*provisioning.TestResults, provisioning.HealthStatus, error) {
+-	logger := logging.FromContext(ctx).With("connection", conn.GetName(), "namespace", conn.GetNamespace())
++	logger := logging.FromContext(ctx)
+ 	start := time.Now()
+ 	outcome := utils.SuccessOutcome
+ 	defer func() {
+diff --git a/public/app/features/alerting/unified/components/rule-viewer/tabs/Details.test.tsx b/public/app/features/alerting/unified/components/rule-viewer/Details.test.tsx
+similarity index 84%
+rename from public/app/features/alerting/unified/components/rule-viewer/tabs/Details.test.tsx
+rename to public/app/features/alerting/unified/components/rule-viewer/Details.test.tsx
+index 7e1b38260808e..96246c8d0fed9 100644
+--- a/public/app/features/alerting/unified/components/rule-viewer/tabs/Details.test.tsx
++++ b/public/app/features/alerting/unified/components/rule-viewer/Details.test.tsx
+@@ -2,12 +2,12 @@ import { render, screen } from 'test/test-utils';
+ 
+ import { setupMockServer } from '@grafana/test-utils/server';
+ 
+-import { setupBackendSrv } from '../../../mockApi';
+-import { mockCombinedRule } from '../../../mocks';
+-import { alertingFactory } from '../../../mocks/server/db';
+-import { setupDataSources } from '../../../testSetup/datasources';
+-import { RECEIVER_NAME, listContactPointsScenario } from '../ContactPointLink.test.scenario';
++import { setupBackendSrv } from '../../mockApi';
++import { mockCombinedRule } from '../../mocks';
++import { alertingFactory } from '../../mocks/server/db';
++import { setupDataSources } from '../../testSetup/datasources';
+ 
++import { RECEIVER_NAME, listContactPointsScenario } from './ContactPointLink.test.scenario';
+ import { Details } from './Details';
+ 
+ const server = setupMockServer();
+@@ -17,7 +17,7 @@ beforeAll(() => {
+   setupDataSources();
+ });
+ 
+-describe('render details tab', () => {
++describe('Details', () => {
+   beforeEach(() => {
+     // we'll re-use the scenario from the contact point link component
+     server.use(...listContactPointsScenario);
+diff --git a/public/app/features/alerting/unified/components/rule-viewer/tabs/Details.tsx b/public/app/features/alerting/unified/components/rule-viewer/Details.tsx
+similarity index 92%
+rename from public/app/features/alerting/unified/components/rule-viewer/tabs/Details.tsx
+rename to public/app/features/alerting/unified/components/rule-viewer/Details.tsx
+index 1fc9aa1ae61a4..d14b98e3591a1 100644
+--- a/public/app/features/alerting/unified/components/rule-viewer/tabs/Details.tsx
++++ b/public/app/features/alerting/unified/components/rule-viewer/Details.tsx
+@@ -10,17 +10,17 @@ import { useDatasource } from 'app/features/datasources/hooks';
+ import { CombinedRule } from 'app/types/unified-alerting';
+ import { GrafanaAlertingRuleDefinition, RulerGrafanaRuleDTO } from 'app/types/unified-alerting-dto';
+ 
+-import { Time } from '../../../../../explore/Time';
+-import { usePendingPeriod } from '../../../hooks/rules/usePendingPeriod';
+-import { makeEditTimeIntervalLink } from '../../../utils/misc';
+-import { getAnnotations, isPausedRule, prometheusRuleType, rulerRuleType } from '../../../utils/rules';
+-import { isNullDate } from '../../../utils/time';
+-import { Tokenize } from '../../Tokenize';
+-import { DetailText } from '../../common/DetailText';
+-import { TimingOptionsMeta } from '../../notification-policies/Policy';
+-import { ContactPointLink } from '../ContactPointLink';
+-
+-import { UpdatedByUser } from './version-history/UpdatedBy';
++import { Time } from '../../../../explore/Time';
++import { usePendingPeriod } from '../../hooks/rules/usePendingPeriod';
++import { makeEditTimeIntervalLink } from '../../utils/misc';
++import { getAnnotations, isPausedRule, prometheusRuleType, rulerRuleType } from '../../utils/rules';
++import { isNullDate } from '../../utils/time';
++import { Tokenize } from '../Tokenize';
++import { DetailText } from '../common/DetailText';
++import { TimingOptionsMeta } from '../notification-policies/Policy';
++
++import { ContactPointLink } from './ContactPointLink';
++import { UpdatedByUser } from './tabs/version-history/UpdatedBy';
+ 
+ enum RuleType {
+   GrafanaManagedAlertRule = 'Grafana-managed alert rule',
+@@ -30,10 +30,10 @@ enum RuleType {
+   Unknown = 'Unknown',
+ }
+ 
+-const DetailGroup = ({ title, children }: { title: string; children: React.ReactNode }) => {
++const DetailGroup = ({ title, children }: { title?: string; children: React.ReactNode }) => {
+   return (
+     <Stack direction="column" gap={1}>
+-      <Text variant="h4">{title}</Text>
++      {title && <Text variant="h4">{title}</Text>}
+       <Stack direction="column" gap={2}>
+         {children}
+       </Stack>
+@@ -98,7 +98,7 @@ export const Details = ({ rule }: DetailsProps) => {
+   );
+   return (
+     <div className={styles.metadata}>
+-      <DetailGroup title={t('alerting.alert.rule', 'Rule')}>
++      <DetailGroup>
+         <DetailText id="rule-type" label={t('alerting.alert.rule-type', 'Rule type')} value={determinedRuleType} />
+         {rulerRuleType.grafana.rule(rule.rulerRule) && (
+           <>
+@@ -227,7 +227,7 @@ export const Details = ({ rule }: DetailsProps) => {
+         <DetailGroup title={t('alerting.alert.annotations', 'Annotations')}>
+           {Object.keys(annotations).length === 0 ? (
+             <div>
+-              <Text color="secondary" italic>
++              <Text color="secondary">
+                 <Trans i18nKey="alerting.alert.no-annotations">No annotations</Trans>
+               </Text>
+             </div>
+@@ -353,13 +353,6 @@ const getStyles = (theme: GrafanaTheme2) => ({
+   metadata: css({
+     display: 'grid',
+     gap: theme.spacing(4),
+-    gridTemplateColumns: '1fr 1fr 1fr',
+-
+-    [theme.breakpoints.down('lg')]: {
+-      gridTemplateColumns: '1fr 1fr',
+-    },
+-    [theme.breakpoints.down('sm')]: {
+-      gridTemplateColumns: '1fr',
+-    },
++    gridTemplateColumns: '1fr',
+   }),
+ });
+diff --git a/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.test.tsx b/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.test.tsx
+index ee7307d893d9e..a9f090342b812 100644
+--- a/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.test.tsx
++++ b/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.test.tsx
+@@ -228,7 +228,7 @@ describe('RuleViewer', () => {
        });
  
+       const recordingRuleIdentifier = ruleId.fromCombinedRule('grafana', recordingRule);
+-      await renderRuleViewer(recordingRule, recordingRuleIdentifier, ActiveTab.Details);
++      await renderRuleViewer(recordingRule, recordingRuleIdentifier);
+ 
+       expect(await screen.findByText('Test recording rule')).toBeInTheDocument();
+       expect(await screen.findByRole('status', { name: 'Alert evaluation currently paused' })).toBeInTheDocument();
+@@ -297,7 +297,8 @@ describe('RuleViewer', () => {
+         await user.click(screen.getByLabelText('2'));
+         await user.click(screen.getByRole('button', { name: /Compare versions/i }));
+         await screen.findByText(/comparing versions/i);
+-        expect(await screen.findByText(/pending period/i)).toBeInTheDocument();
++        // "Pending period" appears in both the always-visible sidebar and the version diff
++        expect((await screen.findAllByText(/pending period/i)).length).toBeGreaterThanOrEqual(1);
+         expect(screen.getAllByTestId('diffGroup')[0]).toHaveTextContent(/pending period changed 5m2h/i);
+         expect(screen.getAllByTestId('diffGroup')[1]).toHaveTextContent(/labels added foo bar/i);
+         expect(screen.getAllByTestId('diffGroup')[2]).toHaveTextContent(/contact point routing added/i);
+@@ -400,8 +401,10 @@ describe('RuleViewer', () => {
+       expect(screen.getByText('cloud test alert')).toBeInTheDocument();
+       expect(screen.getByText('Firing')).toBeInTheDocument();
+ 
+-      expect(screen.getByText(mockRule.annotations[Annotation.summary])).toBeInTheDocument();
+-      expect(screen.getByRole('link', { name: mockRule.annotations[Annotation.runbookURL] })).toBeInTheDocument();
++      // summary appears in both the page header and the always-visible sidebar
++      expect(screen.getAllByText(mockRule.annotations[Annotation.summary])[0]).toBeInTheDocument();
++      // runbook URL appears in both the page header and the always-visible sidebar
++      expect(screen.getAllByRole('link', { name: mockRule.annotations[Annotation.runbookURL] })[0]).toBeInTheDocument();
+       expect(screen.getByText(`Every ${mockRule.group.interval}`)).toBeInTheDocument();
+     });
+ 
+@@ -470,7 +473,7 @@ describe('RuleViewer', () => {
+     const mockRuleIdentifier = ruleId.fromCombinedRule(prometheus.name, mockRule);
+ 
+     it('should render metadata for vanilla Prometheus alert rule', async () => {
+-      renderRuleViewer(mockRule, mockRuleIdentifier, ActiveTab.Details);
++      renderRuleViewer(mockRule, mockRuleIdentifier);
+ 
+       expect(screen.getByText('prom test alert')).toBeInTheDocument();
+ 
+diff --git a/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.tsx b/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.tsx
+index c316ac6c2f2cb..d4af96bb44919 100644
+--- a/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.tsx
++++ b/public/app/features/alerting/unified/components/rule-viewer/RuleViewer.tsx
+@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
+ import { useMeasure } from 'react-use';
+ 
+ import { AlertLabels, StateText } from '@grafana/alerting/unstable';
+-import { NavModelItem, UrlQueryValue } from '@grafana/data';
++import { GrafanaTheme2, NavModelItem, UrlQueryValue } from '@grafana/data';
+ import { Trans, t } from '@grafana/i18n';
+ import { config } from '@grafana/runtime';
+ import {
+@@ -71,10 +71,10 @@ import { decodeGrafanaNamespace } from '../expressions/util';
+ import { RedirectToCloneRule } from '../rules/CloneRule';
+ 
+ import { ContactPointLink } from './ContactPointLink';
++import { Details } from './Details';
+ import { FederatedRuleWarning } from './FederatedRuleWarning';
+ import { useAlertRule } from './RuleContext';
+ import { AlertVersionHistory } from './tabs/AlertVersionHistory';
+-import { Details } from './tabs/Details';
+ import { History } from './tabs/History';
+ import { InstancesList } from './tabs/Instances';
+ import { Notifications } from './tabs/Notifications';
+@@ -88,7 +88,6 @@ export enum ActiveTab {
+   History = 'history',
+   Notifications = 'notifications',
+   Routing = 'routing',
+-  Details = 'details',
+   VersionHistory = 'version-history',
+   Enrichment = 'enrichment',
+ }
+@@ -175,25 +174,31 @@ const RuleViewer = () => {
+       {isGrafanaRulesSource(namespace.rulesSource) && (
+         <InhibitionRulesAlert alertmanagerSourceName={GRAFANA_RULES_SOURCE_NAME} />
+       )}
+-      <Stack direction="column" gap={2}>
+-        {/* tabs and tab content */}
+-        <TabContent>
+-          {activeTab === ActiveTab.Query && <QueryResults rule={rule} />}
+-          {activeTab === ActiveTab.Instances && <InstancesList rule={rule} />}
+-          {activeTab === ActiveTab.History && rulerRuleType.grafana.rule(rule.rulerRule) && (
+-            <History rule={rule.rulerRule} />
+-          )}
+-          {activeTab === ActiveTab.Notifications && rulerRuleType.grafana.rule(rule.rulerRule) && (
+-            <Notifications rule={rule.rulerRule} />
+-          )}
+-          {activeTab === ActiveTab.Routing && <Routing />}
+-          {activeTab === ActiveTab.Details && <Details rule={rule} />}
+-          {activeTab === ActiveTab.VersionHistory && rulerRuleType.grafana.rule(rule.rulerRule) && (
+-            <AlertVersionHistory rule={rule.rulerRule} />
+-          )}
+-          {activeTab === ActiveTab.Enrichment && rule.uid && <RulePageEnrichmentSectionExtension ruleUid={rule.uid} />}
+-        </TabContent>
+-      </Stack>
++      <div className={styles.layout}>
++        <Stack direction="column" gap={2}>
++          {/* tabs and tab content */}
++          <TabContent>
++            {activeTab === ActiveTab.Query && <QueryResults rule={rule} />}
++            {activeTab === ActiveTab.Instances && <InstancesList rule={rule} />}
++            {activeTab === ActiveTab.History && rulerRuleType.grafana.rule(rule.rulerRule) && (
++              <History rule={rule.rulerRule} />
++            )}
++            {activeTab === ActiveTab.Notifications && rulerRuleType.grafana.rule(rule.rulerRule) && (
++              <Notifications rule={rule.rulerRule} />
++            )}
++            {activeTab === ActiveTab.Routing && <Routing />}
++            {activeTab === ActiveTab.VersionHistory && rulerRuleType.grafana.rule(rule.rulerRule) && (
++              <AlertVersionHistory rule={rule.rulerRule} />
++            )}
++            {activeTab === ActiveTab.Enrichment && rule.uid && (
++              <RulePageEnrichmentSectionExtension ruleUid={rule.uid} />
++            )}
++          </TabContent>
++        </Stack>
++        <aside className={styles.sidebar}>
++          <Details rule={rule} />
++        </aside>
++      </div>
+       {duplicateRuleIdentifier && (
+         <RedirectToCloneRule
+           redirectTo={true}
+@@ -500,14 +505,7 @@ function usePageNav(rule: CombinedRule) {
+         // notification history is only available for Grafana managed alert rules and requires feature toggles
+         hideFromTabs: !isGrafanaAlertRule || !config.featureToggles.alertingNotificationHistoryRuleViewer,
+       },
+-      {
+-        text: t('alerting.use-page-nav.page-nav.text.details', 'Details'),
+-        active: activeTab === ActiveTab.Details,
+-        onClick: () => {
+-          setActiveTab(ActiveTab.Details);
+-        },
+-      },
+-      // Enterprise extensions (e.g. Alert enrichment) should appear after Details
++      // Enterprise extensions (e.g. Alert enrichment) should appear after routing
+       ...useRuleViewExtensionsNav(activeTab, setActiveTabFromString),
+       {
+         text: t('alerting.use-page-nav.page-nav.text.versions', 'Versions'),
+@@ -550,10 +548,31 @@ export const calculateTotalInstances = (stats: AlertInstanceTotals) => {
+     .value();
+ };
+ 
+-const getStyles = () => ({
++const getStyles = (theme: GrafanaTheme2) => ({
+   url: css({
+     wordBreak: 'break-all',
+   }),
++  layout: css({
++    display: 'grid',
++    gridTemplateColumns: '1fr 320px',
++    gap: theme.spacing(3),
++    alignItems: 'start',
++
++    [theme.breakpoints.down('lg')]: {
++      gridTemplateColumns: '1fr',
++    },
++  }),
++  sidebar: css({
++    borderLeft: `1px solid ${theme.colors.border.weak}`,
++    paddingLeft: theme.spacing(3),
++
++    [theme.breakpoints.down('lg')]: {
++      borderLeft: 'none',
++      paddingLeft: 0,
++      borderTop: `1px solid ${theme.colors.border.weak}`,
++      paddingTop: theme.spacing(3),
++    },
++  }),
+ });
+ 
+ function isValidRunbookURL(url: string) {
+diff --git a/public/app/features/alerting/unified/components/rules/central-state-history/EventDetails.tsx b/public/app/features/alerting/unified/components/rules/central-state-history/EventDetails.tsx
+index 5a998199eba91..5ac95bd72d6c6 100644
+--- a/public/app/features/alerting/unified/components/rules/central-state-history/EventDetails.tsx
++++ b/public/app/features/alerting/unified/components/rules/central-state-history/EventDetails.tsx
+@@ -15,7 +15,7 @@ import { labelsMatchMatchers } from '../../../utils/alertmanager';
+ import { parsePromQLStyleMatcherLooseSafe } from '../../../utils/matchers';
+ import { parse } from '../../../utils/rule-id';
+ import { MetaText } from '../../MetaText';
+-import { AnnotationValue } from '../../rule-viewer/tabs/Details';
++import { AnnotationValue } from '../../rule-viewer/Details';
+ import { ErrorMessageRow } from '../state-history/ErrorMessageRow';
+ import { LogTimelineViewer } from '../state-history/LogTimelineViewer';
+ import { useFrameSubset } from '../state-history/LokiStateHistory';
+diff --git a/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.test.tsx b/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.test.tsx
+index 3c796301145ed..51df408d5082e 100644
+--- a/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.test.tsx
++++ b/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.test.tsx
+@@ -38,6 +38,8 @@ jest.mock('@grafana/runtime', () => ({
+   },
+ }));
+ 
++import { TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID } from '../triagePredefinedSearches';
++
+ import { TRIAGE_DEFAULT_SEARCH_ID_STORAGE_KEY } from './useTriagePredefinedOverrides';
+ import {
+   TRIAGE_SAVED_SEARCHES_STORAGE_KEY,
+@@ -386,21 +388,24 @@ describe('loadDefaultTriageSavedSearch', () => {
+     expect(result?.id).toBe('triage-predefined-firing-only');
+   });
+ 
+-  it('should return null when no default search exists', async () => {
++  it('should return default predefined (grouped by folder) when no default search exists in user list', async () => {
+     const noDefaultSearches = mockSavedSearches.map((s) => ({ ...s, isDefault: false }));
+     mockStorage(null, noDefaultSearches);
+ 
+     const result = await loadDefaultTriageSavedSearch();
+ 
+-    expect(result).toBeNull();
++    expect(result).not.toBeNull();
++    expect(result?.id).toBe(TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID);
++    expect(result?.id).toBe('triage-predefined-folder-only');
+   });
+ 
+-  it('should return null when storage is empty', async () => {
++  it('should return default predefined (grouped by folder) when storage is empty', async () => {
+     mockStorage(null, null);
+ 
+     const result = await loadDefaultTriageSavedSearch();
+ 
+-    expect(result).toBeNull();
++    expect(result).not.toBeNull();
++    expect(result?.id).toBe(TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID);
+   });
+ });
+ 
+diff --git a/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.ts b/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.ts
+index 4c7eb631feb79..0d6b2c1cd1186 100644
+--- a/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.ts
++++ b/public/app/features/alerting/unified/triage/hooks/useTriageSavedSearches.ts
+@@ -6,7 +6,7 @@ import {
+   createStorageLoader,
+   useGenericSavedSearches,
+ } from '../../hooks/useGenericSavedSearches';
+-import { getTriagePredefinedSearches } from '../triagePredefinedSearches';
++import { TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID, getTriagePredefinedSearches } from '../triagePredefinedSearches';
+ 
+ import { createPredefinedOverridesLoader } from './useTriagePredefinedOverrides';
+ 
+@@ -51,7 +51,11 @@ export async function loadDefaultTriageSavedSearch(): Promise<SavedSearch | null
+   }
+ 
+   const savedSearches = await loadSavedSearches();
+-  return savedSearches.find((s) => s.isDefault) ?? null;
++  const fromUser = savedSearches.find((s) => s.isDefault);
++  if (fromUser) {
++    return fromUser;
++  }
++  return getTriagePredefinedSearches().find((s) => s.id === TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID) ?? null;
+ }
+ 
+ export const trackTriageSavedSearchApplied = createAppliedTracker({ page: 'triage' });
+diff --git a/public/app/features/alerting/unified/triage/rule-details/RuleDetailsDrawer.tsx b/public/app/features/alerting/unified/triage/rule-details/RuleDetailsDrawer.tsx
+index 980f8272f4351..f60d12d8480e2 100644
+--- a/public/app/features/alerting/unified/triage/rule-details/RuleDetailsDrawer.tsx
++++ b/public/app/features/alerting/unified/triage/rule-details/RuleDetailsDrawer.tsx
+@@ -7,8 +7,8 @@ import { GrafanaRuleIdentifier } from 'app/types/unified-alerting';
+ 
+ import { Spacer } from '../../components/Spacer';
+ import { WithReturnButton } from '../../components/WithReturnButton';
++import { Details } from '../../components/rule-viewer/Details';
+ import { Title } from '../../components/rule-viewer/RuleViewer';
+-import { Details } from '../../components/rule-viewer/tabs/Details';
+ import { QueryResults } from '../../components/rule-viewer/tabs/Query';
+ import { useCombinedRule } from '../../hooks/useCombinedRule';
+ import { stringifyErrorLike } from '../../utils/misc';
+diff --git a/public/app/features/alerting/unified/triage/scene/TriageSavedSearchesControl.tsx b/public/app/features/alerting/unified/triage/scene/TriageSavedSearchesControl.tsx
+index d7941163976b6..89e41ce22fda3 100644
+--- a/public/app/features/alerting/unified/triage/scene/TriageSavedSearchesControl.tsx
++++ b/public/app/features/alerting/unified/triage/scene/TriageSavedSearchesControl.tsx
+@@ -15,7 +15,11 @@ import { shouldUseTriageSavedSearches } from '../../featureToggles';
+ import { VARIABLES } from '../constants';
+ import { useTriagePredefinedOverrides } from '../hooks/useTriagePredefinedOverrides';
+ import { trackTriageSavedSearchApplied, useTriageSavedSearches } from '../hooks/useTriageSavedSearches';
+-import { getTriagePredefinedSearches, isTriagePredefinedSearchId } from '../triagePredefinedSearches';
++import {
++  TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID,
++  getTriagePredefinedSearches,
++  isTriagePredefinedSearchId,
++} from '../triagePredefinedSearches';
+ 
+ import {
+   applyTriageSavedSearchState,
+@@ -105,8 +109,9 @@ function TriageSavedSearchesControlRenderer({ model }: SceneComponentProps<Triag
+     return generateTriageUrl(search.query);
+   }, []);
+ 
+-  // Effective default: explicit default ID (predefined or user) or legacy isDefault from saved list
+-  const effectiveDefaultId = defaultSearchId ?? savedSearches.find((s) => s.isDefault)?.id ?? null;
++  // Effective default: explicit default ID, legacy isDefault from saved list, or predefined "grouped by folder"
++  const effectiveDefaultId =
++    defaultSearchId ?? savedSearches.find((s) => s.isDefault)?.id ?? TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID;
+ 
+   // Predefined list: exclude dismissed, apply custom names and effective isDefault
+   const predefinedList = useMemo(
+diff --git a/public/app/features/alerting/unified/triage/triagePredefinedSearches.test.ts b/public/app/features/alerting/unified/triage/triagePredefinedSearches.test.ts
+index 95ee1d42149bf..272782d3dbfff 100644
+--- a/public/app/features/alerting/unified/triage/triagePredefinedSearches.test.ts
++++ b/public/app/features/alerting/unified/triage/triagePredefinedSearches.test.ts
+@@ -1,5 +1,6 @@
+ import { extractFilterObjects } from './scene/triageSavedSearchUtils';
+ import {
++  TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID,
+   TRIAGE_PREDEFINED_SEARCH_ID_PREFIX,
+   getTriagePredefinedSearches,
+   isTriagePredefinedSearchId,
+@@ -50,6 +51,16 @@ describe('triagePredefinedSearches', () => {
+       expect(params.getAll('var-groupBy')).toEqual(['grafana_folder']);
+       expect(params.has('var-filters')).toBe(false);
+     });
++
++    it('default predefined search is folder-only (grouped by folder)', () => {
++      expect(TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID).toBe('triage-predefined-folder-only');
++      const searches = getTriagePredefinedSearches();
++      const defaultSearch = searches.find((s) => s.id === TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID);
++      expect(defaultSearch).toBeDefined();
++      const params = new URLSearchParams(defaultSearch!.query);
++      expect(params.getAll('var-groupBy')).toEqual(['grafana_folder']);
++      expect(params.has('var-filters')).toBe(false);
++    });
+   });
+ 
+   describe('isTriagePredefinedSearchId', () => {
+diff --git a/public/app/features/alerting/unified/triage/triagePredefinedSearches.ts b/public/app/features/alerting/unified/triage/triagePredefinedSearches.ts
+index 171b028332b7b..8fea451efe9ff 100644
+--- a/public/app/features/alerting/unified/triage/triagePredefinedSearches.ts
++++ b/public/app/features/alerting/unified/triage/triagePredefinedSearches.ts
+@@ -23,6 +23,9 @@ const PREDEFINED_IDS = [
+   `${TRIAGE_PREDEFINED_SEARCH_ID_PREFIX}folder-only`,
+ ] as const;
+ 
++/** Predefined search used as default when the user has not set a default (grouped by folder). */
++export const TRIAGE_DEFAULT_PREDEFINED_SEARCH_ID = PREDEFINED_IDS[2];
++
+ /**
+  * Pre-defined triage saved searches for common scenarios.
+  * Uses default time range from scene/utils (15m).
+diff --git a/public/app/features/provisioning/components/Folders/FixFolderMetadataDrawer.test.tsx b/public/app/features/provisioning/components/Folders/FixFolderMetadataDrawer.test.tsx
+index cbce7e9be2036..3b6f8fe6f8243 100644
+--- a/public/app/features/provisioning/components/Folders/FixFolderMetadataDrawer.test.tsx
++++ b/public/app/features/provisioning/components/Folders/FixFolderMetadataDrawer.test.tsx
+@@ -110,10 +110,13 @@ describe('FixFolderMetadataDrawer', () => {
+ 
+     const { user } = render(<FixFolderMetadataDrawer repositoryName={REPO_NAME} onDismiss={jest.fn()} />);
+ 
++    // Click opens the Combobox menu, whose stateReducer clears the input.
++    // We must wait for that render before typing, otherwise the new text
++    // appends to the previous value (e.g. "mainfeature-branch").
+     const branchInput = await screen.findByRole('combobox', { name: /branch/i });
+-    await user.clear(branchInput);
+-    await user.type(branchInput, 'feature-branch');
+-    await user.keyboard('{Enter}');
++    await user.click(branchInput);
++    await waitFor(() => expect(branchInput).toHaveValue(''));
++    await user.keyboard('feature-branch{Enter}');
+ 
+     await user.click(screen.getByRole('button', { name: /fix folder ids/i }));
+ 
+diff --git a/public/locales/en-US/grafana.json b/public/locales/en-US/grafana.json
+index 19298cb04a00e..05e03de19ded7 100644
+--- a/public/locales/en-US/grafana.json
++++ b/public/locales/en-US/grafana.json
+@@ -388,7 +388,6 @@
+         "timing-options": "Timings"
+       },
+       "pending-period": "Pending period",
+-      "rule": "Rule",
+       "rule-identifier": "Rule identifier",
+       "rule-type": "Rule type",
+       "state-error-timeout": "Alert state if execution error or timeout",
+@@ -3530,7 +3529,6 @@
+     "use-page-nav": {
+       "page-nav": {
+         "text": {
+-          "details": "Details",
+           "enrichment": "Alert enrichment",
+           "history": "History",
+           "instances": "Instances",
+diff --git a/scripts/ci/backend-tests/pkgs-with-tests-named.sh b/scripts/ci/backend-tests/pkgs-with-tests-named.sh
+index 82a677cab24f9..b2f586a086a3a 100755
+--- a/scripts/ci/backend-tests/pkgs-with-tests-named.sh
++++ b/scripts/ci/backend-tests/pkgs-with-tests-named.sh
+@@ -60,7 +60,7 @@ fi
+ readarray -t PACKAGES <<< "$(go list -f '{{.Dir}}' -e "${dirs[@]}")"
+ 
+ for i in "${!PACKAGES[@]}"; do
+-    readarray -t PKG_FILES <<< "$(find "${PACKAGES[$i]}" -type f -name '*_test.go')"
++    readarray -t PKG_FILES <<< "$(find "${PACKAGES[$i]}" -maxdepth 1 -type f -name '*_test.go')"
+     if [ ${#PKG_FILES[@]} -eq 0 ] || [ ${#PKG_FILES[@]} -eq 1 ] && [ -z "${PKG_FILES[0]}" ]; then
+         unset "PACKAGES[$i]"
+         continue

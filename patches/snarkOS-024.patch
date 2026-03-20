@@ -1,64 +1,182 @@
-diff --git a/node/bft/src/gateway.rs b/node/bft/src/gateway.rs
-index 6f76bee6c..8e5128c28 100644
---- a/node/bft/src/gateway.rs
-+++ b/node/bft/src/gateway.rs
-@@ -1120,7 +1120,7 @@ impl<N: Network> Transport<N> for Gateway<N> {
-             Event::BlockRequest(request) => {
-                 // Insert the outbound request so we can match it to responses.
-                 self.cache.insert_outbound_block_request(peer_ip, request);
--                // Send the event to the peer and updatet the outbound event cache, use the general rate limit.
-+                // Send the event to the peer and update the outbound event cache, use the general rate limit.
-                 send!(self, insert_outbound_event, CACHE_EVENTS_INTERVAL, max_cache_events)
+diff --git a/cli/src/commands/start.rs b/cli/src/commands/start.rs
+index b07c7d569..317b1e2a2 100644
+--- a/cli/src/commands/start.rs
++++ b/cli/src/commands/start.rs
+@@ -86,6 +86,10 @@ pub struct Start {
+     #[clap(default_value = "", long = "validators")]
+     pub validators: String,
+ 
++    // Specify the IP address and port for narwhal.
++    #[clap(long = "narwhal")]
++    pub narwhal: Option<SocketAddr>,
++
+     /// Specify the IP address and port for the REST server
+     #[clap(default_value = "0.0.0.0:3033", long = "rest")]
+     pub rest: SocketAddr,
+@@ -243,15 +247,19 @@ impl Start {
+         // and the REST IP to `3030 + dev`.
+         if let Some(dev) = self.dev {
+             // Add the dev nodes to the trusted peers.
+-            for i in 0..dev {
+-                if i != dev {
+-                    trusted_peers.push(SocketAddr::from_str(&format!("127.0.0.1:{}", 4130 + i))?);
++            if trusted_peers.is_empty() {
++                for i in 0..dev {
++                    if i != dev {
++                        trusted_peers.push(SocketAddr::from_str(&format!("127.0.0.1:{}", 4130 + i))?);
++                    }
+                 }
              }
-             _ => {
-diff --git a/node/router/src/heartbeat.rs b/node/router/src/heartbeat.rs
-index 30f30df30..cc039be70 100644
---- a/node/router/src/heartbeat.rs
-+++ b/node/router/src/heartbeat.rs
-@@ -105,12 +105,12 @@ pub trait Heartbeat<N: Network>: Outbound<N> {
+-            // To avoid ambiguity, we define the first few nodes to be the trusted validators to connect to.
+-            for i in 0..2 {
+-                if i != dev {
+-                    trusted_validators.push(SocketAddr::from_str(&format!("127.0.0.1:{}", MEMORY_POOL_PORT + i))?);
++            if trusted_validators.is_empty() {
++                // To avoid ambiguity, we define the first few nodes to be the trusted validators to connect to.
++                for i in 0..2 {
++                    if i != dev {
++                        trusted_validators.push(SocketAddr::from_str(&format!("127.0.0.1:{}", MEMORY_POOL_PORT + i))?);
++                    }
+                 }
+             }
+             // Set the node IP to `4130 + dev`.
+@@ -382,8 +390,9 @@ impl Start {
+         crate::helpers::check_validator_machine(node_type, self.dev.is_some());
+ 
+         // Initialize the node.
++        let narwhal_ip = if self.dev.is_some() { self.narwhal } else { None };
+         match node_type {
+-            NodeType::Validator => Node::new_validator(self.node, rest_ip, account, &trusted_peers, &trusted_validators, genesis, cdn, self.dev).await,
++            NodeType::Validator => Node::new_validator(self.node, rest_ip, narwhal_ip, account, &trusted_peers, &trusted_validators, genesis, cdn, self.dev).await,
+             NodeType::Prover => Node::new_prover(self.node, account, &trusted_peers, genesis, self.dev).await,
+             NodeType::Client => Node::new_client(self.node, rest_ip, account, &trusted_peers, genesis, cdn, self.dev).await,
          }
+diff --git a/node/narwhal/events/src/worker_ping.rs b/node/narwhal/events/src/worker_ping.rs
+index 83c53f395..8f651a82f 100644
+--- a/node/narwhal/events/src/worker_ping.rs
++++ b/node/narwhal/events/src/worker_ping.rs
+@@ -54,7 +54,7 @@ impl<N: Network> ToBytes for WorkerPing<N> {
+ impl<N: Network> FromBytes for WorkerPing<N> {
+     fn read_le<R: Read>(mut reader: R) -> IoResult<Self> {
+         let num_transmissions = u32::read_le(&mut reader)?;
+-        let mut transmission_ids = IndexSet::with_capacity(num_transmissions as usize);
++        let mut transmission_ids = IndexSet::new();
+         for _ in 0..num_transmissions {
+             transmission_ids.insert(TransmissionID::read_le(&mut reader)?);
+         }
+diff --git a/node/narwhal/src/gateway.rs b/node/narwhal/src/gateway.rs
+index e7c80f1cf..d1acc4812 100644
+--- a/node/narwhal/src/gateway.rs
++++ b/node/narwhal/src/gateway.rs
+@@ -143,9 +143,9 @@ impl<N: Network> Gateway<N> {
+     ) -> Result<Self> {
+         // Initialize the gateway IP.
+         let ip = match (ip, dev) {
+-            (_, Some(dev)) => SocketAddr::from_str(&format!("127.0.0.1:{}", MEMORY_POOL_PORT + dev))?,
++            (None, Some(dev)) => SocketAddr::from_str(&format!("127.0.0.1:{}", MEMORY_POOL_PORT + dev))?,
+             (None, None) => SocketAddr::from_str(&format!("0.0.0.0:{}", MEMORY_POOL_PORT))?,
+-            (Some(ip), None) => ip,
++            (Some(ip), _) => ip,
+         };
+         // Initialize the TCP stack.
+         let tcp = Tcp::new(Config::new(ip, MAX_COMMITTEE_SIZE));
+diff --git a/node/src/node.rs b/node/src/node.rs
+index 83f2a77a5..7bfa9e878 100644
+--- a/node/src/node.rs
++++ b/node/src/node.rs
+@@ -41,6 +41,7 @@ impl<N: Network> Node<N> {
+     pub async fn new_validator(
+         node_ip: SocketAddr,
+         rest_ip: Option<SocketAddr>,
++        narwhal_ip: Option<SocketAddr>,
+         account: Account<N>,
+         trusted_peers: &[SocketAddr],
+         trusted_validators: &[SocketAddr],
+@@ -49,7 +50,8 @@ impl<N: Network> Node<N> {
+         dev: Option<u16>,
+     ) -> Result<Self> {
+         Ok(Self::Validator(Arc::new(
+-            Validator::new(node_ip, rest_ip, account, trusted_peers, trusted_validators, genesis, cdn, dev).await?,
++            Validator::new(node_ip, rest_ip, narwhal_ip, account, trusted_peers, trusted_validators, genesis, cdn, dev)
++                .await?,
+         )))
      }
  
--    /// Returns a sorted vector of network addresess of all removable connected peers
--    /// where the first entry has the lowest priority andthe last one the highest.
-+    /// Returns a sorted vector of network addresses of all removable connected peers
-+    /// where the first entry has the lowest priority and the last one the highest.
-     ///
-     /// Rules:
-     ///     - Trusted peers and bootstrap nodes are not removable.
--    ///     - Peers that we are currently syncing with are not remeovable.
-+    ///     - Peers that we are currently syncing with are not removable.
-     ///     - Validators are considered higher priority than provers or clients.
-     ///     - Connections that have not been seen in a while are considered lower priority.
-     fn get_removable_peers(&self) -> Vec<Peer<N>> {
-@@ -128,7 +128,7 @@ pub trait Heartbeat<N: Network>: Outbound<N> {
-         let mut peers = self.router().get_connected_peers();
-         peers.sort_by_key(|peer| (peer.is_validator(), peer.last_seen()));
+diff --git a/node/src/prover/mod.rs b/node/src/prover/mod.rs
+index bb210a55f..def01ade1 100644
+--- a/node/src/prover/mod.rs
++++ b/node/src/prover/mod.rs
+@@ -260,8 +260,8 @@ impl<N: Network, C: ConsensusStorage<N>> Prover<N, C> {
+             puzzle_commitment: prover_solution.commitment(),
+             solution: Data::Object(prover_solution),
+         });
+-        // Propagate the "UnconfirmedSolution" to the connected validators.
+-        self.propagate_to_validators(message, &[]);
++        // Propagate the "UnconfirmedSolution".
++        self.propagate(message, &[]);
+     }
  
--        // Deterimine which of the peers can be removed.
-+        // Determine which of the peers can be removed.
-         peers
-             .into_iter()
-             .filter(|peer| {
-@@ -214,7 +214,7 @@ pub trait Heartbeat<N: Network>: Outbound<N> {
-             let peers_to_disconnect = self
-                 .get_removable_peers()
-                 .into_iter()
--                .filter(|peer| !peer.is_prover()) // remove provers as those are handled seperately
-+                .filter(|peer| !peer.is_prover()) // remove provers as those are handled separately
-                 .map(|p| p.ip())
-                 .take(num_surplus_clients_validators);
+     /// Returns the current number of puzzle instances.
+diff --git a/node/src/validator/mod.rs b/node/src/validator/mod.rs
+index 42d8e7cf8..a109460cb 100644
+--- a/node/src/validator/mod.rs
++++ b/node/src/validator/mod.rs
+@@ -74,6 +74,7 @@ impl<N: Network, C: ConsensusStorage<N>> Validator<N, C> {
+     pub async fn new(
+         node_ip: SocketAddr,
+         rest_ip: Option<SocketAddr>,
++        narwhal_ip: Option<SocketAddr>,
+         account: Account<N>,
+         trusted_peers: &[SocketAddr],
+         trusted_validators: &[SocketAddr],
+@@ -101,7 +102,7 @@ impl<N: Network, C: ConsensusStorage<N>> Validator<N, C> {
+         let sync = BlockSync::new(BlockSyncMode::Gateway, ledger_service.clone());
  
-diff --git a/node/router/src/lib.rs b/node/router/src/lib.rs
-index a312b2f2a..f17c1149e 100644
---- a/node/router/src/lib.rs
-+++ b/node/router/src/lib.rs
-@@ -525,7 +525,7 @@ impl<N: Network> Router<N> {
-                 return;
-             }
-             None => {
--                warn!("Couldn't promote {peer_ip} from \"connecting\" to \"connected\": Public/listen address unkown");
-+                warn!("Couldn't promote {peer_ip} from \"connecting\" to \"connected\": Public/listen address unknown");
-                 return;
-             }
-         };
+         // Initialize the consensus.
+-        let mut consensus = Consensus::new(account.clone(), ledger_service, None, trusted_validators, dev)?;
++        let mut consensus = Consensus::new(account.clone(), ledger_service, narwhal_ip, trusted_validators, dev)?;
+         // Initialize the primary channels.
+         let (primary_sender, primary_receiver) = init_primary_channels::<N>();
+         // Start the consensus.
+@@ -474,6 +475,7 @@ mod tests {
+         let validator = Validator::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::new(
+             node,
+             Some(rest),
++            None,
+             account,
+             &[],
+             &[],
+diff --git a/node/sync/locators/src/block_locators.rs b/node/sync/locators/src/block_locators.rs
+index 492296de4..486b98e68 100644
+--- a/node/sync/locators/src/block_locators.rs
++++ b/node/sync/locators/src/block_locators.rs
+@@ -264,7 +264,7 @@ impl<N: Network> FromBytes for BlockLocators<N> {
+         // Read the number of recent block hashes.
+         let num_recents = u32::read_le(&mut reader)?;
+         // Read the recent block hashes.
+-        let mut recents = IndexMap::with_capacity(num_recents as usize);
++        let mut recents = IndexMap::new();
+         for _ in 0..num_recents {
+             let height = u32::read_le(&mut reader)?;
+             let hash = N::BlockHash::read_le(&mut reader)?;
+@@ -274,7 +274,7 @@ impl<N: Network> FromBytes for BlockLocators<N> {
+         // Read the number of checkpoints.
+         let num_checkpoints = u32::read_le(&mut reader)?;
+         // Read the checkpoints.
+-        let mut checkpoints = IndexMap::with_capacity(num_checkpoints as usize);
++        let mut checkpoints = IndexMap::new();
+         for _ in 0..num_checkpoints {
+             let height = u32::read_le(&mut reader)?;
+             let hash = N::BlockHash::read_le(&mut reader)?;
+diff --git a/node/tests/common/node.rs b/node/tests/common/node.rs
+index dd265f676..a690f4d79 100644
+--- a/node/tests/common/node.rs
++++ b/node/tests/common/node.rs
+@@ -49,6 +49,7 @@ pub async fn validator() -> Validator<CurrentNetwork, ConsensusMemory<CurrentNet
+     Validator::new(
+         "127.0.0.1:0".parse().unwrap(),
+         None,
++        None,
+         Account::<CurrentNetwork>::from_str("APrivateKey1zkp2oVPTci9kKcUprnbzMwq95Di1MQERpYBhEeqvkrDirK1").unwrap(),
+         &[],
+         &[],

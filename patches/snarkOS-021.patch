@@ -1,80 +1,421 @@
-diff --git a/cli/Cargo.toml b/cli/Cargo.toml
-index b7a0f38ff..b677b382b 100644
---- a/cli/Cargo.toml
-+++ b/cli/Cargo.toml
-@@ -51,7 +51,7 @@ workspace = true
+diff --git a/Cargo.lock b/Cargo.lock
+index 96cd84bb4..b495f21e9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2787,6 +2787,7 @@ dependencies = [
+  "thiserror",
+  "tokio",
+  "tracing",
++ "tracing-subscriber",
+  "twox-hash",
+ ]
  
- [dependencies.clap]
- workspace = true
--features = [ "derive", "color", "unstable-styles" ]
-+features = [ "derive", "color", "unstable-styles", "help" ]
+diff --git a/consensus/src/consensus/inner/mod.rs b/consensus/src/consensus/inner/mod.rs
+index a0412499e..8b5f5efb8 100644
+--- a/consensus/src/consensus/inner/mod.rs
++++ b/consensus/src/consensus/inner/mod.rs
+@@ -68,7 +68,7 @@ impl ConsensusInner {
+         let canon_hashes = self
+             .storage
+             .get_block_hashes(
+-                Some(crate::OLDEST_FORK_THRESHOLD as u32 + 1),
++                Some(crate::OLDEST_FORK_THRESHOLD as u32),
+                 BlockFilter::CanonOnly(BlockOrder::Descending),
+             )
+             .await?;
+diff --git a/consensus/tests/consensus_sidechain.rs b/consensus/tests/consensus_sidechain.rs
+index 0536cce18..65415c8c8 100644
+--- a/consensus/tests/consensus_sidechain.rs
++++ b/consensus/tests/consensus_sidechain.rs
+@@ -27,7 +27,7 @@ mod consensus_sidechain {
+     // After block 1 is received, block 2 should be fetched from storage and added to the chain.
+     #[tokio::test]
+     async fn new_out_of_order() {
+-        tracing_subscriber::fmt::init();
++        // tracing_subscriber::fmt::init();
+         let consensus = snarkos_testing::sync::create_test_consensus().await;
  
- [dependencies.colored]
- version = "2"
-diff --git a/cli/src/lib.rs b/cli/src/lib.rs
-index 4a0283629..d25820c7e 100644
---- a/cli/src/lib.rs
-+++ b/cli/src/lib.rs
-@@ -20,6 +20,8 @@
- extern crate thiserror;
+         let old_block_height = consensus.storage.canon().await.unwrap().block_height;
+diff --git a/network/Cargo.toml b/network/Cargo.toml
+index 4de0e5a84..f6fa2764c 100644
+--- a/network/Cargo.toml
++++ b/network/Cargo.toml
+@@ -158,5 +158,8 @@ version = "0.2"
+ [dev-dependencies.snarkos-testing]
+ path = "../testing"
  
- pub mod commands;
-+pub use commands::CLI;
++[dev-dependencies.tracing-subscriber]
++version = "0.2"
 +
- pub mod helpers;
+ [dev-dependencies.peak_alloc]
+ version = "0.1.0"
+diff --git a/network/src/peers/peer/connector.rs b/network/src/peers/peer/connector.rs
+index d1b2a1f6f..669db4bb4 100644
+--- a/network/src/peers/peer/connector.rs
++++ b/network/src/peers/peer/connector.rs
+@@ -36,6 +36,14 @@ impl Peer {
+             self.set_connecting();
+             match self.inner_connect(node.version()).await {
+                 Err(e) => {
++                    event_target
++                        .send(PeerEvent {
++                            address: self.address,
++                            data: PeerEventData::FailHandshake,
++                        })
++                        .await
++                        .ok();
++                    metrics::increment_gauge!(snarkos_metrics::queues::PEER_EVENTS, 1.0);
+                     self.fail();
+                     if !e.is_trivial() {
+                         error!(
+@@ -95,12 +103,11 @@ impl Peer {
+                     metrics::decrement_gauge!(CONNECTED, 1.0);
+                 }
+             }
+-            let state = self.status;
+             self.set_disconnected();
+             event_target
+                 .send(PeerEvent {
+                     address: self.address,
+-                    data: PeerEventData::Disconnect(Box::new(self), state),
++                    data: PeerEventData::Disconnect(Box::new(self)),
+                 })
+                 .await
+                 .ok();
+diff --git a/network/src/peers/peer/peer.rs b/network/src/peers/peer/peer.rs
+index 63b232565..87259190b 100644
+--- a/network/src/peers/peer/peer.rs
++++ b/network/src/peers/peer/peer.rs
+@@ -32,26 +32,10 @@ use super::PeerQuality;
+ use crate::{message::Payload, BlockCache, NetworkError, Node};
  
- use anyhow::Result;
-diff --git a/cli/tests/e2e.rs b/cli/tests/e2e.rs
-new file mode 100644
-index 000000000..7ee7eaf13
---- /dev/null
-+++ b/cli/tests/e2e.rs
-@@ -0,0 +1,48 @@
-+// Copyright (c) 2019-2025 Provable Inc.
-+// This file is part of the snarkOS library.
+ use super::{network::*, outbound_handler::*};
+-
+-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+-pub enum PeerStatus {
+-    Connected,
+-    Connecting,
+-    Disconnected,
+-}
+-
+-impl Default for PeerStatus {
+-    fn default() -> Self {
+-        PeerStatus::Disconnected
+-    }
+-}
+-
+ /// A data structure containing information about a peer.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct Peer {
+     pub address: SocketAddr,
+-    #[serde(skip)]
+-    pub status: PeerStatus,
+     pub quality: PeerQuality,
+     pub is_bootnode: bool,
+     #[serde(skip)]
+@@ -74,7 +58,6 @@ impl Peer {
+     pub fn new(address: SocketAddr, is_bootnode: bool) -> Self {
+         Self {
+             address,
+-            status: PeerStatus::Disconnected,
+             quality: Default::default(),
+             is_bootnode,
+             queued_inbound_message_count: Default::default(),
+@@ -204,17 +187,14 @@ impl Peer {
+ 
+     pub(super) fn set_connected(&mut self) {
+         self.quality.connected();
+-        self.status = PeerStatus::Connected;
+     }
+ 
+     pub(super) fn set_connecting(&mut self) {
+         self.quality.see();
+-        self.status = PeerStatus::Connecting;
+     }
+ 
+     pub(super) fn set_disconnected(&mut self) {
+         self.quality.disconnected();
+-        self.status = PeerStatus::Disconnected;
+     }
+ 
+     pub(super) fn set_routable(&mut self, is_routable: bool) {
+diff --git a/network/src/peers/peer/peer_events.rs b/network/src/peers/peer/peer_events.rs
+index c5deee3f2..7f443aec7 100644
+--- a/network/src/peers/peer/peer_events.rs
++++ b/network/src/peers/peer/peer_events.rs
+@@ -16,11 +16,11 @@
+ 
+ use std::net::SocketAddr;
+ 
+-use crate::{Peer, PeerHandle, PeerStatus};
++use crate::{Peer, PeerHandle};
+ 
+ pub enum PeerEventData {
+     Connected(PeerHandle),
+-    Disconnect(Box<Peer>, PeerStatus),
++    Disconnect(Box<Peer>),
+     FailHandshake,
+ }
+ 
+diff --git a/network/src/peers/peer/receiver.rs b/network/src/peers/peer/receiver.rs
+index 044a3ba7f..e8a09056d 100644
+--- a/network/src/peers/peer/receiver.rs
++++ b/network/src/peers/peer/receiver.rs
+@@ -20,7 +20,7 @@ use tokio::{net::TcpStream, sync::mpsc};
+ 
+ use snarkos_metrics::{self as metrics, connections::*};
+ 
+-use crate::{NetworkError, Node, Peer, PeerEvent, PeerEventData, PeerHandle, PeerStatus, Version};
++use crate::{NetworkError, Node, Peer, PeerEvent, PeerEventData, PeerHandle, Version};
+ 
+ use super::{network::PeerIOHandle, PeerAction};
+ 
+@@ -80,7 +80,7 @@ impl Peer {
+             event_target
+                 .send(PeerEvent {
+                     address: peer.address,
+-                    data: PeerEventData::Disconnect(Box::new(peer), PeerStatus::Connected),
++                    data: PeerEventData::Disconnect(Box::new(peer)),
+                 })
+                 .await
+                 .ok();
+diff --git a/network/src/peers/peer_book.rs b/network/src/peers/peer_book.rs
+index 5fd8cbb3d..fc18d145c 100644
+--- a/network/src/peers/peer_book.rs
++++ b/network/src/peers/peer_book.rs
+@@ -30,7 +30,7 @@ use tokio::{net::TcpStream, sync::mpsc};
+ 
+ use snarkos_metrics::{self as metrics, connections::*};
+ 
+-use crate::{NetworkError, Node, Payload, Peer, PeerEvent, PeerEventData, PeerHandle, PeerStatus};
++use crate::{NetworkError, Node, Payload, Peer, PeerEvent, PeerEventData, PeerHandle};
+ 
+ ///
+ /// A data structure for storing the history of all peers with this node server.
+@@ -64,7 +64,7 @@ impl PeerBookRef {
+                         old_peer.disconnect().await;
+                     }
+                 }
+-                PeerEventData::Disconnect(peer, status) => {
++                PeerEventData::Disconnect(peer) => {
+                     self.connected_peers.remove(peer.address).await;
+ 
+                     let queued_inbound_message_count = peer.queued_inbound_message_count.swap(0, Ordering::SeqCst);
+@@ -75,9 +75,6 @@ impl PeerBookRef {
+                     if self.disconnected_peers.insert(peer.address, *peer).await.is_none() {
+                         metrics::increment_gauge!(DISCONNECTED, 1.0);
+                     }
+-                    if status == PeerStatus::Connecting {
+-                        self.pending_connections.fetch_sub(1, Ordering::SeqCst);
+-                    }
+                 }
+                 PeerEventData::FailHandshake => {
+                     self.pending_connections.fetch_sub(1, Ordering::SeqCst);
+diff --git a/network/tests/topology.rs b/network/tests/topology.rs
+index 3329db984..c00e0aaa7 100644
+--- a/network/tests/topology.rs
++++ b/network/tests/topology.rs
+@@ -42,6 +42,42 @@ async fn test_nodes<F: Fn() -> TestSetup>(n: usize, setup: F) -> Vec<Node> {
+     nodes
+ }
+ 
++#[tokio::test(flavor = "multi_thread")]
++async fn reconnect_nodes() {
++    // tracing_subscriber::fmt::init();
++    let setup = || TestSetup {
++        consensus_setup: None,
++        peer_sync_interval: 999999,
++        max_peers: N as u16 * 4,
++        ..Default::default()
++    };
++    let nodes = test_nodes(N, setup).await;
++    let addresses = nodes.iter().map(|x| x.expect_local_addr()).collect::<Vec<_>>();
 +
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at:
++    for _ in 0..(4 * N) {
++        for (i, node) in nodes.iter().enumerate() {
++            node.connect_to_addresses(&addresses[i + 1..]).await;
++        }
++        wait_until!(5, {
++            nodes
++                .iter()
++                .all(|node| node.peer_book.get_connected_peer_count() == N as u32 - 1)
++        });
++        for node in &nodes {
++            assert_eq!(node.peer_book.pending_connections(), 0);
++        }
 +
-+// http://www.apache.org/licenses/LICENSE-2.0
-+
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+use clap::{Parser, error::ErrorKind};
-+
-+use snarkos_cli::CLI;
-+
-+#[test]
-+fn pass_help_argument() {
-+    // Test for top level...
-+    let result = CLI::try_parse_from(["snarkos", "--help"]);
-+    let err = result.unwrap_err();
-+    assert_eq!(err.kind(), ErrorKind::DisplayHelp);
-+
-+    // ...and for sub commands
-+    let result = CLI::try_parse_from(["snarkos", "account", "-h"]);
-+    let err = result.unwrap_err();
-+    assert_eq!(err.kind(), ErrorKind::DisplayHelp);
-+
-+    let result = CLI::try_parse_from(["snarkos", "account", "--help"]);
-+    let err = result.unwrap_err();
-+    assert_eq!(err.kind(), ErrorKind::DisplayHelp);
++        for node in &nodes {
++            for address in &addresses {
++                node.disconnect_from_peer(*address).await;
++            }
++        }
++        wait_until!(5, {
++            nodes.iter().all(|node| node.peer_book.get_active_peer_count() == 0)
++        });
++    }
 +}
 +
-+#[test]
-+fn pass_valid_command() {
-+    let result = CLI::try_parse_from(["snarkos", "start"]);
-+    assert!(result.is_ok());
-+}
-+
-+#[test]
-+fn pass_invalid_command() {
-+    let result = CLI::try_parse_from(["snarkos", "bisect"]);
-+    let err = result.unwrap_err();
-+    assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
-+}
+ #[tokio::test(flavor = "multi_thread")]
+ async fn spawn_nodes_in_a_line() {
+     let setup = || TestSetup {
+diff --git a/storage/src/storage/key_value/store.rs b/storage/src/storage/key_value/store.rs
+index 8d16eef5d..1a4bcc6df 100644
+--- a/storage/src/storage/key_value/store.rs
++++ b/storage/src/storage/key_value/store.rs
+@@ -194,14 +194,6 @@ impl<S: KeyValueStorage + Validator + 'static> SyncStorage for KeyValueStore<S>
+         Ok(())
+     }
+ 
+-    fn cache_block_children(&mut self, _block_hash: Digest, _block_children: Vec<Digest>) {
+-        unimplemented!();
+-    }
+-
+-    fn get_cached_block_children(&mut self, _block_hash: &Digest) -> Option<Vec<Digest>> {
+-        unimplemented!();
+-    }
+-
+     fn get_block_children(&mut self, hash: &Digest) -> Result<Vec<Digest>> {
+         Ok(self
+             .inner()
+diff --git a/storage/src/storage/sqlite/mod.rs b/storage/src/storage/sqlite/mod.rs
+index 2da941431..d1eed88ae 100644
+--- a/storage/src/storage/sqlite/mod.rs
++++ b/storage/src/storage/sqlite/mod.rs
+@@ -15,7 +15,6 @@
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use anyhow::*;
+-use hash_hasher::{HashBuildHasher, HashedMap, HashedSet};
+ use rusqlite::{
+     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+     Connection,
+@@ -30,14 +29,12 @@ mod sync;
+ 
+ pub struct SqliteStorage {
+     conn: Connection,
+-    block_children_cache: HashedMap<Digest, HashedSet<Digest>>,
+ }
+ 
+ impl SqliteStorage {
+     pub fn new_ephemeral() -> Result<Self> {
+         Ok(Self {
+             conn: Connection::open_in_memory()?,
+-            block_children_cache: HashedMap::with_hasher(HashBuildHasher::default()),
+         })
+     }
+ 
+@@ -47,7 +44,6 @@ impl SqliteStorage {
+                 path,
+                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+             )?,
+-            block_children_cache: HashedMap::with_hasher(HashBuildHasher::default()),
+         })
+     }
+ }
+diff --git a/storage/src/storage/sqlite/sync.rs b/storage/src/storage/sqlite/sync.rs
+index d5d6688d5..4b2b7db38 100644
+--- a/storage/src/storage/sqlite/sync.rs
++++ b/storage/src/storage/sqlite/sync.rs
+@@ -16,7 +16,6 @@
+ 
+ use std::convert::TryInto;
+ 
+-use hash_hasher::{HashBuildHasher, HashedSet};
+ use rusqlite::{params, OptionalExtension, Row, ToSql};
+ use snarkvm_dpc::{AleoAmount, MerkleRootHash, Network, PedersenMerkleRootHash, ProofOfSuccinctWork};
+ use tracing::*;
+@@ -159,11 +158,6 @@ impl SyncStorage for SqliteStorage {
+     fn insert_block(&mut self, block: &SerialBlock) -> Result<()> {
+         let hash = block.header.hash();
+ 
+-        self.block_children_cache
+-            .entry(block.header.previous_block_hash.clone())
+-            .or_insert_with(|| HashedSet::with_hasher(HashBuildHasher::default()))
+-            .insert(hash.clone());
+-
+         let mut block_query = self.conn.prepare_cached(
+             r"
+         INSERT INTO blocks (
+@@ -490,17 +484,39 @@ impl SyncStorage for SqliteStorage {
+         })
+     }
+ 
+-    fn cache_block_children(&mut self, block_hash: Digest, block_children: Vec<Digest>) {
+-        self.block_children_cache
+-            .entry(block_hash)
+-            .or_insert_with(|| HashedSet::with_hasher(HashBuildHasher::default()))
+-            .extend(block_children);
+-    }
+-
+-    fn get_cached_block_children(&mut self, block_hash: &Digest) -> Option<Vec<Digest>> {
+-        self.block_children_cache
+-            .get(block_hash)
+-            .map(|set| set.iter().cloned().collect())
++    fn longest_child_path(&mut self, block_hash: &Digest) -> Result<Vec<Digest>> {
++        let mut stmt = self.conn.prepare_cached(
++            r"
++            WITH RECURSIVE
++                children(parent, sub, length) AS (
++                    SELECT ?, NULL, 0 as length
++                    UNION ALL
++                    SELECT blocks.hash, blocks.previous_block_hash, children.length + 1 FROM blocks
++                    INNER JOIN children
++                    WHERE blocks.previous_block_hash = children.parent
++                ),
++                preferred_tip AS (
++                    SELECT parent, sub, length FROM children
++                    WHERE length = (SELECT max(length) FROM children)
++                    ORDER BY parent
++                    LIMIT 1
++                ),
++                total_tip(parent, remaining) AS (
++                    SELECT preferred_tip.parent, preferred_tip.length FROM preferred_tip
++                    UNION ALL
++                    SELECT blocks.previous_block_hash, total_tip.remaining - 1
++                    FROM total_tip
++                    INNER JOIN blocks ON blocks.hash = total_tip.parent
++                    WHERE total_tip.remaining > 0
++                )
++                SELECT total_tip.parent, total_tip.remaining FROM total_tip
++                order by remaining;
++        ",
++        )?;
++        let out = stmt
++            .query_map([block_hash], |row| row.get(0))?
++            .collect::<rusqlite::Result<Vec<Digest>>>()?;
++        Ok(out)
+     }
+ 
+     fn get_block_children(&mut self, hash: &Digest) -> Result<Vec<Digest>> {
+diff --git a/storage/src/storage/sync.rs b/storage/src/storage/sync.rs
+index ab9d4e8e3..33e4bc84a 100644
+--- a/storage/src/storage/sync.rs
++++ b/storage/src/storage/sync.rs
+@@ -131,13 +131,7 @@ pub trait SyncStorage {
+         loop {
+             for path in &round {
+                 let last_hash = path.last().unwrap();
+-                let children = if let Some(children) = self.get_cached_block_children(last_hash) {
+-                    children.to_vec()
+-                } else {
+-                    let children = self.get_block_children(last_hash)?;
+-                    self.cache_block_children(last_hash.clone(), children.clone());
+-                    children
+-                };
++                let children = self.get_block_children(last_hash)?;
+                 next_round.extend(children.into_iter().map(|x| {
+                     let mut path = path.clone();
+                     path.push(x);
+@@ -202,12 +196,6 @@ pub trait SyncStorage {
+         Ok(trees.remove(block_hash).expect("missing block hash tree"))
+     }
+ 
+-    /// Stores the immediate children of `block_hash` in a cache.
+-    fn cache_block_children(&mut self, block_hash: Digest, block_children: Vec<Digest>);
+-
+-    /// Attempts to get the immediate children of `block_hash` from a cache.
+-    fn get_cached_block_children(&mut self, block_hash: &Digest) -> Option<Vec<Digest>>;
+-
+     /// Gets the immediate children of `block_hash`.
+     fn get_block_children(&mut self, block_hash: &Digest) -> Result<Vec<Digest>>;
+ 

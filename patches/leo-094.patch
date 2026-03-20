@@ -1,127 +1,106 @@
-diff --git a/.circleci/config.yml b/.circleci/config.yml
-index 8e2e2ea7ef..ec466f2fa1 100755
---- a/.circleci/config.yml
-+++ b/.circleci/config.yml
-@@ -42,15 +42,20 @@ commands:
-       - run:
-           name: Install Rust
-           command: |
--            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
--            source "$HOME/.cargo/env"
--            rustup install 1.82.0
--            rustup override set 1.82.0
--            cargo --version --verbose
--            rustc --version
-+            # If Rust is not installed on the machine, install it
-+            if ! command -v rustc &> /dev/null; then
-+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-+              source "$HOME/.cargo/env"
-+              rustup install 1.82.0
-+              rustup override set 1.82.0
-+              cargo --version --verbose
-+              rustc --version
-+            fi
-             if [ ! -f "Cargo.lock" ]; then
-               cargo generate-lockfile
-             fi
-+            cargo install cargo-mtime
-+            
-             
- 
-   install-rust-windows:
-@@ -71,6 +76,7 @@ commands:
-             if (!(Test-Path "Cargo.lock" -PathType Leaf)) {
-                 cargo generate-lockfile
-             }
-+            cargo install cargo-mtime
- 
-   build-and-test:
-     description: "Build and run tests"
-@@ -79,12 +85,14 @@ commands:
-           name: Build
-           no_output_timeout: 30m
-           command: |
-+            cargo-mtime . ~/.cache/mtimes/project.db
-             cargo test --no-run --all --locked --profile ci --features only_testnet
-       - run:
-           name: Run tests
-           no_output_timeout: 30m
-           # The `--verbose` flag is used to check which files are being recompiled. Ideally, this should be none.
-           command: |
-+            cargo-mtime . ~/.cache/mtimes/project.db
-             cargo test --all --locked --profile ci --features only_testnet --verbose
- 
-   install_rust_nightly:
-@@ -144,6 +152,7 @@ jobs:
-             - cargo-v1-{{ arch }}-{{ checksum "Cargo.toml" }}-{{ checksum "Cargo.lock" }}
-             - cargo-v1-{{ arch }}-{{ checksum "Cargo.toml" }}
-             - cargo-v1-{{ arch }}
-+      - install-rust
-       - run:
-             name: Update Submodules
-             command: git submodule update --init --recursive
-diff --git a/.circleci/leo-example.sh b/.circleci/leo-example.sh
-index 2e794f8121..8fbce490c0 100755
---- a/.circleci/leo-example.sh
-+++ b/.circleci/leo-example.sh
-@@ -1,3 +1,9 @@
-+# Alias the leo command to use the local binary.
-+# Note: Use a full path for $LEO when running locally.
-+leo() {
-+  $LEO "$@"
-+}
-+
- (
-   # Create a new Leo lottery example program.
-   $LEO example lottery || exit
-diff --git a/.github/workflows/codecov.yml b/.github/workflows/codecov.yml
-index 1e31031cbb..4a2ae1f647 100644
---- a/.github/workflows/codecov.yml
-+++ b/.github/workflows/codecov.yml
-@@ -55,7 +55,7 @@ jobs:
-           make install DESTDIR=../../kcov-build
-           cd ../..
-           rm -rf kcov-master
--          for file in target/debug/deps/*-*; do if [[ "$file" != *\.* ]]; then mkdir -p "target/cov/$(basename $file)"; ./kcov-build/usr/local/bin/kcov --exclude-pattern=/.cargo,/usr/lib --exclude-region='@kcov_skip(start):@kcov_skip(end)' --verify "target/cov/$(basename $file)" "$file"; fi done
-+          for file in target/ci/deps/*-*; do if [[ "$file" != *\.* ]]; then mkdir -p "target/cov/$(basename $file)"; ./kcov-build/usr/local/bin/kcov --exclude-pattern=/.cargo,/usr/lib --exclude-region='@kcov_skip(start):@kcov_skip(end)' --verify "target/cov/$(basename $file)" "$file"; fi done
- 
-       - name: Upload coverage to Codecov
-         uses: codecov/codecov-action@v3
-diff --git a/build.rs b/build.rs
-index 5420a093a7..c374d98662 100644
---- a/build.rs
-+++ b/build.rs
-@@ -71,8 +71,24 @@ fn check_file_licenses<P: AsRef<Path>>(path: P) {
-         }
+diff --git a/asg/src/error/mod.rs b/asg/src/error/mod.rs
+index f3d9533ffa..fd045ff26d 100644
+--- a/asg/src/error/mod.rs
++++ b/asg/src/error/mod.rs
+@@ -192,6 +192,13 @@ impl AsgConvertError {
+         )
      }
  
--    // Re-run upon any changes to the workspace.
--    println!("cargo:rerun-if-changed=.");
-+    // Watch the directories that contain Rust source files
-+    println!("cargo:rerun-if-changed=compiler");
-+    println!("cargo:rerun-if-changed=errors");
-+    println!("cargo:rerun-if-changed=leo");
-+    println!("cargo:rerun-if-changed=tests/test-framework");
-+    println!("cargo:rerun-if-changed=utils");
++    pub fn duplicate_variable_definition(name: &str, span: &Span) -> Self {
++        Self::new_from_span(
++            format!("a variable named \"{}\" already exists in this scope", name),
++            span,
++        )
++    }
 +
-+    // Watch the build script itself
-+    println!("cargo:rerun-if-changed=build.rs");
+     pub fn index_into_non_tuple(name: &str, span: &Span) -> Self {
+         Self::new_from_span(format!("failed to index into non-tuple '{}'", name), span)
+     }
+diff --git a/asg/src/statement/definition.rs b/asg/src/statement/definition.rs
+index 4e2ce3cd83..f340052409 100644
+--- a/asg/src/statement/definition.rs
++++ b/asg/src/statement/definition.rs
+@@ -130,10 +130,16 @@ impl<'a> FromAst<'a, leo_ast::DefinitionStatement> for &'a Statement<'a> {
+         }
+ 
+         for variable in variables.iter() {
+-            scope
+-                .variables
+-                .borrow_mut()
+-                .insert(variable.borrow().name.name.to_string(), *variable);
++            let mut variables = scope.variables.borrow_mut();
++            let var_name = variable.borrow().name.name.to_string();
++            if variables.contains_key(&var_name) {
++                return Err(AsgConvertError::duplicate_variable_definition(
++                    &var_name,
++                    &statement.span,
++                ));
++            }
 +
-+    // Watch the license header file
-+    println!("cargo:rerun-if-changed=.resources/license_header");
-+
-+    // Watch the Cargo.toml file
-+    println!("cargo:rerun-if-changed=Cargo.toml");
-+
-+    // Watch the Cargo.lock file
-+    println!("cargo:rerun-if-changed=Cargo.lock");
++            variables.insert(var_name, *variable);
+         }
+ 
+         let statement = scope
+diff --git a/grammar/FORMAT_ABNF_GRAMMAR.md b/grammar/FORMAT_ABNF_GRAMMAR.md
+index cc88f9fda1..e1283d1b8e 100644
+Binary files a/grammar/FORMAT_ABNF_GRAMMAR.md and b/grammar/FORMAT_ABNF_GRAMMAR.md differ
+diff --git a/tests/compiler/function/duplicate_definition_fail.leo b/tests/compiler/function/duplicate_definition_fail.leo
+index b3f2eb8a7b..2909fae2b1 100644
+--- a/tests/compiler/function/duplicate_definition_fail.leo
++++ b/tests/compiler/function/duplicate_definition_fail.leo
+@@ -1,11 +1,13 @@
+ /*
+ namespace: Compile
+ expectation: Fail
++input_file: input/integers.in
+ */
+ 
+ 
+-function main() {
+-    console.log("{}", 1u8);  
++function main(a: u32) -> u32 {
++    console.log("{}", 1u8);
++    return 10u32; 
  }
  
- // The build script; it currently only checks the licenses.
-diff --git a/examples b/examples
-index b75bb77851..155f8410fb 160000
---- a/examples
-+++ b/examples
-@@ -1 +1 @@
--Subproject commit b75bb77851667f6ece0af4cacfc27715aa7186aa
-+Subproject commit 155f8410fb199c971b50950882a74ff593f8f5d9
+ function main() {
+diff --git a/tests/compiler/statements/duplicate_variable.leo b/tests/compiler/statements/duplicate_variable.leo
+new file mode 100644
+index 0000000000..3271a58d7a
+--- /dev/null
++++ b/tests/compiler/statements/duplicate_variable.leo
+@@ -0,0 +1,12 @@
++/*
++namespace: Compile
++expectation: Fail
++input_file: inputs/dummy.in
++*/
++
++function main(k: bool) -> bool {
++	let x = 1u8;
++  let x = true;
++	
++	return k == true;
++}
+\ No newline at end of file
+diff --git a/tests/expectations/compiler/compiler/function/duplicate_definition_fail.leo.out b/tests/expectations/compiler/compiler/function/duplicate_definition_fail.leo.out
+index 3b1bf075b9..7b1e418ef4 100644
+--- a/tests/expectations/compiler/compiler/function/duplicate_definition_fail.leo.out
++++ b/tests/expectations/compiler/compiler/function/duplicate_definition_fail.leo.out
+@@ -2,4 +2,4 @@
+ namespace: Compile
+ expectation: Fail
+ outputs:
+-  - "    --> compiler-test:8:1\n     |\n   8 | function main() {\n   9 | ...\n  10 | }\n     | ^\n     |\n     = a function named \"main\" already exists in this scope"
++  - "    --> compiler-test:6:12\n     |\n   6 |     return 10u32; \n     |            ^^^^^\n     |\n     = unexpected type, expected: '()', received: 'u32'"
+diff --git a/tests/expectations/compiler/compiler/statements/duplicate_variable.leo.out b/tests/expectations/compiler/compiler/statements/duplicate_variable.leo.out
+new file mode 100644
+index 0000000000..a313c9602a
+--- /dev/null
++++ b/tests/expectations/compiler/compiler/statements/duplicate_variable.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Compile
++expectation: Fail
++outputs:
++  - "    --> compiler-test:5:3\n     |\n   5 |   let x = true;\n     |   ^^^^^^^^^^^^\n     |\n     = a variable named \"x\" already exists in this scope"

@@ -1,0 +1,3949 @@
+diff --git a/rspack.config.ts b/rspack.config.ts
+index 42d051a2089d88..51d1d4c11fe824 100644
+--- a/rspack.config.ts
++++ b/rspack.config.ts
+@@ -486,6 +486,7 @@ const appConfig: Configuration = {
+                   'node_modules/**/*',
+                   'tests/**/*',
+                   '**/*.spec.*',
++                  '**/*.snapshots.*',
+                   'static/eslint/**/*',
+                   'scripts/**/*',
+                 ],
+diff --git a/src/sentry/api/endpoints/broadcast_index.py b/src/sentry/api/endpoints/broadcast_index.py
+index aa50be37cfccec..6b93cebd0b089c 100644
+--- a/src/sentry/api/endpoints/broadcast_index.py
++++ b/src/sentry/api/endpoints/broadcast_index.py
+@@ -7,6 +7,8 @@
+ from django.db import IntegrityError, router, transaction
+ from django.db.models import Q
+ from django.utils import timezone
++from rest_framework.request import Request
++from rest_framework.response import Response
+ 
+ from sentry.api.api_owners import ApiOwner
+ from sentry.api.api_publish_status import ApiPublishStatus
+@@ -24,10 +26,6 @@
+ logger = logging.getLogger("sentry")
+ 
+ 
+-from rest_framework.request import Request
+-from rest_framework.response import Response
+-
+-
+ @control_silo_endpoint
+ class BroadcastIndexEndpoint(ControlSiloOrganizationEndpoint):
+     owner = ApiOwner.UNOWNED
+@@ -70,9 +68,14 @@ def convert_args(self, request: Request, *args, **kwargs):
+     def get(
+         self, request: Request, organization: RpcOrganization | None = None, **kwargs
+     ) -> Response:
++        limit = None
+         if request.GET.get("show") == "all" and request.access.has_permission("broadcasts.admin"):
+             # superusers can slice and dice
+             queryset = Broadcast.objects.all().order_by("-date_added")
++        elif request.GET.get("show") == "latest":
++            limit = self.get_per_page(request, default_per_page=3, max_per_page=100)
++            # Used to show broadcasts in the sidebar and avoid an empty state when users have seen all broadcasts already
++            queryset = Broadcast.objects.filter(is_active=True).order_by("-date_added")
+         else:
+             # only allow active broadcasts if they're not a superuser
+             queryset = Broadcast.objects.filter(
+@@ -114,8 +117,13 @@ def get(
+ 
+         if organization:
+             data = self._secondary_filtering(request, organization, queryset)
++            if limit is not None:
++                data = data[:limit]
+             return self.respond(self._serialize_objects(data, request))
+ 
++        if limit is not None:
++            return self.respond(self._serialize_objects(list(queryset[:limit]), request))
++
+         sort_by = request.GET.get("sortBy")
+         if sort_by == "expires":
+             order_by = "-date_expires"
+diff --git a/src/sentry/features/temporary.py b/src/sentry/features/temporary.py
+index 54dd9228cdb937..7e4138a424fd73 100644
+--- a/src/sentry/features/temporary.py
++++ b/src/sentry/features/temporary.py
+@@ -231,20 +231,12 @@ def register_temporary_features(manager: FeatureManager) -> None:
+     manager.add("organizations:performance-web-vitals-seer-suggestions", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable the warning banner to inform users of pending deprecation of the transactions dataset
+     manager.add("organizations:performance-transaction-deprecation-banner", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+-    # Enable preprod build distribution
+-    manager.add("organizations:preprod-build-distribution", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable preprod frontend routes
+     manager.add("organizations:preprod-frontend-routes", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable preprod issue reporting
+     manager.add("organizations:preprod-issues", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+-    # Enable writing preprod size metrics to EAP for querying
+-    manager.add("organizations:preprod-size-metrics-eap-write", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
+-    # Enable writing preprod build distribution data to EAP for querying
+-    manager.add("organizations:preprod-build-distribution-eap-write", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
+     # Enable preprod PR comments for build distribution
+     manager.add("organizations:preprod-build-distribution-pr-comments", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+-    # Enable preprod app size dashboard widget
+-    manager.add("organizations:preprod-app-size-dashboard", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=True)
+     # Enable enforcement of preprod size quota checks (when disabled, size quota checks always return True)
+     manager.add("organizations:preprod-enforce-size-quota", OrganizationFeature, FeatureHandlerStrategy.FLAGPOLE, api_expose=False)
+     # Enable enforcement of preprod distribution quota checks (when disabled, distribution quota checks always return True)
+diff --git a/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py b/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py
+index c695bf60873cd2..a18250ebfd378b 100644
+--- a/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py
++++ b/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py
+@@ -127,12 +127,19 @@ def _get_slug_reservation_by_type_from_list(
+         )
+ 
+     def provision_organization(
+-        self, *, region_name: str, org_provision_args: OrganizationProvisioningOptions
++        self,
++        *,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
++        org_provision_args: OrganizationProvisioningOptions,
+     ) -> RpcOrganizationSlugReservation:
++        resolved_cell_name = cell_name or region_name
++        assert resolved_cell_name is not None, "cell_name or region_name must be provided"
++
+         # Generate a new non-conflicting slug and org ID
+-        org_id = self._generate_org_snowflake_id(region_name=region_name)
++        org_id = self._generate_org_snowflake_id(region_name=resolved_cell_name)
+         slug = self._generate_org_slug(
+-            region_name=region_name, slug=org_provision_args.provision_options.slug
++            region_name=resolved_cell_name, slug=org_provision_args.provision_options.slug
+         )
+ 
+         # Generate a provisioning outbox for the region and drain
+@@ -151,13 +158,13 @@ def provision_organization(
+                 slug=slug,
+                 organization_id=org_id,
+                 user_id=org_provision_args.provision_options.owning_user_id,
+-                cell_name=region_name,
++                cell_name=resolved_cell_name,
+             )
+ 
+             org_slug_res.save(unsafe_write=True)
+             create_organization_provisioning_outbox(
+                 organization_id=org_id,
+-                region_name=region_name,
++                region_name=resolved_cell_name,
+                 org_provision_payload=provision_payload,
+             ).save()
+ 
+@@ -174,18 +181,25 @@ def provision_organization(
+         return serialize_slug_reservation(org_slug_res)
+ 
+     def idempotent_provision_organization(
+-        self, *, region_name: str, org_provision_args: OrganizationProvisioningOptions
++        self,
++        *,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
++        org_provision_args: OrganizationProvisioningOptions,
+     ) -> RpcOrganizationSlugReservation | None:
+         raise NotImplementedError()
+ 
+     def update_organization_slug(
+         self,
+         *,
+-        region_name: str,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
+         organization_id: int,
+         desired_slug: str,
+         require_exact: bool = True,
+     ) -> RpcOrganizationSlugReservation:
++        resolved_cell_name = cell_name or region_name
++        assert resolved_cell_name is not None, "cell_name or region_name must be provided"
+         existing_slug_reservations = list(
+             OrganizationSlugReservation.objects.filter(organization_id=organization_id)
+         )
+@@ -206,12 +220,12 @@ def update_organization_slug(
+         # If there's already a matching primary slug reservation for the org,
+         # just replicate it to the region to kick off the organization sync process
+         if existing_primary_alias and existing_primary_alias.slug == desired_slug:
+-            existing_primary_alias.handle_async_replication(region_name, organization_id)
++            existing_primary_alias.handle_async_replication(resolved_cell_name, organization_id)
+             return serialize_slug_reservation(existing_primary_alias)
+ 
+         slug_base = desired_slug
+         if not require_exact:
+-            slug_base = self._generate_org_slug(region_name=region_name, slug=slug_base)
++            slug_base = self._generate_org_slug(region_name=resolved_cell_name, slug=slug_base)
+ 
+         try:
+             with outbox_context(
+@@ -221,7 +235,7 @@ def update_organization_slug(
+                     slug=slug_base,
+                     organization_id=organization_id,
+                     user_id=-1,
+-                    cell_name=region_name,
++                    cell_name=resolved_cell_name,
+                     reservation_type=OrganizationSlugReservationType.TEMPORARY_RENAME_ALIAS.value,
+                 ).save(unsafe_write=True)
+ 
+@@ -290,19 +304,23 @@ def _validate_primary_slug_updated(
+     def bulk_create_organization_slug_reservations(
+         self,
+         *,
+-        region_name: str,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
+         slug_mapping: dict[int, str],
+     ) -> None:
++        resolved_cell_name = cell_name or region_name
++        assert resolved_cell_name is not None, "cell_name or region_name must be provided"
++
+         slug_reservations_to_create: list[OrganizationSlugReservation] = []
+ 
+         with outbox_context(transaction.atomic(router.db_for_write(OrganizationSlugReservation))):
+             for org_id, slug in slug_mapping.items():
+                 slug_reservation = OrganizationSlugReservation(
+-                    slug=self._generate_org_slug(slug=slug, region_name=region_name),
++                    slug=self._generate_org_slug(slug=slug, region_name=resolved_cell_name),
+                     organization_id=org_id,
+                     reservation_type=OrganizationSlugReservationType.TEMPORARY_RENAME_ALIAS.value,
+                     user_id=-1,
+-                    cell_name=region_name,
++                    cell_name=resolved_cell_name,
+                 )
+                 slug_reservation.save(unsafe_write=True)
+ 
+diff --git a/src/sentry/hybridcloud/services/control_organization_provisioning/service.py b/src/sentry/hybridcloud/services/control_organization_provisioning/service.py
+index 3b33ea075700a7..2b5e6375b0b716 100644
+--- a/src/sentry/hybridcloud/services/control_organization_provisioning/service.py
++++ b/src/sentry/hybridcloud/services/control_organization_provisioning/service.py
+@@ -19,13 +19,17 @@ class ControlOrganizationProvisioningRpcService(RpcService):
+     @abstractmethod
+     @rpc_method
+     def provision_organization(
+-        self, *, region_name: str, org_provision_args: OrganizationProvisioningOptions
++        self,
++        *,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
++        org_provision_args: OrganizationProvisioningOptions,
+     ) -> RpcOrganizationSlugReservation:
+         """
+         Provisions an organization, an organization member, and team based on the provisioning args passed.
+ 
+         In the event of a slug conflict, a new slug will be generated using the provided slug as a seed.
+-        :param region_name: The region to provision the organization in.
++        :param cell_name: The cell to provision the organization in.
+         :param org_provision_args: Provisioning and post-provisioning options for the organization.
+         :return: RpcOrganizationSlugReservation containing the organization ID and slug.
+         """
+@@ -33,7 +37,11 @@ def provision_organization(
+     @abstractmethod
+     @rpc_method
+     def idempotent_provision_organization(
+-        self, *, region_name: str, org_provision_args: OrganizationProvisioningOptions
++        self,
++        *,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
++        org_provision_args: OrganizationProvisioningOptions,
+     ) -> RpcOrganizationSlugReservation | None:
+         """
+         Provisions an organization, an organization member, and team based on the provisioning args passed.
+@@ -43,7 +51,7 @@ def idempotent_provision_organization(
+ 
+         Note: This is not intended to be used for normal organization provisioning; but rather, for use-cases
+         such as integrations which require strong idempotency.
+-        :param region_name: The region to provision the organization in.
++        :param cell_name: The cell to provision the organization in.
+         :param org_provision_args: Provisioning and post-provisioning options for the organization.
+         :return: RpcOrganization the organization ID and slug.
+         """
+@@ -53,7 +61,8 @@ def idempotent_provision_organization(
+     def update_organization_slug(
+         self,
+         *,
+-        region_name: str,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
+         organization_id: int,
+         desired_slug: str,
+         require_exact: bool = True,
+@@ -66,7 +75,7 @@ def update_organization_slug(
+         outbox to the desired region in order to ensure that a slug change in control _will eventually_
+         result in a slug change on the region side.
+ 
+-        :param region_name: The region where the organization exists
++        :param cell_name: The cell where the organization exists
+         :param organization_id: the ID of the organization whose slug to change
+         :param desired_slug: The slug to update the organization with
+         :param require_exact: Determines whether the slug can be modified with a unique suffix in the
+@@ -79,17 +88,16 @@ def update_organization_slug(
+     def bulk_create_organization_slug_reservations(
+         self,
+         *,
+-        region_name: str,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
+         slug_mapping: dict[int, str],
+     ) -> None:
+         """
+         Only really intended for bulk organization import usage. Creates unique organization slug
+         reservations for the given list of IDs and slug bases for organizations already provisioned
+-        in the provided region.
++        in the provided cell.
+ 
+-        :param region_name: The region where the imported organization exist
+-        :param organization_ids_and_slugs: A set of ID and base slug tuples to reserve slugs for.
+-            This parameter is deprecated. Use slug_mapping instead.
++        :param cell_name: The cell where the imported organizations exist
+         :param slug_mapping: A map of organization id -> slug to reserve.
+         :return:
+         """
+diff --git a/src/sentry/hybridcloud/services/region_organization_provisioning/impl.py b/src/sentry/hybridcloud/services/region_organization_provisioning/impl.py
+index 6287920eeaf882..d4db77f57a2152 100644
+--- a/src/sentry/hybridcloud/services/region_organization_provisioning/impl.py
++++ b/src/sentry/hybridcloud/services/region_organization_provisioning/impl.py
+@@ -166,9 +166,24 @@ def create_organization_in_region(
+ 
+         return True
+ 
++    def create_organization_in_cell(
++        self,
++        *,
++        cell_name: str,
++        organization_id: int,
++        provision_payload: OrganizationProvisioningOptions,
++    ) -> bool:
++        return self.create_organization_in_region(
++            region_name=cell_name,
++            organization_id=organization_id,
++            provision_payload=provision_payload,
++        )
++
+     def update_organization_slug_from_reservation(
+         self,
+-        region_name: str,
++        *,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
+         org_slug_temporary_alias_res: RpcOrganizationSlugReservation,
+     ) -> bool:
+         # Skip any non-primary organization slug updates
+diff --git a/src/sentry/hybridcloud/services/region_organization_provisioning/service.py b/src/sentry/hybridcloud/services/region_organization_provisioning/service.py
+index e3884771fd990b..b0a07fa2d1d057 100644
+--- a/src/sentry/hybridcloud/services/region_organization_provisioning/service.py
++++ b/src/sentry/hybridcloud/services/region_organization_provisioning/service.py
+@@ -27,14 +27,27 @@ def create_organization_in_region(
+         region_name: str,
+         organization_id: int,
+         provision_payload: OrganizationProvisioningOptions,
++    ) -> bool:
++        """
++        TODO(cells): Deprecated, remove method when all callers are updated to use create_organization_in_cell
++        """
++
++    @regional_rpc_method(resolve=ByCellName())
++    @abstractmethod
++    def create_organization_in_cell(
++        self,
++        *,
++        cell_name: str,
++        organization_id: int,
++        provision_payload: OrganizationProvisioningOptions,
+     ) -> bool:
+         """
+         CAUTION: THIS IS ONLY INTENDED TO BE USED BY THE `organization_provisioning` RPC SERVICE.
+         DO NOT USE FOR LOCAL ORGANIZATION PROVISIONING.
+ 
+-        An RPC method for creating an organization in the desired region.
++        An RPC method for creating an organization in the desired cell.
+ 
+-        :param region_name: The region to create an organization in.
++        :param cell_name: The cell to create an organization in.
+         :param organization_id: The desired organization's ID, which must be a snowflake ID.
+         :param provision_payload: The provisioning options for the organization.
+         """
+@@ -43,7 +56,9 @@ def create_organization_in_region(
+     @abstractmethod
+     def update_organization_slug_from_reservation(
+         self,
+-        region_name: str,
++        *,
++        cell_name: str | None = None,  # TODO(cells): make required when all callers are updated
++        region_name: str | None = None,  # TODO(cells): remove when all callers are updated
+         org_slug_temporary_alias_res: RpcOrganizationSlugReservation,
+     ) -> bool:
+         """
+@@ -53,7 +68,7 @@ def update_organization_slug_from_reservation(
+         An RPC method for processing a slug change on the region, after it has been reserved
+         as a temporary alias in the control silo.
+ 
+-        :param region_name: The region name where the organization resides.
++        :param cell_name: The cell where the organization resides.
+         :param org_slug_temporary_alias_res: OrganizationSlugReservation for the new temporary alias.
+         :return: True if provisioning succeeded, False if a conflict occurred
+         """
+diff --git a/src/sentry/hybridcloud/tasks/deliver_webhooks.py b/src/sentry/hybridcloud/tasks/deliver_webhooks.py
+index ded29aea27a784..38736607dcedaa 100644
+--- a/src/sentry/hybridcloud/tasks/deliver_webhooks.py
++++ b/src/sentry/hybridcloud/tasks/deliver_webhooks.py
+@@ -439,9 +439,7 @@ def _record_delivery_time_metrics(payload: WebhookPayload) -> None:
+         if payload.destination_type == DestinationType.SENTRY_REGION
+         else "codecov"
+     )
+-    tags = {"region_sent_to": region_sent_to}
+-    if options.get("hybridcloud.deliver_webhooks.delivery_time_include_github_tags"):
+-        tags |= _get_github_delivery_time_tags(payload)
++    tags = {"region_sent_to": region_sent_to} | _get_github_delivery_time_tags(payload)
+     metrics.distribution(
+         "hybridcloud.deliver_webhooks.delivery_time_ms",
+         # e.g. 0.123 seconds → 123 milliseconds
+diff --git a/src/sentry/incidents/endpoints/serializers/workflow_engine_detector.py b/src/sentry/incidents/endpoints/serializers/workflow_engine_detector.py
+index 482eb57e2ad835..93c4a1055b6b27 100644
+--- a/src/sentry/incidents/endpoints/serializers/workflow_engine_detector.py
++++ b/src/sentry/incidents/endpoints/serializers/workflow_engine_detector.py
+@@ -439,6 +439,9 @@ def serialize(self, obj: Detector, attrs, user, **kwargs) -> AlertRuleSerializer
+             "detectionType": obj.config.get("detection_type"),
+         }
+ 
++        if not obj.enabled:
++            data["snooze"] = True
++
+         if "latestIncident" in self.expand:
+             data["latestIncident"] = attrs.get("latestIncident", None)
+ 
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index 27f21b438f3294..8468e7a9891d40 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -2491,11 +2491,6 @@
+     default=False,
+     flags=FLAG_AUTOMATOR_MODIFIABLE,
+ )
+-register(
+-    "hybridcloud.deliver_webhooks.delivery_time_include_github_tags",
+-    default=False,
+-    flags=FLAG_AUTOMATOR_MODIFIABLE,
+-)
+ register(
+     "hybridcloud.webhookpayload.skip_on_failure_providers",
+     type=Sequence,
+diff --git a/src/sentry/preprod/api/endpoints/project_installable_preprod_artifact_download.py b/src/sentry/preprod/api/endpoints/project_installable_preprod_artifact_download.py
+index 5f1d91f1c5f273..e5d11e50ddd42b 100644
+--- a/src/sentry/preprod/api/endpoints/project_installable_preprod_artifact_download.py
++++ b/src/sentry/preprod/api/endpoints/project_installable_preprod_artifact_download.py
+@@ -8,7 +8,6 @@
+ from rest_framework.request import Request
+ from rest_framework.response import Response
+ 
+-from sentry import features
+ from sentry.api.api_owners import ApiOwner
+ from sentry.api.api_publish_status import ApiPublishStatus
+ from sentry.api.base import cell_silo_endpoint
+@@ -119,13 +118,12 @@ def get(self, request: Request, project: Project, url_path: str) -> HttpResponse
+             # Update build distribution data in EAP with new download count
+             try:
+                 organization = project.organization
+-                if features.has("organizations:preprod-build-distribution-eap-write", organization):
+-                    produce_preprod_build_distribution_to_eap(
+-                        artifact=preprod_artifact,
+-                        organization=organization,
+-                        organization_id=project.organization_id,
+-                        project_id=project.id,
+-                    )
++                produce_preprod_build_distribution_to_eap(
++                    artifact=preprod_artifact,
++                    organization=organization,
++                    organization_id=project.organization_id,
++                    project_id=project.id,
++                )
+             except Exception:
+                 logger.exception(
+                     "Failed to write preprod build distribution to EAP after download",
+diff --git a/src/sentry/preprod/size_analysis/grouptype.py b/src/sentry/preprod/size_analysis/grouptype.py
+index a6e634747b7cca..99381650d5b86a 100644
+--- a/src/sentry/preprod/size_analysis/grouptype.py
++++ b/src/sentry/preprod/size_analysis/grouptype.py
+@@ -7,8 +7,10 @@
+ from typing import TYPE_CHECKING, Any, NotRequired, TypeAlias, TypedDict
+ from uuid import uuid4
+ 
++from sentry.exceptions import InvalidSearchQuery
+ from sentry.issues.grouptype import GroupCategory, GroupType
+ from sentry.issues.issue_occurrence import IssueEvidence
++from sentry.preprod.artifact_search import artifact_matches_query
+ from sentry.types.group import PriorityLevel
+ from sentry.utils import metrics
+ from sentry.workflow_engine.endpoints.validators.base import BaseDetectorTypeValidator
+@@ -86,7 +88,33 @@ class SizeAnalysisValue(TypedDict):
+ class PreprodSizeAnalysisDetectorHandler(
+     BaseDetectorHandler[SizeAnalysisValue, SizeAnalysisEvaluation]
+ ):
++    def _matches_query(self, data_packet: SizeAnalysisDataPacket) -> bool:
++        query = self.detector.config.get("query", "")
++        if not query or not query.strip():
++            return True
++
++        metadata = data_packet.packet.get("metadata")
++        if not metadata:
++            raise ValueError(
++                f"Data packet is missing metadata required to evaluate query filter: {query}"
++            )
++
++        artifact = metadata["head_artifact"]
++        organization = self.detector.project.organization
++
++        try:
++            return artifact_matches_query(artifact, query, organization)
++        except InvalidSearchQuery:
++            logger.exception(
++                "preprod.size_analysis.invalid_detector_query",
++                extra={"detector_id": self.detector.id, "query": query},
++            )
++            return False
++
+     def evaluate_impl(self, data_packet: SizeAnalysisDataPacket) -> GroupedDetectorEvaluationResult:
++        if not self._matches_query(data_packet):
++            return GroupedDetectorEvaluationResult(result={}, tainted=False)
++
+         value = self.extract_value(data_packet)
+         evaluation, priority = self._evaluate_conditions(value)
+         if evaluation is None or priority is None:
+@@ -268,6 +296,10 @@ class PreprodSizeAnalysisGroupType(GroupType):
+                     "enum": ["install_size", "download_size"],
+                     "description": "The measurement to track",
+                 },
++                "query": {
++                    "type": "string",
++                    "description": "Search query to filter which artifacts are monitored",
++                },
+             },
+             "required": ["threshold_type", "measurement"],
+             "additionalProperties": False,
+diff --git a/src/sentry/preprod/tasks.py b/src/sentry/preprod/tasks.py
+index fc1b42d851c48e..877e32800ba73d 100644
+--- a/src/sentry/preprod/tasks.py
++++ b/src/sentry/preprod/tasks.py
+@@ -10,7 +10,6 @@
+ from django.db import router, transaction
+ from django.utils import timezone
+ 
+-from sentry import features
+ from sentry.constants import DataCategory
+ from sentry.models.commitcomparison import CommitComparison
+ from sentry.models.organization import Organization
+@@ -514,23 +513,22 @@ def _assemble_preprod_artifact_size_analysis(
+ 
+         try:
+             organization = preprod_artifact.project.organization
+-            if features.has("organizations:preprod-size-metrics-eap-write", organization):
+-                for size_metric in size_metrics_updated:
+-                    produce_preprod_size_metric_to_eap(
+-                        size_metric=size_metric,
+-                        organization=organization,
+-                        organization_id=org_id,
+-                        project_id=project.id,
+-                    )
+-                logger.info(
+-                    "Successfully wrote preprod size metrics to EAP",
+-                    extra={
+-                        "preprod_artifact_id": preprod_artifact.id,
+-                        "size_metrics_ids": [m.id for m in size_metrics_updated],
+-                        "organization_id": org_id,
+-                        "project_id": project.id,
+-                    },
++            for size_metric in size_metrics_updated:
++                produce_preprod_size_metric_to_eap(
++                    size_metric=size_metric,
++                    organization=organization,
++                    organization_id=org_id,
++                    project_id=project.id,
+                 )
++            logger.info(
++                "Successfully wrote preprod size metrics to EAP",
++                extra={
++                    "preprod_artifact_id": preprod_artifact.id,
++                    "size_metrics_ids": [m.id for m in size_metrics_updated],
++                    "organization_id": org_id,
++                    "project_id": project.id,
++                },
++            )
+         except Exception as eap_error:
+             logger.exception(
+                 "Failed to write preprod size metrics to EAP",
+@@ -744,21 +742,20 @@ def _assemble_preprod_artifact_installable_app(
+ 
+     try:
+         organization = preprod_artifact.project.organization
+-        if features.has("organizations:preprod-build-distribution-eap-write", organization):
+-            produce_preprod_build_distribution_to_eap(
+-                artifact=preprod_artifact,
+-                organization=organization,
+-                organization_id=org_id,
+-                project_id=project.id,
+-            )
+-            logger.info(
+-                "Successfully wrote preprod build distribution to EAP",
+-                extra={
+-                    "preprod_artifact_id": preprod_artifact.id,
+-                    "organization_id": org_id,
+-                    "project_id": project.id,
+-                },
+-            )
++        produce_preprod_build_distribution_to_eap(
++            artifact=preprod_artifact,
++            organization=organization,
++            organization_id=org_id,
++            project_id=project.id,
++        )
++        logger.info(
++            "Successfully wrote preprod build distribution to EAP",
++            extra={
++                "preprod_artifact_id": preprod_artifact.id,
++                "organization_id": org_id,
++                "project_id": project.id,
++            },
++        )
+     except Exception:
+         logger.exception(
+             "Failed to write preprod build distribution to EAP",
+diff --git a/static/app/actionCreators/modal.tsx b/static/app/actionCreators/modal.tsx
+index 5b0f2b0a7cf6a2..4649acaf1e4c9f 100644
+--- a/static/app/actionCreators/modal.tsx
++++ b/static/app/actionCreators/modal.tsx
+@@ -1,6 +1,7 @@
+ import type {ModalTypes} from 'sentry/components/globalModal';
+ import type {CreateReleaseIntegrationModalOptions} from 'sentry/components/modals/createReleaseIntegrationModal';
+ import type {DashboardWidgetQuerySelectorModalOptions} from 'sentry/components/modals/dashboardWidgetQuerySelectorModal';
++import type {DataWidgetViewerModalOptions} from 'sentry/components/modals/dataWidgetViewerModal';
+ import type {SaveQueryModalProps} from 'sentry/components/modals/explore/saveQueryModal';
+ import type {GenerateDashboardFromSeerModalProps} from 'sentry/components/modals/generateDashboardFromSeerModal';
+ import type {ImportDashboardFromFileModalProps} from 'sentry/components/modals/importDashboardFromFileModal';
+@@ -11,7 +12,6 @@ import type {ReprocessEventModalOptions} from 'sentry/components/modals/reproces
+ import type {TokenRegenerationConfirmationModalProps} from 'sentry/components/modals/tokenRegenerationConfirmationModal';
+ import type {AddToDashboardModalProps} from 'sentry/components/modals/widgetBuilder/addToDashboardModal';
+ import type {LinkToDashboardModalProps} from 'sentry/components/modals/widgetBuilder/linkToDashboardModal';
+-import type {WidgetViewerModalOptions} from 'sentry/components/modals/widgetViewerModal';
+ import type {ConsoleModalProps} from 'sentry/components/onboarding/consoleModal';
+ import type {Category} from 'sentry/components/platformPicker';
+ import ModalStore from 'sentry/stores/modalStore';
+@@ -21,6 +21,7 @@ import type {IssueOwnership} from 'sentry/types/group';
+ import type {MissingMember, Organization, OrgRole} from 'sentry/types/organization';
+ import type {Project} from 'sentry/types/project';
+ import type {Theme} from 'sentry/utils/theme';
++import {DisplayType} from 'sentry/views/dashboards/types';
+ import type {AttributeBreakdownViewerModalOptions} from 'sentry/views/explore/components/attributeBreakdowns/attributeBreakdownViewerModal';
+ 
+ export type ModalOptions = ModalTypes['options'];
+@@ -327,19 +328,32 @@ export async function openDashboardWidgetQuerySelectorModal(
+ export async function openWidgetViewerModal({
+   onClose,
+   ...options
+-}: WidgetViewerModalOptions & {onClose?: () => void}) {
+-  const {
+-    default: Modal,
+-    modalCss,
+-    backdropCss,
+-  } = await import('sentry/components/modals/widgetViewerModal');
+-
+-  openModal(deps => <Modal {...deps} {...options} />, {
+-    closeEvents: 'none',
+-    modalCss,
+-    backdropCss,
+-    onClose,
+-  });
++}: DataWidgetViewerModalOptions & {onClose?: () => void}) {
++  if (options.widget.displayType === DisplayType.TEXT) {
++    const {
++      default: Modal,
++      modalCss,
++      backdropCss,
++    } = await import('sentry/components/modals/textWidgetViewerModal');
++    openModal(deps => <Modal {...deps} {...options} />, {
++      closeEvents: 'none',
++      modalCss,
++      backdropCss,
++      onClose,
++    });
++  } else {
++    const {
++      default: Modal,
++      modalCss,
++      backdropCss,
++    } = await import('sentry/components/modals/dataWidgetViewerModal');
++    openModal(deps => <Modal {...deps} {...options} />, {
++      closeEvents: 'none',
++      modalCss,
++      backdropCss,
++      onClose,
++    });
++  }
+ }
+ 
+ export async function openCreateNewIntegrationModal() {
+diff --git a/static/app/components/emptyMessage.mdx b/static/app/components/emptyMessage.mdx
+index 4d2c293859785e..37192ef522d959 100644
+--- a/static/app/components/emptyMessage.mdx
++++ b/static/app/components/emptyMessage.mdx
+@@ -8,8 +8,8 @@ resources:
+ 
+ import {Button} from '@sentry/scraps/button';
+ 
+-import EmptyMessage from 'sentry/components/emptyMessage';
+-import Panel from 'sentry/components/panels/panel';
++import {EmptyMessage} from 'sentry/components/emptyMessage';
++import {Panel} from 'sentry/components/panels/panel';
+ import {IconSearch} from 'sentry/icons';
+ import * as Storybook from 'sentry/stories';
+ 
+diff --git a/static/app/components/modals/widgetViewerModal.spec.tsx b/static/app/components/modals/dataWidgetViewerModal.spec.tsx
+similarity index 99%
+rename from static/app/components/modals/widgetViewerModal.spec.tsx
+rename to static/app/components/modals/dataWidgetViewerModal.spec.tsx
+index 57cf301e2e7fd1..d859e840e43251 100644
+--- a/static/app/components/modals/widgetViewerModal.spec.tsx
++++ b/static/app/components/modals/dataWidgetViewerModal.spec.tsx
+@@ -17,7 +17,7 @@ import {
+ import {resetMockDate, setMockDate} from 'sentry-test/utils';
+ 
+ import type {ModalRenderProps} from 'sentry/actionCreators/modal';
+-import WidgetViewerModal from 'sentry/components/modals/widgetViewerModal';
++import DataWidgetViewerModal from 'sentry/components/modals/dataWidgetViewerModal';
+ import PageFiltersStore from 'sentry/components/pageFilters/store';
+ import MemberListStore from 'sentry/stores/memberListStore';
+ import ProjectsStore from 'sentry/stores/projectsStore';
+@@ -84,7 +84,7 @@ async function renderModal({
+     navigate: jest.fn(),
+   });
+   const rendered = render(
+-    <WidgetViewerModal
++    <DataWidgetViewerModal
+       Header={stubEl}
+       Footer={stubEl as ModalRenderProps['Footer']}
+       Body={stubEl as ModalRenderProps['Body']}
+@@ -111,7 +111,7 @@ async function renderModal({
+   return rendered;
+ }
+ 
+-describe('Modals -> WidgetViewerModal', () => {
++describe('Modals -> DataWidgetViewerModal', () => {
+   let initialData: InitialData;
+   let initialDataWithFlag: InitialData;
+   beforeEach(() => {
+diff --git a/static/app/components/modals/widgetViewerModal.tsx b/static/app/components/modals/dataWidgetViewerModal.tsx
+similarity index 99%
+rename from static/app/components/modals/widgetViewerModal.tsx
+rename to static/app/components/modals/dataWidgetViewerModal.tsx
+index 4f3caee4383128..c79eb9b9038e8a 100644
+--- a/static/app/components/modals/widgetViewerModal.tsx
++++ b/static/app/components/modals/dataWidgetViewerModal.tsx
+@@ -121,7 +121,7 @@ import {MetricsDataSwitcher} from 'sentry/views/performance/landing/metricsDataS
+ 
+ import {WidgetViewerQueryField} from './widgetViewerModal/utils';
+ 
+-export interface WidgetViewerModalOptions {
++export interface DataWidgetViewerModalOptions {
+   organization: Organization;
+   widget: Widget;
+   widgetLegendState: WidgetLegendSelectionState;
+@@ -132,7 +132,7 @@ export interface WidgetViewerModalOptions {
+   widgetInterval?: string;
+ }
+ 
+-interface Props extends ModalRenderProps, WidgetViewerModalOptions {
++interface Props extends ModalRenderProps, DataWidgetViewerModalOptions {
+   organization: Organization;
+   selection: PageFilters;
+ }
+@@ -182,7 +182,7 @@ async function fetchDiscoverTotal(
+   }
+ }
+ 
+-function WidgetViewerModal(props: Props) {
++function DataWidgetViewerModal(props: Props) {
+   const {
+     organization,
+     widget,
+@@ -1220,4 +1220,4 @@ const EmptyQueryContainer = styled('span')`
+   color: ${p => p.theme.tokens.content.disabled};
+ `;
+ 
+-export default withPageFilters(WidgetViewerModal);
++export default withPageFilters(DataWidgetViewerModal);
+diff --git a/static/app/components/modals/textWidgetViewerModal.spec.tsx b/static/app/components/modals/textWidgetViewerModal.spec.tsx
+new file mode 100644
+index 00000000000000..5a9832869d07d7
+--- /dev/null
++++ b/static/app/components/modals/textWidgetViewerModal.spec.tsx
+@@ -0,0 +1,193 @@
++import type {Location} from 'history';
++import {DashboardFixture} from 'sentry-fixture/dashboard';
++import {OrganizationFixture} from 'sentry-fixture/organization';
++import {UserFixture} from 'sentry-fixture/user';
++import {WidgetFixture} from 'sentry-fixture/widget';
++
++import {render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
++
++import type {ModalRenderProps} from 'sentry/actionCreators/modal';
++import TextWidgetViewerModal from 'sentry/components/modals/textWidgetViewerModal';
++import PageFiltersStore from 'sentry/components/pageFilters/store';
++import ConfigStore from 'sentry/stores/configStore';
++import {trackAnalytics} from 'sentry/utils/analytics';
++import {DisplayType} from 'sentry/views/dashboards/types';
++import type {DashboardPermissions, Widget} from 'sentry/views/dashboards/types';
++import WidgetLegendSelectionState from 'sentry/views/dashboards/widgetLegendSelectionState';
++
++jest.mock('sentry/utils/analytics');
++
++jest.mock('sentry/views/dashboards/widgetCard/widgetCardChartContainer', () => ({
++  WidgetCardChartContainer: jest.fn(() => <div data-test-id="widget-chart" />),
++}));
++
++const stubEl = (props: {children?: React.ReactNode}) => <div>{props.children}</div>;
++
++function renderModal({
++  widget = WidgetFixture({
++    displayType: DisplayType.TEXT,
++    id: '1',
++    title: 'My Text Widget',
++  }),
++  onEdit,
++  closeModal = jest.fn(),
++  dashboardPermissions,
++  dashboardCreator,
++  organization = OrganizationFixture(),
++  routerQuery = {},
++}: {
++  closeModal?: jest.Mock;
++  dashboardCreator?: ReturnType<typeof UserFixture>;
++  dashboardPermissions?: DashboardPermissions;
++  onEdit?: jest.Mock;
++  organization?: ReturnType<typeof OrganizationFixture>;
++  routerQuery?: Record<string, string>;
++  widget?: Widget;
++} = {}) {
++  const widgetLegendLocation = {
++    pathname: '/mock-pathname/',
++    query: routerQuery,
++    hash: '',
++    search: '',
++    state: undefined,
++    key: 'initial',
++  } as Location;
++
++  const widgetLegendState = new WidgetLegendSelectionState({
++    location: widgetLegendLocation,
++    dashboard: DashboardFixture([widget], {id: 'new', title: 'Dashboard'}),
++    organization,
++    navigate: jest.fn(),
++  });
++
++  return render(
++    <TextWidgetViewerModal
++      Header={stubEl}
++      Footer={stubEl as ModalRenderProps['Footer']}
++      Body={stubEl as ModalRenderProps['Body']}
++      CloseButton={stubEl}
++      closeModal={closeModal}
++      organization={organization}
++      widget={widget}
++      widgetLegendState={widgetLegendState}
++      onEdit={onEdit}
++      dashboardPermissions={dashboardPermissions}
++      dashboardCreator={dashboardCreator}
++    />,
++    {
++      organization,
++      initialRouterConfig: {
++        location: {pathname: '/mock-pathname/', query: routerQuery},
++      },
++    }
++  );
++}
++
++describe('Modals -> TextWidgetViewerModal', () => {
++  beforeEach(() => {
++    MockApiClient.addMockResponse({
++      url: '/organizations/org-slug/user-teams/',
++      body: [],
++    });
++
++    PageFiltersStore.init();
++    PageFiltersStore.onInitializeUrlState({
++      projects: [],
++      environments: [],
++      datetime: {start: null, end: null, period: '14d', utc: null},
++    });
++
++    ConfigStore.set('user', UserFixture({id: '1'}));
++  });
++
++  afterEach(() => {
++    MockApiClient.clearMockResponses();
++    jest.clearAllMocks();
++  });
++
++  it('renders the widget title', async () => {
++    renderModal();
++
++    expect(await screen.findByText('My Text Widget')).toBeInTheDocument();
++  });
++
++  it('renders the chart container', async () => {
++    renderModal();
++
++    expect(await screen.findByTestId('widget-chart')).toBeInTheDocument();
++  });
++
++  describe('Edit button', () => {
++    it('shows edit button when onEdit and widget.id are provided', async () => {
++      renderModal({onEdit: jest.fn()});
++
++      expect(
++        await screen.findByRole('button', {name: 'Edit Widget'})
++      ).toBeInTheDocument();
++    });
++
++    it('does not show edit button when onEdit is not provided', () => {
++      renderModal();
++
++      expect(screen.queryByRole('button', {name: 'Edit Widget'})).not.toBeInTheDocument();
++    });
++
++    it('does not show edit button when widget has no id', () => {
++      renderModal({
++        widget: WidgetFixture({displayType: DisplayType.TEXT, title: 'No ID Widget'}),
++        onEdit: jest.fn(),
++      });
++
++      expect(screen.queryByRole('button', {name: 'Edit Widget'})).not.toBeInTheDocument();
++    });
++
++    it('calls closeModal, onEdit, and tracks analytics on click', async () => {
++      const closeModal = jest.fn();
++      const onEdit = jest.fn();
++
++      renderModal({closeModal, onEdit});
++
++      await userEvent.click(await screen.findByRole('button', {name: 'Edit Widget'}));
++
++      expect(closeModal).toHaveBeenCalled();
++      expect(onEdit).toHaveBeenCalled();
++      expect(trackAnalytics).toHaveBeenCalledWith(
++        'dashboards_views.widget_viewer.edit',
++        expect.objectContaining({
++          display_type: DisplayType.TEXT,
++        })
++      );
++    });
++
++    it('is disabled when user does not have edit access', async () => {
++      // Use an org without org:admin so hasEveryAccess returns false
++      renderModal({
++        organization: OrganizationFixture({access: []}),
++        onEdit: jest.fn(),
++        dashboardPermissions: {isEditableByEveryone: false},
++        dashboardCreator: UserFixture({id: '999'}),
++      });
++
++      expect(await screen.findByRole('button', {name: 'Edit Widget'})).toBeDisabled();
++    });
++
++    it('is enabled when user is the dashboard creator', async () => {
++      renderModal({
++        onEdit: jest.fn(),
++        dashboardPermissions: {isEditableByEveryone: false},
++        dashboardCreator: UserFixture({id: '1'}), // matches ConfigStore user
++      });
++
++      expect(await screen.findByRole('button', {name: 'Edit Widget'})).toBeEnabled();
++    });
++
++    it('is enabled when dashboard is editable by everyone', async () => {
++      renderModal({
++        onEdit: jest.fn(),
++        dashboardPermissions: {isEditableByEveryone: true},
++      });
++
++      expect(await screen.findByRole('button', {name: 'Edit Widget'})).toBeEnabled();
++    });
++  });
++});
+diff --git a/static/app/components/modals/textWidgetViewerModal.tsx b/static/app/components/modals/textWidgetViewerModal.tsx
+new file mode 100644
+index 00000000000000..df4375413cb8a8
+--- /dev/null
++++ b/static/app/components/modals/textWidgetViewerModal.tsx
+@@ -0,0 +1,119 @@
++import {Fragment} from 'react';
++import {css} from '@emotion/react';
++
++import {Button} from '@sentry/scraps/button';
++import {Flex} from '@sentry/scraps/layout';
++import {Heading} from '@sentry/scraps/text';
++
++import type {ModalRenderProps} from 'sentry/actionCreators/modal';
++import {t} from 'sentry/locale';
++import type {PageFilters} from 'sentry/types/core';
++import type {Organization} from 'sentry/types/organization';
++import type {User} from 'sentry/types/user';
++import {trackAnalytics} from 'sentry/utils/analytics';
++import {useUser} from 'sentry/utils/useUser';
++import {useUserTeams} from 'sentry/utils/useUserTeams';
++import {withPageFilters} from 'sentry/utils/withPageFilters';
++import type {
++  DashboardFilters,
++  DashboardPermissions,
++  Widget,
++} from 'sentry/views/dashboards/types';
++import {checkUserHasEditAccess} from 'sentry/views/dashboards/utils/checkUserHasEditAccess';
++import {WidgetCardChartContainer} from 'sentry/views/dashboards/widgetCard/widgetCardChartContainer';
++import type WidgetLegendSelectionState from 'sentry/views/dashboards/widgetLegendSelectionState';
++
++interface TextWidgetViewerModalOptions {
++  organization: Organization;
++  widget: Widget;
++  widgetLegendState: WidgetLegendSelectionState;
++  dashboardCreator?: User;
++  dashboardFilters?: DashboardFilters;
++  dashboardPermissions?: DashboardPermissions;
++  onEdit?: () => void;
++}
++
++interface Props extends ModalRenderProps, TextWidgetViewerModalOptions {
++  organization: Organization;
++  selection: PageFilters;
++}
++
++const HALF_CONTAINER_HEIGHT = 300;
++
++function TextWidgetViewerModal(props: Props) {
++  const {
++    organization,
++    widget,
++    selection,
++    Footer,
++    Body,
++    Header,
++    closeModal,
++    onEdit,
++    widgetLegendState,
++    dashboardPermissions,
++    dashboardCreator,
++  } = props;
++  const currentUser = useUser();
++  const {teams: userTeams} = useUserTeams();
++  const hasEditAccess = checkUserHasEditAccess(
++    currentUser,
++    userTeams,
++    organization,
++    dashboardPermissions,
++    dashboardCreator
++  );
++
++  return (
++    <Fragment>
++      <Header closeButton>
++        <Heading as="h3">{widget.title}</Heading>
++      </Header>
++      <Body>
++        <Flex maxHeight={`${HALF_CONTAINER_HEIGHT}px`}>
++          <WidgetCardChartContainer
++            selection={selection}
++            widget={widget}
++            noPadding
++            widgetLegendState={widgetLegendState}
++          />
++        </Flex>
++      </Body>
++      <Footer>
++        <Flex flexGrow={1} align="center" justify={{sm: 'right', xs: 'center'}}>
++          {onEdit && widget.id && (
++            <Button
++              onClick={() => {
++                closeModal();
++                onEdit();
++                trackAnalytics('dashboards_views.widget_viewer.edit', {
++                  organization,
++                  widget_type: widget.widgetType ?? 'null',
++                  display_type: widget.displayType,
++                });
++              }}
++              disabled={!hasEditAccess}
++              tooltipProps={{
++                title:
++                  !hasEditAccess && t('You do not have permission to edit this widget'),
++              }}
++            >
++              {t('Edit Widget')}
++            </Button>
++          )}
++        </Flex>
++      </Footer>
++    </Fragment>
++  );
++}
++
++export const modalCss = css`
++  width: 100%;
++  max-width: 1200px;
++`;
++
++export const backdropCss = css`
++  z-index: 9998;
++`;
++
++export default withPageFilters(TextWidgetViewerModal);
+diff --git a/static/app/components/performanceOnboarding/sidebar.tsx b/static/app/components/performanceOnboarding/sidebar.tsx
+index 8d10ce0ba9f913..cda4b218e270ad 100644
+--- a/static/app/components/performanceOnboarding/sidebar.tsx
++++ b/static/app/components/performanceOnboarding/sidebar.tsx
+@@ -33,11 +33,10 @@ import OnboardingDrawerStore, {
+ import {useLegacyStore} from 'sentry/stores/useLegacyStore';
+ import pulsingIndicatorStyles from 'sentry/styles/pulsingIndicator';
+ import type {Project} from 'sentry/types/project';
+-import EventWaiter from 'sentry/utils/eventWaiter';
+ import useApi from 'sentry/utils/useApi';
++import {useEventWaiter} from 'sentry/utils/useEventWaiter';
+ import {useLocation} from 'sentry/utils/useLocation';
+ import useOrganization from 'sentry/utils/useOrganization';
+-import usePrevious from 'sentry/utils/usePrevious';
+ import useProjects from 'sentry/utils/useProjects';
+ 
+ import {filterProjects} from './utils';
+@@ -233,15 +232,12 @@ function OnboardingContent({currentProject}: {currentProject: Project}) {
+   const organization = useOrganization();
+   const {isSelfHosted, urlPrefix} = useLegacyStore(ConfigStore);
+   const copyEnabled = useCopySetupInstructionsEnabled();
+-  const [received, setReceived] = useState<boolean>(false);
+-
+-  const previousProject = usePrevious(currentProject);
+-
+-  useEffect(() => {
+-    if (previousProject.id !== currentProject.id) {
+-      setReceived(false);
+-    }
+-  }, [previousProject.id, currentProject.id]);
++  const firstIssue = useEventWaiter({
++    eventType: 'transaction',
++    organization,
++    project: currentProject,
++  });
++  const received = !!firstIssue;
+ 
+   const currentPlatform = currentProject.platform
+     ? platforms.find(p => p.id === currentProject.platform)
+@@ -362,17 +358,7 @@ function OnboardingContent({currentProject}: {currentProject: Project}) {
+           );
+         })}
+       </Steps>
+-      <EventWaiter
+-        api={api}
+-        organization={organization}
+-        project={currentProject}
+-        eventType="transaction"
+-        onIssueReceived={() => {
+-          setReceived(true);
+-        }}
+-      >
+-        {() => (received ? <EventReceivedIndicator /> : <EventWaitingIndicator />)}
+-      </EventWaiter>
++      {received ? <EventReceivedIndicator /> : <EventWaitingIndicator />}
+     </TabSelectionScope>
+   );
+ }
+diff --git a/static/app/components/updatedEmptyState.tsx b/static/app/components/updatedEmptyState.tsx
+index 86b38d9a0b9af0..f6e38c71701757 100644
+--- a/static/app/components/updatedEmptyState.tsx
++++ b/static/app/components/updatedEmptyState.tsx
+@@ -33,9 +33,9 @@ import {useLegacyStore} from 'sentry/stores/useLegacyStore';
+ import pulsingIndicatorStyles from 'sentry/styles/pulsingIndicator';
+ import type {PlatformIntegration, Project} from 'sentry/types/project';
+ import {trackAnalytics} from 'sentry/utils/analytics';
+-import EventWaiter from 'sentry/utils/eventWaiter';
+ import {decodeInteger} from 'sentry/utils/queryString';
+ import useApi from 'sentry/utils/useApi';
++import {useEventWaiter} from 'sentry/utils/useEventWaiter';
+ import {useLocation} from 'sentry/utils/useLocation';
+ import {useNavigate} from 'sentry/utils/useNavigate';
+ import useOrganization from 'sentry/utils/useOrganization';
+@@ -56,32 +56,31 @@ export function SetupTitle({project}: {project: Project}) {
+ 
+ function WaitingIndicator({project}: {project: Project}) {
+   const organization = useOrganization();
++  const firstIssue = useEventWaiter({
++    eventType: 'error',
++    organization,
++    project,
++  });
++
++  if (!firstIssue) {
++    return <EventWaitingIndicator />;
++  }
+ 
+   return (
+-    <EventWaiter organization={organization} project={project} eventType="error">
+-      {({firstIssue}) =>
+-        firstIssue ? (
+-          <LinkButton
+-            onClick={() =>
+-              trackAnalytics('growth.onboarding_take_to_error', {
+-                organization,
+-                platform: project.platform,
+-              })
+-            }
+-            to={`/organizations/${organization.slug}/issues/${
+-              firstIssue && firstIssue !== true && 'id' in firstIssue
+-                ? `${firstIssue.id}/`
+-                : ''
+-            }?referrer=onboarding-first-event-indicator`}
+-            priority="primary"
+-          >
+-            {t('Take me to my error')}
+-          </LinkButton>
+-        ) : (
+-          <EventWaitingIndicator />
+-        )
++    <LinkButton
++      onClick={() =>
++        trackAnalytics('growth.onboarding_take_to_error', {
++          organization,
++          platform: project.platform,
++        })
+       }
+-    </EventWaiter>
++      to={`/organizations/${organization.slug}/issues/${
++        firstIssue !== true && 'id' in firstIssue ? `${firstIssue.id}/` : ''
++      }?referrer=onboarding-first-event-indicator`}
++      priority="primary"
++    >
++      {t('Take me to my error')}
++    </LinkButton>
+   );
+ }
+ 
+diff --git a/static/app/utils/eventWaiter.spec.tsx b/static/app/utils/eventWaiter.spec.tsx
+deleted file mode 100644
+index 0b32e5598e5452..00000000000000
+--- a/static/app/utils/eventWaiter.spec.tsx
++++ /dev/null
+@@ -1,157 +0,0 @@
+-import {OrganizationFixture} from 'sentry-fixture/organization';
+-import {ProjectFixture} from 'sentry-fixture/project';
+-
+-import {act, render} from 'sentry-test/reactTestingLibrary';
+-
+-import EventWaiter from 'sentry/utils/eventWaiter';
+-
+-jest.useFakeTimers();
+-
+-describe('EventWaiter', () => {
+-  it('waits for the first projet event', async () => {
+-    const org = OrganizationFixture();
+-    const project = ProjectFixture({
+-      firstEvent: null,
+-    });
+-
+-    // Start with a project *without* a first event
+-    const projectApiMock = MockApiClient.addMockResponse({
+-      url: `/projects/${org.slug}/${project.slug}/`,
+-      method: 'GET',
+-      body: project,
+-    });
+-
+-    const child = jest.fn().mockReturnValue(null);
+-
+-    render(
+-      <EventWaiter
+-        api={new MockApiClient()}
+-        organization={org}
+-        project={project}
+-        eventType="error"
+-        pollInterval={10}
+-      >
+-        {child}
+-      </EventWaiter>
+-    );
+-    expect(child).toHaveBeenCalledWith({firstIssue: null});
+-
+-    // Add the first events and associated responses and tick the timer
+-    project.firstEvent = '2019-05-01T00:00:00.000Z';
+-
+-    const events = [
+-      {
+-        id: 1,
+-        firstSeen: project.firstEvent,
+-      },
+-      {
+-        id: 2,
+-        firstSeen: null,
+-      },
+-    ];
+-    MockApiClient.addMockResponse({
+-      url: `/projects/${org.slug}/${project.slug}/issues/`,
+-      method: 'GET',
+-      body: events,
+-    });
+-
+-    child.mockClear();
+-
+-    // Advanced time for the first setInterval tick to occur
+-    act(() => jest.advanceTimersByTime(1));
+-
+-    // We have to await *two* API calls. We could normally do this using tick(),
+-    // however since we have enabled fake timers, we cannot tick.
+-    await act(() => Promise.resolve());
+-    await act(() => Promise.resolve());
+-
+-    expect(child).toHaveBeenCalledWith({firstIssue: events[0]});
+-
+-    // Check that the polling has stopped
+-    projectApiMock.mockClear();
+-
+-    act(() => jest.advanceTimersByTime(10));
+-    expect(projectApiMock).not.toHaveBeenCalled();
+-  });
+-
+-  it('receives a first event of `true` when first even has expired', async () => {
+-    const org = OrganizationFixture();
+-    const project = ProjectFixture({
+-      firstEvent: '2019-05-01T00:00:00.000Z',
+-    });
+-
+-    MockApiClient.addMockResponse({
+-      url: `/projects/${org.slug}/${project.slug}/`,
+-      method: 'GET',
+-      body: project,
+-    });
+-
+-    // No events to list
+-    MockApiClient.addMockResponse({
+-      url: `/projects/${org.slug}/${project.slug}/issues/`,
+-      method: 'GET',
+-      body: [],
+-    });
+-
+-    const child = jest.fn().mockReturnValue(null);
+-
+-    render(
+-      <EventWaiter
+-        api={new MockApiClient()}
+-        organization={org}
+-        project={project}
+-        eventType="error"
+-        pollInterval={10}
+-      >
+-        {child}
+-      </EventWaiter>
+-    );
+-
+-    // We have to await *two* API calls. We could normally do this using tick(),
+-    // however since we have enabled fake timers, we cannot tick.
+-    await act(() => Promise.resolve());
+-    await act(() => Promise.resolve());
+-
+-    expect(child).toHaveBeenCalledWith({firstIssue: true});
+-  });
+-
+-  it('does not poll when disabled', () => {
+-    const org = OrganizationFixture();
+-    const project = ProjectFixture();
+-
+-    const projectApiMock = MockApiClient.addMockResponse({
+-      url: `/projects/${org.slug}/${project.slug}/`,
+-      method: 'GET',
+-      body: project,
+-    });
+-
+-    // No events to list
+-    MockApiClient.addMockResponse({
+-      url: `/projects/${org.slug}/${project.slug}/issues/`,
+-      method: 'GET',
+-      body: [],
+-    });
+-
+-    const child = jest.fn().mockReturnValue(null);
+-
+-    render(
+-      <EventWaiter
+-        api={new MockApiClient()}
+-        organization={org}
+-        project={project}
+-        eventType="error"
+-        pollInterval={10}
+-        disabled
+-      >
+-        {child}
+-      </EventWaiter>
+-    );
+-
+-    expect(child).toHaveBeenCalledWith({firstIssue: null});
+-
+-    // Ensure we do not call it again
+-    projectApiMock.mockClear();
+-    jest.advanceTimersByTime(10);
+-    expect(projectApiMock).not.toHaveBeenCalled();
+-  });
+-});
+diff --git a/static/app/utils/eventWaiter.tsx b/static/app/utils/eventWaiter.tsx
+deleted file mode 100644
+index 4b980d85842641..00000000000000
+--- a/static/app/utils/eventWaiter.tsx
++++ /dev/null
+@@ -1,169 +0,0 @@
+-import {Component} from 'react';
+-import * as Sentry from '@sentry/react';
+-
+-import type {Client} from 'sentry/api';
+-import type {Group} from 'sentry/types/group';
+-import type {Organization} from 'sentry/types/organization';
+-import type {Project} from 'sentry/types/project';
+-import withApi from 'sentry/utils/withApi';
+-
+-const DEFAULT_POLL_INTERVAL = 5000;
+-
+-/**
+- * When no event has been received this will be set to null or false.
+- * Otherwise it will be the Group of the issue that was received.
+- * Or in the case of transactions & replay the value will be set to true.
+- * The `group.id` value is used to generate links directly into the event.
+- */
+-type FirstIssue = null | boolean | Group;
+-
+-interface EventWaiterProps {
+-  api: Client;
+-  children: (props: {firstIssue: FirstIssue}) => React.ReactNode;
+-  eventType: 'error' | 'transaction' | 'replay' | 'profile' | 'log';
+-  organization: Organization;
+-  project: Project;
+-  disabled?: boolean;
+-  onIssueReceived?: (props: {firstIssue: FirstIssue}) => void;
+-  pollInterval?: number;
+-}
+-
+-type EventWaiterState = {
+-  firstIssue: FirstIssue;
+-};
+-
+-function getFirstEvent(eventType: EventWaiterProps['eventType'], resp: Project) {
+-  switch (eventType) {
+-    case 'error':
+-      return resp.firstEvent;
+-    case 'transaction':
+-      return resp.firstTransactionEvent;
+-    case 'replay':
+-      return resp.hasReplays;
+-    case 'profile':
+-      return resp.hasProfiles;
+-    case 'log':
+-      return resp.hasLogs;
+-    default:
+-      return null;
+-  }
+-}
+-
+-/**
+- * This is a render prop component that can be used to wait for the first event
+- * of a project to be received via polling.
+- */
+-class EventWaiter extends Component<EventWaiterProps, EventWaiterState> {
+-  state: EventWaiterState = {
+-    firstIssue: null,
+-  };
+-
+-  componentDidMount() {
+-    this.pollHandler();
+-    this.startPolling();
+-  }
+-
+-  componentDidUpdate() {
+-    this.stopPolling();
+-    this.startPolling();
+-  }
+-
+-  componentWillUnmount() {
+-    this.stopPolling();
+-  }
+-
+-  pollingInterval: number | null = null;
+-
+-  pollHandler = async () => {
+-    const {api, organization, project, eventType, onIssueReceived} = this.props;
+-    let firstEvent: string | boolean | null = null;
+-    let firstIssue: Group | boolean | null = null;
+-
+-    try {
+-      const resp = await api.requestPromise(
+-        `/projects/${organization.slug}/${project.slug}/`
+-      );
+-      firstEvent = getFirstEvent(eventType, resp);
+-    } catch (resp: any) {
+-      if (!resp) {
+-        return;
+-      }
+-
+-      // This means org or project does not exist, we need to stop polling
+-      // Also stop polling on auth-related errors (403/401)
+-      if ([404, 403, 401, 0].includes(resp.status)) {
+-        // TODO: Add some UX around this... redirect? error message?
+-        this.stopPolling();
+-        return;
+-      }
+-
+-      Sentry.setExtras({
+-        status: resp.status,
+-        detail: resp.responseJSON?.detail,
+-      });
+-      Sentry.captureException(new Error(`Error polling for first ${eventType} event`));
+-    }
+-
+-    if (firstEvent === null || firstEvent === false) {
+-      return;
+-    }
+-
+-    if (eventType === 'error') {
+-      // Locate the projects first issue group. The project.firstEvent field will
+-      // *not* include sample events, while just looking at the issues list will.
+-      // We will wait until the project.firstEvent is set and then locate the
+-      // event given that event datetime
+-      const issues: Group[] = await api.requestPromise(
+-        `/projects/${organization.slug}/${project.slug}/issues/`
+-      );
+-
+-      // The event may have expired, default to true
+-      firstIssue = issues.find((issue: Group) => issue.firstSeen === firstEvent) || true;
+-    } else if (eventType === 'transaction') {
+-      firstIssue = Boolean(firstEvent);
+-    } else if (eventType === 'replay') {
+-      firstIssue = Boolean(firstEvent);
+-    } else if (eventType === 'profile') {
+-      firstIssue = Boolean(firstEvent);
+-    } else if (eventType === 'log') {
+-      firstIssue = Boolean(firstEvent);
+-    }
+-
+-    if (onIssueReceived) {
+-      onIssueReceived({firstIssue});
+-    }
+-
+-    this.stopPolling();
+-    this.setState({firstIssue});
+-  };
+-
+-  startPolling() {
+-    const {disabled, organization, project} = this.props;
+-
+-    if (disabled || !organization || !project || this.state.firstIssue) {
+-      return;
+-    }
+-
+-    // Proactively clear interval just in case stopPolling was not called
+-    if (this.pollingInterval) {
+-      window.clearInterval(this.pollingInterval);
+-    }
+-
+-    this.pollingInterval = window.setInterval(
+-      this.pollHandler,
+-      this.props.pollInterval || DEFAULT_POLL_INTERVAL
+-    );
+-  }
+-
+-  stopPolling() {
+-    if (this.pollingInterval) {
+-      clearInterval(this.pollingInterval);
+-    }
+-  }
+-
+-  render() {
+-    return this.props.children({firstIssue: this.state.firstIssue});
+-  }
+-}
+-
+-export default withApi(EventWaiter);
+diff --git a/static/app/utils/useEventWaiter.spec.tsx b/static/app/utils/useEventWaiter.spec.tsx
+new file mode 100644
+index 00000000000000..bb681b0a62d887
+--- /dev/null
++++ b/static/app/utils/useEventWaiter.spec.tsx
+@@ -0,0 +1,188 @@
++import {OrganizationFixture} from 'sentry-fixture/organization';
++import {ProjectFixture} from 'sentry-fixture/project';
++
++import {act, renderHookWithProviders, waitFor} from 'sentry-test/reactTestingLibrary';
++
++import {useEventWaiter} from 'sentry/utils/useEventWaiter';
++
++describe('useEventWaiter', () => {
++  it('waits for the first project event and resolves the matching issue', async () => {
++    const org = OrganizationFixture();
++    const project = ProjectFixture({firstEvent: null});
++
++    // Start with a project *without* a first event
++    const projectApiMock = MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/`,
++      method: 'GET',
++      body: project,
++    });
++
++    const {result} = renderHookWithProviders(
++      () =>
++        useEventWaiter({
++          eventType: 'error',
++          organization: org,
++          project,
++          pollInterval: 100,
++        }),
++      {organization: org}
++    );
++
++    // Initially null
++    expect(result.current).toBeNull();
++
++    // Simulate first event arriving on subsequent poll
++    const events = [
++      {id: 1, firstSeen: '2019-05-01T00:00:00.000Z'},
++      {id: 2, firstSeen: null},
++    ];
++
++    MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/`,
++      method: 'GET',
++      body: ProjectFixture({firstEvent: '2019-05-01T00:00:00.000Z'}),
++    });
++
++    MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/issues/`,
++      method: 'GET',
++      body: events,
++    });
++
++    // Wait for the hook to resolve the first issue
++    await waitFor(() => {
++      expect(result.current).toEqual(events[0]);
++    });
++
++    // Verify polling stops after resolution
++    projectApiMock.mockClear();
++  });
++
++  it('returns true when first event has expired (no matching issue)', async () => {
++    const org = OrganizationFixture();
++    const project = ProjectFixture({firstEvent: '2019-05-01T00:00:00.000Z'});
++
++    MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/`,
++      method: 'GET',
++      body: project,
++    });
++
++    // No matching issues
++    MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/issues/`,
++      method: 'GET',
++      body: [],
++    });
++
++    const {result} = renderHookWithProviders(
++      () =>
++        useEventWaiter({
++          eventType: 'error',
++          organization: org,
++          project,
++          pollInterval: 100,
++        }),
++      {organization: org}
++    );
++
++    await waitFor(() => {
++      expect(result.current).toBe(true);
++    });
++  });
++
++  it('returns true for transaction events', async () => {
++    const org = OrganizationFixture();
++    const project = ProjectFixture({firstTransactionEvent: true});
++
++    MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/`,
++      method: 'GET',
++      body: project,
++    });
++
++    const {result} = renderHookWithProviders(
++      () =>
++        useEventWaiter({
++          eventType: 'transaction',
++          organization: org,
++          project,
++          pollInterval: 100,
++        }),
++      {organization: org}
++    );
++
++    await waitFor(() => {
++      expect(result.current).toBe(true);
++    });
++  });
++
++  it('does not poll when disabled', () => {
++    const org = OrganizationFixture();
++    const project = ProjectFixture();
++
++    const projectApiMock = MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/`,
++      method: 'GET',
++      body: project,
++    });
++
++    const {result} = renderHookWithProviders(
++      () =>
++        useEventWaiter({
++          eventType: 'error',
++          organization: org,
++          project,
++          disabled: true,
++          pollInterval: 100,
++        }),
++      {organization: org}
++    );
++
++    expect(result.current).toBeNull();
++    expect(projectApiMock).not.toHaveBeenCalled();
++  });
++
++  it('stops polling after first event is detected', async () => {
++    jest.useFakeTimers();
++
++    const org = OrganizationFixture();
++    const project = ProjectFixture({firstEvent: null});
++
++    // API returns a project with firstTransactionEvent already set
++    const projectApiMock = MockApiClient.addMockResponse({
++      url: `/projects/${org.slug}/${project.slug}/`,
++      method: 'GET',
++      body: ProjectFixture({firstTransactionEvent: true}),
++    });
++
++    const {result} = renderHookWithProviders(
++      () =>
++        useEventWaiter({
++          eventType: 'transaction',
++          organization: org,
++          project,
++          pollInterval: 100,
++        }),
++      {organization: org}
++    );
++
++    // Flush the initial fetch
++    await act(async () => {
++      await jest.advanceTimersByTimeAsync(1);
++    });
++
++    expect(result.current).toBe(true);
++    expect(projectApiMock).toHaveBeenCalledTimes(1);
++
++    // Advance well past multiple poll intervals
++    await act(async () => {
++      await jest.advanceTimersByTimeAsync(1000);
++    });
++
++    // Polling should have stopped — no calls beyond the initial fetch
++    expect(projectApiMock).toHaveBeenCalledTimes(1);
++
++    jest.useRealTimers();
++  });
++});
+diff --git a/static/app/utils/useEventWaiter.tsx b/static/app/utils/useEventWaiter.tsx
+new file mode 100644
+index 00000000000000..03eb5aeb083b03
+--- /dev/null
++++ b/static/app/utils/useEventWaiter.tsx
+@@ -0,0 +1,157 @@
++import {useEffect} from 'react';
++import * as Sentry from '@sentry/react';
++
++import type {Group} from 'sentry/types/group';
++import type {Organization} from 'sentry/types/organization';
++import type {Project} from 'sentry/types/project';
++import getApiUrl from 'sentry/utils/api/getApiUrl';
++import {useApiQuery} from 'sentry/utils/queryClient';
++import RequestError from 'sentry/utils/requestError/requestError';
++
++const DEFAULT_POLL_INTERVAL = 5000;
++
++/**
++ * When no event has been received this will be set to null or false.
++ * Otherwise it will be the Group of the issue that was received.
++ * Or in the case of transactions & replay the value will be set to true.
++ * The `group.id` value is used to generate links directly into the event.
++ */
++type FirstEvent = null | boolean | Group;
++
++type EventType = 'error' | 'transaction' | 'replay' | 'profile' | 'log';
++
++interface UseEventWaiterOptions {
++  eventType: EventType;
++  organization: Organization;
++  project: Project;
++  disabled?: boolean;
++  pollInterval?: number;
++}
++
++function getFirstEvent(eventType: EventType, resp: Project) {
++  switch (eventType) {
++    case 'error':
++      return resp.firstEvent;
++    case 'transaction':
++      return resp.firstTransactionEvent;
++    case 'replay':
++      return resp.hasReplays;
++    case 'profile':
++      return resp.hasProfiles;
++    case 'log':
++      return resp.hasLogs;
++    default:
++      return null;
++  }
++}
++
++/**
++ * Hook that polls for the first event of a project.
++ * Returns null until the first event is detected, then returns the
++ * resolved FirstEvent (a Group for errors, or true for other event types).
++ * Once resolved, polling stops automatically.
++ */
++export function useEventWaiter({
++  eventType,
++  organization,
++  project,
++  disabled,
++  pollInterval = DEFAULT_POLL_INTERVAL,
++}: UseEventWaiterOptions): FirstEvent {
++  const shouldPoll = !disabled && !!organization && !!project;
++
++  const projectUrl = getApiUrl('/projects/$organizationIdOrSlug/$projectIdOrSlug/', {
++    path: {
++      organizationIdOrSlug: organization.slug,
++      projectIdOrSlug: project.slug,
++    },
++  });
++
++  const issuesUrl = getApiUrl(
++    '/projects/$organizationIdOrSlug/$projectIdOrSlug/issues/',
++    {
++      path: {
++        organizationIdOrSlug: organization.slug,
++        projectIdOrSlug: project.slug,
++      },
++    }
++  );
++
++  // Poll the project endpoint to detect when the first event arrives
++  const projectQuery = useApiQuery<Project>([projectUrl], {
++    refetchInterval: query => {
++      if (!shouldPoll) {
++        return false;
++      }
++      // Stop polling once the first event has been detected
++      if (query.state.data) {
++        const [projectData] = query.state.data;
++        if (getFirstEvent(eventType, projectData)) {
++          return false;
++        }
++      }
++      return pollInterval;
++    },
++    enabled: shouldPoll,
++    staleTime: 0,
++    retry: (_, error) => {
++      if (error instanceof RequestError) {
++        // Stop retrying for auth/not-found errors
++        if (error.status && [401, 403, 404, 0].includes(error.status)) {
++          return false;
++        }
++      }
++      return true;
++    },
++  });
++
++  const firstEvent = projectQuery.data
++    ? getFirstEvent(eventType, projectQuery.data)
++    : null;
++
++  // For errors, fetch the first issue group once we know the firstEvent exists
++  const issuesQuery = useApiQuery<Group[]>([issuesUrl], {
++    enabled: eventType === 'error' && !!firstEvent,
++    staleTime: 0,
++  });
++
++  // Report errors to Sentry (matching original behavior)
++  useEffect(() => {
++    if (!projectQuery.error) {
++      return;
++    }
++
++    const err = projectQuery.error;
++    if (err instanceof RequestError) {
++      if (err.status !== undefined && [401, 403, 404, 0].includes(err.status)) {
++        return;
++      }
++
++      Sentry.setExtras({
++        status: err.status,
++        detail: err.responseJSON?.detail,
++      });
++    }
++
++    Sentry.captureException(
++      new Error(`Error polling for first ${eventType} event`, {cause: err})
++    );
++  }, [projectQuery.error, eventType]);
++
++  if (firstEvent === null || firstEvent === false) {
++    return null;
++  }
++
++  if (eventType === 'error') {
++    if (!issuesQuery.data) {
++      return null;
++    }
++    // The event may have expired, default to true
++    return (
++      issuesQuery.data.find((issue: Group) => issue.firstSeen === firstEvent) || true
++    );
++  }
++
++  // transaction, replay, profile, log
++  return Boolean(firstEvent);
++}
+diff --git a/static/app/views/dashboards/datasetConfig/mobileAppSize.tsx b/static/app/views/dashboards/datasetConfig/mobileAppSize.tsx
+index 34904e5ffbff61..013a2e0a6f9b33 100644
+--- a/static/app/views/dashboards/datasetConfig/mobileAppSize.tsx
++++ b/static/app/views/dashboards/datasetConfig/mobileAppSize.tsx
+@@ -18,7 +18,6 @@ import type {
+ } from 'sentry/utils/discover/fields';
+ import {SizeUnit} from 'sentry/utils/discover/fields';
+ import {AggregationKey} from 'sentry/utils/fields';
+-import useOrganization from 'sentry/utils/useOrganization';
+ import type {
+   DatasetConfig,
+   SearchBarData,
+@@ -192,29 +191,16 @@ function MobileAppSizeSearchBar({
+ function useMobileAppSizeSearchBarDataProvider(
+   props: SearchBarDataProviderProps
+ ): SearchBarData {
+-  const organization = useOrganization();
+   const {
+     selection: {projects},
+   } = usePageFilters();
+ 
+   const {attributes: stringAttributes, secondaryAliases: stringSecondaryAliases} =
+-    usePreprodItemAttributes(
+-      {enabled: organization.features.includes('preprod-app-size-dashboard')},
+-      'string',
+-      HIDDEN_PREPROD_ATTRIBUTES
+-    );
++    usePreprodItemAttributes({enabled: true}, 'string', HIDDEN_PREPROD_ATTRIBUTES);
+   const {attributes: numberAttributes, secondaryAliases: numberSecondaryAliases} =
+-    usePreprodItemAttributes(
+-      {enabled: organization.features.includes('preprod-app-size-dashboard')},
+-      'number',
+-      HIDDEN_PREPROD_ATTRIBUTES
+-    );
++    usePreprodItemAttributes({enabled: true}, 'number', HIDDEN_PREPROD_ATTRIBUTES);
+   const {attributes: booleanAttributes, secondaryAliases: booleanSecondaryAliases} =
+-    usePreprodItemAttributes(
+-      {enabled: organization.features.includes('preprod-app-size-dashboard')},
+-      'boolean',
+-      HIDDEN_PREPROD_ATTRIBUTES
+-    );
++    usePreprodItemAttributes({enabled: true}, 'boolean', HIDDEN_PREPROD_ATTRIBUTES);
+ 
+   const {filterKeys, filterKeySections, getTagValues} =
+     useTraceItemSearchQueryBuilderProps({
+diff --git a/static/app/views/dashboards/manage/dashboardGrid.spec.tsx b/static/app/views/dashboards/manage/dashboardGrid.spec.tsx
+index 507e7fbea89696..d9ac3775c24853 100644
+--- a/static/app/views/dashboards/manage/dashboardGrid.spec.tsx
++++ b/static/app/views/dashboards/manage/dashboardGrid.spec.tsx
+@@ -174,6 +174,27 @@ describe('Dashboards - DashboardGrid', () => {
+     );
+   });
+ 
++  it('does not forward search query parameter to dashboard links', () => {
++    render(
++      <DashboardGrid
++        onDashboardsChange={jest.fn()}
++        organization={organization}
++        dashboards={dashboards}
++        location={{
++          ...LocationFixture(),
++          query: {query: 'agent', statsPeriod: '7d'},
++        }}
++        columnCount={3}
++        rowCount={3}
++      />
++    );
++
++    expect(screen.getByRole('link', {name: 'Dashboard 1'})).toHaveAttribute(
++      'href',
++      '/organizations/org-slug/dashboard/1/?statsPeriod=7d'
++    );
++  });
++
+   it('can delete dashboards', async () => {
+     render(
+       <DashboardGrid
+diff --git a/static/app/views/dashboards/manage/dashboardGrid.tsx b/static/app/views/dashboards/manage/dashboardGrid.tsx
+index 4c02fdccaf339f..443a014c5271ba 100644
+--- a/static/app/views/dashboards/manage/dashboardGrid.tsx
++++ b/static/app/views/dashboards/manage/dashboardGrid.tsx
+@@ -180,10 +180,9 @@ function DashboardGrid({
+ 
+   // TODO(__SENTRY_USING_REACT_ROUTER_SIX): We can remove this later, react
+   // router 6 handles empty query objects without appending a trailing ?
++  const {query: _searchQuery, ...queryWithoutSearch} = location.query;
+   const queryLocation = {
+-    ...(location.query && Object.keys(location.query).length > 0
+-      ? {query: location.query}
+-      : {}),
++    ...(Object.keys(queryWithoutSearch).length > 0 ? {query: queryWithoutSearch} : {}),
+   };
+ 
+   function renderMiniDashboards() {
+diff --git a/static/app/views/dashboards/manage/dashboardTable.spec.tsx b/static/app/views/dashboards/manage/dashboardTable.spec.tsx
+index 0865b2092c30be..1807b86f97016f 100644
+--- a/static/app/views/dashboards/manage/dashboardTable.spec.tsx
++++ b/static/app/views/dashboards/manage/dashboardTable.spec.tsx
+@@ -171,6 +171,25 @@ describe('Dashboards - DashboardTable', () => {
+     );
+   });
+ 
++  it('does not forward search query parameter to dashboard links', async () => {
++    render(
++      <DashboardTable
++        onDashboardsChange={jest.fn()}
++        organization={organization}
++        dashboards={dashboards}
++        location={{
++          ...LocationFixture(),
++          query: {query: 'agent', statsPeriod: '7d'},
++        }}
++      />
++    );
++
++    expect(await screen.findByRole('link', {name: 'Dashboard 1'})).toHaveAttribute(
++      'href',
++      '/organizations/org-slug/dashboard/1/?statsPeriod=7d'
++    );
++  });
++
+   it('can delete dashboards', async () => {
+     render(
+       <DashboardTable
+diff --git a/static/app/views/dashboards/manage/dashboardTable.tsx b/static/app/views/dashboards/manage/dashboardTable.tsx
+index a8e325f26798bb..acce980f9883de 100644
+--- a/static/app/views/dashboards/manage/dashboardTable.tsx
++++ b/static/app/views/dashboards/manage/dashboardTable.tsx
+@@ -145,10 +145,9 @@ function DashboardTable({
+ 
+   // TODO(__SENTRY_USING_REACT_ROUTER_SIX): We can remove this later, react
+   // router 6 handles empty query objects without appending a trailing ?
++  const {query: _searchQuery, ...queryWithoutSearch} = location.query;
+   const queryLocation = {
+-    ...(location.query && Object.keys(location.query).length > 0
+-      ? {query: location.query}
+-      : {}),
++    ...(Object.keys(queryWithoutSearch).length > 0 ? {query: queryWithoutSearch} : {}),
+   };
+ 
+   function renderHeadCell(column: GridColumnOrder<string>) {
+diff --git a/static/app/views/dashboards/manage/index.tsx b/static/app/views/dashboards/manage/index.tsx
+index 8c35a49a2b2863..10704553d645ea 100644
+--- a/static/app/views/dashboards/manage/index.tsx
++++ b/static/app/views/dashboards/manage/index.tsx
+@@ -527,6 +527,8 @@ function ManageDashboards() {
+     );
+   }
+ 
++  const {query: _query, ...queryWithoutSearch} = location.query;
++
+   function onCreate() {
+     trackAnalytics('dashboards_manage.create.start', {
+       organization,
+@@ -535,7 +537,7 @@ function ManageDashboards() {
+     navigate(
+       normalizeUrl({
+         pathname: `/organizations/${organization.slug}/dashboards/new/`,
+-        query: location.query,
++        query: queryWithoutSearch,
+       })
+     );
+   }
+@@ -562,7 +564,7 @@ function ManageDashboards() {
+     navigate(
+       normalizeUrl({
+         pathname: `/organizations/${organization.slug}/dashboards/${dashboardId}/`,
+-        query: location.query,
++        query: queryWithoutSearch,
+       })
+     );
+   }
+@@ -576,7 +578,7 @@ function ManageDashboards() {
+     navigate(
+       normalizeUrl({
+         pathname: `/organizations/${organization.slug}/dashboards/new/${dashboardId}/`,
+-        query: location.query,
++        query: queryWithoutSearch,
+       })
+     );
+   }
+diff --git a/static/app/views/dashboards/utils.tsx b/static/app/views/dashboards/utils.tsx
+index 0f51f63b84b04b..f6b3c21091152c 100644
+--- a/static/app/views/dashboards/utils.tsx
++++ b/static/app/views/dashboards/utils.tsx
+@@ -651,6 +651,7 @@ export const usesTimeSeriesData = (displayType?: DisplayType) => {
+     DisplayType.WHEEL,
+     DisplayType.RAGE_AND_DEAD_CLICKS,
+     DisplayType.AGENTS_TRACES_TABLE,
++    DisplayType.TEXT,
+   ].includes(displayType);
+ };
+ 
+@@ -668,6 +669,7 @@ export const widgetFetchesOwnData = (widgetType: DisplayType) => {
+     DisplayType.SERVER_TREE,
+     DisplayType.RAGE_AND_DEAD_CLICKS,
+     DisplayType.AGENTS_TRACES_TABLE,
++    DisplayType.TEXT,
+   ];
+   return widgetTypesThatFetchOwnData.includes(widgetType);
+ };
+diff --git a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+index 7783168d8239d4..2283e6d6098323 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+@@ -1,4 +1,11 @@
+-import {Fragment, useCallback, useEffect, useState, type CSSProperties} from 'react';
++import {
++  Fragment,
++  useCallback,
++  useEffect,
++  useRef,
++  useState,
++  type CSSProperties,
++} from 'react';
+ import {closestCorners, DndContext, useDraggable, useDroppable} from '@dnd-kit/core';
+ import {css, Global, useTheme} from '@emotion/react';
+ import styled from '@emotion/styled';
+@@ -44,7 +51,6 @@ import {
+ } from 'sentry/views/dashboards/widgetBuilder/contexts/widgetBuilderContext';
+ import type {OnDataFetchedParams} from 'sentry/views/dashboards/widgetCard';
+ import {DashboardsMEPProvider} from 'sentry/views/dashboards/widgetCard/dashboardsMEPContext';
+-import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {MetricsDataSwitcher} from 'sentry/views/performance/landing/metricsDataSwitcher';
+ 
+ export interface ThresholdMetaState {
+@@ -86,11 +92,20 @@ function WidgetBuilderV2({
+     DEFAULT_WIDGET_DRAG_POSITIONING
+   );
+ 
+-  const {navigationParentRef} = useNavigationContext();
+-  // Check if we have a valid nav reference
+-  const hasValidNav = Boolean(navigationParentRef?.current);
++  const navigationElementRef = useRef<HTMLDivElement>(null);
++
++  useEffect(() => {
++    if (navigationElementRef.current) return;
++
++    const navigationElement = document.querySelector(
++      'nav[aria-label="Primary Navigation"]'
++    )?.parentElement;
++    if (navigationElement) {
++      navigationElementRef.current = navigationElement as HTMLDivElement;
++    }
++  }, []);
+ 
+-  const dimensions = useDimensions({elementRef: navigationParentRef});
++  const dimensions = useDimensions({elementRef: navigationElementRef});
+ 
+   const handleDragEnd = ({over}: any) => {
+     setTranslate(snapPreviewToCorners(over));
+@@ -150,7 +165,7 @@ function WidgetBuilderV2({
+             <CustomMeasurementsProvider organization={organization} selection={selection}>
+               <ContainerWithoutSidebar
+                 style={
+-                  hasValidNav
++                  navigationElementRef.current
+                     ? isMediumScreen
+                       ? {
+                           left: 0,
+diff --git a/static/app/views/dashboards/widgetCard/chart.tsx b/static/app/views/dashboards/widgetCard/chart.tsx
+index 5ead9fda96eaed..ea884f9dada669 100644
+--- a/static/app/views/dashboards/widgetCard/chart.tsx
++++ b/static/app/views/dashboards/widgetCard/chart.tsx
+@@ -264,6 +264,7 @@ function WidgetCardChart(props: WidgetCardChartProps) {
+         <AgentsTracesTableWidgetVisualization
+           limit={widget.limit}
+           tableWidths={widget.tableWidths}
++          dashboardFilters={props.dashboardFilters}
+           frameless
+         />
+       </TableWrapper>
+diff --git a/static/app/views/dashboards/widgetCard/index.spec.tsx b/static/app/views/dashboards/widgetCard/index.spec.tsx
+index aeea64d51967fe..66986d1e47ee0b 100644
+--- a/static/app/views/dashboards/widgetCard/index.spec.tsx
++++ b/static/app/views/dashboards/widgetCard/index.spec.tsx
+@@ -848,6 +848,32 @@ describe('Dashboards > WidgetCard', () => {
+     expect(await screen.findByText('Indexed')).toBeInTheDocument();
+   });
+ 
++  it('does not render description for text display type widgets', async () => {
++    renderWithProviders(
++      <WidgetCard
++        api={api}
++        widget={{
++          ...multipleQueryWidget,
++          displayType: DisplayType.TEXT,
++          description: 'Valid widget description',
++        }}
++        selection={selection}
++        isEditingDashboard={false}
++        onDelete={() => undefined}
++        onEdit={() => undefined}
++        onDuplicate={() => undefined}
++        renderErrorMessage={() => undefined}
++        showContextMenu
++        widgetLimitReached={false}
++        widgetLegendState={widgetLegendState}
++      />
++    );
++
++    // Wait for the widget to render by checking for the actions button
++    await screen.findByLabelText('Widget actions');
++    expect(screen.queryByLabelText('Widget description')).not.toBeInTheDocument();
++  });
++
+   it('displays the transaction deprecation warning and explore links for transaction widgets', async () => {
+     renderWithProviders(
+       <WidgetCard
+diff --git a/static/app/views/dashboards/widgetCard/index.tsx b/static/app/views/dashboards/widgetCard/index.tsx
+index e9dedd60b90a6b..c665b7591c6543 100644
+--- a/static/app/views/dashboards/widgetCard/index.tsx
++++ b/static/app/views/dashboards/widgetCard/index.tsx
+@@ -380,7 +380,9 @@ function WidgetCard(props: Props) {
+       >
+         <WidgetFrame
+           title={widget.title}
+-          description={widget.description}
++          description={
++            widget.displayType === DisplayType.TEXT ? undefined : widget.description
++          }
+           badgeProps={badges}
+           warnings={warnings}
+           actionsDisabled={actionsDisabled}
+diff --git a/static/app/views/dashboards/widgetCard/widgetCardChartContainer.tsx b/static/app/views/dashboards/widgetCard/widgetCardChartContainer.tsx
+index 5ed21cda133ee9..2e9b8481c7b6a7 100644
+--- a/static/app/views/dashboards/widgetCard/widgetCardChartContainer.tsx
++++ b/static/app/views/dashboards/widgetCard/widgetCardChartContainer.tsx
+@@ -24,10 +24,10 @@ import WidgetCardChart from './chart';
+ import {WidgetCardDataLoader} from './widgetCardDataLoader';
+ 
+ type Props = {
+-  api: Client;
+   selection: PageFilters;
+   widget: Widget;
+   widgetLegendState: WidgetLegendSelectionState;
++  api?: Client;
+   chartGroup?: string;
+   dashboardFilters?: DashboardFilters;
+   disableTableActions?: boolean;
+diff --git a/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx b/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx
+index a72ef2ed3ff585..a6366b25156a2f 100644
+--- a/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx
++++ b/static/app/views/dashboards/widgets/agentsTracesTableWidget/agentsTracesTableWidgetVisualization.tsx
+@@ -1,8 +1,10 @@
++import type {DashboardFilters} from 'sentry/views/dashboards/types';
+ import {DEFAULT_TRACES_TABLE_WIDTHS} from 'sentry/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview';
+ import {useTraceViewDrawer} from 'sentry/views/insights/pages/agents/components/drawer';
+ import {TracesTable} from 'sentry/views/insights/pages/agents/components/tracesTable';
+ 
+ interface AgentsTracesTableWidgetVisualizationProps {
++  dashboardFilters?: DashboardFilters;
+   frameless?: boolean;
+   limit?: number;
+   tableWidths?: number[];
+@@ -11,6 +13,7 @@ interface AgentsTracesTableWidgetVisualizationProps {
+ export function AgentsTracesTableWidgetVisualization({
+   limit,
+   tableWidths = DEFAULT_TRACES_TABLE_WIDTHS,
++  dashboardFilters,
+   frameless,
+ }: AgentsTracesTableWidgetVisualizationProps) {
+   const {openTraceViewDrawer} = useTraceViewDrawer();
+@@ -20,6 +23,7 @@ export function AgentsTracesTableWidgetVisualization({
+       openTraceViewDrawer={openTraceViewDrawer}
+       limit={limit}
+       tableWidths={tableWidths}
++      dashboardFilters={dashboardFilters}
+       frameless={frameless}
+     />
+   );
+diff --git a/static/app/views/insights/pages/agents/components/tracesTable.tsx b/static/app/views/insights/pages/agents/components/tracesTable.tsx
+index c9e899bc439aa0..b2136444c9f385 100644
+--- a/static/app/views/insights/pages/agents/components/tracesTable.tsx
++++ b/static/app/views/insights/pages/agents/components/tracesTable.tsx
+@@ -24,6 +24,8 @@ import {t} from 'sentry/locale';
+ import {isOverflown} from 'sentry/utils/useHoverOverlay';
+ import {useLocation} from 'sentry/utils/useLocation';
+ import useOrganization from 'sentry/utils/useOrganization';
++import {WidgetType, type DashboardFilters} from 'sentry/views/dashboards/types';
++import {applyDashboardFilters} from 'sentry/views/dashboards/utils';
+ import {FRAMELESS_STYLES} from 'sentry/views/dashboards/widgets/tableWidget/tableWidgetVisualization';
+ import {SAMPLING_MODE} from 'sentry/views/explore/hooks/useProgressiveQuery';
+ import {useTraces} from 'sentry/views/explore/hooks/useTraces';
+@@ -90,6 +92,7 @@ const DEFAULT_LIMIT = 10;
+ 
+ interface TracesTableProps {
+   openTraceViewDrawer: ReturnType<typeof useTraceViewDrawer>['openTraceViewDrawer'];
++  dashboardFilters?: DashboardFilters;
+   frameless?: boolean;
+   limit?: number;
+   tableWidths?: number[];
+@@ -98,6 +101,7 @@ interface TracesTableProps {
+ export function TracesTable({
+   openTraceViewDrawer,
+   frameless,
++  dashboardFilters,
+   limit = DEFAULT_LIMIT,
+   tableWidths,
+ }: TracesTableProps) {
+@@ -112,7 +116,13 @@ export function TracesTable({
+         : defaultColumnOrder,
+   });
+ 
+-  const combinedQuery = useCombinedQuery(getHasAiSpansFilter());
++  const combinedQuery =
++    applyDashboardFilters(
++      useCombinedQuery(getHasAiSpansFilter()),
++      dashboardFilters,
++      WidgetType.SPANS // This widget technically has its own widget type, but it uses the spans dataset
++    ) ?? '';
++
+   const {cursor, setCursor} = useTableCursor();
+ 
+   const tracesRequest = useTraces({
+diff --git a/static/app/views/navigation/index.tsx b/static/app/views/navigation/index.tsx
+index fe8fac2b66d65e..7e5afbba06d7fb 100644
+--- a/static/app/views/navigation/index.tsx
++++ b/static/app/views/navigation/index.tsx
+@@ -25,7 +25,7 @@ import {useResetActiveNavigationGroup} from 'sentry/views/navigation/useResetAct
+ 
+ function UserAndOrganizationNavigation() {
+   const theme = useTheme();
+-  const {layout, navigationParentRef} = useNavigationContext();
++  const {layout} = useNavigationContext();
+   const {currentStepId, endTour} = useNavigationTour();
+   const tourIsActive = currentStepId !== null;
+   const hoverProps = useResetActiveNavigationGroup();
+@@ -61,7 +61,6 @@ function UserAndOrganizationNavigation() {
+ 
+   return (
+     <Flex
+-      ref={navigationParentRef}
+       top={0}
+       position={tourIsActive ? undefined : 'sticky'}
+       bottom={layout === NavigationLayout.MOBILE ? undefined : 0}
+diff --git a/static/app/views/navigation/navigationContext.tsx b/static/app/views/navigation/navigationContext.tsx
+index 44a49d957a8ca5..96e5d59902e99d 100644
+--- a/static/app/views/navigation/navigationContext.tsx
++++ b/static/app/views/navigation/navigationContext.tsx
+@@ -15,7 +15,6 @@ interface NavigationContext {
+   isCollapsed: boolean;
+   isInteractingRef: React.RefObject<boolean | null>;
+   layout: NavigationLayout;
+-  navigationParentRef: React.RefObject<HTMLDivElement | null>;
+   setActivePrimaryNavigationGroup: (
+     activePrimaryNavigationGroup: PrimaryNavigationGroup | null
+   ) => void;
+@@ -25,7 +24,6 @@ interface NavigationContext {
+ }
+ 
+ const NavigationContext = createContext<NavigationContext>({
+-  navigationParentRef: {current: null},
+   layout: NavigationLayout.SIDEBAR,
+   isCollapsed: false,
+   setIsCollapsed: () => {},
+@@ -42,9 +40,11 @@ export function useNavigationContext(): NavigationContext {
+   return useContext(NavigationContext);
+ }
+ 
+-export function NavigationContextProvider({children}: {children: React.ReactNode}) {
+-  const navigationParentRef = useRef<HTMLDivElement>(null);
++interface NavigationContextProviderProps {
++  children: React.ReactNode;
++}
+ 
++export function NavigationContextProvider(props: NavigationContextProviderProps) {
+   const isInteractingRef = useRef(false);
+   const [isCollapsed, setIsCollapsed] = useLocalStorageState(
+     NAVIGATION_SIDEBAR_COLLAPSED_LOCAL_STORAGE_KEY,
+@@ -67,7 +67,6 @@ export function NavigationContextProvider({children}: {children: React.ReactNode
+ 
+   const value = useMemo(
+     () => ({
+-      navigationParentRef,
+       layout: isMobile ? NavigationLayout.MOBILE : NavigationLayout.SIDEBAR,
+       isCollapsed,
+       setIsCollapsed,
+@@ -94,7 +93,9 @@ export function NavigationContextProvider({children}: {children: React.ReactNode
+ 
+   return (
+     <NavigationTourReminderContextProvider>
+-      <NavigationContext.Provider value={value}>{children}</NavigationContext.Provider>
++      <NavigationContext.Provider value={value}>
++        {props.children}
++      </NavigationContext.Provider>
+     </NavigationTourReminderContextProvider>
+   );
+ }
+diff --git a/static/app/views/navigation/primary/index.tsx b/static/app/views/navigation/primary/index.tsx
+index 22532dbd950c31..5e8318e967f673 100644
+--- a/static/app/views/navigation/primary/index.tsx
++++ b/static/app/views/navigation/primary/index.tsx
+@@ -35,7 +35,7 @@ import {PrimaryNavigationOnboarding} from 'sentry/views/navigation/primary/onboa
+ import {PrimaryNavigationServiceIncidents} from 'sentry/views/navigation/primary/serviceIncidents';
+ import {useActivateNavigationGroupOnHover} from 'sentry/views/navigation/primary/useActivateNavigationGroupOnHover';
+ import {UserDropdown} from 'sentry/views/navigation/primary/userDropdown';
+-import {PrimaryNavigationWhatsNew} from 'sentry/views/navigation/primary/whatsNew/whatsNew';
++import {PrimaryNavigationWhatsNew} from 'sentry/views/navigation/primary/whatsNew';
+ import {NavigationLayout, PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ 
+ function SidebarBody({
+diff --git a/static/app/views/navigation/primary/whatsNew/whatsNew.spec.tsx b/static/app/views/navigation/primary/whatsNew.spec.tsx
+similarity index 92%
+rename from static/app/views/navigation/primary/whatsNew/whatsNew.spec.tsx
+rename to static/app/views/navigation/primary/whatsNew.spec.tsx
+index 2d14c2bf7eda22..64f01616af5e99 100644
+--- a/static/app/views/navigation/primary/whatsNew/whatsNew.spec.tsx
++++ b/static/app/views/navigation/primary/whatsNew.spec.tsx
+@@ -3,8 +3,7 @@ import {BroadcastFixture} from 'sentry-fixture/broadcast';
+ import {act, render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+ 
+ import {trackAnalytics} from 'sentry/utils/analytics';
+-import {BROADCAST_CATEGORIES} from 'sentry/views/navigation/primary/whatsNew/item';
+-import {PrimaryNavigationWhatsNew} from 'sentry/views/navigation/primary/whatsNew/whatsNew';
++import {PrimaryNavigationWhatsNew} from 'sentry/views/navigation/primary/whatsNew';
+ 
+ jest.mock('sentry/utils/analytics');
+ 
+@@ -101,10 +100,10 @@ describe('WhatsNew', () => {
+     await userEvent.click(screen.getByRole('button', {name: "What's New"}));
+ 
+     // Verify that the broadcast content is rendered correctly
+-    expect(await screen.findByText(BROADCAST_CATEGORIES.blog)).toBeInTheDocument();
++    expect(await screen.findByText('Blog Post')).toBeInTheDocument();
+     const titleLink = screen.getByRole('link', {name: broadcast.title});
+     expect(titleLink).toHaveAttribute('href', broadcast.link);
+-    expect(screen.getByText(/Source maps are JSON/)).toBeInTheDocument();
++    expect(screen.getByText(broadcast.message)).toBeInTheDocument();
+ 
+     // Simulate click and check if analytics tracking is called
+     await userEvent.click(titleLink);
+diff --git a/static/app/views/navigation/primary/whatsNew.tsx b/static/app/views/navigation/primary/whatsNew.tsx
+new file mode 100644
+index 00000000000000..ce666686b95242
+--- /dev/null
++++ b/static/app/views/navigation/primary/whatsNew.tsx
+@@ -0,0 +1,224 @@
++import {Fragment, useEffect, useMemo} from 'react';
++import styled from '@emotion/styled';
++
++import {Tag} from '@sentry/scraps/badge';
++import {Flex, Stack} from '@sentry/scraps/layout';
++import {ExternalLink} from '@sentry/scraps/link';
++import {Text} from '@sentry/scraps/text';
++
++import {LoadingIndicator} from 'sentry/components/loadingIndicator';
++import {IconBroadcast} from 'sentry/icons';
++import {t} from 'sentry/locale';
++import type {Broadcast} from 'sentry/types/system';
++import {trackAnalytics} from 'sentry/utils/analytics';
++import getApiUrl from 'sentry/utils/api/getApiUrl';
++import {
++  setApiQueryData,
++  useApiQuery,
++  useMutation,
++  useQueryClient,
++} from 'sentry/utils/queryClient';
++import useApi from 'sentry/utils/useApi';
++import useOrganization from 'sentry/utils/useOrganization';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
++import {
++  PrimaryButtonOverlay,
++  SidebarButton,
++  SidebarItemUnreadIndicator,
++  usePrimaryButtonOverlay,
++} from 'sentry/views/navigation/primary/components';
++import {NavigationLayout} from 'sentry/views/navigation/types';
++
++const BROADCAST_CATEGORIES: Record<NonNullable<Broadcast['category']>, string> = {
++  announcement: t('Announcement'),
++  feature: t('New Feature'),
++  blog: t('Blog Post'),
++  event: t('Event'),
++  video: t('Video'),
++};
++
++function WhatsNewContent({
++  unseenPostIds,
++  isPending,
++  broadcasts = [],
++}: {
++  broadcasts: Broadcast[] | undefined;
++  isPending: boolean;
++  unseenPostIds: string[];
++}) {
++  const api = useApi();
++  const organization = useOrganization();
++  const queryClient = useQueryClient();
++
++  const {mutate: markBroadcastsAsSeen} = useMutation({
++    mutationFn: (newUnseenPostIds: string[]) => {
++      return api.requestPromise('/broadcasts/', {
++        method: 'PUT',
++        query: {id: newUnseenPostIds},
++        data: {hasSeen: '1'},
++      });
++    },
++    onSuccess: () => {
++      setApiQueryData<Broadcast[]>(
++        queryClient,
++        [
++          getApiUrl(`/organizations/$organizationIdOrSlug/broadcasts/`, {
++            path: {organizationIdOrSlug: organization.slug},
++          }),
++        ],
++        data => (data ? data.map(item => ({...item, hasSeen: true})) : [])
++      );
++    },
++  });
++
++  useEffect(() => {
++    const MARK_SEEN_DELAY = 1000;
++    const markSeenTimeout = window.setTimeout(() => {
++      markBroadcastsAsSeen(unseenPostIds);
++    }, MARK_SEEN_DELAY);
++
++    return () => {
++      if (markSeenTimeout) {
++        window.clearTimeout(markSeenTimeout);
++      }
++    };
++  }, [unseenPostIds, markBroadcastsAsSeen]);
++
++  if (isPending) {
++    return <LoadingIndicator />;
++  }
++
++  if (broadcasts.length === 0) {
++    return (
++      <Flex padding="xl" justify="center" align="center" minHeight="150px">
++        <Text variant="muted">{t('No recent updates from the Sentry team.')}</Text>
++      </Flex>
++    );
++  }
++
++  return (
++    <Fragment>
++      {broadcasts.map(item => {
++        return (
++          <SidebarPanelItemRoot key={item.id}>
++            <Stack align="start" marginBottom="lg">
++              {item.category && (
++                <CategoryTag variant="muted">
++                  {BROADCAST_CATEGORIES[item.category]}
++                </CategoryTag>
++              )}
++              <Title
++                hasSeen={item.hasSeen}
++                href={item.link}
++                onClick={() =>
++                  trackAnalytics('whats_new.link_clicked', {
++                    organization,
++                    title: item.title,
++                    category: item.category,
++                  })
++                }
++              >
++                {item.title}
++              </Title>
++              <Message>{item.message}</Message>
++            </Stack>
++            {item.mediaUrl && <Media src={item.mediaUrl} alt={item.title} />}
++          </SidebarPanelItemRoot>
++        );
++      })}
++    </Fragment>
++  );
++}
++
++export function PrimaryNavigationWhatsNew() {
++  const organization = useOrganization();
++  const {isPending, data: broadcasts} = useApiQuery<Broadcast[]>(
++    [
++      getApiUrl(`/organizations/$organizationIdOrSlug/broadcasts/`, {
++        path: {organizationIdOrSlug: organization.slug},
++      }),
++    ],
++    {
++      // Five minute stale time prevents window focus frequent refetches
++      staleTime: 1000 * 60 * 5,
++      // 10 minutes poll
++      refetchInterval: 1000 * 60 * 10,
++      refetchOnWindowFocus: true,
++    }
++  );
++  const unseenPostIds = useMemo(
++    () => (broadcasts ?? []).filter(item => !item.hasSeen).map(item => item.id),
++    [broadcasts]
++  );
++
++  const {
++    isOpen,
++    triggerProps: overlayTriggerProps,
++    overlayProps,
++  } = usePrimaryButtonOverlay();
++
++  const {layout} = useNavigationContext();
++
++  return (
++    <Fragment>
++      <SidebarButton
++        analyticsKey="broadcasts"
++        label={t("What's New")}
++        buttonProps={{
++          ...overlayTriggerProps,
++          icon: <IconBroadcast />,
++          size: 'sm',
++        }}
++      >
++        {unseenPostIds.length > 0 && (
++          <SidebarItemUnreadIndicator
++            data-test-id="whats-new-unread-indicator"
++            isMobile={layout === NavigationLayout.MOBILE}
++          />
++        )}
++      </SidebarButton>
++      {isOpen && (
++        <PrimaryButtonOverlay overlayProps={overlayProps}>
++          <WhatsNewContent
++            unseenPostIds={unseenPostIds}
++            isPending={isPending}
++            broadcasts={broadcasts}
++          />
++        </PrimaryButtonOverlay>
++      )}
++    </Fragment>
++  );
++}
++
++const SidebarPanelItemRoot = styled('div')`
++  line-height: 1.5;
++  margin: 0 ${p => p.theme.space['2xl']};
++  padding: ${p => p.theme.space.xl} 0;
++
++  :not(:first-child) {
++    border-top: 1px solid ${p => p.theme.tokens.border.primary};
++  }
++`;
++
++const Title = styled(ExternalLink)<{hasSeen: boolean}>`
++  font-size: ${p => p.theme.font.size.lg};
++  color: ${p => p.theme.tokens.content.accent};
++  ${p => !p.hasSeen && `font-weight: ${p.theme.font.weight.sans.medium}`};
++  &:focus-visible {
++    box-shadow: none;
++  }
++`;
++
++const Message = styled('div')`
++  color: ${p => p.theme.tokens.content.secondary};
++`;
++
++const Media = styled('img')`
++  border-radius: ${p => p.theme.radius.md};
++  border: 1px solid ${p => p.theme.colors.gray200};
++  max-width: 100%;
++`;
++
++const CategoryTag = styled(Tag)`
++  margin-bottom: ${p => p.theme.space.md};
++`;
+diff --git a/static/app/views/navigation/primary/whatsNew/item.tsx b/static/app/views/navigation/primary/whatsNew/item.tsx
+deleted file mode 100644
+index 8997723dc00466..00000000000000
+--- a/static/app/views/navigation/primary/whatsNew/item.tsx
++++ /dev/null
+@@ -1,87 +0,0 @@
+-import {useCallback} from 'react';
+-import styled from '@emotion/styled';
+-
+-import {Tag} from '@sentry/scraps/badge';
+-import {Stack} from '@sentry/scraps/layout';
+-import {ExternalLink} from '@sentry/scraps/link';
+-
+-import {t} from 'sentry/locale';
+-import type {Broadcast} from 'sentry/types/system';
+-import {trackAnalytics} from 'sentry/utils/analytics';
+-import useOrganization from 'sentry/utils/useOrganization';
+-
+-export const BROADCAST_CATEGORIES: Record<NonNullable<Broadcast['category']>, string> = {
+-  announcement: t('Announcement'),
+-  feature: t('New Feature'),
+-  blog: t('Blog Post'),
+-  event: t('Event'),
+-  video: t('Video'),
+-};
+-
+-interface BroadcastPanelItemProps extends Pick<
+-  Broadcast,
+-  'hasSeen' | 'category' | 'title' | 'message' | 'link' | 'mediaUrl'
+-> {}
+-
+-export function WhatsNewItem({
+-  hasSeen,
+-  title,
+-  message,
+-  link,
+-  mediaUrl,
+-  category,
+-}: BroadcastPanelItemProps) {
+-  const organization = useOrganization();
+-
+-  const handlePanelClicked = useCallback(() => {
+-    trackAnalytics('whats_new.link_clicked', {organization, title, category});
+-  }, [organization, title, category]);
+-
+-  return (
+-    <SidebarPanelItemRoot>
+-      <Stack align="start" marginBottom="lg">
+-        {category && (
+-          <CategoryTag variant="muted">{BROADCAST_CATEGORIES[category]}</CategoryTag>
+-        )}
+-        <Title hasSeen={hasSeen} href={link} onClick={handlePanelClicked}>
+-          {title}
+-        </Title>
+-        <Message>{message}</Message>
+-      </Stack>
+-      {mediaUrl && <Media src={mediaUrl} alt={title} />}
+-    </SidebarPanelItemRoot>
+-  );
+-}
+-
+-const SidebarPanelItemRoot = styled('div')`
+-  line-height: 1.5;
+-  margin: 0 ${p => p.theme.space['2xl']};
+-  padding: ${p => p.theme.space.xl} 0;
+-
+-  :not(:first-child) {
+-    border-top: 1px solid ${p => p.theme.tokens.border.primary};
+-  }
+-`;
+-
+-const Title = styled(ExternalLink)<Pick<BroadcastPanelItemProps, 'hasSeen'>>`
+-  font-size: ${p => p.theme.font.size.lg};
+-  color: ${p => p.theme.tokens.content.accent};
+-  ${p => !p.hasSeen && `font-weight: ${p.theme.font.weight.sans.medium}`};
+-  &:focus-visible {
+-    box-shadow: none;
+-  }
+-`;
+-
+-const Message = styled('div')`
+-  color: ${p => p.theme.tokens.content.secondary};
+-`;
+-
+-const Media = styled('img')`
+-  border-radius: ${p => p.theme.radius.md};
+-  border: 1px solid ${p => p.theme.colors.gray200};
+-  max-width: 100%;
+-`;
+-
+-const CategoryTag = styled(Tag)`
+-  margin-bottom: ${p => p.theme.space.md};
+-`;
+diff --git a/static/app/views/navigation/primary/whatsNew/whatsNew.tsx b/static/app/views/navigation/primary/whatsNew/whatsNew.tsx
+deleted file mode 100644
+index 597077c7eafc0d..00000000000000
+--- a/static/app/views/navigation/primary/whatsNew/whatsNew.tsx
++++ /dev/null
+@@ -1,166 +0,0 @@
+-import {Fragment, useEffect, useMemo} from 'react';
+-import styled from '@emotion/styled';
+-
+-import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+-import {IconBroadcast} from 'sentry/icons';
+-import {t} from 'sentry/locale';
+-import type {Organization} from 'sentry/types/organization';
+-import type {Broadcast} from 'sentry/types/system';
+-import getApiUrl from 'sentry/utils/api/getApiUrl';
+-import {
+-  setApiQueryData,
+-  useApiQuery,
+-  useMutation,
+-  useQueryClient,
+-  type ApiQueryKey,
+-} from 'sentry/utils/queryClient';
+-import useApi from 'sentry/utils/useApi';
+-import useOrganization from 'sentry/utils/useOrganization';
+-import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+-import {
+-  PrimaryButtonOverlay,
+-  SidebarButton,
+-  SidebarItemUnreadIndicator,
+-  usePrimaryButtonOverlay,
+-} from 'sentry/views/navigation/primary/components';
+-import {WhatsNewItem} from 'sentry/views/navigation/primary/whatsNew/item';
+-import {NavigationLayout} from 'sentry/views/navigation/types';
+-
+-const MARK_SEEN_DELAY = 1000;
+-
+-function makeBroadcastsQueryKey({
+-  organization,
+-}: {
+-  organization: Organization;
+-}): ApiQueryKey {
+-  return [
+-    getApiUrl(`/organizations/$organizationIdOrSlug/broadcasts/`, {
+-      path: {organizationIdOrSlug: organization.slug},
+-    }),
+-  ];
+-}
+-
+-function useFetchBroadcasts() {
+-  const organization = useOrganization();
+-
+-  return useApiQuery<Broadcast[]>(makeBroadcastsQueryKey({organization}), {
+-    // Five minute stale time prevents window focus frequent refetches
+-    staleTime: 1000 * 60 * 5,
+-    // 10 minutes poll
+-    refetchInterval: 1000 * 60 * 10,
+-    refetchOnWindowFocus: true,
+-  });
+-}
+-
+-function WhatsNewContent({unseenPostIds}: {unseenPostIds: string[]}) {
+-  const api = useApi();
+-  const organization = useOrganization();
+-  const queryClient = useQueryClient();
+-
+-  const {mutate: markBroadcastsAsSeen} = useMutation({
+-    mutationFn: (newUnseenPostIds: string[]) => {
+-      return api.requestPromise('/broadcasts/', {
+-        method: 'PUT',
+-        query: {id: newUnseenPostIds},
+-        data: {hasSeen: '1'},
+-      });
+-    },
+-    onSuccess: () => {
+-      setApiQueryData<Broadcast[]>(
+-        queryClient,
+-        makeBroadcastsQueryKey({organization}),
+-        data => (data ? data.map(item => ({...item, hasSeen: true})) : [])
+-      );
+-    },
+-  });
+-
+-  const {isPending, data: broadcasts = []} = useFetchBroadcasts();
+-
+-  useEffect(() => {
+-    const markSeenTimeout = window.setTimeout(() => {
+-      markBroadcastsAsSeen(unseenPostIds);
+-    }, MARK_SEEN_DELAY);
+-
+-    return () => {
+-      if (markSeenTimeout) {
+-        window.clearTimeout(markSeenTimeout);
+-      }
+-    };
+-  }, [unseenPostIds, markBroadcastsAsSeen]);
+-
+-  if (isPending) {
+-    return <LoadingIndicator />;
+-  }
+-
+-  if (broadcasts.length === 0) {
+-    return <Empty>{t('No recent updates from the Sentry team.')}</Empty>;
+-  }
+-
+-  return (
+-    <Fragment>
+-      {broadcasts.map(item => (
+-        <WhatsNewItem
+-          key={item.id}
+-          hasSeen={item.hasSeen}
+-          title={item.title}
+-          message={item.message}
+-          link={item.link}
+-          mediaUrl={item.mediaUrl}
+-          category={item.category}
+-        />
+-      ))}
+-    </Fragment>
+-  );
+-}
+-
+-export function PrimaryNavigationWhatsNew() {
+-  const {data: broadcasts = []} = useFetchBroadcasts();
+-  const unseenPostIds = useMemo(
+-    () => broadcasts.filter(item => !item.hasSeen).map(item => item.id),
+-    [broadcasts]
+-  );
+-
+-  const {
+-    isOpen,
+-    triggerProps: overlayTriggerProps,
+-    overlayProps,
+-  } = usePrimaryButtonOverlay();
+-
+-  const {layout} = useNavigationContext();
+-
+-  return (
+-    <Fragment>
+-      <SidebarButton
+-        analyticsKey="broadcasts"
+-        label={t("What's New")}
+-        buttonProps={{
+-          ...overlayTriggerProps,
+-          icon: <IconBroadcast />,
+-          size: 'sm',
+-        }}
+-      >
+-        {unseenPostIds.length > 0 && (
+-          <SidebarItemUnreadIndicator
+-            data-test-id="whats-new-unread-indicator"
+-            isMobile={layout === NavigationLayout.MOBILE}
+-          />
+-        )}
+-      </SidebarButton>
+-      {isOpen && (
+-        <PrimaryButtonOverlay overlayProps={overlayProps}>
+-          <WhatsNewContent unseenPostIds={unseenPostIds} />
+-        </PrimaryButtonOverlay>
+-      )}
+-    </Fragment>
+-  );
+-}
+-
+-const Empty = styled('div')`
+-  display: flex;
+-  align-items: center;
+-  justify-content: center;
+-  color: ${p => p.theme.tokens.content.secondary};
+-  padding: 0 60px;
+-  text-align: center;
+-  min-height: 150px;
+-`;
+diff --git a/static/app/views/navigation/secondary/sections/admin/adminSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/admin/adminSecondaryNavigation.tsx
+index d859235ad4a4c2..c5ee34a1f1d45f 100644
+--- a/static/app/views/navigation/secondary/sections/admin/adminSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/admin/adminSecondaryNavigation.tsx
+@@ -1,4 +1,3 @@
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ import SettingsNavigation from 'sentry/views/settings/components/settingsNavigation';
+ 
+ export function AdminSecondaryNavigation() {
+@@ -27,7 +26,6 @@ export function AdminSecondaryNavigation() {
+           ],
+         },
+       ]}
+-      primaryNavGroup={PrimaryNavigationGroup.ADMIN}
+     />
+   );
+ }
+diff --git a/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
+index b0ee5d62894d56..03548063df114d 100644
+--- a/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
+@@ -15,10 +15,8 @@ import {DEFAULT_PREBUILT_SORT} from 'sentry/views/dashboards/manage/settings';
+ import {DashboardFilter} from 'sentry/views/dashboards/types';
+ import type {DashboardListItem} from 'sentry/views/dashboards/types';
+ import {isSidebarLinkActive} from 'sentry/views/navigation/primary/components';
+-import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+ import {DashboardsNavigationItems} from 'sentry/views/navigation/secondary/sections/dashboards/dashboardsNavigationItems';
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ 
+ export function DashboardsSecondaryNavigation() {
+   const organization = useOrganization();
+@@ -39,9 +37,7 @@ export function DashboardsSecondaryNavigation() {
+ 
+   return (
+     <Fragment>
+-      <SecondaryNavigation.Header>
+-        {PRIMARY_NAVIGATION_GROUP_CONFIG[PrimaryNavigationGroup.DASHBOARDS].label}
+-      </SecondaryNavigation.Header>
++      <SecondaryNavigation.Header>{t('Dashboards')}</SecondaryNavigation.Header>
+       <SecondaryNavigation.Body>
+         <SecondaryNavigation.Section id="dashboards-all">
+           <SecondaryNavigation.Item
+diff --git a/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.tsx
+index 6dcf5beb9a9c79..a602ee99f271e9 100644
+--- a/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.tsx
+@@ -12,10 +12,8 @@ import useProjects from 'sentry/utils/useProjects';
+ import {useGetSavedQueries} from 'sentry/views/explore/hooks/useGetSavedQueries';
+ import {canUseMetricsUI} from 'sentry/views/explore/metrics/metricsFlags';
+ import {CONVERSATIONS_LANDING_SUB_PATH} from 'sentry/views/insights/pages/conversations/settings';
+-import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+ import {ExploreSavedQueryNavigationItems} from 'sentry/views/navigation/secondary/sections/explore/exploreSavedQueryNavigationItems';
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ 
+ const MAX_STARRED_QUERIES_DISPLAYED = 20;
+ 
+@@ -67,9 +65,7 @@ export function ExploreSecondaryNavigation() {
+ 
+   return (
+     <Fragment>
+-      <SecondaryNavigation.Header>
+-        {PRIMARY_NAVIGATION_GROUP_CONFIG[PrimaryNavigationGroup.EXPLORE].label}
+-      </SecondaryNavigation.Header>
++      <SecondaryNavigation.Header>{t('Explore')}</SecondaryNavigation.Header>
+       <SecondaryNavigation.Body>
+         <SecondaryNavigation.Section id="explore-main">
+           <Feature features={['performance-view']}>
+diff --git a/static/app/views/navigation/secondary/sections/insights/insightsSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/insights/insightsSecondaryNavigation.tsx
+index 9b9231b1f6e57b..482ca357862dac 100644
+--- a/static/app/views/navigation/secondary/sections/insights/insightsSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/insights/insightsSecondaryNavigation.tsx
+@@ -28,9 +28,7 @@ import {
+   MOBILE_SIDEBAR_LABEL,
+ } from 'sentry/views/insights/pages/mobile/settings';
+ import {DOMAIN_VIEW_BASE_URL} from 'sentry/views/insights/pages/settings';
+-import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ 
+ export function InsightsSecondaryNavigation() {
+   const user = useUser();
+@@ -53,9 +51,7 @@ export function InsightsSecondaryNavigation() {
+ 
+   return (
+     <Fragment>
+-      <SecondaryNavigation.Header>
+-        {PRIMARY_NAVIGATION_GROUP_CONFIG[PrimaryNavigationGroup.INSIGHTS].label}
+-      </SecondaryNavigation.Header>
++      <SecondaryNavigation.Header>{t('Insights')}</SecondaryNavigation.Header>
+       <SecondaryNavigation.Body>
+         <SecondaryNavigation.Section id="insights-main">
+           <SecondaryNavigation.Item
+diff --git a/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx
+index 86780a662a5bfe..df84d777d1bf06 100644
+--- a/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx
+@@ -7,10 +7,9 @@ import useOrganization from 'sentry/utils/useOrganization';
+ import {makeMonitorBasePathname} from 'sentry/views/detectors/pathnames';
+ import {ISSUE_TAXONOMY_CONFIG} from 'sentry/views/issueList/taxonomies';
+ import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+-import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+ import {IssueViews} from 'sentry/views/navigation/secondary/sections/issues/issueViews/issueViews';
+-import {NavigationLayout, PrimaryNavigationGroup} from 'sentry/views/navigation/types';
++import {NavigationLayout} from 'sentry/views/navigation/types';
+ 
+ export function IssuesSecondaryNavigation() {
+   const organization = useOrganization();
+@@ -18,9 +17,7 @@ export function IssuesSecondaryNavigation() {
+   const baseUrl = `/organizations/${organization.slug}/issues`;
+   return (
+     <Fragment>
+-      <SecondaryNavigation.Header>
+-        {PRIMARY_NAVIGATION_GROUP_CONFIG[PrimaryNavigationGroup.ISSUES].label}
+-      </SecondaryNavigation.Header>
++      <SecondaryNavigation.Header>{t('Issues')}</SecondaryNavigation.Header>
+       <SecondaryNavigation.Body>
+         <SecondaryNavigation.Section id="issues-feed">
+           <SecondaryNavigation.Item
+diff --git a/static/app/views/navigation/secondary/sections/monitors/monitorsSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/monitors/monitorsSecondaryNavigation.tsx
+index 7aa2d40df87b3b..0b30efa166a419 100644
+--- a/static/app/views/navigation/secondary/sections/monitors/monitorsSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/monitors/monitorsSecondaryNavigation.tsx
+@@ -3,9 +3,7 @@ import {Fragment} from 'react';
+ import Feature from 'sentry/components/acl/feature';
+ import {t} from 'sentry/locale';
+ import useOrganization from 'sentry/utils/useOrganization';
+-import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ 
+ export function MonitorsSecondaryNavigation() {
+   const organization = useOrganization();
+@@ -13,9 +11,7 @@ export function MonitorsSecondaryNavigation() {
+ 
+   return (
+     <Fragment>
+-      <SecondaryNavigation.Header>
+-        {PRIMARY_NAVIGATION_GROUP_CONFIG[PrimaryNavigationGroup.MONITORS].label}
+-      </SecondaryNavigation.Header>
++      <SecondaryNavigation.Header>{t('Monitors')}</SecondaryNavigation.Header>
+       <SecondaryNavigation.Body>
+         <SecondaryNavigation.Section id="monitors-views">
+           <SecondaryNavigation.Item
+diff --git a/static/app/views/navigation/secondary/sections/prevent/preventSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/prevent/preventSecondaryNavigation.tsx
+index e64ba56e3fec82..0469418c178969 100644
+--- a/static/app/views/navigation/secondary/sections/prevent/preventSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/prevent/preventSecondaryNavigation.tsx
+@@ -2,39 +2,22 @@ import {Fragment} from 'react';
+ 
+ import Feature from 'sentry/components/acl/feature';
+ import {t} from 'sentry/locale';
+-import type {Organization} from 'sentry/types/organization';
+ import normalizeUrl from 'sentry/utils/url/normalizeUrl';
+ import useOrganization from 'sentry/utils/useOrganization';
+-import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+-
+-function makePreventPathname({
+-  path,
+-  organization,
+-}: {
+-  organization: Organization;
+-  path: '/' | `/${string}/`;
+-}) {
+-  return normalizeUrl(`/organizations/${organization.slug}/prevent${path}`);
+-}
+ 
+ export function PreventSecondaryNavigation() {
+   const organization = useOrganization();
+-  const testsPathname = makePreventPathname({
+-    organization,
+-    path: `/tests/`,
+-  });
+-  const tokensPathName = makePreventPathname({
+-    organization,
+-    path: `/tokens/`,
+-  });
++  const testsPathname = normalizeUrl(
++    `/organizations/${organization.slug}/prevent/tests/`
++  );
++  const tokensPathName = normalizeUrl(
++    `/organizations/${organization.slug}/prevent/tokens/`
++  );
+ 
+   return (
+     <Fragment>
+-      <SecondaryNavigation.Header>
+-        {PRIMARY_NAVIGATION_GROUP_CONFIG[PrimaryNavigationGroup.PREVENT].label}
+-      </SecondaryNavigation.Header>
++      <SecondaryNavigation.Header>{t('Prevent')}</SecondaryNavigation.Header>
+       <SecondaryNavigation.Body>
+         <SecondaryNavigation.Section id="prevent-main">
+           <Feature features={['prevent-test-analytics']}>
+diff --git a/static/app/views/navigation/useCollapsedNavigation.tsx b/static/app/views/navigation/useCollapsedNavigation.tsx
+index 266e5c0323e5e0..acf1639d865962 100644
+--- a/static/app/views/navigation/useCollapsedNavigation.tsx
++++ b/static/app/views/navigation/useCollapsedNavigation.tsx
+@@ -25,7 +25,6 @@ const IGNORE_ELEMENTS = [
+  */
+ export function useCollapsedNavigation() {
+   const {
+-    navigationParentRef,
+     isCollapsed,
+     isInteractingRef,
+     endInteraction,
+@@ -43,6 +42,18 @@ export function useCollapsedNavigation() {
+     setActivePrimaryNavigationGroup(null);
+   }, [endInteraction, setActivePrimaryNavigationGroup, setCollapsedNavigationIsOpen]);
+ 
++  const navigationParentRef = useRef<HTMLDivElement>(null);
++
++  useEffect(() => {
++    if (navigationParentRef.current) return;
++    const navigationParentEl = document.querySelector(
++      'nav[aria-label="Primary Navigation"]'
++    )?.parentElement;
++    if (navigationParentEl) {
++      navigationParentRef.current = navigationParentEl as HTMLDivElement;
++    }
++  }, []);
++
+   const shouldNavigationStayOpen = useCallback(() => {
+     const hasKeyboardFocus = navigationParentRef.current?.querySelector(':focus-visible');
+     const hasOpenMenu = navigationParentRef.current?.querySelector(
+diff --git a/static/app/views/performance/onboarding.tsx b/static/app/views/performance/onboarding.tsx
+index af75e15f695d04..068ee564e26d67 100644
+--- a/static/app/views/performance/onboarding.tsx
++++ b/static/app/views/performance/onboarding.tsx
+@@ -1,4 +1,4 @@
+-import {Fragment, useEffect, useState} from 'react';
++import {Fragment, useEffect} from 'react';
+ import {useTheme} from '@emotion/react';
+ import styled from '@emotion/styled';
+ import * as Sentry from '@sentry/react';
+@@ -65,10 +65,10 @@ import type {Organization} from 'sentry/types/organization';
+ import type {Project} from 'sentry/types/project';
+ import {trackAnalytics} from 'sentry/utils/analytics';
+ import {generateLinkToEventInTraceView} from 'sentry/utils/discover/urls';
+-import EventWaiter from 'sentry/utils/eventWaiter';
+ import {decodeInteger} from 'sentry/utils/queryString';
+ import {testableWindowLocation} from 'sentry/utils/testableWindowLocation';
+ import useApi from 'sentry/utils/useApi';
++import {useEventWaiter} from 'sentry/utils/useEventWaiter';
+ import {useLocation} from 'sentry/utils/useLocation';
+ import {useNavigate} from 'sentry/utils/useNavigate';
+ import useProjects from 'sentry/utils/useProjects';
+@@ -420,7 +420,19 @@ export function Onboarding({organization, project}: OnboardingProps) {
+   const navigate = useNavigate();
+   const {isSelfHosted, urlPrefix} = useLegacyStore(ConfigStore);
+   const copyEnabled = useCopySetupInstructionsEnabled();
+-  const [received, setReceived] = useState<boolean>(false);
++
++  const doesNotSupportPerformance = project.platform
++    ? withoutPerformanceSupport.has(project.platform)
++    : false;
++
++  const firstIssue = useEventWaiter({
++    eventType: 'transaction',
++    organization,
++    project,
++    disabled: doesNotSupportPerformance,
++  });
++  const received = !!firstIssue;
++
+   const isEAPTraceEnabled = organization.features.includes('trace-spans-format');
+   const tracesQuery = useTraces({
+     enabled: received,
+@@ -447,10 +459,6 @@ export function Onboarding({organization, project}: OnboardingProps) {
+   const {isPending: isLoadingRegistry, data: registryData} =
+     useSourcePackageRegistries(organization);
+ 
+-  const doesNotSupportPerformance = project.platform
+-    ? withoutPerformanceSupport.has(project.platform)
+-    : false;
+-
+   useEffect(() => {
+     if (isLoading || !currentPlatform || !dsn || !projectKeyId) {
+       return;
+@@ -565,20 +573,10 @@ export function Onboarding({organization, project}: OnboardingProps) {
+ 
+   const steps = [...installSteps, ...configureSteps, ...verifySteps];
+ 
+-  const eventWaitingIndicator = (
+-    <EventWaiter
+-      api={api}
+-      organization={organization}
+-      project={project}
+-      eventType="transaction"
+-      onIssueReceived={() => {
+-        setReceived(true);
+-      }}
+-    >
+-      {({firstIssue}) =>
+-        firstIssue ? <EventReceivedIndicator /> : <EventWaitingIndicator />
+-      }
+-    </EventWaiter>
++  const eventWaitingIndicator = received ? (
++    <EventReceivedIndicator />
++  ) : (
++    <EventWaitingIndicator />
+   );
+ 
+   return (
+diff --git a/static/app/views/profiling/onboarding.tsx b/static/app/views/profiling/onboarding.tsx
+index 00b2ee7aab56ad..dbd0d2e606a845 100644
+--- a/static/app/views/profiling/onboarding.tsx
++++ b/static/app/views/profiling/onboarding.tsx
+@@ -39,11 +39,11 @@ import {useLegacyStore} from 'sentry/stores/useLegacyStore';
+ import pulsingIndicatorStyles from 'sentry/styles/pulsingIndicator';
+ import {space} from 'sentry/styles/space';
+ import type {Project} from 'sentry/types/project';
+-import EventWaiter from 'sentry/utils/eventWaiter';
+ import {useProfileEvents} from 'sentry/utils/profiling/hooks/useProfileEvents';
+ import {generateProfileFlamechartRoute} from 'sentry/utils/profiling/routes';
+ import {getSelectedProjectList} from 'sentry/utils/project/useSelectedProjectsHaveField';
+ import useApi from 'sentry/utils/useApi';
++import {useEventWaiter} from 'sentry/utils/useEventWaiter';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import useProjects from 'sentry/utils/useProjects';
+ 
+@@ -110,8 +110,13 @@ function StepRenderer({
+ }) {
+   const theme = useTheme();
+   const {type, title} = step;
+-  const api = useApi();
+   const organization = useOrganization();
++  const firstIssue = useEventWaiter({
++    eventType: 'profile',
++    organization,
++    project,
++    disabled: !isLastStep,
++  });
+ 
+   return (
+     <GuidedSteps.Step
+@@ -125,18 +130,7 @@ function StepRenderer({
+       <GuidedSteps.ButtonWrapper>
+         <GuidedSteps.BackButton size="md" />
+         <GuidedSteps.NextButton size="md" />
+-        {isLastStep && (
+-          <EventWaiter
+-            api={api}
+-            organization={organization}
+-            project={project}
+-            eventType="profile"
+-          >
+-            {({firstIssue}) => (
+-              <WaitingIndicator project={project} hasProfile={!!firstIssue} />
+-            )}
+-          </EventWaiter>
+-        )}
++        {isLastStep && <WaitingIndicator project={project} hasProfile={!!firstIssue} />}
+       </GuidedSteps.ButtonWrapper>
+       {/* This spacer ensures the whole pulse effect is visible, as the parent has overflow: hidden */}
+       {isLastStep && <PulseSpacer />}
+diff --git a/static/app/views/settings/components/settingsNavigation.tsx b/static/app/views/settings/components/settingsNavigation.tsx
+index 5e2bf11b5de37b..3bf4bfa08a1e52 100644
+--- a/static/app/views/settings/components/settingsNavigation.tsx
++++ b/static/app/views/settings/components/settingsNavigation.tsx
+@@ -1,9 +1,8 @@
+ import {cloneElement, Component, Fragment} from 'react';
+ import * as Sentry from '@sentry/react';
+ 
+-import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
++import {t} from 'sentry/locale';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+-import type {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ import {SettingsNavigationGroup} from 'sentry/views/settings/components/settingsNavigationGroup';
+ import type {NavigationProps, NavigationSection} from 'sentry/views/settings/types';
+ 
+@@ -28,26 +27,19 @@ type Props = DefaultProps &
+      * The configuration for this navigation panel
+      */
+     navigationObjects: NavigationSection[];
+-    /**
+-     * The primary navigation group for this settings page
+-     */
+-    primaryNavGroup: PrimaryNavigationGroup;
+   };
+ 
+ function SettingsSecondaryNavigation({
+   navigationObjects,
+   hookConfigs,
+   hooks,
+-  primaryNavGroup,
+   ...otherProps
+ }: Props) {
+   const navWithHooks = navigationObjects.concat(hookConfigs);
+ 
+   return (
+     <Fragment>
+-      <SecondaryNavigation.Header>
+-        {PRIMARY_NAVIGATION_GROUP_CONFIG[primaryNavGroup].label}
+-      </SecondaryNavigation.Header>
++      <SecondaryNavigation.Header>{t('Settings')}</SecondaryNavigation.Header>
+       <SecondaryNavigation.Body>
+         {navWithHooks.map(config => (
+           <SettingsNavigationGroup key={config.name} {...otherProps} {...config} />
+@@ -83,13 +75,11 @@ class SettingsNavigation extends Component<Props> {
+       hookConfigs,
+       stickyTop,
+       organization,
+-      primaryNavGroup,
+       ...otherProps
+     } = this.props;
+ 
+     return (
+       <SettingsSecondaryNavigation
+-        primaryNavGroup={primaryNavGroup}
+         navigationObjects={navigationObjects}
+         hooks={hooks}
+         hookConfigs={hookConfigs}
+diff --git a/static/app/views/settings/organization/organizationSettingsNavigation.tsx b/static/app/views/settings/organization/organizationSettingsNavigation.tsx
+index 0b2eba2f043d8d..08aa79e0bfc252 100644
+--- a/static/app/views/settings/organization/organizationSettingsNavigation.tsx
++++ b/static/app/views/settings/organization/organizationSettingsNavigation.tsx
+@@ -5,7 +5,6 @@ import HookStore from 'sentry/stores/hookStore';
+ import type {HookName, Hooks} from 'sentry/types/hooks';
+ import type {Organization} from 'sentry/types/organization';
+ import {withOrganization} from 'sentry/utils/withOrganization';
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ import SettingsNavigation from 'sentry/views/settings/components/settingsNavigation';
+ import {getUserOrgNavigationConfiguration} from 'sentry/views/settings/organization/userOrgNavigationConfiguration';
+ import type {NavigationSection} from 'sentry/views/settings/types';
+@@ -89,7 +88,6 @@ class OrganizationSettingsNavigation extends Component<Props, State> {
+         hooks={hooks}
+         hookConfigs={hookConfigs}
+         isSelfHosted={isSelfHosted}
+-        primaryNavGroup={PrimaryNavigationGroup.SETTINGS}
+       />
+     );
+   }
+diff --git a/static/app/views/settings/project/projectSettingsNavigation.tsx b/static/app/views/settings/project/projectSettingsNavigation.tsx
+index ff4d2fd31a154e..963c755577cd51 100644
+--- a/static/app/views/settings/project/projectSettingsNavigation.tsx
++++ b/static/app/views/settings/project/projectSettingsNavigation.tsx
+@@ -1,7 +1,6 @@
+ import type {Organization} from 'sentry/types/organization';
+ import type {Project} from 'sentry/types/project';
+ import {withProject} from 'sentry/utils/withProject';
+-import {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ import SettingsNavigation from 'sentry/views/settings/components/settingsNavigation';
+ import getConfiguration from 'sentry/views/settings/project/navigationConfiguration';
+ 
+@@ -22,7 +21,6 @@ function ProjectSettingsNavigation({organization, project}: Props) {
+       features={new Set(organization.features)}
+       organization={organization}
+       project={project}
+-      primaryNavGroup={PrimaryNavigationGroup.SETTINGS}
+     />
+   );
+ }
+diff --git a/tests/sentry/api/endpoints/test_broadcast_index.py b/tests/sentry/api/endpoints/test_broadcast_index.py
+index 44dafef0076b28..62750538fa9400 100644
+--- a/tests/sentry/api/endpoints/test_broadcast_index.py
++++ b/tests/sentry/api/endpoints/test_broadcast_index.py
+@@ -63,6 +63,58 @@ def test_basic_user_with_all(self) -> None:
+         assert response.data[0]["id"] == str(broadcast1.id)
+         assert "createdBy" not in response.data[0]
+ 
++    def test_show_latest_returns_only_active(self) -> None:
++        active_broadcast = Broadcast.objects.create(message="active", is_active=True)
++        Broadcast.objects.create(message="inactive", is_active=False)
++
++        self.login_as(user=self.user)
++
++        response = self.client.get("/api/0/broadcasts/?show=latest")
++        assert response.status_code == 200
++        assert len(response.data) == 1
++        assert response.data[0]["id"] == str(active_broadcast.id)
++
++    def test_show_latest_default_limit(self) -> None:
++        for i in range(5):
++            Broadcast.objects.create(message=f"broadcast {i}", is_active=True)
++
++        self.login_as(user=self.user)
++
++        response = self.client.get("/api/0/broadcasts/?show=latest")
++        assert response.status_code == 200
++        assert len(response.data) == 3
++
++    def test_show_latest_custom_limit(self) -> None:
++        for i in range(5):
++            Broadcast.objects.create(message=f"broadcast {i}", is_active=True)
++
++        self.login_as(user=self.user)
++
++        response = self.client.get("/api/0/broadcasts/?show=latest&per_page=2")
++        assert response.status_code == 200
++        assert len(response.data) == 2
++
++    def test_show_latest_invalid_limit(self) -> None:
++        self.login_as(user=self.user)
++
++        response = self.client.get("/api/0/broadcasts/?show=latest&per_page=abc")
++        assert response.status_code == 400
++
++    def test_show_latest_negative_limit(self) -> None:
++        self.login_as(user=self.user)
++
++        response = self.client.get("/api/0/broadcasts/?show=latest&per_page=-1")
++        assert response.status_code == 400
++
++    def test_show_latest_does_not_require_admin(self) -> None:
++        Broadcast.objects.create(message="active", is_active=True)
++
++        self.login_as(user=self.user)
++
++        response = self.client.get("/api/0/broadcasts/?show=latest")
++        assert response.status_code == 200
++        assert len(response.data) == 1
++
+     def test_organization_filtering(self) -> None:
+         broadcast1 = Broadcast.objects.create(message="foo", is_active=True)
+         broadcast2 = Broadcast.objects.create(message="bar", is_active=True)
+diff --git a/tests/sentry/hybridcloud/services/test_region_organization_provisioning.py b/tests/sentry/hybridcloud/services/test_region_organization_provisioning.py
+index b6dd620b51ac3b..ccabf18a8169dd 100644
+--- a/tests/sentry/hybridcloud/services/test_region_organization_provisioning.py
++++ b/tests/sentry/hybridcloud/services/test_region_organization_provisioning.py
+@@ -69,8 +69,8 @@ def test_provisions_when_no_conflicting_orgs(self) -> None:
+         user = self.create_user()
+         provision_options = self.get_provisioning_args(user)
+         organization_id = 42
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=organization_id, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=organization_id, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert result
+@@ -83,8 +83,8 @@ def test_provisions_test_org_without_default_team(self) -> None:
+         user = self.create_user()
+         provision_options = self.get_provisioning_args(user, create_default_team=False)
+         organization_id = 42
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=organization_id, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=organization_id, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert result
+@@ -104,8 +104,8 @@ def test_provisions_when_fully_conflicting_org_has_matching_owner(self) -> None:
+         assert existing_org.id == organization_id
+ 
+         provision_options = self.get_provisioning_args(user, create_default_team=False)
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=organization_id, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=organization_id, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert result
+@@ -125,8 +125,8 @@ def test_does_not_provision_and_returns_false_when_multiple_orgs_conflict(self)
+ 
+         provisioning_user = self.create_user()
+         provision_options = self.get_provisioning_args(provisioning_user, create_default_team=False)
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=organization_id, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=organization_id, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert not result
+@@ -142,8 +142,8 @@ def test_truncates_name_when_too_long(self) -> None:
+         user = self.create_user()
+         provision_options = self.get_provisioning_args(user)
+         provision_options.provision_options.name = "a" * 128
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=42, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=42, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert result is True
+@@ -161,8 +161,8 @@ def test_does_not_provision_and_returns_false_when_conflicting_org_with_differen
+ 
+         provisioning_user = self.create_user()
+         provision_options = self.get_provisioning_args(provisioning_user)
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=organization_id, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=organization_id, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert not result
+@@ -183,8 +183,8 @@ def test_does_not_provision_when_organization_id_already_in_use(
+         )
+ 
+         provision_options = self.get_provisioning_args(user)
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=organization_id, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=organization_id, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert not result
+@@ -201,8 +201,8 @@ def test_does_not_provision_when_organization_slug_already_in_use(
+         self.create_organization(slug="santry", name="Santry", owner=user)
+ 
+         provision_options = self.get_provisioning_args(user)
+-        result = region_organization_provisioning_rpc_service.create_organization_in_region(
+-            organization_id=organization_id, provision_payload=provision_options, region_name="us"
++        result = region_organization_provisioning_rpc_service.create_organization_in_cell(
++            organization_id=organization_id, provision_payload=provision_options, cell_name="us"
+         )
+ 
+         assert not result
+@@ -217,10 +217,10 @@ def test_streamline_only_is_true(self) -> None:
+         user = self.create_user()
+         provision_options = self.get_provisioning_args(user)
+         organization_id = 42
+-        region_organization_provisioning_rpc_service.create_organization_in_region(
++        region_organization_provisioning_rpc_service.create_organization_in_cell(
+             organization_id=organization_id,
+             provision_payload=provision_options,
+-            region_name="us",
++            cell_name="us",
+         )
+         with assume_test_silo_mode(SiloMode.REGION):
+             org: Organization = Organization.objects.get(id=organization_id)
+diff --git a/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py b/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
+index 90d1917468fe82..9cbc60801ee74e 100644
+--- a/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
++++ b/tests/sentry/hybridcloud/tasks/test_deliver_webhooks.py
+@@ -1099,7 +1099,6 @@ def test_delivery_time_metrics_codecov_region_sent_to(self, mock_metrics: MagicM
+ 
+     @responses.activate
+     @override_regions(region_config)
+-    @override_options({"hybridcloud.deliver_webhooks.delivery_time_include_github_tags": True})
+     @patch("sentry.hybridcloud.tasks.deliver_webhooks.metrics")
+     def test_delivery_time_metrics_github_event_and_action(self, mock_metrics: MagicMock) -> None:
+         responses.add(
+@@ -1131,7 +1130,6 @@ def test_delivery_time_metrics_github_event_and_action(self, mock_metrics: Magic
+ 
+     @responses.activate
+     @override_regions(region_config)
+-    @override_options({"hybridcloud.deliver_webhooks.delivery_time_include_github_tags": True})
+     @patch("sentry.hybridcloud.tasks.deliver_webhooks.metrics")
+     def test_delivery_time_metrics_github_event_only(self, mock_metrics: MagicMock) -> None:
+         responses.add(
+diff --git a/tests/sentry/incidents/endpoints/test_organization_alert_rule_index.py b/tests/sentry/incidents/endpoints/test_organization_alert_rule_index.py
+index b64f4663369522..79d4ffc969277a 100644
+--- a/tests/sentry/incidents/endpoints/test_organization_alert_rule_index.py
++++ b/tests/sentry/incidents/endpoints/test_organization_alert_rule_index.py
+@@ -266,6 +266,31 @@ def test_list_shows_count_when_stored_as_upsampled_count(
+             "LIST should return count() to user, hiding internal upsampled_count() storage"
+         )
+ 
++    def test_workflow_engine_serializer_snoozed_detector(self) -> None:
++        team = self.create_team(organization=self.organization, members=[self.user])
++        ProjectTeam.objects.create(project=self.project, team=team)
++        self.detector.update(enabled=False)
++        self.login_as(self.user)
++
++        with self.feature(
++            ["organizations:incidents", "organizations:workflow-engine-rule-serializers"]
++        ):
++            resp = self.get_success_response(self.organization.slug)
++
++        assert resp.data[0]["snooze"] is True
++
++    def test_workflow_engine_serializer_enabled_detector_no_snooze(self) -> None:
++        team = self.create_team(organization=self.organization, members=[self.user])
++        ProjectTeam.objects.create(project=self.project, team=team)
++        self.login_as(self.user)
++
++        with self.feature(
++            ["organizations:incidents", "organizations:workflow-engine-rule-serializers"]
++        ):
++            resp = self.get_success_response(self.organization.slug)
++
++        assert "snooze" not in resp.data[0]
++
+ 
+ @freeze_time("2024-12-11 03:21:34")
+ class AlertRuleListDeltaTest(AlertRuleIndexBase, TestWorkflowEngineSerializer):
+diff --git a/tests/sentry/incidents/serializers/test_workflow_engine_detector.py b/tests/sentry/incidents/serializers/test_workflow_engine_detector.py
+index b7f9d7e6603fb6..72374aef2a427e 100644
+--- a/tests/sentry/incidents/serializers/test_workflow_engine_detector.py
++++ b/tests/sentry/incidents/serializers/test_workflow_engine_detector.py
+@@ -190,6 +190,15 @@ def test_sentry_app(self, mock_sentry_app_components_preparer: Any) -> None:
+         )
+         assert self._sort_triggers(serialized_detector) == self._sort_triggers(sentry_app_expected)
+ 
++    def test_snooze_enabled_detector(self) -> None:
++        serialized = serialize(self.detector, self.user, WorkflowEngineDetectorSerializer())
++        assert "snooze" not in serialized
++
++    def test_snooze_disabled_detector(self) -> None:
++        self.detector.update(enabled=False)
++        serialized = serialize(self.detector, self.user, WorkflowEngineDetectorSerializer())
++        assert serialized["snooze"] is True
++
+     def test_new_models_only(self) -> None:
+         # test that we can still serialize if objects do not have lookup table entries
+         # this is required for firing actions
+diff --git a/tests/sentry/preprod/size_analysis/test_grouptype.py b/tests/sentry/preprod/size_analysis/test_grouptype.py
+index da720e4e278f91..735c7e4b130a0b 100644
+--- a/tests/sentry/preprod/size_analysis/test_grouptype.py
++++ b/tests/sentry/preprod/size_analysis/test_grouptype.py
+@@ -376,6 +376,178 @@ def test_evaluate_diff_raises_when_base_missing(self):
+             handler.evaluate(data_packet)
+ 
+ 
++@region_silo_test
++class PreprodSizeAnalysisDetectorQueryFilterTest(TestCase):
++    def setUp(self) -> None:
++        super().setUp()
++        self.condition_group = self.create_data_condition_group(
++            organization=self.project.organization,
++        )
++        self.create_data_condition(
++            condition_group=self.condition_group,
++            type=Condition.GREATER,
++            comparison=1000000,
++            condition_result=DetectorPriorityLevel.HIGH,
++        )
++        self.head_artifact = self.create_preprod_artifact(
++            project=self.project,
++            app_id="com.example.app",
++            artifact_type=PreprodArtifact.ArtifactType.APK,
++        )
++        self.head_artifact = PreprodArtifact.objects.select_related("mobile_app_info").get(
++            id=self.head_artifact.id
++        )
++        self.base_artifact = self.create_preprod_artifact(
++            project=self.project,
++            app_id="com.example.app",
++            artifact_type=PreprodArtifact.ArtifactType.APK,
++        )
++        self.base_artifact = PreprodArtifact.objects.select_related("mobile_app_info").get(
++            id=self.base_artifact.id
++        )
++
++    def _make_data_packet(self) -> SizeAnalysisDataPacket:
++        return DataPacket(
++            source_id="test",
++            packet={
++                "head_install_size_bytes": 5000000,
++                "head_download_size_bytes": 2000000,
++                "metadata": {
++                    "platform": "android",
++                    "head_metric_id": 100,
++                    "base_metric_id": 200,
++                    "head_artifact_id": self.head_artifact.id,
++                    "base_artifact_id": self.base_artifact.id,
++                    "head_artifact": self.head_artifact,
++                    "base_artifact": self.base_artifact,
++                },
++            },
++        )
++
++    def test_no_query_evaluates_normally(self):
++        detector = self.create_detector(
++            name="test-detector",
++            type=PreprodSizeAnalysisGroupType.slug,
++            project=self.project,
++            config={"threshold_type": "absolute", "measurement": "install_size"},
++            workflow_condition_group=self.condition_group,
++        )
++        handler = PreprodSizeAnalysisDetectorHandler(detector)
++        result = handler.evaluate(self._make_data_packet())
++
++        assert None in result
++        assert result[None].priority == DetectorPriorityLevel.HIGH
++
++    def test_empty_query_evaluates_normally(self):
++        detector = self.create_detector(
++            name="test-detector",
++            type=PreprodSizeAnalysisGroupType.slug,
++            project=self.project,
++            config={"threshold_type": "absolute", "measurement": "install_size", "query": ""},
++            workflow_condition_group=self.condition_group,
++        )
++        handler = PreprodSizeAnalysisDetectorHandler(detector)
++        result = handler.evaluate(self._make_data_packet())
++
++        assert None in result
++        assert result[None].priority == DetectorPriorityLevel.HIGH
++
++    def test_whitespace_query_evaluates_normally(self):
++        detector = self.create_detector(
++            name="test-detector",
++            type=PreprodSizeAnalysisGroupType.slug,
++            project=self.project,
++            config={"threshold_type": "absolute", "measurement": "install_size", "query": "   "},
++            workflow_condition_group=self.condition_group,
++        )
++        handler = PreprodSizeAnalysisDetectorHandler(detector)
++        result = handler.evaluate(self._make_data_packet())
++
++        assert None in result
++        assert result[None].priority == DetectorPriorityLevel.HIGH
++
++    def test_matching_query_evaluates_normally(self):
++        detector = self.create_detector(
++            name="test-detector",
++            type=PreprodSizeAnalysisGroupType.slug,
++            project=self.project,
++            config={
++                "threshold_type": "absolute",
++                "measurement": "install_size",
++                "query": "app_id:com.example.app",
++            },
++            workflow_condition_group=self.condition_group,
++        )
++        handler = PreprodSizeAnalysisDetectorHandler(detector)
++        result = handler.evaluate(self._make_data_packet())
++
++        assert None in result
++        assert result[None].priority == DetectorPriorityLevel.HIGH
++
++    def test_non_matching_query_skips_evaluation(self):
++        detector = self.create_detector(
++            name="test-detector",
++            type=PreprodSizeAnalysisGroupType.slug,
++            project=self.project,
++            config={
++                "threshold_type": "absolute",
++                "measurement": "install_size",
++                "query": "app_id:com.other.app",
++            },
++            workflow_condition_group=self.condition_group,
++        )
++        handler = PreprodSizeAnalysisDetectorHandler(detector)
++        result = handler.evaluate(self._make_data_packet())
++
++        assert result == {}
++
++    def test_invalid_query_skips_evaluation_and_logs_exception(self):
++        detector = self.create_detector(
++            name="test-detector",
++            type=PreprodSizeAnalysisGroupType.slug,
++            project=self.project,
++            config={
++                "threshold_type": "absolute",
++                "measurement": "install_size",
++                "query": "foo OR bar",
++            },
++            workflow_condition_group=self.condition_group,
++        )
++        handler = PreprodSizeAnalysisDetectorHandler(detector)
++
++        with mock.patch("sentry.preprod.size_analysis.grouptype.logger") as mock_logger:
++            result = handler.evaluate(self._make_data_packet())
++
++        assert result == {}
++        mock_logger.exception.assert_called_once_with(
++            "preprod.size_analysis.invalid_detector_query",
++            extra={"detector_id": detector.id, "query": "foo OR bar"},
++        )
++
++    def test_no_metadata_with_query_raises_error(self):
++        detector = self.create_detector(
++            name="test-detector",
++            type=PreprodSizeAnalysisGroupType.slug,
++            project=self.project,
++            config={
++                "threshold_type": "absolute",
++                "measurement": "install_size",
++                "query": "app_id:com.example.app",
++            },
++            workflow_condition_group=self.condition_group,
++        )
++        data_packet: SizeAnalysisDataPacket = DataPacket(
++            source_id="test",
++            packet={
++                "head_install_size_bytes": 5000000,
++                "head_download_size_bytes": 2000000,
++            },
++        )
++        handler = PreprodSizeAnalysisDetectorHandler(detector)
++        with pytest.raises(ValueError, match="missing metadata required to evaluate query filter"):
++            handler.evaluate(data_packet)
++
++
+ @region_silo_test
+ class PreprodSizeAnalysisDetectorHandlerIntegrationTest(TestCase):
+     def test_e2e(self):
+diff --git a/tests/sentry/preprod/test_tasks.py b/tests/sentry/preprod/test_tasks.py
+index 56cae25844c989..63df06affacc88 100644
+--- a/tests/sentry/preprod/test_tasks.py
++++ b/tests/sentry/preprod/test_tasks.py
+@@ -981,30 +981,8 @@ def test_assemble_preprod_artifact_size_analysis_removes_stale_metrics(self) ->
+         assert second_analysis_file is not None
+         assert main_metrics.analysis_file_id == second_analysis_file.id
+ 
+-    def test_assemble_preprod_artifact_size_analysis_writes_to_eap_when_flag_enabled(self) -> None:
+-        """Test that size metrics are written to EAP when feature flag is enabled"""
+-        with self.feature("organizations:preprod-size-metrics-eap-write"):
+-            with patch("sentry.preprod.tasks.produce_preprod_size_metric_to_eap") as mock_eap_write:
+-                status, details = self._run_task_and_verify_status(
+-                    b'{"analysis_duration": 1.5, "download_size": 1000, "install_size": 2000, "treemap": null, "analysis_version": null, "app_components": [{"component_type": 0, "name": "Main App", "app_id": "com.example.app", "path": "/", "download_size": 1000, "install_size": 2000}]}'
+-                )
+-
+-                assert status == ChunkFileState.OK
+-                assert details is None
+-
+-                # Verify produce_preprod_size_metric_to_eap was called exactly once
+-                # We have other integration tests that verify the EAP write itself works
+-                assert mock_eap_write.call_count == 1
+-
+-                call_args = mock_eap_write.call_args
+-                assert call_args is not None
+-                size_metric = call_args.kwargs["size_metric"]
+-                assert size_metric.preprod_artifact_id == self.preprod_artifact.id
+-                assert call_args.kwargs["organization_id"] == self.organization.id
+-                assert call_args.kwargs["project_id"] == self.project.id
+-
+-    def test_assemble_preprod_artifact_size_analysis_skips_eap_when_flag_disabled(self) -> None:
+-        """Test that size metrics are NOT written to EAP when feature flag is disabled"""
++    def test_assemble_preprod_artifact_size_analysis_writes_to_eap(self) -> None:
++        """Test that size metrics are written to EAP"""
+         with patch("sentry.preprod.tasks.produce_preprod_size_metric_to_eap") as mock_eap_write:
+             status, details = self._run_task_and_verify_status(
+                 b'{"analysis_duration": 1.5, "download_size": 1000, "install_size": 2000, "treemap": null, "analysis_version": null, "app_components": [{"component_type": 0, "name": "Main App", "app_id": "com.example.app", "path": "/", "download_size": 1000, "install_size": 2000}]}'
+@@ -1013,49 +991,53 @@ def test_assemble_preprod_artifact_size_analysis_skips_eap_when_flag_disabled(se
+             assert status == ChunkFileState.OK
+             assert details is None
+ 
+-            # Verify produce_preprod_size_metric_to_eap was NOT called
+-            mock_eap_write.assert_not_called()
++            # Verify produce_preprod_size_metric_to_eap was called exactly once
++            # We have other integration tests that verify the EAP write itself works
++            assert mock_eap_write.call_count == 1
++
++            call_args = mock_eap_write.call_args
++            assert call_args is not None
++            size_metric = call_args.kwargs["size_metric"]
++            assert size_metric.preprod_artifact_id == self.preprod_artifact.id
++            assert call_args.kwargs["organization_id"] == self.organization.id
++            assert call_args.kwargs["project_id"] == self.project.id
+ 
+     def test_assemble_preprod_artifact_size_analysis_eap_write_failure_does_not_fail_task(
+         self,
+     ) -> None:
+         """Test that EAP write failures don't cause the main task to fail"""
+-        with self.feature("organizations:preprod-size-metrics-eap-write"):
+-            with patch(
+-                "sentry.preprod.tasks.produce_preprod_size_metric_to_eap",
+-                side_effect=Exception("EAP write failed"),
+-            ):
+-                status, details = self._run_task_and_verify_status(
+-                    b'{"analysis_duration": 1.5, "download_size": 1000, "install_size": 2000, "treemap": null, "analysis_version": null, "app_components": [{"component_type": 0, "name": "Main App", "app_id": "com.example.app", "path": "/", "download_size": 1000, "install_size": 2000}]}'
+-                )
++        with patch(
++            "sentry.preprod.tasks.produce_preprod_size_metric_to_eap",
++            side_effect=Exception("EAP write failed"),
++        ):
++            status, details = self._run_task_and_verify_status(
++                b'{"analysis_duration": 1.5, "download_size": 1000, "install_size": 2000, "treemap": null, "analysis_version": null, "app_components": [{"component_type": 0, "name": "Main App", "app_id": "com.example.app", "path": "/", "download_size": 1000, "install_size": 2000}]}'
++            )
+ 
+-                assert status == ChunkFileState.OK
+-                assert details is None
++            assert status == ChunkFileState.OK
++            assert details is None
+ 
+-                size_metrics = PreprodArtifactSizeMetrics.objects.filter(
+-                    preprod_artifact=self.preprod_artifact
+-                )
+-                assert len(size_metrics) == 1
+-                assert (
+-                    size_metrics[0].state == PreprodArtifactSizeMetrics.SizeAnalysisState.COMPLETED
+-                )
++            size_metrics = PreprodArtifactSizeMetrics.objects.filter(
++                preprod_artifact=self.preprod_artifact
++            )
++            assert len(size_metrics) == 1
++            assert size_metrics[0].state == PreprodArtifactSizeMetrics.SizeAnalysisState.COMPLETED
+ 
+     def test_assemble_preprod_artifact_size_analysis_writes_multiple_metrics_to_eap(self) -> None:
+-        """Test that all size metrics (main + components) are written to EAP when flag is enabled"""
+-        with self.feature("organizations:preprod-size-metrics-eap-write"):
+-            with patch("sentry.preprod.tasks.produce_preprod_size_metric_to_eap") as mock_eap_write:
+-                status, details = self._run_task_and_verify_status(
+-                    b'{"analysis_duration": 2.5, "download_size": 5000, "install_size": 10000, "treemap": null, "analysis_version": "1.0", "app_components": [{"component_type": 0, "name": "Main App", "app_id": "com.example.app", "path": "/", "download_size": 3000, "install_size": 6000}, {"component_type": 1, "name": "Watch App", "app_id": "com.example.app.watchkitapp", "path": "/Watch", "download_size": 2000, "install_size": 4000}]}'
+-                )
++        """Test that all size metrics (main + components) are written to EAP"""
++        with patch("sentry.preprod.tasks.produce_preprod_size_metric_to_eap") as mock_eap_write:
++            status, details = self._run_task_and_verify_status(
++                b'{"analysis_duration": 2.5, "download_size": 5000, "install_size": 10000, "treemap": null, "analysis_version": "1.0", "app_components": [{"component_type": 0, "name": "Main App", "app_id": "com.example.app", "path": "/", "download_size": 3000, "install_size": 6000}, {"component_type": 1, "name": "Watch App", "app_id": "com.example.app.watchkitapp", "path": "/Watch", "download_size": 2000, "install_size": 4000}]}'
++            )
+ 
+-                assert status == ChunkFileState.OK
+-                assert details is None
++            assert status == ChunkFileState.OK
++            assert details is None
+ 
+-                assert mock_eap_write.call_count == 2
++            assert mock_eap_write.call_count == 2
+ 
+-                for call in mock_eap_write.call_args_list:
+-                    assert call.kwargs["organization_id"] == self.organization.id
+-                    assert call.kwargs["project_id"] == self.project.id
++            for call in mock_eap_write.call_args_list:
++                assert call.kwargs["organization_id"] == self.organization.id
++                assert call.kwargs["project_id"] == self.project.id
+ 
+ 
+ class DetectExpiredPreprodArtifactsTest(TestCase):

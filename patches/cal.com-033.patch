@@ -1,22 +1,139 @@
-diff --git a/scripts/seed-app-store.ts b/scripts/seed-app-store.ts
-index 22e0725a64..45b1f36ed9 100644
---- a/scripts/seed-app-store.ts
-+++ b/scripts/seed-app-store.ts
-@@ -50,8 +50,15 @@ async function createApp(
+diff --git a/packages/emails/lib/generateIcsString.test.ts b/packages/emails/lib/generateIcsString.test.ts
+index d7b9887bc4c774..a0232548035ddc 100644
+--- a/packages/emails/lib/generateIcsString.test.ts
++++ b/packages/emails/lib/generateIcsString.test.ts
+@@ -1,6 +1,8 @@
+-import { describe, expect } from "vitest";
++import { describe, expect, vi } from "vitest";
+ 
+ import { ORGANIZER_EMAIL_EXEMPT_DOMAINS } from "@calcom/lib/constants";
++import { ErrorCode } from "@calcom/lib/errorCodes";
++import { ErrorWithCode } from "@calcom/lib/errors";
+ import { buildCalendarEvent, buildPerson } from "@calcom/lib/test/builder";
+ import { buildVideoCallData } from "@calcom/lib/test/builder";
+ import type { CalendarEvent } from "@calcom/types/Calendar";
+@@ -166,4 +168,90 @@ describe("generateIcsString", () => {
+       expect(icsString).toEqual(expect.stringContaining(`LOCATION:${event.location}`));
      });
+   });
++  describe("error handling", () => {
++    test("throws ErrorWithCode.BadRequest when ics library returns ValidationError", async () => {
++      // Mock the ics library to return a ValidationError
++      const ics = await import("ics");
++      const createEventSpy = vi.spyOn(ics, "createEvent");
++
++      // Simulate a Yup ValidationError (which has name: "ValidationError")
++      const validationError = {
++        name: "ValidationError",
++        message: "attendees[0].email must be a valid email",
++        errors: ["attendees[0].email must be a valid email"],
++      };
++
++      createEventSpy.mockReturnValueOnce({
++        error: validationError as unknown as Error,
++        value: undefined,
++      });
++
++      const event = buildCalendarEvent({
++        iCalSequence: 0,
++        attendees: [buildPerson()],
++      });
++
++      expect(() =>
++        generateIcsString({
++          event,
++          status: "CONFIRMED",
++        })
++      ).toThrow(ErrorWithCode);
++
++      try {
++        generateIcsString({
++          event,
++          status: "CONFIRMED",
++        });
++      } catch (error) {
++        expect(error).toBeInstanceOf(ErrorWithCode);
++        expect((error as ErrorWithCode).code).toBe(ErrorCode.BadRequest);
++        expect((error as ErrorWithCode).message).toBe("attendees[0].email must be a valid email");
++      }
++
++      createEventSpy.mockRestore();
++    });
++
++    test("re-throws non-ValidationError errors as-is", async () => {
++      const ics = await import("ics");
++      const createEventSpy = vi.spyOn(ics, "createEvent");
++
++      // Simulate a different type of error
++      const genericError = new Error("Some other error");
++
++      createEventSpy.mockReturnValueOnce({
++        error: genericError,
++        value: undefined,
++      });
++
++      const event = buildCalendarEvent({
++        iCalSequence: 0,
++        attendees: [buildPerson()],
++      });
++
++      expect(() =>
++        generateIcsString({
++          event,
++          status: "CONFIRMED",
++        })
++      ).toThrow(genericError);
++
++      createEventSpy.mockRestore();
++    });
++
++    test("returns ics string when there is no error", () => {
++      const event = buildCalendarEvent({
++        iCalSequence: 0,
++        attendees: [buildPerson()],
++      });
++
++      const icsString = generateIcsString({
++        event,
++        status: "CONFIRMED",
++      });
++
++      expect(icsString).toBeDefined();
++      expect(typeof icsString).toBe("string");
++    });
++  });
+ });
+diff --git a/packages/emails/lib/generateIcsString.ts b/packages/emails/lib/generateIcsString.ts
+index 981834f2c8e293..658fb35cdf7953 100644
+--- a/packages/emails/lib/generateIcsString.ts
++++ b/packages/emails/lib/generateIcsString.ts
+@@ -6,6 +6,8 @@ import { RRule } from "rrule";
+ import { getRichDescription } from "@calcom/lib/CalEventParser";
+ import { getVideoCallUrlFromCalEvent } from "@calcom/lib/CalEventParser";
+ import { ORGANIZER_EMAIL_EXEMPT_DOMAINS } from "@calcom/lib/constants";
++import { ErrorCode } from "@calcom/lib/errorCodes";
++import { ErrorWithCode } from "@calcom/lib/errors";
+ import type { CalendarEvent, Person } from "@calcom/types/Calendar";
  
-     // Only enable apps if they have valid keys (or don't require keys)
--    const enabled = shouldEnableApp(dirName, keys as Prisma.JsonValue);
--    const data = { slug, dirName, categories, keys, enabled };
-+    const keysToValidate = (keys ?? foundApp?.keys) as Prisma.JsonValue | undefined;
-+    const enabled = shouldEnableApp(dirName, keysToValidate);
-+    const data = {
-+      slug,
-+      dirName,
-+      categories,
-+      ...(keys !== undefined && { keys }),
-+      enabled,
-+    };
+ export enum BookingAction {
+@@ -55,7 +57,7 @@ const generateIcsString = ({
+   status: EventStatus;
+   partstat?: ParticipationStatus;
+   t?: TFunction;
+-}) => {
++}): string | undefined => {
+   const location = getVideoCallUrlFromCalEvent(event) || event.location;
  
-     if (!foundApp) {
-       await prisma.app.create({
+   // Taking care of recurrence rule
+@@ -111,6 +113,11 @@ const generateIcsString = ({
+     busyStatus: "BUSY",
+   });
+   if (icsEvent.error) {
++    // The ics library throws Yup ValidationError objects (not Error instances) for invalid data like invalid email formats.
++    // Convert these to ErrorWithCode.BadRequest so they return 400 instead of falling through to a generic 500.
++    if (icsEvent.error.name === "ValidationError") {
++      throw new ErrorWithCode(ErrorCode.BadRequest, icsEvent.error.message);
++    }
+     throw icsEvent.error;
+   }
+   return icsEvent.value;

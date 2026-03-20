@@ -1,71 +1,2694 @@
+diff --git a/.ci/devnet_ci.sh b/.ci/devnet_ci.sh
+index 93cca16d3..df6147ff2 100755
+--- a/.ci/devnet_ci.sh
++++ b/.ci/devnet_ci.sh
+@@ -15,6 +15,9 @@ total_clients=$2
+ network_id=$3
+ min_height=$4
+ 
++# The verobsity of snarkos nodes.
++NODE_VERBOSITY=1
++
+ # Default values if not provided
+ : "${total_validators:=4}"
+ : "${total_clients:=2}"
+@@ -49,7 +52,7 @@ trap 'echo "⛔️ Error in $BASH_SOURCE at line $LINENO: \"$BASH_COMMAND\" fail
+ 
+ # Flags used by all nodes.
+ common_flags=(
+-  --nodisplay --nobanner --noupdater "--network=$network_id" --verbosity=1
++  --nodisplay --nobanner --noupdater "--network=$network_id" "--verbosity=$NODE_VERBOSITY"
+   "--dev-num-validators=$total_validators"
+ )
+ 
+@@ -168,9 +171,10 @@ echo "{
+ " > program/program.json
+ 
+ # Deploy the test program and wait for the deployment to be processed.
++echo "● Testing program deployment..."
+ _deploy_result=$(cd program && snarkos developer deploy --dev-key 0 --network "$network_id" --endpoint=localhost:3030 --broadcast --wait --timeout 20 "$program_name")
+ 
+-# Ensure we are able to fetch the program fromn the node.
++# Ensure we are able to fetch the program from the node.
+ status_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3030/v2/$network_name/program/${program_name}/0")
+ if (( status_code == 200 )); then
+   echo "✅ Program exists on the node"
+@@ -180,19 +184,16 @@ else
+ fi
+ 
+ # Ensure the latest edition is indeed 0.
++echo "● Testing retrieval of program editions..."
+ edition=$(curl -s -o /dev/null "http://localhost:3030/v2/$network_name/program/${program_name}/latest_edition")
+-if (( edition == 0 )); then
+-  echo "✅ Only program edition 0 exists on the node"
+-else
++if (( edition != 0 )); then
+   echo "❌ Test failed! Invalid latest edition {} for test program returned, not 0."
+   exit 1
+ fi
+ 
+ # Also check that the latest edition for the default program (credits.aleo) is 0.
+ edition=$(curl -s -o /dev/null "http://localhost:3030/v2/$network_name/program/credits.aleo/latest_edition")
+-if (( edition == 0 )); then
+-  echo "✅ Only program edition 0 exists on the node"
+-else
++if (( edition != 0 )); then
+   echo "❌ Test failed! Invalid latest edition {} for credits.aleo returned, not 0."
+   exit 1
+ fi
+@@ -207,13 +208,31 @@ else
+ fi
+ 
+ # Execute a function in the deployed program and wait for the execution to be processed.
++echo "● Testing program execution with V2 API..."
++execute_result=$(cd program && snarkos developer execute --dev-key 0 --network "$network_id" --broadcast --endpoint=http://localhost:3030 \
++    "$program_name" main 1u32 1u32 --wait --timeout 10)
++
++# Fail if the execution transaction does not exist.
++tx=$(echo "$execute_result" | tail -n 1)
++found=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3030/v2/$network_name/transaction/$tx")
++# Fail if the HTTP response is not 2XX.
++if (( found < 200 || found >= 300 )); then
++  printf "❌ Test failed! Transaction does not exist or contains an error: \nexecute_result: %s\nfound: %s\n" \
++    "$execute_result" "$found"
++  exit 1
++else
++  echo "✅ Transaction executed successfully: $execute_result"
++fi
++
+ # Use the old flags here `--query` and `--broadcast=URL` to test they still work.
+ # Also, use the v1 API to test it still works.
+-execute_result=$(cd program && snarkos developer execute --dev-key 0 --network "$network_id" --query=localhost:3030 "--broadcast=http://localhost:3030/v1/$network_name/transaction/broadcast" "$program_name" main 1u32 1u32 --wait --timeout 20)
++echo "● Testing program execution with V1 API..."
++execute_result=$(cd program && snarkos developer execute --dev-key 0 --network "$network_id" --query=http://localhost:3030/v1 \
++    "--broadcast=http://localhost:3030/v1/$network_name/transaction/broadcast" "$program_name" main 1u32 1u32 --wait --timeout 10)
+ 
+ # Fail if the execution transaction does not exist.
+ tx=$(echo "$execute_result" | tail -n 1)
+-found=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3030/v2/$network_name/transaction/$tx")
++found=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3030/v1/$network_name/transaction/$tx")
+ # Fail if the HTTP response is not 2XX.
+ if (( found < 200 || found >= 300 )); then
+   printf "❌ Test failed! Transaction does not exist or contains an error: \nexecute_result: %s\nfound: %s\n" \
+@@ -224,6 +243,7 @@ else
+ fi
+ 
+ # Fail if status does not exist or is not set to "accepted".
++echo "● Testing confirmed transaction endpoint..."
+ rest_confirmed=$(curl -s "http://localhost:3030/v2/$network_name/transaction/confirmed/$tx")
+ 
+ rest_status=$(jq --raw-output '.status' <<< "$rest_confirmed")
+@@ -235,9 +255,10 @@ fi
+ echo "ℹ️Testing REST API and REST Error Handling"
+ 
+ # Test invalid transaction data (JsonDataError) returns 422 Unprocessable Content
+-echo "Testing invalid transaction data returns 422 status code..."
+-(cd program && snarkos developer execute --dev-key 0 --network "$network_id" --endpoint=localhost:3030 \
+-  --store txn_data.json --store-format=string "$program_name" main 1u32 1u32)
++echo "● Testing invalid transaction data returns 422 status code..."
++(cd program && snarkos developer execute --dev-key 0 --network "$network_id" \
++  --endpoint=localhost:3030  --store txn_data.json --store-format=string \
++  "$program_name" main 1u32 1u32)
+ 
+ # Modify the proof data
+ # This changes the last three characters in the hash but keeps the correct length.
+@@ -300,7 +321,7 @@ fi
+ echo "✅ Malformed JSON returns properly formatted RestError with JSON syntax error message"
+ 
+ # Test invalid Content-Type header returns 400 Bad Request
+-echo "Testing missing Content-Type header returns 400 status code..."
++echo "● Testing missing Content-Type header returns 400 status code..."
+ missing_content_type_response=$(curl -s -w "%{http_code}" -X POST \
+   -d '{"valid": "json"}' \
+   "http://localhost:3030/v2/$network_name/transaction/broadcast" \
+@@ -314,7 +335,8 @@ else
+ fi
+ 
+ # Test that missing Content-Type returns a properly formatted RestError
+-echo "Testing missing Content-Type returns valid RestError format..."
++echo "● Testing missing Content-Type returns valid RestError format..."
++
+ missing_content_type_error=$(curl -s -X POST \
+   -d '{"valid": "json"}' \
+   "http://localhost:3030/v2/$network_name/transaction/broadcast")
+@@ -334,6 +356,8 @@ fi
+ echo "✅ Missing Content-Type returns properly formatted RestError with Content-Type error message"
+ 
+ # Scan the network for records.
++echo "● Testing `snarkos developer scan`..."
++
+ scan_result=$(snarkos developer scan --dev-key 0 --network "$network_id" --start 0 --endpoint=localhost:3030)
+ num_records=$(echo "$scan_result" | grep -c "owner")
+ # Fail if the scan did not return 4 records.
+diff --git a/Cargo.lock b/Cargo.lock
+index 12a8b45a7..ef940f929 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -209,7 +209,7 @@ checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -231,7 +231,7 @@ checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -242,7 +242,7 @@ checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -267,7 +267,7 @@ dependencies = [
+  "axum-core 0.4.5",
+  "bytes",
+  "futures-util",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "itoa",
+@@ -294,7 +294,7 @@ dependencies = [
+  "bytes",
+  "form_urlencoded",
+  "futures-util",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "hyper 1.8.1",
+@@ -326,7 +326,7 @@ dependencies = [
+  "async-trait",
+  "bytes",
+  "futures-util",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "mime",
+@@ -345,7 +345,7 @@ checksum = "59446ce19cd142f8833f856eb31f3eb097812d1479ab224f54d72428ca21ea22"
+ dependencies = [
+  "bytes",
+  "futures-core",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "mime",
+@@ -367,7 +367,7 @@ dependencies = [
+  "bytes",
+  "futures-util",
+  "headers",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "mime",
+@@ -453,7 +453,7 @@ dependencies = [
+  "regex",
+  "rustc-hash 1.1.0",
+  "shlex",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -587,9 +587,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "cc"
+-version = "1.2.46"
++version = "1.2.47"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b97463e1064cb1b1c1384ad0a0b9c8abd0988e2a91f52606c80ef14aadb63e36"
++checksum = "cd405d82c84ff7f35739f175f67d8b9fb7687a0e84ccdc78bd3568839827cf07"
+ dependencies = [
+  "find-msvc-tools",
+  "jobserver",
+@@ -652,9 +652,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "clap"
+-version = "4.5.52"
++version = "4.5.53"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "aa8120877db0e5c011242f96806ce3c94e0737ab8108532a76a3300a01db2ab8"
++checksum = "c9e340e012a1bf4935f5282ed1436d1489548e8f72308207ea5df0e23d2d03f8"
+ dependencies = [
+  "clap_builder",
+  "clap_derive",
+@@ -662,9 +662,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "clap_builder"
+-version = "4.5.52"
++version = "4.5.53"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "02576b399397b659c26064fbc92a75fede9d18ffd5f80ca1cd74ddab167016e1"
++checksum = "d76b5d13eaa18c901fd2f7fca939fefe3a0727a953561fefdf3b2922b8569d00"
+ dependencies = [
+  "anstream",
+  "anstyle",
+@@ -681,7 +681,7 @@ dependencies = [
+  "heck",
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -822,7 +822,7 @@ dependencies = [
+  "cookie",
+  "document-features",
+  "idna",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "log",
+  "serde",
+  "serde_derive",
+@@ -1024,7 +1024,7 @@ checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1058,7 +1058,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "strsim",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1072,7 +1072,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "strsim",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1083,7 +1083,7 @@ checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
+ dependencies = [
+  "darling_core 0.20.11",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1094,7 +1094,7 @@ checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
+ dependencies = [
+  "darling_core 0.21.3",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1149,7 +1149,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "structmeta 0.3.0",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1160,7 +1160,7 @@ checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1181,7 +1181,7 @@ dependencies = [
+  "convert_case",
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1224,7 +1224,7 @@ checksum = "97369cbbc041bc366949bc74d34658d6cda5621039731c6310521892a3a20ae0"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1348,7 +1348,7 @@ checksum = "685adfa4d6f3d765a26bc5dbc936577de9abf756c1feeb3089b01dd395034842"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1367,12 +1367,33 @@ dependencies = [
+  "syn 0.11.11",
+ ]
+ 
++[[package]]
++name = "env_filter"
++version = "0.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
++dependencies = [
++ "log",
++]
++
+ [[package]]
+ name = "env_home"
+ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
+ 
++[[package]]
++name = "env_logger"
++version = "0.11.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "13c863f0904021b108aa8b2f55046443e6b1ebde8fd4a15c399893aae4fa069f"
++dependencies = [
++ "anstream",
++ "anstyle",
++ "env_filter",
++ "log",
++]
++
+ [[package]]
+ name = "envmnt"
+ version = "0.8.4"
+@@ -1558,7 +1579,7 @@ checksum = "162ee34ebcb7c64a8abebc059ce0fee27c2262618d7b60ed8faf72fef13c3650"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -1723,8 +1744,8 @@ dependencies = [
+  "fnv",
+  "futures-core",
+  "futures-sink",
+- "http 1.3.1",
+- "indexmap 2.12.0",
++ "http 1.4.0",
++ "indexmap 2.12.1",
+  "slab",
+  "tokio",
+  "tokio-util",
+@@ -1759,9 +1780,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "hashbrown"
+-version = "0.16.0"
++version = "0.16.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
++checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+ dependencies = [
+  "allocator-api2",
+  "equivalent",
+@@ -1790,7 +1811,7 @@ dependencies = [
+  "base64 0.22.1",
+  "bytes",
+  "headers-core",
+- "http 1.3.1",
++ "http 1.4.0",
+  "httpdate",
+  "mime",
+  "sha1",
+@@ -1802,7 +1823,7 @@ version = "0.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "54b4a22553d4242c49fddb9ba998a99962b5cc6f22cb5a3482bec22522403ce4"
+ dependencies = [
+- "http 1.3.1",
++ "http 1.4.0",
+ ]
+ 
+ [[package]]
+@@ -1854,12 +1875,11 @@ dependencies = [
+ 
+ [[package]]
+ name = "http"
+-version = "1.3.1"
++version = "1.4.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f4a85d31aea989eead29a3aaf9e1115a180df8282431156e533de47660892565"
++checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
+ dependencies = [
+  "bytes",
+- "fnv",
+  "itoa",
+ ]
+ 
+@@ -1881,7 +1901,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1efedce1fb8e6913f23e0c92de8e62cd5b772a67e7b3946df930a62566c93184"
+ dependencies = [
+  "bytes",
+- "http 1.3.1",
++ "http 1.4.0",
+ ]
+ 
+ [[package]]
+@@ -1892,7 +1912,7 @@ checksum = "b021d93e26becf5dc7e1b75b1bed1fd93124b374ceb73f43d4d4eafec896a64a"
+ dependencies = [
+  "bytes",
+  "futures-core",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "pin-project-lite",
+ ]
+@@ -1955,7 +1975,7 @@ dependencies = [
+  "futures-channel",
+  "futures-core",
+  "h2",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "httparse",
+  "httpdate",
+@@ -1973,7 +1993,7 @@ version = "0.27.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
+ dependencies = [
+- "http 1.3.1",
++ "http 1.4.0",
+  "hyper 1.8.1",
+  "hyper-util",
+  "rustls",
+@@ -2037,7 +2057,7 @@ dependencies = [
+  "futures-channel",
+  "futures-core",
+  "futures-util",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "hyper 1.8.1",
+  "ipnet",
+@@ -2197,12 +2217,12 @@ dependencies = [
+ 
+ [[package]]
+ name = "indexmap"
+-version = "2.12.0"
++version = "2.12.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6717a8d2a5a929a1a2eb43a12812498ed141a0bcfb7e8f7844fbdbe4303bba9f"
++checksum = "0ad4bb2b565bca0645f4d68c5c9af97fba094e9791da685bf83cb5f3ce74acf2"
+ dependencies = [
+  "equivalent",
+- "hashbrown 0.16.0",
++ "hashbrown 0.16.1",
+  "rayon",
+  "serde",
+  "serde_core",
+@@ -2240,7 +2260,7 @@ dependencies = [
+  "indoc",
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -2510,7 +2530,7 @@ version = "0.16.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "96051b46fc183dc9cd4a223960ef37b9af631b55191852a8274bfef064cda20f"
+ dependencies = [
+- "hashbrown 0.16.0",
++ "hashbrown 0.16.1",
+ ]
+ 
+ [[package]]
+@@ -2575,7 +2595,7 @@ dependencies = [
+  "base64 0.21.7",
+  "hyper 0.14.32",
+  "hyper-tls 0.5.0",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "ipnet",
+  "metrics",
+  "metrics-util",
+@@ -2667,7 +2687,7 @@ dependencies = [
+  "cfg-if",
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -2767,7 +2787,7 @@ checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -2863,7 +2883,7 @@ checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -2984,7 +3004,7 @@ checksum = "6e918e4ff8c4549eb882f14b3a4bc8c8bc93de829416eacf579f1207a8fbf861"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -3078,7 +3098,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+ dependencies = [
+  "proc-macro2",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -3130,7 +3150,7 @@ dependencies = [
+  "itertools 0.14.0",
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -3413,7 +3433,7 @@ checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -3473,7 +3493,7 @@ dependencies = [
+  "futures-core",
+  "futures-util",
+  "h2",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "hyper 1.8.1",
+@@ -3841,7 +3861,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -3850,7 +3870,7 @@ version = "1.0.145"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
+ dependencies = [
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "itoa",
+  "memchr",
+  "ryu",
+@@ -3900,7 +3920,7 @@ dependencies = [
+  "chrono",
+  "hex",
+  "indexmap 1.9.3",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "schemars 0.9.0",
+  "schemars 1.1.0",
+  "serde_core",
+@@ -3918,7 +3938,7 @@ dependencies = [
+  "darling 0.21.3",
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -3981,9 +4001,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "signal-hook-registry"
+-version = "1.4.6"
++version = "1.4.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
++checksum = "7664a098b8e616bdfcc2dc0e9ac44eb231eedf41db4e9fe95d8d32ec728dedad"
+ dependencies = [
+  "libc",
+ ]
+@@ -4098,7 +4118,7 @@ dependencies = [
+  "colored 3.0.0",
+  "console-subscriber",
+  "crossterm 0.29.0",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "nix",
+  "num_cpus",
+@@ -4151,8 +4171,8 @@ dependencies = [
+  "colored 3.0.0",
+  "deadline",
+  "futures-util",
+- "http 1.3.1",
+- "indexmap 2.12.0",
++ "http 1.4.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "lru 0.16.2",
+  "num_cpus",
+@@ -4197,7 +4217,7 @@ dependencies = [
+  "colored 3.0.0",
+  "deadline",
+  "futures",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "itertools 0.14.0",
+  "locktick",
+  "lru 0.16.2",
+@@ -4222,6 +4242,7 @@ dependencies = [
+  "snarkos-node-sync",
+  "snarkos-node-tcp",
+  "snarkvm",
++ "test-log",
+  "test-strategy 0.4.3",
+  "time",
+  "tokio",
+@@ -4239,7 +4260,7 @@ version = "4.3.0"
+ dependencies = [
+  "anyhow",
+  "bytes",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "proptest",
+  "serde",
+  "snarkos-node-network",
+@@ -4257,7 +4278,7 @@ version = "4.3.0"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "parking_lot",
+  "rand 0.8.5",
+@@ -4274,7 +4295,7 @@ version = "4.3.0"
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "lru 0.16.2",
+  "parking_lot",
+@@ -4289,7 +4310,7 @@ dependencies = [
+  "anyhow",
+  "bincode",
+  "colored 3.0.0",
+- "http 1.3.1",
++ "http 1.4.0",
+  "locktick",
+  "parking_lot",
+  "rayon",
+@@ -4310,7 +4331,7 @@ dependencies = [
+  "aleo-std",
+  "anyhow",
+  "colored 3.0.0",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "itertools 0.14.0",
+  "locktick",
+  "lru 0.16.2",
+@@ -4366,8 +4387,8 @@ dependencies = [
+  "axum-extra",
+  "base64 0.22.1",
+  "built",
+- "http 1.3.1",
+- "indexmap 2.12.0",
++ "http 1.4.0",
++ "indexmap 2.12.1",
+  "jsonwebtoken",
+  "locktick",
+  "once_cell",
+@@ -4448,7 +4469,7 @@ version = "4.3.0"
+ dependencies = [
+  "anyhow",
+  "futures",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "itertools 0.14.0",
+  "locktick",
+  "parking_lot",
+@@ -4480,7 +4501,7 @@ name = "snarkos-node-sync-locators"
+ version = "4.3.0"
+ dependencies = [
+  "anyhow",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "serde",
+  "snarkvm",
+  "tracing",
+@@ -4538,7 +4559,7 @@ dependencies = [
+  "fxhash",
+  "hashbrown 0.15.5",
+  "hex",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "itertools 0.14.0",
+  "num-traits",
+  "rand 0.8.5",
+@@ -4614,7 +4635,7 @@ name = "snarkvm-circuit-environment"
+ version = "4.3.0"
+ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608feb8acc991eb74298e791e2de4b92bc3"
+ dependencies = [
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "itertools 0.14.0",
+  "nom",
+  "num-traits",
+@@ -4808,7 +4829,7 @@ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608fe
+ dependencies = [
+  "anyhow",
+  "enum-iterator",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "lazy_static",
+  "paste",
+  "serde",
+@@ -4847,7 +4868,7 @@ dependencies = [
+  "enum-iterator",
+  "enum_index",
+  "enum_index_derive",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "num-derive",
+  "num-traits",
+  "seq-macro",
+@@ -4986,7 +5007,7 @@ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608fe
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "lru 0.16.2",
+  "parking_lot",
+@@ -5027,7 +5048,7 @@ version = "4.3.0"
+ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608feb8acc991eb74298e791e2de4b92bc3"
+ dependencies = [
+  "anyhow",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "rayon",
+  "serde_json",
+  "snarkvm-console",
+@@ -5049,7 +5070,7 @@ version = "4.3.0"
+ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608feb8acc991eb74298e791e2de4b92bc3"
+ dependencies = [
+  "anyhow",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "proptest",
+  "rand 0.8.5",
+  "rand_chacha 0.3.1",
+@@ -5080,7 +5101,7 @@ name = "snarkvm-ledger-narwhal-batch-certificate"
+ version = "4.3.0"
+ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608feb8acc991eb74298e791e2de4b92bc3"
+ dependencies = [
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "rayon",
+  "serde_json",
+  "snarkvm-console",
+@@ -5093,7 +5114,7 @@ name = "snarkvm-ledger-narwhal-batch-header"
+ version = "4.3.0"
+ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608feb8acc991eb74298e791e2de4b92bc3"
+ dependencies = [
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "rayon",
+  "serde_json",
+  "snarkvm-console",
+@@ -5117,7 +5138,7 @@ name = "snarkvm-ledger-narwhal-subdag"
+ version = "4.3.0"
+ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608feb8acc991eb74298e791e2de4b92bc3"
+ dependencies = [
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "rayon",
+  "serde_json",
+  "snarkvm-console",
+@@ -5157,7 +5178,7 @@ dependencies = [
+  "aleo-std",
+  "anyhow",
+  "bincode",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "lru 0.16.2",
+  "parking_lot",
+@@ -5177,7 +5198,7 @@ dependencies = [
+  "aleo-std",
+  "anyhow",
+  "colored 3.0.0",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "lru 0.16.2",
+  "parking_lot",
+@@ -5217,7 +5238,7 @@ dependencies = [
+  "aleo-std-storage",
+  "anyhow",
+  "bincode",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "parking_lot",
+  "rayon",
+@@ -5293,7 +5314,7 @@ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608fe
+ dependencies = [
+  "aleo-std",
+  "anyhow",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "itertools 0.14.0",
+  "locktick",
+  "lru 0.16.2",
+@@ -5327,7 +5348,7 @@ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608fe
+ dependencies = [
+  "aleo-std",
+  "colored 3.0.0",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "locktick",
+  "parking_lot",
+  "rand 0.8.5",
+@@ -5351,7 +5372,7 @@ version = "4.3.0"
+ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608feb8acc991eb74298e791e2de4b92bc3"
+ dependencies = [
+  "enum-iterator",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "paste",
+  "rand 0.8.5",
+  "rand_chacha 0.3.1",
+@@ -5407,7 +5428,7 @@ source = "git+https://github.com/ProvableHQ/snarkVM.git?rev=fbd99608f#fbd99608fe
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5486,7 +5507,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "structmeta-derive 0.2.0",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5498,7 +5519,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "structmeta-derive 0.3.0",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5509,7 +5530,7 @@ checksum = "a60bcaff7397072dca0017d1db428e30d5002e00b6847703e2e42005c95fbe00"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5520,7 +5541,7 @@ checksum = "152a0b65a590ff6c3da95cabe2353ee04e6167c896b28e3b14478c2636c922fc"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5542,7 +5563,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "rustversion",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5575,9 +5596,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "syn"
+-version = "2.0.110"
++version = "2.0.111"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a99801b5bd34ede4cf3fc688c5919368fea4e4814a4664359503e6015b280aea"
++checksum = "390cc9a294ab71bdb1aa2e99d13be9c753cd2d7bd6560c77118597410c4d2e87"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+@@ -5610,7 +5631,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5663,6 +5684,28 @@ version = "0.5.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
+ 
++[[package]]
++name = "test-log"
++version = "0.2.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e33b98a582ea0be1168eba097538ee8dd4bbe0f2b01b22ac92ea30054e5be7b"
++dependencies = [
++ "env_logger",
++ "test-log-macros",
++ "tracing-subscriber",
++]
++
++[[package]]
++name = "test-log-macros"
++version = "0.2.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "451b374529930d7601b1eef8d32bc79ae870b6079b069401709c2a8bf9e75f36"
++dependencies = [
++ "proc-macro2",
++ "quote 1.0.42",
++ "syn 2.0.111",
++]
++
+ [[package]]
+ name = "test-strategy"
+ version = "0.3.1"
+@@ -5672,7 +5715,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "structmeta 0.2.0",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5685,7 +5728,7 @@ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+  "structmeta 0.3.0",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5714,7 +5757,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5725,7 +5768,7 @@ checksum = "3ff15c8ecd7de3849db632e14d18d2571fa09dfc5ed93479bc4485c7a517c913"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5857,7 +5900,7 @@ checksum = "af407857209536a95c8e56f8231ef2c2e2aff839b22e07a1ffcbc617e9db9fa5"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -5932,7 +5975,7 @@ version = "0.9.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f0dc8b1fb61449e27716ec0e1bdf0f6b8f3e8f6b05391e8497b8b6d7804ea6d8"
+ dependencies = [
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "serde_core",
+  "serde_spanned",
+  "toml_datetime",
+@@ -5977,7 +6020,7 @@ dependencies = [
+  "base64 0.22.1",
+  "bytes",
+  "h2",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "hyper 1.8.1",
+@@ -6033,15 +6076,15 @@ dependencies = [
+ 
+ [[package]]
+ name = "tower-http"
+-version = "0.6.6"
++version = "0.6.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "adc82fd73de2a9722ac5da747f12383d2bfdb93591ee6c58486e0097890f05f2"
++checksum = "9cf146f99d442e8e68e585f5d798ccd3cad9a7835b917e09728880a862706456"
+ dependencies = [
+  "bitflags 2.10.0",
+  "bytes",
+  "futures-core",
+  "futures-util",
+- "http 1.3.1",
++ "http 1.4.0",
+  "http-body 1.0.1",
+  "http-body-util",
+  "http-range-header",
+@@ -6080,7 +6123,7 @@ dependencies = [
+  "axum 0.8.7",
+  "forwarded-header-value",
+  "governor",
+- "http 1.3.1",
++ "http 1.4.0",
+  "pin-project",
+  "thiserror 2.0.17",
+  "tower 0.5.2",
+@@ -6107,7 +6150,7 @@ checksum = "81383ab64e72a7a8b8e13130c49e3dab29def6d0c7d76a03087b3cf71c5c6903"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -6167,7 +6210,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "04659ddb06c87d233c566112c1c9c5b9e98256d9af50ec3bc9c8327f873a7568"
+ dependencies = [
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -6273,12 +6316,12 @@ dependencies = [
+ 
+ [[package]]
+ name = "ureq-proto"
+-version = "0.5.2"
++version = "0.5.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "60b4531c118335662134346048ddb0e54cc86bd7e81866757873055f0e38f5d2"
++checksum = "d81f9efa9df032be5934a46a068815a10a042b494b6a58cb0a1a97bb5467ed6f"
+ dependencies = [
+  "base64 0.22.1",
+- "http 1.3.1",
++ "http 1.4.0",
+  "httparse",
+  "log",
+ ]
+@@ -6425,7 +6468,7 @@ dependencies = [
+  "bumpalo",
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+  "wasm-bindgen-shared",
+ ]
+ 
+@@ -6542,7 +6585,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -6553,7 +6596,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -6799,28 +6842,28 @@ checksum = "b659052874eb698efe5b9e8cf382204678a0086ebf46982b79d6ca3182927e5d"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+  "synstructure",
+ ]
+ 
+ [[package]]
+ name = "zerocopy"
+-version = "0.8.27"
++version = "0.8.30"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0894878a5fa3edfd6da3f88c4805f4c8558e2b996227a3d864f47fe11e38282c"
++checksum = "4ea879c944afe8a2b25fef16bb4ba234f47c694565e97383b36f3a878219065c"
+ dependencies = [
+  "zerocopy-derive",
+ ]
+ 
+ [[package]]
+ name = "zerocopy-derive"
+-version = "0.8.27"
++version = "0.8.30"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "88d2b8d9c68ad2b9e4340d7832716a4d21a22a1154777ad56ea55c51a9cf3831"
++checksum = "cf955aa904d6040f70dc8e9384444cb1030aed272ba3cb09bbc4ab9e7c1f34f5"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -6840,7 +6883,7 @@ checksum = "d71e5d6e06ab090c67b5e44993ec16b72dcbaabc526db883a360057678b48502"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+  "synstructure",
+ ]
+ 
+@@ -6861,7 +6904,7 @@ checksum = "ce36e65b0d2999d2aafac989fb249189a141aee1f53c612c1f37d72631959f69"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -6894,7 +6937,7 @@ checksum = "eadce39539ca5cb3985590102671f2567e659fca9666581ad3411d59207951f3"
+ dependencies = [
+  "proc-macro2",
+  "quote 1.0.42",
+- "syn 2.0.110",
++ "syn 2.0.111",
+ ]
+ 
+ [[package]]
+@@ -6908,7 +6951,7 @@ dependencies = [
+  "crossbeam-utils",
+  "displaydoc",
+  "flate2",
+- "indexmap 2.12.0",
++ "indexmap 2.12.1",
+  "memchr",
+  "thiserror 2.0.17",
+  "time",
+diff --git a/Cargo.toml b/Cargo.toml
+index deafe1649..2ca61a8c8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -169,6 +169,9 @@ version = "=0.3.19"
+ [workspace.dependencies.test-strategy]
+ version = "0.4"
+ 
++[workspace.dependencies.test-log]
++version = "0.2"
++
+ [workspace.dependencies.snarkos-account]
+ path = "account"
+ version = "=4.3.0"
+diff --git a/cli/Cargo.toml b/cli/Cargo.toml
+index b4003a039..c343f405e 100644
+--- a/cli/Cargo.toml
++++ b/cli/Cargo.toml
+@@ -162,6 +162,10 @@ default-features = true
+ version = "1"
+ features = [ "derive" ]
+ 
++[dev-dependencies.snarkvm]
++workspace = true
++features = [ "test-helpers" ]
++
+ [target."cfg(target_family = \"unix\")".dependencies.nix]
+ version = "0.30"
+ default-features = false
+diff --git a/cli/src/commands/developer/execute.rs b/cli/src/commands/developer/execute.rs
+index 5797eacff..0fc7ef013 100644
+--- a/cli/src/commands/developer/execute.rs
++++ b/cli/src/commands/developer/execute.rs
+@@ -152,7 +152,7 @@ impl Execute {
+             let vm = VM::from(store)?;
+ 
+             if !is_static_query && program_id != ProgramID::from_str("credits.aleo")? {
+-                let height = query.current_block_height()?;
++                let height = query.current_block_height().with_context(|| "Failed to retrieve current block height")?;
+                 let version = N::CONSENSUS_VERSION(height)?;
+                 debug!("At block height {height} and consensus {version:?}");
+                 let edition = Developer::get_latest_edition(&endpoint, &program_id)
+diff --git a/cli/src/commands/developer/mod.rs b/cli/src/commands/developer/mod.rs
+index 801b1b105..d5b1e311e 100644
+--- a/cli/src/commands/developer/mod.rs
++++ b/cli/src/commands/developer/mod.rs
+@@ -43,6 +43,7 @@ use std::{
+     thread,
+     time::{Duration, Instant},
+ };
++use tracing::debug;
+ use ureq::http::{self, Uri};
+ 
+ /// The format to store a generated transaction as.
+@@ -52,6 +53,13 @@ pub enum StoreFormat {
+     Bytes,
+ }
+ 
++/// The API version used by an endpoint
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub enum ApiVersion {
++    V1,
++    V2,
++}
++
+ /// Commands to deploy and execute transactions
+ #[derive(Debug, Parser)]
+ pub enum DeveloperCommand {
+@@ -183,14 +191,26 @@ impl Developer {
+     /// # Arguments
+     ///  - `base_url`: the hostname (and path prefix) of the node to query. this must exclude the network name.
+     ///  - `route`: the route to the endpoint (e.g., `stateRoot/latest`). This cannot start with a slash.
+-    fn build_endpoint<N: Network>(base_url: &http::Uri, route: &str) -> Result<String> {
++    ///
++    /// # Returns
++    /// The full endpoint Uri and the API version used by it.
++    fn build_endpoint<N: Network>(base_url: &http::Uri, route: &str) -> Result<(String, ApiVersion)> {
+         // This function is only called internally but check for additional sanity.
+         ensure!(!route.starts_with('/'), "path cannot start with a slash");
+ 
+-        // If the route already ends with a version segment (v1 or v2), don't prepend a version.
+-        let route_has_version_suffix = {
++        // Determine the API version we are interacting with.
++        let api_version = {
+             let r = base_url.path().trim_end_matches('/');
+-            r.ends_with(API_VERSION_V1) || r.ends_with(API_VERSION_V2)
++
++            if r.ends_with(API_VERSION_V1) {
++                ApiVersion::V1
++            } else if r.ends_with(API_VERSION_V2) {
++                ApiVersion::V2
++            } else {
++                // Default to v1.
++                // Note: If the snarkos-node-rest switches default to v2, this needs to be updated.
++                ApiVersion::V1
++            }
+         };
+ 
+         // Work around a bug in the `http` crate where empty paths will be set to '/'
+@@ -199,13 +219,8 @@ impl Developer {
+         let sep = if base_url.path().ends_with('/') { "" } else { "/" };
+ 
+         // Build "{base}/{maybe_version}/{network}/{route}"
+-        let prefix = if route_has_version_suffix {
+-            format!("{}/", N::SHORT_NAME)
+-        } else {
+-            format!("{}/{}/", API_VERSION_V2, N::SHORT_NAME)
+-        };
+-
+-        Ok(format!("{base_url}{sep}{prefix}{route}"))
++        let full_uri = format!("{base_url}{sep}{network}/{route}", network = N::SHORT_NAME);
++        Ok((full_uri, api_version))
+     }
+ 
+     /// Converts the returned JSON error (if any) into an anyhow Error chain.
+@@ -218,15 +233,43 @@ impl Developer {
+         } else if response.status() == http::StatusCode::NOT_FOUND {
+             Ok(None)
+         } else {
+-            let rest_error: RestError =
+-                response.into_body().read_json().with_context(|| "Failed to parse error JSON")?;
++            // V2 returns the error in JSON format.
++            let is_json = response
++                .headers()
++                .get(http::header::CONTENT_TYPE)
++                .and_then(|h| h.to_str().ok())
++                .map(|ct| ct.contains("json"))
++                .unwrap_or(false);
++
++            if is_json {
++                let rest_error: RestError =
++                    response.into_body().read_json().with_context(|| "Failed to parse error JSON")?;
++
++                Err(rest_error.parse())
++            } else {
++                // V1 returns the error message a string.
++                let err_msg = response.into_body().read_to_string()?;
++                Err(anyhow!(err_msg))
++            }
++        }
++    }
+ 
+-            Err(rest_error.parse())
++    /// Extracts the API version from a custom endpoint.
++    fn parse_custom_endpoint<N: Network>(url: &Uri) -> (String, ApiVersion) {
++        // Determine API version for custom endpoint.
++        if let Some(pq) = url.path_and_query()
++            && pq.path().ends_with(&format!("{API_VERSION_V2}/{}/transaction/broadcast", N::SHORT_NAME))
++        {
++            (url.to_string(), ApiVersion::V2)
++        } else {
++            (url.to_string(), ApiVersion::V1)
+         }
+     }
+ 
+     /// Helper function to send a POST request with a JSON body to an endpoint and await a JSON response.
+     fn http_post_json<I: Serialize, O: DeserializeOwned>(path: &str, arg: &I) -> Result<Option<O>> {
++        debug!("Issuing POST request to \"{path}\"");
++
+         let result =
+             ureq::post(path).config().http_status_as_error(false).build().send_json(arg).map_err(|err| err.into());
+ 
+@@ -241,7 +284,9 @@ impl Developer {
+ 
+     /// Helper function to send a GET request to an endpoint and await a JSON response.
+     fn http_get_json<N: Network, O: DeserializeOwned>(base_url: &http::Uri, route: &str) -> Result<Option<O>> {
+-        let endpoint = Self::build_endpoint::<N>(base_url, route)?;
++        let (endpoint, _api_version) = Self::build_endpoint::<N>(base_url, route)?;
++        debug!("Issuing GET request to \"{endpoint}\"");
++
+         let result = ureq::get(&endpoint).config().http_status_as_error(false).build().call().map_err(|err| err.into());
+ 
+         match Self::handle_ureq_result(result).with_context(|| "HTTP GET request failed")? {
+@@ -255,7 +300,9 @@ impl Developer {
+ 
+     /// Helper function to send a GET request to an endpoint and await the response.
+     fn http_get<N: Network>(base_url: &http::Uri, route: &str) -> Result<Option<ureq::Body>> {
+-        let endpoint = Self::build_endpoint::<N>(base_url, route)?;
++        let (endpoint, _api_version) = Self::build_endpoint::<N>(base_url, route)?;
++        debug!("Issuing GET request to \"{endpoint}\"");
++
+         let result = ureq::get(&endpoint).config().http_status_as_error(false).build().call().map_err(|err| err.into());
+ 
+         Self::handle_ureq_result(result).with_context(|| "HTTP GET request failed")
+@@ -266,6 +313,7 @@ impl Developer {
+         endpoint: &Uri,
+         transaction_id: &N::TransactionID,
+         timeout_seconds: u64,
++        api_version: ApiVersion,
+     ) -> Result<()> {
+         let start_time = Instant::now();
+         let timeout_duration = Duration::from_secs(timeout_seconds);
+@@ -273,16 +321,31 @@ impl Developer {
+ 
+         while start_time.elapsed() < timeout_duration {
+             // Check if transaction exists in a confirmed block
+-            let result = Self::http_get::<N>(endpoint, &format!("transaction/{transaction_id}"))
+-                .with_context(|| "Failed to check transaction status")?;
++            let result = Self::http_get::<N>(endpoint, &format!("transaction/{transaction_id}"));
+ 
+-            match result {
+-                Some(_) => return Ok(()),
+-                None => {
+-                    // Transaction not found yet, continue polling.
+-                    thread::sleep(poll_interval);
++            match api_version {
++                ApiVersion::V1 => match result {
++                    Ok(Some(_)) => return Ok(()),
++                    Ok(None) => {
++                        // Transaction not found yet, continue polling.
++                    }
++                    Err(err) => {
++                        // The V1 API returns 500 on missing transactions. Retroy on any error.
++                        eprintln!("Got error when fetching transaction ({err}). Will retry...");
++                    }
++                },
++                ApiVersion::V2 => {
++                    // With the V2 API, we can differentiate between benign errors and fatal errors.
++                    match result.with_context(|| "Failed to check transaction status")? {
++                        Some(_) => return Ok(()),
++                        None => {
++                            // Transaction not found yet, continue polling.
++                        }
++                    }
+                 }
+             }
++
++            thread::sleep(poll_interval);
+         }
+ 
+         // Timeout reached
+@@ -368,8 +431,9 @@ impl Developer {
+ 
+         // Determine if the transaction should be broadcast to the network.
+         if let Some(broadcast_value) = broadcast {
+-            let broadcast_endpoint = if let Some(url) = broadcast_value {
+-                url.to_string()
++            let (broadcast_endpoint, api_version) = if let Some(url) = broadcast_value {
++                debug!("Using custom endpoint for broadcasting: {url}");
++                Self::parse_custom_endpoint::<N>(url)
+             } else {
+                 Self::build_endpoint::<N>(endpoint, "transaction/broadcast")?
+             };
+@@ -408,7 +472,7 @@ impl Developer {
+                     // If wait is enabled, wait for transaction confirmation
+                     if wait {
+                         println!("⏳ Waiting for transaction confirmation (timeout: {timeout}s)...");
+-                        Self::wait_for_transaction_confirmation::<N>(endpoint, &transaction_id, timeout)?;
++                        Self::wait_for_transaction_confirmation::<N>(endpoint, &transaction_id, timeout, api_version)?;
+ 
+                         match transaction {
+                             Transaction::Deploy(..) => {
+@@ -448,3 +512,70 @@ impl Developer {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    use snarkvm::ledger::test_helpers::CurrentNetwork;
++
++    /// Test that the default endpoints (V1) work as expected.
++    ///
++    /// Note, if the default endpoint ever changes, this test needs to be updated.
++    #[test]
++    fn test_build_endpoint_default_v1() {
++        let base_uri_str = "http://localhost:3030";
++        let base_uri = Uri::try_from(base_uri_str).unwrap();
++        let (endpoint, api_version) =
++            Developer::build_endpoint::<CurrentNetwork>(&base_uri, "transaction/broadcast").unwrap();
++
++        assert_eq!(endpoint, format!("{base_uri_str}/{}/transaction/broadcast", CurrentNetwork::SHORT_NAME));
++        assert_eq!(api_version, ApiVersion::V1);
++    }
++
++    /// Ensure that the V1 endpoints work as expected.
++    #[test]
++    fn test_build_endpoint_v1() {
++        let base_uri_str = "http://localhost:3030/v1";
++        let base_uri = Uri::try_from(base_uri_str).unwrap();
++        let (endpoint, api_version) =
++            Developer::build_endpoint::<CurrentNetwork>(&base_uri, "transaction/broadcast").unwrap();
++
++        assert_eq!(endpoint, format!("{base_uri_str}/{}/transaction/broadcast", CurrentNetwork::SHORT_NAME));
++        assert_eq!(api_version, ApiVersion::V1);
++    }
++
++    /// Ensure that the V2 endpoints work as expected.
++    #[test]
++    fn test_build_endpoint_v2() {
++        let base_uri_str = "http://localhost:3030/v2";
++        let base_uri = Uri::try_from(base_uri_str).unwrap();
++        let (endpoint, api_version) =
++            Developer::build_endpoint::<CurrentNetwork>(&base_uri, "transaction/broadcast").unwrap();
++
++        assert_eq!(endpoint, format!("{base_uri_str}/{}/transaction/broadcast", CurrentNetwork::SHORT_NAME));
++        assert_eq!(api_version, ApiVersion::V2);
++    }
++
++    #[test]
++    fn test_custom_endpoint_v1() {
++        let endpoint_str = "http://localhost:3030/v1/mainnet/transaction/broadcast";
++        let endpoint = Uri::try_from(endpoint_str).unwrap();
++
++        let (parsed, api_version) = Developer::parse_custom_endpoint::<CurrentNetwork>(&endpoint);
++
++        assert_eq!(parsed, endpoint_str);
++        assert_eq!(api_version, ApiVersion::V1);
++    }
++
++    #[test]
++    fn test_custom_endpoint_v2() {
++        let endpoint_str = "http://localhost:3030/v2/mainnet/transaction/broadcast";
++        let endpoint = Uri::try_from(endpoint_str).unwrap();
++
++        let (parsed, api_version) = Developer::parse_custom_endpoint::<CurrentNetwork>(&endpoint);
++
++        assert_eq!(parsed, endpoint_str);
++        assert_eq!(api_version, ApiVersion::V2);
++    }
++}
+diff --git a/cli/src/commands/developer/scan.rs b/cli/src/commands/developer/scan.rs
+index 0e8e889c8..13b999b5b 100644
+--- a/cli/src/commands/developer/scan.rs
++++ b/cli/src/commands/developer/scan.rs
+@@ -28,7 +28,7 @@ use snarkvm::{
+ #[cfg(not(feature = "test_targets"))]
+ use snarkvm::prelude::FromBytes;
+ 
+-use anyhow::{Context, Result, bail, ensure};
++use anyhow::{Context, Result, anyhow, bail, ensure};
+ use clap::{Parser, builder::NonEmptyStringValueParser};
+ #[cfg(feature = "locktick")]
+ use locktick::parking_lot::RwLock;
+@@ -39,6 +39,7 @@ use std::{
+     str::FromStr,
+     sync::Arc,
+ };
++use tracing::debug;
+ use ureq::http::Uri;
+ use zeroize::Zeroize;
+ 
+@@ -144,35 +145,42 @@ impl Scan {
+ 
+     /// Returns the `start` and `end` blocks to scan.
+     fn parse_block_range<N: Network>(&self, endpoint: &Uri) -> Result<(u32, u32)> {
+-        match (self.start, self.end, self.last) {
+-            (Some(start), Some(end), None) => {
+-                ensure!(end > start, "The given scan range is invalid (start = {start}, end = {end})");
++        // Compute the end height.
++        let end = if let Some(end) = self.end {
++            end
++        } else {
++            // If not end height was given, request the latest block height from the endpoint.
++            let (endpoint, _api_version) = Developer::build_endpoint::<N>(endpoint, "block/height/latest")?;
++            let result = ureq::get(&endpoint).call().map_err(|e| e.into());
++            let end: u32 = Developer::handle_ureq_result(result)
++                .and_then(|body| body.ok_or(anyhow!("Endpoint returned 404 for latest block height")))?
++                .read_to_string()?
++                .parse()?;
++
++            debug!("Set end height to {end} based on latest block height of the endpoint");
++            end
++        };
+ 
+-                Ok((start, end))
+-            }
+-            (Some(start), None, None) => {
+-                // Request the latest block height from the endpoint.
+-                let endpoint = Developer::build_endpoint::<N>(endpoint, "block/height/latest")?;
+-                let latest_height = u32::from_str(&ureq::get(&endpoint).call()?.into_body().read_to_string()?)?;
+-
+-                // Print a warning message if the user is attempting to scan the whole chain.
+-                if start == 0 {
+-                    println!("⚠️  Attention - Scanning the entire chain. This may take a while...\n");
+-                }
++        // Compute the start height.
++        let start = if let Some(start) = self.start {
++            start
++        } else if let Some(last) = self.last {
++            let start = end.saturating_sub(last);
++            debug!("Setting start height to {start} (based on last={last} and end={end})");
++            start
++        } else {
++            debug!("Picking default value (0) for start height");
++            0
++        };
+ 
+-                Ok((start, latest_height))
+-            }
+-            (None, Some(end), None) => Ok((0, end)),
+-            (None, None, Some(last)) => {
+-                // Request the latest block height from the endpoint.
+-                let endpoint = Developer::build_endpoint::<N>(endpoint, "block/height/latest")?;
+-                let latest_height = u32::from_str(&ureq::get(&endpoint).call()?.into_body().read_to_string()?)?;
++        ensure!(end > start, "The given scan range is invalid (start = {start}, end = {end})");
+ 
+-                Ok((latest_height.saturating_sub(last), latest_height))
+-            }
+-            (None, None, None) => bail!("Missing data about block range."),
+-            _ => bail!("`last` flags can't be used with `start` or `end`"),
++        // Print a warning message if the user is attempting to scan the whole chain.
++        if start == 0 && self.end.is_none() {
++            println!("⚠️  Attention - Scanning the entire chain. This may take a while...\n");
+         }
++
++        Ok((start, end))
+     }
+ 
+     /// Returns the CDN to prefetch initial blocks from, from the given configurations.
+@@ -215,8 +223,11 @@ impl Scan {
+         #[cfg(not(feature = "test_targets"))]
+         let is_development_network = {
+             // Fetch the genesis block from the endpoint.
+-            let endpoint = Developer::build_endpoint::<N>(endpoint, "block/0")?;
+-            let endpoint_genesis_block: Block<N> = ureq::get(endpoint).call()?.into_body().read_json()?;
++            let endpoint_genesis_block: Block<N> = match Developer::http_get_json::<N, _>(endpoint, "block/0")? {
++                Some(block) => block,
++                None => bail!("Enpoint returend 404 for genesis block"),
++            };
++
+             // If the endpoint's block differs from our (production) block, it is on a development network.
+             endpoint_genesis_block != Block::from_bytes_le(N::genesis_bytes())?
+         };
+@@ -255,12 +266,11 @@ impl Scan {
+                 std::cmp::min(MAX_BLOCK_RANGE, end_height.saturating_sub(request_start).saturating_add(1));
+             let request_end = request_start.saturating_add(num_blocks_to_request);
+ 
+-            // Establish the endpoint.
+-            let blocks_endpoint =
+-                Developer::build_endpoint::<N>(endpoint, &format!("blocks?start={request_start}&end={request_end}"))?;
+-            // Fetch blocks
+-            let blocks: Vec<Block<N>> = (|| ureq::get(&blocks_endpoint).call()?.into_body().read_json())()
+-                .with_context(|| format!("Failed to fetch blocks range {request_start}..{request_end}"))?;
++            // Fetch blocks.
++            let blocks: Vec<Block<N>> =
++                Developer::http_get_json::<N, _>(endpoint, &format!("blocks?start={request_start}&end={request_end}"))
++                    .and_then(|blocks| blocks.ok_or(anyhow!("Enpoint returend 404 for the specified block range")))
++                    .with_context(|| format!("Failed to fetch blocks range {request_start}..{request_end}"))?;
+ 
+             // Scan the blocks for owned records.
+             for block in &blocks {
+@@ -385,7 +395,8 @@ impl Scan {
+             let serial_number = Record::<N, Plaintext<N>>::serial_number(private_key, commitment)?;
+ 
+             // Establish the endpoint.
+-            let endpoint = Developer::build_endpoint::<N>(endpoint, &format!("find/transitionID/{serial_number}"))?;
++            let (endpoint, _api_version) =
++                Developer::build_endpoint::<N>(endpoint, &format!("find/transitionID/{serial_number}"))?;
+ 
+             // Check if the record is spent.
+             match ureq::get(&endpoint).call() {
+diff --git a/cli/src/helpers/logger.rs b/cli/src/helpers/logger.rs
+index bf3465bc3..01e431127 100644
+--- a/cli/src/helpers/logger.rs
++++ b/cli/src/helpers/logger.rs
+@@ -71,6 +71,7 @@ fn parse_log_verbosity(verbosity: u8) -> Result<EnvFilter> {
+             .add_directive("tower=warn".parse().unwrap())
+             .add_directive("axum=warn".parse().unwrap())
+             .add_directive("ureq=warn".parse().unwrap())
++            .add_directive("rustls=warn".parse().unwrap())
+     } else {
+         let filter = filter.add_directive("snarkos_node_bft::gateway=debug".parse().unwrap());
+ 
+@@ -85,6 +86,7 @@ fn parse_log_verbosity(verbosity: u8) -> Result<EnvFilter> {
+             .add_directive("tower=off".parse().unwrap())
+             .add_directive("axum=off".parse().unwrap())
+             .add_directive("ureq=off".parse().unwrap())
++            .add_directive("rustls=off".parse().unwrap())
+     };
+ 
+     let filter = if verbosity >= 5 {
+diff --git a/node/bft/Cargo.toml b/node/bft/Cargo.toml
+index 25e79280a..c52bbe6f8 100644
+--- a/node/bft/Cargo.toml
++++ b/node/bft/Cargo.toml
+@@ -190,6 +190,9 @@ features = [ "test" ]
+ [dev-dependencies.test-strategy]
+ workspace = true
+ 
++[dev-dependencies.test-log]
++workspace = true
++
+ [dev-dependencies.tower-http]
+ version = "0.6"
+ features = [ "fs", "trace" ]
+diff --git a/node/bft/events/src/disconnect.rs b/node/bft/events/src/disconnect.rs
+index 720e394d6..e5e5012ac 100644
+--- a/node/bft/events/src/disconnect.rs
++++ b/node/bft/events/src/disconnect.rs
+@@ -15,20 +15,34 @@
+ 
+ use super::*;
+ 
+-use std::io;
++use tracing::warn;
+ 
+ /// The reason behind the node disconnecting from a peer.
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+ #[repr(u8)]
+ pub enum DisconnectReason {
+     /// The peer's challenge response is invalid.
+-    InvalidChallengeResponse,
++    InvalidChallengeResponse = 0,
+     /// No reason given.
+-    NoReasonGiven,
++    NoReasonGiven = 1,
+     /// The peer is not following the protocol.
+-    ProtocolViolation,
++    ProtocolViolation = 2,
+     /// The peer's client is outdated, judging by its version.
+-    OutdatedClientVersion,
++    OutdatedClientVersion = 3,
++    /// The disconnect reason is not known. This is used for when the peers sends a disconnect reason that is not known to us.
++    UnknownReason = u8::MAX,
++}
++
++impl std::fmt::Display for DisconnectReason {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::InvalidChallengeResponse => write!(f, "invalid challenge response"),
++            Self::NoReasonGiven => write!(f, "no reason given"),
++            Self::ProtocolViolation => write!(f, "protocol violation"),
++            Self::OutdatedClientVersion => write!(f, "outdated client version"),
++            Self::UnknownReason => write!(f, "unknown"),
++        }
++    }
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+@@ -52,19 +66,30 @@ impl EventTrait for Disconnect {
+ 
+ impl ToBytes for Disconnect {
+     fn write_le<W: Write>(&self, mut writer: W) -> IoResult<()> {
+-        (self.reason as u8).write_le(&mut writer)?;
+-        Ok(())
++        if self.reason == DisconnectReason::UnknownReason {
++            return Err(io_error("Cannot serialize unknown disconnect reason"));
++        }
++
++        (self.reason as u8).write_le(&mut writer)
+     }
+ }
+ 
+ impl FromBytes for Disconnect {
+     fn read_le<R: Read>(mut reader: R) -> IoResult<Self> {
+-        let reason = match u8::read_le(&mut reader) {
+-            Ok(0) => DisconnectReason::InvalidChallengeResponse,
+-            Ok(1) => DisconnectReason::NoReasonGiven,
+-            Ok(2) => DisconnectReason::ProtocolViolation,
+-            Ok(3) => DisconnectReason::OutdatedClientVersion,
+-            _ => return Err(io::Error::other("Invalid 'Disconnect' event")),
++        let index = match u8::read_le(&mut reader) {
++            Ok(index) => index,
++            Err(err) => return Err(io_error(format!("Failed to deserialize disconnect reason: {err}"))),
++        };
++
++        let reason = match index {
++            0 => DisconnectReason::InvalidChallengeResponse,
++            1 => DisconnectReason::NoReasonGiven,
++            2 => DisconnectReason::ProtocolViolation,
++            3 => DisconnectReason::OutdatedClientVersion,
++            val => {
++                warn!("received unknown disconnect reason (id={val})");
++                DisconnectReason::UnknownReason
++            }
+         };
+ 
+         Ok(Self { reason })
+@@ -99,10 +124,10 @@ mod tests {
+     }
+ 
+     #[test]
+-    #[should_panic(expected = "Invalid 'Disconnect' event")]
+-    fn deserializing_invalid_data_panics() {
++    fn deserialize_unknown_reason() {
+         let mut buf = BytesMut::default().writer();
+-        "not a DisconnectReason-value".as_bytes().write_le(&mut buf).unwrap();
+-        let _disconnect = Disconnect::read_le(buf.into_inner().reader()).unwrap();
++        51u8.to_le_bytes().write_le(&mut buf).unwrap();
++        let disconnect = Disconnect::read_le(buf.into_inner().reader()).unwrap();
++        assert_eq!(disconnect.reason, DisconnectReason::UnknownReason);
+     }
+ }
+diff --git a/node/bft/src/bft.rs b/node/bft/src/bft.rs
+index 742b9732e..cc3159e86 100644
+--- a/node/bft/src/bft.rs
++++ b/node/bft/src/bft.rs
+@@ -499,18 +499,20 @@ impl<N: Network> BFT<N> {
+         // Acquire the BFT lock.
+         let _lock = self.lock.lock().await;
+ 
++        // ### First, insert the certificate into the DAG. ###
+         // Retrieve the round of the new certificate to add to the DAG.
+         let certificate_round = certificate.round();
+ 
+         // Insert the certificate into the DAG.
+         self.dag.write().insert(certificate);
+ 
+-        // Get the previous round number.
++        // ### Second, determine if a new leader certificate can be committed. ###
+         let commit_round = certificate_round.saturating_sub(1);
+ 
+         // Leaders are elected in even rounds.
+         // If the previous round is odd, the current round cannot commit any leader certs.
+-        if commit_round % 2 != 0 || commit_round < 2 {
++        // Similarly, no leader certificate can be committed for round zero.
++        if !commit_round.is_multiple_of(2) || commit_round < 2 {
+             return Ok(());
+         }
+         // If the commit round is at or below the last committed round, return early.
+@@ -585,6 +587,9 @@ impl<N: Network> BFT<N> {
+         &self,
+         leader_certificate: BatchCertificate<N>,
+     ) -> Result<()> {
++        #[cfg(debug_assertions)]
++        trace!("Attempting to commit leader certificate for round {}...", leader_certificate.round());
++
+         // Fetch the leader round.
+         let latest_leader_round = leader_certificate.round();
+         // Determine the list of all previous leader certificates since the last committed round.
+@@ -629,6 +634,11 @@ impl<N: Network> BFT<N> {
+                     leader_certificates.push(previous_certificate.clone());
+                     // Update the current certificate to the previous leader certificate.
+                     current_certificate = previous_certificate;
++                } else {
++                    #[cfg(debug_assertions)]
++                    trace!(
++                        "Skipping anchor for round {round} as it is not linked to the most recent committed leader certificate"
++                    );
+                 }
+             }
+         }
+@@ -965,16 +975,31 @@ impl<N: Network> BFT<N> {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use crate::{BFT, MAX_LEADER_CERTIFICATE_DELAY_IN_SECS, helpers::Storage};
++    use crate::{
++        BFT,
++        MAX_LEADER_CERTIFICATE_DELAY_IN_SECS,
++        helpers::{Storage, dag::test_helpers::mock_dag_with_modified_last_committed_round},
++    };
++
+     use snarkos_account::Account;
+-    use snarkos_node_bft_ledger_service::MockLedgerService;
++    use snarkos_node_bft_ledger_service::{LedgerService, MockLedgerService};
+     use snarkos_node_bft_storage_service::BFTMemoryService;
+     use snarkos_node_sync::BlockSync;
+     use snarkvm::{
+         console::account::{Address, PrivateKey},
+         ledger::{
+-            committee::Committee,
+-            narwhal::batch_certificate::test_helpers::{sample_batch_certificate, sample_batch_certificate_for_round},
++            committee::{
++                Committee,
++                test_helpers::{sample_committee, sample_committee_for_round, sample_committee_for_round_and_members},
++            },
++            narwhal::{
++                BatchCertificate,
++                batch_certificate::test_helpers::{
++                    sample_batch_certificate,
++                    sample_batch_certificate_for_round,
++                    sample_batch_certificate_for_round_with_committee,
++                },
++            },
+         },
+         utilities::TestRng,
+     };
+@@ -998,8 +1023,8 @@ mod tests {
+         Storage<CurrentNetwork>,
+     ) {
+         let committee = match committee_round {
+-            Some(round) => snarkvm::ledger::committee::test_helpers::sample_committee_for_round(round, rng),
+-            None => snarkvm::ledger::committee::test_helpers::sample_committee(rng),
++            Some(round) => sample_committee_for_round(round, rng),
++            None => sample_committee(rng),
+         };
+         let account = Account::new(rng).unwrap();
+         let ledger = Arc::new(MockLedgerService::new(committee.clone()));
+@@ -1418,7 +1443,6 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    #[tracing_test::traced_test]
+     async fn test_bft_gc_on_commit() -> Result<()> {
+         let rng = &mut TestRng::default();
+ 
+@@ -1465,7 +1489,8 @@ mod tests {
+         let account = Account::new(rng)?;
+         let bft = initialize_bft(account.clone(), storage.clone(), ledger.clone())?;
+ 
+-        *bft.dag.write() = crate::helpers::dag::test_helpers::mock_dag_with_modified_last_committed_round(commit_round);
++        // Create an empty mock DAG with last committed round set to `commit_round`.
++        *bft.dag.write() = mock_dag_with_modified_last_committed_round(commit_round);
+ 
+         // Ensure that the `gc_round` has not been updated yet.
+         assert_eq!(bft.storage().gc_round(), committee_round.saturating_sub(max_gc_rounds));
+@@ -1940,4 +1965,309 @@ mod tests {
+         }
+         Ok(())
+     }
++
++    /// Tests that a leader certificate can be committed by sufficient endorsements in a succeeding leader certificate.
++    #[test_log::test(tokio::test)]
++    async fn test_commit_via_is_linked() {
++        let rng = &mut TestRng::default();
++
++        let committee_round = 0;
++        let leader_round_1 = 2;
++        let leader_round_2 = 4; // subsequent even round
++        let max_gc_rounds = 50;
++
++        // Create a committee with four members.
++        let num_authors = 4;
++        let private_keys: Vec<_> = (0..num_authors).map(|_| PrivateKey::new(rng).unwrap()).collect();
++        let addresses: Vec<_> = private_keys.iter().map(|pkey| Address::try_from(pkey).unwrap()).collect();
++
++        let committee = sample_committee_for_round_and_members(committee_round, addresses.clone(), rng);
++        let ledger = Arc::new(MockLedgerService::new(committee.clone()));
++        let storage = Storage::new(ledger.clone(), Arc::new(BFTMemoryService::new()), max_gc_rounds);
++        let bft = initialize_bft(Account::new(rng).unwrap(), storage.clone(), ledger.clone()).unwrap();
++
++        let mut certificates_by_round: IndexMap<u64, IndexSet<BatchCertificate<CurrentNetwork>>> = IndexMap::new();
++
++        // Round 1
++        let round1_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let author = &private_keys[idx];
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++
++                sample_batch_certificate_for_round_with_committee(1, IndexSet::new(), author, &endorsements[..], rng)
++            })
++            .collect();
++        certificates_by_round.insert(1, round1_certs.clone());
++
++        let leader1 = ledger.get_committee_for_round(leader_round_1 + 1).unwrap().get_leader(leader_round_1).unwrap();
++        let mut leader1_certificate = None;
++
++        let round2_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let author = &private_keys[idx];
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++                let cert = sample_batch_certificate_for_round_with_committee(
++                    leader_round_1,
++                    round1_certs.iter().map(|c| c.id()).collect(),
++                    author,
++                    &endorsements[..],
++                    rng,
++                );
++
++                if cert.author() == leader1 {
++                    leader1_certificate = Some(cert.clone());
++                }
++                cert
++            })
++            .collect();
++        certificates_by_round.insert(leader_round_1, round2_certs.clone());
++
++        let round3_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let author = &private_keys[idx];
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++
++                let previous_certificate_ids: IndexSet<_> = round2_certs
++                    .iter()
++                    .filter_map(|cert| {
++                        // Only have the leader endorse the previous round's leader certificate.
++                        if cert.author() == leader1 && cert.author() != addresses[idx] { None } else { Some(cert.id()) }
++                    })
++                    .collect();
++
++                sample_batch_certificate_for_round_with_committee(
++                    leader_round_1 + 1,
++                    previous_certificate_ids,
++                    author,
++                    &endorsements[..],
++                    rng,
++                )
++            })
++            .collect();
++        certificates_by_round.insert(leader_round_1 + 1, round3_certs.clone());
++
++        // Ensure the first leader's certificate is not committed yet.
++        let leader_certificate_1 = leader1_certificate.unwrap();
++        assert!(
++            !bft.dag.read().is_recently_committed(leader_round_1, leader_certificate_1.id()),
++            "Leader certificate 1 should not be committed yet"
++        );
++        assert_eq!(bft.dag.read().last_committed_round(), 0);
++
++        let leader2 = ledger.get_committee_for_round(leader_round_2 + 1).unwrap().get_leader(leader_round_2).unwrap();
++        let round4_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++
++                sample_batch_certificate_for_round_with_committee(
++                    leader_round_2,
++                    round3_certs.iter().map(|c| c.id()).collect(),
++                    &private_keys[idx],
++                    &endorsements[..],
++                    rng,
++                )
++            })
++            .collect();
++        certificates_by_round.insert(leader_round_2, round4_certs.clone());
++
++        // Insert all certificates into the storage and DAG.
++        for certificate in certificates_by_round.into_iter().flat_map(|(_, certs)| certs) {
++            storage.testing_only_insert_certificate_testing_only(certificate.clone());
++            bft.update_dag::<false, false>(certificate).await.unwrap();
++        }
++
++        let leader_certificate_2 = storage.get_certificate_for_round_with_author(leader_round_2, leader2).unwrap();
++
++        assert!(
++            bft.is_linked(leader_certificate_1.clone(), leader_certificate_2.clone()).unwrap(),
++            "Leader certificate 1 should be linked to leader certificate 2"
++        );
++
++        // Explicitely commit leader certificate 2.
++        bft.commit_leader_certificate::<false, false>(leader_certificate_2.clone()).await.unwrap();
++
++        // Leader certificate 1 should be committed transitively when committing the leader certificate 2.
++        assert!(
++            bft.dag.read().is_recently_committed(leader_round_1, leader_certificate_1.id()),
++            "Leader certificate for round 2 should be committed when committing at round 4"
++        );
++
++        // Leader certificate 2 should be committed as the above call was successful.
++        assert!(
++            bft.dag.read().is_recently_committed(leader_round_2, leader_certificate_2.id()),
++            "Leader certificate for round 4 should be committed"
++        );
++
++        assert_eq!(bft.dag.read().last_committed_round(), 4);
++    }
++
++    #[test_log::test(tokio::test)]
++    async fn test_commit_via_is_linked_with_skipped_anchor() {
++        let rng = &mut TestRng::default();
++
++        let committee_round = 0;
++        let leader_round_1 = 2;
++        let leader_round_2 = 4;
++        let max_gc_rounds = 50;
++
++        let num_authors = 4;
++        let private_keys: Vec<_> = (0..num_authors).map(|_| PrivateKey::new(rng).unwrap()).collect();
++        let addresses: Vec<_> = private_keys.iter().map(|pkey| Address::try_from(pkey).unwrap()).collect();
++
++        let committee = sample_committee_for_round_and_members(committee_round, addresses.clone(), rng);
++        let ledger = Arc::new(MockLedgerService::new(committee.clone()));
++        let storage = Storage::new(ledger.clone(), Arc::new(BFTMemoryService::new()), max_gc_rounds);
++        let bft = initialize_bft(Account::new(rng).unwrap(), storage.clone(), ledger.clone()).unwrap();
++
++        let mut certificates_by_round: IndexMap<u64, IndexSet<BatchCertificate<CurrentNetwork>>> = IndexMap::new();
++
++        // Round 1
++        let round1_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let author = &private_keys[idx];
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++
++                sample_batch_certificate_for_round_with_committee(1, IndexSet::new(), author, &endorsements[..], rng)
++            })
++            .collect();
++        certificates_by_round.insert(1, round1_certs.clone());
++
++        let leader1 = ledger.get_committee_for_round(leader_round_1 + 1).unwrap().get_leader(leader_round_1).unwrap();
++        let mut leader1_certificate = None;
++
++        let round2_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let author = &private_keys[idx];
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++                let cert = sample_batch_certificate_for_round_with_committee(
++                    leader_round_1,
++                    round1_certs.iter().map(|c| c.id()).collect(),
++                    author,
++                    &endorsements[..],
++                    rng,
++                );
++
++                if cert.author() == leader1 {
++                    leader1_certificate = Some(cert.clone());
++                }
++                cert
++            })
++            .collect();
++        certificates_by_round.insert(leader_round_1, round2_certs.clone());
++
++        let round3_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let author = &private_keys[idx];
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++
++                let previous_certificate_ids: IndexSet<_> = round2_certs
++                    .iter()
++                    .filter_map(|cert| {
++                        // Only have the leader endorse the previous round's leader certificate.
++                        if cert.author() == leader1 && cert.author() != addresses[idx] { None } else { Some(cert.id()) }
++                    })
++                    .collect();
++
++                sample_batch_certificate_for_round_with_committee(
++                    leader_round_1 + 1,
++                    previous_certificate_ids,
++                    author,
++                    &endorsements[..],
++                    rng,
++                )
++            })
++            .collect();
++        certificates_by_round.insert(leader_round_1 + 1, round3_certs.clone());
++
++        // Ensure the first leader's certificate is not committed yet.
++        let leader_certificate_1 = leader1_certificate.unwrap();
++        assert!(
++            !bft.dag.read().is_recently_committed(leader_round_1, leader_certificate_1.id()),
++            "Leader certificate 1 should not be committed yet"
++        );
++
++        let leader2 = ledger.get_committee_for_round(leader_round_2 + 1).unwrap().get_leader(leader_round_2).unwrap();
++        let round4_certs: IndexSet<_> = (0..num_authors)
++            .map(|idx| {
++                let endorsements: Vec<_> = private_keys
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(other_idx, pkey)| if idx == other_idx { None } else { Some(*pkey) })
++                    .collect();
++
++                // Do not create a path to the previous leader certificate.
++                let previous_certificate_ids: IndexSet<_> = round3_certs
++                    .iter()
++                    .filter_map(|cert| if cert.author() == leader1 { None } else { Some(cert.id()) })
++                    .collect();
++
++                sample_batch_certificate_for_round_with_committee(
++                    leader_round_2,
++                    previous_certificate_ids,
++                    &private_keys[idx],
++                    &endorsements[..],
++                    rng,
++                )
++            })
++            .collect();
++        certificates_by_round.insert(leader_round_2, round4_certs.clone());
++
++        // Insert all certificates into the storage and DAG.
++        for certificate in certificates_by_round.into_iter().flat_map(|(_, certs)| certs) {
++            storage.testing_only_insert_certificate_testing_only(certificate.clone());
++            bft.update_dag::<false, false>(certificate).await.unwrap();
++        }
++
++        let leader_certificate_2 = storage.get_certificate_for_round_with_author(leader_round_2, leader2).unwrap();
++
++        assert!(
++            !bft.is_linked(leader_certificate_1.clone(), leader_certificate_2.clone()).unwrap(),
++            "Leader certificate 1 should not be linked to leader certificate 2"
++        );
++        assert_eq!(bft.dag.read().last_committed_round(), 0);
++
++        // Explicitely commit leader certificate 2.
++        bft.commit_leader_certificate::<false, false>(leader_certificate_2.clone()).await.unwrap();
++
++        // Leader certificate 1 should be committed transitively when committing the leader certificate 2.
++        assert!(
++            !bft.dag.read().is_recently_committed(leader_round_1, leader_certificate_1.id()),
++            "Leader certificate for round 2 should not be committed when committing at round 4"
++        );
++
++        // Leader certificate 2 should be committed as the above call was successful.
++        assert!(
++            bft.dag.read().is_recently_committed(leader_round_2, leader_certificate_2.id()),
++            "Leader certificate for round 4 should be committed"
++        );
++        assert_eq!(bft.dag.read().last_committed_round(), 4);
++    }
+ }
 diff --git a/node/bft/src/gateway.rs b/node/bft/src/gateway.rs
-index 09fe7dc4c..fd1491b92 100644
+index da530e3a9..ae2a0255d 100644
 --- a/node/bft/src/gateway.rs
 +++ b/node/bft/src/gateway.rs
-@@ -1290,7 +1290,10 @@ impl<N: Network> Handshake for Gateway<N> {
-                 }
-                 Err(error) => {
-                     if let Some(peer) = self.peer_pool.write().get_mut(&addr) {
--                        peer.downgrade_to_candidate(addr);
-+                        // The peer may only be downgraded if it's a ConnectingPeer.
-+                        if peer.is_connecting() {
-+                            peer.downgrade_to_candidate(addr);
-+                        }
-                     }
-                     // This error needs to be "repackaged" in order to conform to the return type.
-                     return Err(error);
-@@ -1390,7 +1393,12 @@ impl<N: Network> Gateway<N> {
-         // Verify the challenge request. If a disconnect reason was returned, send the disconnect message and abort.
-         if let Some(reason) = self.verify_challenge_request(peer_addr, &peer_request) {
+@@ -20,7 +20,7 @@ use crate::{
+     MAX_BATCH_DELAY_IN_MS,
+     MEMORY_POOL_PORT,
+     Worker,
+-    events::{EventCodec, PrimaryPing},
++    events::{Disconnect as DisconnectEvent, DisconnectReason, EventCodec, PrimaryPing},
+     helpers::{Cache, PrimarySender, Storage, SyncSender, WorkerSender, assign_to_worker},
+     spawn_blocking,
+ };
+@@ -34,7 +34,6 @@ use snarkos_node_bft_events::{
+     ChallengeRequest,
+     ChallengeResponse,
+     DataBlocks,
+-    DisconnectReason,
+     Event,
+     EventTrait,
+     TransmissionRequest,
+@@ -684,7 +683,7 @@ impl<N: Network> Gateway<N> {
+             }
+             Event::Disconnect(message) => {
+                 // The peer informs us that they had disconnected. Disconnect from them too.
+-                debug!("Peer '{peer_ip}' decided to disconnect due to '{:?}'", message.reason);
++                debug!("Peer '{peer_ip}' decided to disconnect due to '{}'", message.reason);
+                 self.disconnect(peer_ip);
+                 Ok(false)
+             }
+@@ -1368,8 +1367,8 @@ macro_rules! expect_event {
+                 data
+             }
+             // Received a disconnect event, abort.
+-            Some(Event::Disconnect(reason)) => {
+-                return Err(error(format!("{CONTEXT} '{}' disconnected: {reason:?}", $peer_addr)));
++            Some(Event::Disconnect(DisconnectEvent { reason })) => {
++                return Err(error(format!("{CONTEXT} '{}' disconnected: {reason}", $peer_addr)));
+             }
+             // Received an unexpected event, abort.
+             Some(ty) => {
+@@ -1441,7 +1440,7 @@ impl<N: Network> Gateway<N> {
+             .await
+         {
              send_event(&mut framed, peer_addr, reason.into()).await?;
 -            return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
-+            if reason == DisconnectReason::NoReasonGiven {
-+                // The Aleo address is already connected; no reason to return an error.
-+                return Ok(None);
-+            } else {
-+                return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++            return Err(error(format!("Dropped '{peer_addr}' for reason: {reason}")));
+         }
+         // Verify the challenge request. If a disconnect reason was returned, send the disconnect message and abort.
+         if let Some(reason) = self.verify_challenge_request(peer_addr, &peer_request) {
+@@ -1450,7 +1449,7 @@ impl<N: Network> Gateway<N> {
+                 // The Aleo address is already connected; no reason to return an error.
+                 return Ok(None);
+             } else {
+-                return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++                return Err(error(format!("Dropped '{peer_addr}' for reason: {reason}")));
+             }
+         }
+ 
+@@ -1512,7 +1511,7 @@ impl<N: Network> Gateway<N> {
+                 // The Aleo address is already connected; no reason to return an error.
+                 return Ok(None);
+             } else {
+-                return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++                return Err(io_error(format!("Dropped '{peer_addr}' for reason: {reason}")));
+             }
+         }
+ 
+@@ -1548,7 +1547,7 @@ impl<N: Network> Gateway<N> {
+             .await
+         {
+             send_event(&mut framed, peer_addr, reason.into()).await?;
+-            return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++            return Err(io_error(format!("Dropped '{peer_addr}' for reason: {reason}")));
+         }
+ 
+         Ok(Some(peer_request))
+diff --git a/node/bft/src/helpers/dag.rs b/node/bft/src/helpers/dag.rs
+index 53f149734..d125ecb5a 100644
+--- a/node/bft/src/helpers/dag.rs
++++ b/node/bft/src/helpers/dag.rs
+@@ -40,7 +40,8 @@ pub struct DAG<N: Network> {
+     /// where each entry has a round number as its key and a set of certificate IDs as its value.
+     recent_committed_ids: BTreeMap<u64, IndexSet<Field<N>>>,
+ 
+-    /// The last round that was committed.
++    /// The latest round a certificate was committed too.
++    /// This corresponds to the latest leader certificate's round, because the leader certificate always has the greatest round number of its subDAG.
+     last_committed_round: u64,
+ }
+ 
+@@ -62,7 +63,7 @@ impl<N: Network> DAG<N> {
+         &self.graph
+     }
+ 
+-    /// Returns the last committed round.
++    /// Returns the latest round a certificate was committed to.
+     pub const fn last_committed_round(&self) -> u64 {
+         self.last_committed_round
+     }
+@@ -135,6 +136,10 @@ impl<N: Network> DAG<N> {
+ 
+         // Update the last committed round.
+         if self.last_committed_round < certificate_round {
++            trace!(
++                "Last committed round updated from {last_committed_round} to {certificate_round}",
++                last_committed_round = self.last_committed_round
++            );
+             self.last_committed_round = certificate_round;
+         } else {
+             // TODO(kaimast); only remove old certificates for specific author here?
+diff --git a/node/bft/src/helpers/storage.rs b/node/bft/src/helpers/storage.rs
+index 36db1f197..ee0450c78 100644
+--- a/node/bft/src/helpers/storage.rs
++++ b/node/bft/src/helpers/storage.rs
+@@ -241,7 +241,9 @@ impl<N: Network> Storage<N> {
+             for gc_round in current_gc_round..=next_gc_round {
+                 // Iterate over the certificates for the GC round.
+                 for id in self.get_certificate_ids_for_round(gc_round).into_iter() {
+-                    // Remove the certificate from storage.
++                    trace!(
++                        "Garbage collecting certificate {id} at round {gc_round} (cut-off is round {next_gc_round})"
++                    );
+                     self.remove_certificate(id);
+                 }
+             }
+diff --git a/node/router/messages/src/disconnect.rs b/node/router/messages/src/disconnect.rs
+index c76046eb1..b33db328f 100644
+--- a/node/router/messages/src/disconnect.rs
++++ b/node/router/messages/src/disconnect.rs
+@@ -90,12 +90,4 @@ mod tests {
+             assert_eq!(reason, &disconnect.reason);
+         }
+     }
+-
+-    #[test]
+-    #[should_panic]
+-    fn disconnect_invalid_data_panics() {
+-        let mut buf = BytesMut::default().writer();
+-        "not a DisconnectReason-value".as_bytes().write_le(&mut buf).unwrap();
+-        let _disconnect = Disconnect::read_le(buf.into_inner().reader()).unwrap();
+-    }
+ }
+diff --git a/node/router/messages/src/helpers/disconnect.rs b/node/router/messages/src/helpers/disconnect.rs
+index e642911cd..599bb15b0 100644
+--- a/node/router/messages/src/helpers/disconnect.rs
++++ b/node/router/messages/src/helpers/disconnect.rs
+@@ -13,7 +13,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-use snarkvm::prelude::{FromBytes, ToBytes, error};
++use snarkvm::prelude::{FromBytes, ToBytes, io_error};
+ 
+ use std::io;
+ 
+@@ -50,6 +50,8 @@ pub enum DisconnectReason {
+     YouNeedToSyncFirst,
+     /// The peer's listening port is closed.
+     YourPortIsClosed(u16),
++    /// The disconnect reason is not known. This is used for when the peers sends a disconnect reason that is not known to us.
++    UnknownReason,
+ }
+ 
+ impl ToBytes for DisconnectReason {
+@@ -73,32 +75,66 @@ impl ToBytes for DisconnectReason {
+                 14u8.write_le(&mut writer)?;
+                 port.write_le(writer)
+             }
++            Self::UnknownReason => Err(io_error("Cannot serialize unknown disconnect reason")),
+         }
+     }
+ }
+ 
+ impl FromBytes for DisconnectReason {
+     fn read_le<R: io::Read>(mut reader: R) -> io::Result<Self> {
+-        match u8::read_le(&mut reader)? {
+-            0 => Ok(Self::ExceededForkRange),
+-            1 => Ok(Self::InvalidChallengeResponse),
+-            2 => Ok(Self::InvalidForkDepth),
+-            3 => Ok(Self::INeedToSyncFirst),
+-            4 => Ok(Self::NoReasonGiven),
+-            5 => Ok(Self::ProtocolViolation),
+-            6 => Ok(Self::OutdatedClientVersion),
+-            7 => Ok(Self::PeerHasDisconnected),
+-            8 => Ok(Self::PeerRefresh),
+-            9 => Ok(Self::ShuttingDown),
+-            10 => Ok(Self::SyncComplete),
+-            11 => Ok(Self::TooManyFailures),
+-            12 => Ok(Self::TooManyPeers),
+-            13 => Ok(Self::YouNeedToSyncFirst),
++        let index = match u8::read_le(&mut reader) {
++            Ok(index) => index,
++            Err(err) => return Err(io_error(format!("Failed to deserialize disconnect reason: {err}"))),
++        };
++
++        let reason = match index {
++            0 => Self::ExceededForkRange,
++            1 => Self::InvalidChallengeResponse,
++            2 => Self::InvalidForkDepth,
++            3 => Self::INeedToSyncFirst,
++            4 => Self::NoReasonGiven,
++            5 => Self::ProtocolViolation,
++            6 => Self::OutdatedClientVersion,
++            7 => Self::PeerHasDisconnected,
++            8 => Self::PeerRefresh,
++            9 => Self::ShuttingDown,
++            10 => Self::SyncComplete,
++            11 => Self::TooManyFailures,
++            12 => Self::TooManyPeers,
++            13 => Self::YouNeedToSyncFirst,
+             14 => {
+                 let port = u16::read_le(reader)?;
+-                Ok(Self::YourPortIsClosed(port))
++                Self::YourPortIsClosed(port)
 +            }
++            val => {
++                warn!("Received unknown disconnect reason (id={val})");
++                Self::UnknownReason
+             }
+-            _ => Err(error("Invalid disconnect reason")),
++        };
++
++        Ok(reason)
++    }
++}
++
++impl std::fmt::Display for DisconnectReason {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::ExceededForkRange => write!(f, "exceeded fork range"),
++            Self::InvalidChallengeResponse => write!(f, "invalid challenge response"),
++            Self::InvalidForkDepth => write!(f, "invalid fork depth"),
++            Self::INeedToSyncFirst => write!(f, "I need to sync first"),
++            Self::NoReasonGiven => write!(f, "no reason given"),
++            Self::ProtocolViolation => write!(f, "protocol violation"),
++            Self::OutdatedClientVersion => write!(f, "outdated client version"),
++            Self::PeerHasDisconnected => write!(f, "peer has disconnected"),
++            Self::PeerRefresh => write!(f, "periodic peer refresh"),
++            Self::ShuttingDown => write!(f, "shutting down"),
++            Self::SyncComplete => write!(f, "block sync complete"),
++            Self::TooManyFailures => write!(f, "too many failures"),
++            Self::TooManyPeers => write!(f, "too many peers"),
++            Self::YouNeedToSyncFirst => write!(f, "you need to sync first"),
++            Self::YourPortIsClosed(port) => write!(f, "your port is closed ({port})"),
++            Self::UnknownReason => write!(f, "unknown reason"),
+         }
+     }
+ }
+diff --git a/node/router/src/handshake.rs b/node/router/src/handshake.rs
+index ba4c4876f..bfe5e6398 100644
+--- a/node/router/src/handshake.rs
++++ b/node/router/src/handshake.rs
+@@ -24,7 +24,7 @@ use snarkos_node_network::log_repo_sha_comparison;
+ use snarkos_node_tcp::{ConnectionSide, P2P, Tcp};
+ use snarkvm::{
+     ledger::narwhal::Data,
+-    prelude::{Address, Field, Network, block::Header, error},
++    prelude::{Address, Field, Network, block::Header, error, io_error},
+ };
+ 
+ use anyhow::{Result, bail};
+@@ -45,7 +45,9 @@ impl<N: Network> P2P for Router<N> {
+ /// A macro unwrapping the expected handshake message or returning an error for unexpected messages.
+ #[macro_export]
+ macro_rules! expect_message {
+-    ($msg_ty:path, $framed:expr, $peer_addr:expr) => {
++    ($msg_ty:path, $framed:expr, $peer_addr:expr) => {{
++        use snarkvm::utilities::io_error;
++
+         match $framed.try_next().await? {
+             // Received the expected message, proceed.
+             Some($msg_ty(data)) => {
+@@ -53,27 +55,27 @@ macro_rules! expect_message {
+                 data
+             }
+             // Received a disconnect message, abort.
+-            Some(Message::Disconnect(reason)) => {
+-                return Err(error(format!("'{}' disconnected: {reason:?}", $peer_addr)))
++            Some(Message::Disconnect($crate::messages::Disconnect { reason })) => {
++                return Err(io_error(format!("'{}' disconnected: {reason}", $peer_addr)));
+             }
+             // Received an unexpected message, abort.
+             Some(ty) => {
+-                return Err(error(format!(
++                return Err(io_error(format!(
+                     "'{}' did not follow the handshake protocol: received {:?} instead of {}",
+                     $peer_addr,
+                     ty.name(),
+                     stringify!($msg_ty),
+-                )))
++                )));
+             }
+             // Received nothing.
+             None => {
+-                return Err(error(format!(
++                return Err(io_error(format!(
+                     "the peer disconnected before sending {:?}, likely due to peer saturation or shutdown",
+                     stringify!($msg_ty),
+-                )))
++                )));
+             }
+         }
+-    };
++    }};
+ }
+ 
+ /// Send the given message to the peer.
+@@ -217,12 +219,12 @@ impl<N: Network> Router<N> {
+             .await
+         {
+             send(&mut framed, peer_addr, reason.into()).await?;
+-            return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++            return Err(io_error(format!("Dropped '{peer_addr}' for reason: {reason}")));
+         }
+         // Verify the challenge request. If a disconnect reason was returned, send the disconnect message and abort.
+         if let Some(reason) = self.verify_challenge_request(peer_addr, &peer_request) {
+             send(&mut framed, peer_addr, reason.into()).await?;
+-            return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++            return Err(io_error(format!("Dropped '{peer_addr}' for reason: {reason}")));
          }
  
          /* Step 3: Send the challenge response. */
-@@ -1507,7 +1515,7 @@ impl<N: Network> Gateway<N> {
-         // Ensure the address is not already connected.
-         if self.is_connected_address(address) {
-             warn!("{CONTEXT} Dropping '{peer_addr}' for being already connected ({address})");
--            return Some(DisconnectReason::ProtocolViolation);
-+            return Some(DisconnectReason::NoReasonGiven);
+@@ -280,7 +282,7 @@ impl<N: Network> Router<N> {
+         // Verify the challenge request. If a disconnect reason was returned, send the disconnect message and abort.
+         if let Some(reason) = self.verify_challenge_request(peer_addr, &peer_request) {
+             send(&mut framed, peer_addr, reason.into()).await?;
+-            return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++            return Err(io_error(format!("Dropped '{peer_addr}' for reason: {reason}")));
          }
-         None
-     }
-diff --git a/node/router/src/handshake.rs b/node/router/src/handshake.rs
-index 78cdefa0a..4d21ee077 100644
---- a/node/router/src/handshake.rs
-+++ b/node/router/src/handshake.rs
-@@ -147,7 +147,10 @@ impl<N: Network> Router<N> {
-                 }
-                 Err(_) => {
-                     if let Some(peer) = self.peer_pool.write().get_mut(&addr) {
--                        peer.downgrade_to_candidate(addr);
-+                        // The peer may only be downgraded if it's a ConnectingPeer.
-+                        if peer.is_connecting() {
-+                            peer.downgrade_to_candidate(addr);
-+                        }
-                     }
-                 }
+ 
+         /* Step 2: Send the challenge response followed by own challenge request. */
+@@ -327,7 +329,7 @@ impl<N: Network> Router<N> {
+             .await
+         {
+             send(&mut framed, peer_addr, reason.into()).await?;
+-            return Err(error(format!("Dropped '{peer_addr}' for reason: {reason:?}")));
++            return Err(io_error(format!("Dropped '{peer_addr}' for reason: {reason}")));
+         }
+ 
+         Ok(Some(peer_request))
+diff --git a/node/router/src/inbound.rs b/node/router/src/inbound.rs
+index d3d9e51eb..22cbd5322 100644
+--- a/node/router/src/inbound.rs
++++ b/node/router/src/inbound.rs
+@@ -161,7 +161,7 @@ pub trait Inbound<N: Network>: Reading + Outbound<N> {
              }
-diff --git a/node/src/bootstrap_client/handshake.rs b/node/src/bootstrap_client/handshake.rs
-index bb13b7a6c..30d4d230c 100644
---- a/node/src/bootstrap_client/handshake.rs
-+++ b/node/src/bootstrap_client/handshake.rs
-@@ -139,7 +139,10 @@ impl<N: Network> Handshake for BootstrapClient<N> {
-                 Err(error) => {
-                     debug!("Handshake with '{peer_addr}' failed: {error}");
-                     if let Some(peer) = self.peer_pool.write().get_mut(&addr) {
--                        peer.downgrade_to_candidate(addr);
-+                        // The peer may only be downgraded if it's a ConnectingPeer.
-+                        if peer.is_connecting() {
-+                            peer.downgrade_to_candidate(addr);
-+                        }
-                     }
-                     return Err(error);
-                 }
+             Message::Disconnect(message) => {
+                 // The peer informs us that they had disconnected. Disconnect from them too.
+-                debug!("Peer '{peer_ip}' decided to disconnect due to '{:?}'", message.reason);
++                debug!("Peer '{peer_ip}' decided to disconnect due to '{}'", message.reason);
+                 self.router().disconnect(peer_ip);
+                 Ok(false)
+             }
+diff --git a/node/src/client/router.rs b/node/src/client/router.rs
+index 7607248e2..398f31eb9 100644
+--- a/node/src/client/router.rs
++++ b/node/src/client/router.rs
+@@ -268,7 +268,7 @@ impl<N: Network, C: ConsensusStorage<N>> Inbound<N> for Client<N, C> {
+ 
+     /// Saves the latest epoch hash and latest block header in the node.
+     fn puzzle_response(&self, peer_ip: SocketAddr, _epoch_hash: N::BlockHash, _header: Header<N>) -> bool {
+-        debug!("Disconnecting '{peer_ip}' for the following reason - {:?}", DisconnectReason::ProtocolViolation);
++        debug!("Disconnecting '{peer_ip}' for the following reason - {}", DisconnectReason::ProtocolViolation);
+         false
+     }
+ 
+diff --git a/node/src/prover/router.rs b/node/src/prover/router.rs
+index 4c1319878..fe15e1d3e 100644
+--- a/node/src/prover/router.rs
++++ b/node/src/prover/router.rs
+@@ -162,7 +162,7 @@ impl<N: Network, C: ConsensusStorage<N>> Inbound<N> for Prover<N, C> {
+ 
+     /// Handles a `BlockRequest` message.
+     fn block_request(&self, peer_ip: SocketAddr, _message: BlockRequest) -> bool {
+-        debug!("Disconnecting '{peer_ip}' for the following reason - {:?}", DisconnectReason::ProtocolViolation);
++        debug!("Disconnecting '{peer_ip}' for the following reason - {}", DisconnectReason::ProtocolViolation);
+         false
+     }
+ 
+@@ -173,7 +173,7 @@ impl<N: Network, C: ConsensusStorage<N>> Inbound<N> for Prover<N, C> {
+         _blocks: Vec<Block<N>>,
+         _latest_consensus_version: Option<ConsensusVersion>,
+     ) -> bool {
+-        debug!("Disconnecting '{peer_ip}' for the following reason - {:?}", DisconnectReason::ProtocolViolation);
++        debug!("Disconnecting '{peer_ip}' for the following reason - {}", DisconnectReason::ProtocolViolation);
+         false
+     }
+ 
+@@ -201,7 +201,7 @@ impl<N: Network, C: ConsensusStorage<N>> Inbound<N> for Prover<N, C> {
+ 
+     /// Disconnects on receipt of a `PuzzleRequest` message.
+     fn puzzle_request(&self, peer_ip: SocketAddr) -> bool {
+-        debug!("Disconnecting '{peer_ip}' for the following reason - {:?}", DisconnectReason::ProtocolViolation);
++        debug!("Disconnecting '{peer_ip}' for the following reason - {}", DisconnectReason::ProtocolViolation);
+         false
+     }
+ 
+diff --git a/node/src/validator/router.rs b/node/src/validator/router.rs
+index a8ad2026b..eb4f1ee3b 100644
+--- a/node/src/validator/router.rs
++++ b/node/src/validator/router.rs
+@@ -247,7 +247,7 @@ impl<N: Network, C: ConsensusStorage<N>> Inbound<N> for Validator<N, C> {
+ 
+     /// Disconnects on receipt of a `PuzzleResponse` message.
+     fn puzzle_response(&self, peer_ip: SocketAddr, _epoch_hash: N::BlockHash, _header: Header<N>) -> bool {
+-        debug!("Disconnecting '{peer_ip}' for the following reason - {:?}", DisconnectReason::ProtocolViolation);
++        debug!("Disconnecting '{peer_ip}' for the following reason - {}", DisconnectReason::ProtocolViolation);
+         false
+     }
+ 
+diff --git a/node/tests/common/test_peer.rs b/node/tests/common/test_peer.rs
+index 24985f918..e7700ef32 100644
+--- a/node/tests/common/test_peer.rs
++++ b/node/tests/common/test_peer.rs
+@@ -21,7 +21,7 @@ use snarkos_node_router::{
+ };
+ use snarkvm::{
+     ledger::narwhal::Data,
+-    prelude::{Address, Field, FromBytes, MainnetV0 as CurrentNetwork, Network, TestRng, block::Block, error},
++    prelude::{Address, Field, FromBytes, MainnetV0 as CurrentNetwork, Network, TestRng, block::Block},
+ };
+ 
+ use std::{

@@ -1,15 +1,628 @@
-diff --git a/static/app/components/core/button/linkButton.tsx b/static/app/components/core/button/linkButton.tsx
-index 407781bbac6..8e8bee79d8d 100644
---- a/static/app/components/core/button/linkButton.tsx
-+++ b/static/app/components/core/button/linkButton.tsx
-@@ -105,10 +105,6 @@ const StyledLinkButton = styled(
-   }
- )<LinkButtonProps>`
-   ${p => getLinkButtonStyles(p)}
--
--  &:focus-visible {
--    box-shadow: none;
--  }
- `;
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 5750a36dd02b15..9f17d942937a32 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -2212,7 +2212,10 @@ def _get_severity_score(event: Event) -> tuple[float, str]:
+                     "issues.severity.seer-timeout",
+                     settings.SEER_SEVERITY_TIMEOUT,
+                 )
+-                response = make_severity_score_request(payload, timeout=timeout)
++                viewer_context = SeerViewerContext(organization_id=event.project.organization_id)
++                response = make_severity_score_request(
++                    payload, timeout=timeout, viewer_context=viewer_context
++                )
+                 severity = orjson.loads(response.data).get("severity")
+                 reason = "ml"
+         except MaxRetryError:
+diff --git a/src/sentry/feedback/endpoints/organization_feedback_categories.py b/src/sentry/feedback/endpoints/organization_feedback_categories.py
+index 741cc499cfabfa..7349b163c94cf0 100644
+--- a/src/sentry/feedback/endpoints/organization_feedback_categories.py
++++ b/src/sentry/feedback/endpoints/organization_feedback_categories.py
+@@ -26,6 +26,7 @@
+ from sentry.grouping.utils import hash_from_values
+ from sentry.models.organization import Organization
+ from sentry.seer.seer_setup import has_seer_access
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.utils.cache import cache
  
- const getLinkButtonStyles = (p: LinkButtonProps) => {
+ logger = logging.getLogger(__name__)
+@@ -107,6 +108,8 @@ def get(self, request: Request, organization: Organization) -> Response:
+                 {"detail": "AI categorization is not available for this organization."}, status=403
+             )
+ 
++        viewer_context = SeerViewerContext(organization_id=organization.id, user_id=request.user.id)
++
+         try:
+             start, end = get_date_range_from_stats_period(
+                 request.GET,
+@@ -192,6 +195,7 @@ def get(self, request: Request, organization: Organization) -> Response:
+                     seer_request,
+                     timeout=SEER_TIMEOUT_S,
+                     retries=SEER_RETRIES,
++                    viewer_context=viewer_context,
+                 )
+             except Exception:
+                 logger.exception("Seer failed to generate user feedback label groups")
+diff --git a/src/sentry/feedback/endpoints/organization_feedback_summary.py b/src/sentry/feedback/endpoints/organization_feedback_summary.py
+index 1fba02bdba8587..3b8a3cfdcae4f6 100644
+--- a/src/sentry/feedback/endpoints/organization_feedback_summary.py
++++ b/src/sentry/feedback/endpoints/organization_feedback_summary.py
+@@ -18,6 +18,7 @@
+ from sentry.models.group import Group, GroupStatus
+ from sentry.models.organization import Organization
+ from sentry.seer.seer_setup import has_seer_access
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.utils import metrics
+ from sentry.utils.cache import cache
+ 
+@@ -35,13 +36,17 @@
+ SEER_RETRIES = Retry(total=1, backoff_factor=3)  # 1 retry after a 3 second delay.
+ 
+ 
+-def get_summary_from_seer(feedback_msgs: list[str]) -> str | None:
++def get_summary_from_seer(
++    feedback_msgs: list[str],
++    viewer_context: SeerViewerContext | None = None,
++) -> str | None:
+     request_body = SummarizeFeedbacksRequest(feedbacks=feedback_msgs)
+     try:
+         response = make_summarize_feedbacks_request(
+             request_body,
+             timeout=SEER_TIMEOUT_S,
+             retries=SEER_RETRIES,
++            viewer_context=viewer_context,
+         )
+     except Exception:
+         logger.exception(
+@@ -90,6 +95,8 @@ def get(self, request: Request, organization: Organization) -> Response:
+                 {"detail": "AI summaries are not available for this organization."}, status=403
+             )
+ 
++        viewer_context = SeerViewerContext(organization_id=organization.id, user_id=request.user.id)
++
+         try:
+             start, end = get_date_range_from_stats_period(
+                 request.GET,
+@@ -155,7 +162,7 @@ def get(self, request: Request, organization: Organization) -> Response:
+         if len(feedback_msgs) < MIN_FEEDBACKS_TO_SUMMARIZE:
+             logger.error("Too few feedbacks to summarize after enforcing the character limit")
+ 
+-        summary = get_summary_from_seer(feedback_msgs)
++        summary = get_summary_from_seer(feedback_msgs, viewer_context=viewer_context)
+         if summary is None:
+             return Response(
+                 {"detail": "Failed to generate a summary for a list of feedbacks"}, status=500
+diff --git a/src/sentry/feedback/usecases/ingest/create_feedback.py b/src/sentry/feedback/usecases/ingest/create_feedback.py
+index 31db278493164d..4bc071a9f78241 100644
+--- a/src/sentry/feedback/usecases/ingest/create_feedback.py
++++ b/src/sentry/feedback/usecases/ingest/create_feedback.py
+@@ -27,6 +27,7 @@
+ from sentry.models.group import GroupStatus
+ from sentry.models.project import Project
+ from sentry.seer.seer_setup import has_seer_access
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.signals import first_feedback_received, first_new_feedback_received
+ from sentry.types.group import GroupSubStatus
+ from sentry.utils import json, metrics
+@@ -270,12 +271,16 @@ def create_feedback_issue(
+ 
+     feedback_message = event["contexts"]["feedback"]["message"]
+ 
++    viewer_context = SeerViewerContext(organization_id=project.organization_id)
++
+     # Spam detection.
+     is_message_spam = None
+     is_spam_enabled = spam_detection_enabled(project)
+     if is_spam_enabled:
+         # Will be None if the request fails
+-        is_message_spam = is_spam_seer(feedback_message, project.organization_id)
++        is_message_spam = is_spam_seer(
++            feedback_message, project.organization_id, viewer_context=viewer_context
++        )
+ 
+         metrics.incr(
+             "feedback.create_feedback_issue.seer_spam_detection",
+@@ -300,7 +305,12 @@ def create_feedback_issue(
+ 
+     use_ai_title = should_query_seer
+     title = truncate_feedback_title(
+-        get_feedback_title(feedback_message, project.organization_id, use_ai_title)
++        get_feedback_title(
++            feedback_message,
++            project.organization_id,
++            use_ai_title,
++            viewer_context=viewer_context,
++        )
+     )
+ 
+     # Set feedback summary to the title without the "User Feedback: " prefix
+@@ -335,7 +345,9 @@ def create_feedback_issue(
+     # Generating labels using Seer, which will later be used to categorize feedbacks
+     if should_query_seer:
+         try:
+-            labels = generate_labels(feedback_message, project.organization_id)
++            labels = generate_labels(
++                feedback_message, project.organization_id, viewer_context=viewer_context
++            )
+             # This will rarely happen unless the user writes a really long feedback message
+             if len(labels) > MAX_AI_LABELS:
+                 logger.info(
+diff --git a/src/sentry/feedback/usecases/label_generation.py b/src/sentry/feedback/usecases/label_generation.py
+index d2d67660c67da5..98a071bfbfeb2f 100644
+--- a/src/sentry/feedback/usecases/label_generation.py
++++ b/src/sentry/feedback/usecases/label_generation.py
+@@ -1,6 +1,7 @@
+ import logging
+ 
+ from sentry.feedback.lib.seer_api import LabelGenerationRequest, make_label_generation_request
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.utils import metrics
+ 
+ logger = logging.getLogger(__name__)
+@@ -17,7 +18,11 @@
+ 
+ 
+ @metrics.wraps("feedback.generate_labels")
+-def generate_labels(feedback_message: str, organization_id: int) -> list[str]:
++def generate_labels(
++    feedback_message: str,
++    organization_id: int,
++    viewer_context: SeerViewerContext | None = None,
++) -> list[str]:
+     """
+     Generate labels for a feedback message.
+ 
+@@ -33,6 +38,7 @@ def generate_labels(feedback_message: str, organization_id: int) -> list[str]:
+             request,
+             timeout=SEER_TIMEOUT_S,
+             retries=SEER_RETRIES,
++            viewer_context=viewer_context,
+         )
+     except Exception:
+         logger.exception("Seer failed to generate user feedback labels")
+diff --git a/src/sentry/feedback/usecases/spam_detection.py b/src/sentry/feedback/usecases/spam_detection.py
+index 07966d6eb6821c..a7306c4cc4b23c 100644
+--- a/src/sentry/feedback/usecases/spam_detection.py
++++ b/src/sentry/feedback/usecases/spam_detection.py
+@@ -4,6 +4,7 @@
+ from sentry.feedback.lib.seer_api import SpamDetectionRequest, make_spam_detection_request
+ from sentry.models.project import Project
+ from sentry.seer.seer_setup import has_seer_access
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.utils import metrics
+ 
+ logger = logging.getLogger(__name__)
+@@ -13,7 +14,11 @@
+ 
+ 
+ @metrics.wraps("feedback.spam_detection_seer")
+-def is_spam_seer(message: str, organization_id: int) -> bool | None:
++def is_spam_seer(
++    message: str,
++    organization_id: int,
++    viewer_context: SeerViewerContext | None = None,
++) -> bool | None:
+     """
+     Check if a message is spam using Seer.
+ 
+@@ -30,6 +35,7 @@ def is_spam_seer(message: str, organization_id: int) -> bool | None:
+             seer_request,
+             timeout=SEER_TIMEOUT_S,
+             retries=SEER_RETRIES,
++            viewer_context=viewer_context,
+         )
+     except Exception:
+         logger.exception("Seer failed to check if message is spam")
+diff --git a/src/sentry/feedback/usecases/title_generation.py b/src/sentry/feedback/usecases/title_generation.py
+index fd537aca0c312a..cae8feffc110b5 100644
+--- a/src/sentry/feedback/usecases/title_generation.py
++++ b/src/sentry/feedback/usecases/title_generation.py
+@@ -6,6 +6,7 @@
+     GenerateFeedbackTitleRequest,
+     make_title_generation_request,
+ )
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.utils import metrics
+ 
+ logger = logging.getLogger(__name__)
+@@ -45,7 +46,11 @@ def truncate_feedback_title(title: str, max_words: int = 10) -> str:
+ 
+ 
+ @metrics.wraps("feedback.ai_title_generation")
+-def get_feedback_title_from_seer(feedback_message: str, organization_id: int) -> str | None:
++def get_feedback_title_from_seer(
++    feedback_message: str,
++    organization_id: int,
++    viewer_context: SeerViewerContext | None = None,
++) -> str | None:
+     """
+     Generate an AI-powered title for user feedback using Seer, or None if generation fails.
+ 
+@@ -67,6 +72,7 @@ def get_feedback_title_from_seer(feedback_message: str, organization_id: int) ->
+             seer_request,
+             timeout=SEER_TIMEOUT_S,
+             retries=SEER_RETRIES,
++            viewer_context=viewer_context,
+         )
+     except Exception:
+         return None
+@@ -88,11 +94,19 @@ def get_feedback_title_from_seer(feedback_message: str, organization_id: int) ->
+         return None
+ 
+ 
+-def get_feedback_title(feedback_message: str, organization_id: int, use_seer: bool) -> str:
++def get_feedback_title(
++    feedback_message: str,
++    organization_id: int,
++    use_seer: bool,
++    viewer_context: SeerViewerContext | None = None,
++) -> str:
+     if use_seer:
+         # Message is fallback if Seer fails.
+         raw_title = (
+-            get_feedback_title_from_seer(feedback_message, organization_id) or feedback_message
++            get_feedback_title_from_seer(
++                feedback_message, organization_id, viewer_context=viewer_context
++            )
++            or feedback_message
+         )
+     else:
+         raw_title = feedback_message
+diff --git a/src/sentry/seer/autofix/autofix.py b/src/sentry/seer/autofix/autofix.py
+index 2473559b99d486..259c1a2a49e2bd 100644
+--- a/src/sentry/seer/autofix/autofix.py
++++ b/src/sentry/seer/autofix/autofix.py
+@@ -37,6 +37,7 @@
+     make_autofix_update_request,
+ )
+ from sentry.seer.explorer.utils import _convert_profile_to_execution_tree, fetch_profile_data
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.services import eventstore
+ from sentry.services.eventstore.models import Event, GroupEvent
+ from sentry.snuba.ourlogs import OurLogs
+@@ -465,7 +466,11 @@ def _call_autofix(
+         option=orjson.OPT_NON_STR_KEYS,
+     )
+ 
+-    response = make_autofix_start_request(body)
++    viewer_context = SeerViewerContext(organization_id=group.organization.id)
++    if not isinstance(user, AnonymousUser):
++        viewer_context["user_id"] = user.id
++
++    response = make_autofix_start_request(body, viewer_context=viewer_context)
+ 
+     if response.status >= 400:
+         raise Exception(f"Seer request failed with status {response.status}")
+@@ -717,7 +722,8 @@ def update_autofix(
+ 
+     data = AutofixUpdateRequest(organization_id=organization_id, run_id=run_id, payload=payload)
+     body = orjson.dumps(data)
+-    response = make_autofix_update_request(body)
++    viewer_context = SeerViewerContext(organization_id=organization_id)
++    response = make_autofix_update_request(body, viewer_context=viewer_context)
+ 
+     if response.status >= 400:
+         return Response({"detail": "Failed to update autofix run"}, status=500)
+diff --git a/src/sentry/seer/autofix/issue_summary.py b/src/sentry/seer/autofix/issue_summary.py
+index 459b79d8818742..45d98e53908525 100644
+--- a/src/sentry/seer/autofix/issue_summary.py
++++ b/src/sentry/seer/autofix/issue_summary.py
+@@ -257,7 +257,8 @@ def _call_seer(
+         organization_id=group.organization.id,
+         project_id=group.project.id,
+     )
+-    response = make_summarize_issue_request(body, timeout=30)
++    viewer_context = SeerViewerContext(organization_id=group.organization.id)
++    response = make_summarize_issue_request(body, timeout=30, viewer_context=viewer_context)
+ 
+     if response.status >= 400:
+         raise Exception(f"Seer request failed with status {response.status}")
+@@ -305,7 +306,10 @@ def _generate_fixability_score(
+     )
+     if summary is not None:
+         body["summary"] = summary
+-    response = make_fixability_score_request(body, timeout=settings.SEER_FIXABILITY_TIMEOUT)
++    viewer_context = SeerViewerContext(organization_id=group.organization.id)
++    response = make_fixability_score_request(
++        body, timeout=settings.SEER_FIXABILITY_TIMEOUT, viewer_context=viewer_context
++    )
+     if response.status >= 400:
+         raise Exception(f"Seer API error: {response.status}")
+     response_data = orjson.loads(response.data)
+diff --git a/src/sentry/seer/autofix/utils.py b/src/sentry/seer/autofix/utils.py
+index d0c434c8bda07e..0763e486c8d01f 100644
+--- a/src/sentry/seer/autofix/utils.py
++++ b/src/sentry/seer/autofix/utils.py
+@@ -461,9 +461,11 @@ def has_project_connected_repos(
+ 
+ def bulk_get_project_preferences(organization_id: int, project_ids: list[int]) -> dict[str, dict]:
+     """Bulk fetch Seer project preferences. Returns dict mapping project ID (string) to preference dict."""
++    viewer_context = SeerViewerContext(organization_id=organization_id)
+     response = make_bulk_get_project_preferences_request(
+         BulkGetProjectPreferencesRequest(organization_id=organization_id, project_ids=project_ids),
+         timeout=10,
++        viewer_context=viewer_context,
+     )
+ 
+     if response.status >= 400:
+@@ -478,9 +480,11 @@ def bulk_set_project_preferences(organization_id: int, preferences: list[dict])
+     if not preferences:
+         return
+ 
++    viewer_context = SeerViewerContext(organization_id=organization_id)
+     response = make_bulk_set_project_preferences_request(
+         BulkSetProjectPreferencesRequest(organization_id=organization_id, preferences=preferences),
+         timeout=15,
++        viewer_context=viewer_context,
+     )
+ 
+     if response.status >= 400:
+@@ -532,7 +536,8 @@ def get_autofix_state(
+         check_repo_access=check_repo_access,
+         is_user_fetching=is_user_fetching,
+     )
+-    response = make_get_autofix_state_request(body)
++    viewer_context = SeerViewerContext(organization_id=organization_id)
++    response = make_get_autofix_state_request(body, viewer_context=viewer_context)
+ 
+     if response.status >= 400:
+         raise Exception(f"Seer request failed with status {response.status}")
+diff --git a/src/sentry/seer/code_review/webhooks/task.py b/src/sentry/seer/code_review/webhooks/task.py
+index 72c287e3c46e7c..0b9dd10adaae3f 100644
+--- a/src/sentry/seer/code_review/webhooks/task.py
++++ b/src/sentry/seer/code_review/webhooks/task.py
+@@ -16,6 +16,7 @@
+     SeerCodeReviewTaskRequestForPrReview,
+ )
+ from sentry.seer.code_review.utils import transform_webhook_to_codegen_request
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.silo.base import SiloMode
+ from sentry.tasks.base import instrumented_task
+ from sentry.taskworker.namespaces import seer_code_review_tasks
+@@ -131,7 +132,10 @@ def process_github_webhook_event(
+         if tags:
+             sentry_sdk.set_tags(tags)
+         path = get_seer_endpoint_for_event(github_event).value
+-        make_seer_request(path=path, payload=event_payload)
++        viewer_context: SeerViewerContext | None = None
++        if tags and (org_id := tags.get("sentry_organization_id")):
++            viewer_context = SeerViewerContext(organization_id=int(org_id))
++        make_seer_request(path=path, payload=event_payload, viewer_context=viewer_context)
+     except Exception as e:
+         status = e.__class__.__name__
+         # Retryable errors are automatically retried by taskworker.
+diff --git a/src/sentry/seer/endpoints/project_seer_preferences.py b/src/sentry/seer/endpoints/project_seer_preferences.py
+index d64b8f9935d039..71c0de00d78b2c 100644
+--- a/src/sentry/seer/endpoints/project_seer_preferences.py
++++ b/src/sentry/seer/endpoints/project_seer_preferences.py
+@@ -21,7 +21,7 @@
+     make_set_project_preference_request,
+ )
+ from sentry.seer.models import PreferenceResponse, SeerApiError, SeerProjectPreference
+-from sentry.seer.signed_seer_api import seer_autofix_default_connection_pool
++from sentry.seer.signed_seer_api import SeerViewerContext, seer_autofix_default_connection_pool
+ from sentry.seer.utils import filter_repo_by_provider
+ from sentry.types.ratelimit import RateLimit, RateLimitCategory
+ 
+@@ -140,8 +140,13 @@ def post(self, request: Request, project: Project) -> Response:
+                 }
+             ).dict(),
+         )
++        viewer_context = SeerViewerContext(
++            organization_id=project.organization.id, user_id=request.user.id
++        )
+         response = make_set_project_preference_request(
+-            body, connection_pool=seer_autofix_default_connection_pool
++            body,
++            connection_pool=seer_autofix_default_connection_pool,
++            viewer_context=viewer_context,
+         )
+ 
+         if response.status >= 400:
+@@ -151,8 +156,13 @@ def post(self, request: Request, project: Project) -> Response:
+ 
+     def get(self, request: Request, project: Project) -> Response:
+         body = GetProjectPreferenceRequest(project_id=project.id)
++        viewer_context = SeerViewerContext(
++            organization_id=project.organization.id, user_id=request.user.id
++        )
+         response = make_get_project_preference_request(
+-            body, connection_pool=seer_autofix_default_connection_pool
++            body,
++            connection_pool=seer_autofix_default_connection_pool,
++            viewer_context=viewer_context,
+         )
+ 
+         if response.status >= 400:
+diff --git a/src/sentry/seer/explorer/client.py b/src/sentry/seer/explorer/client.py
+index f7f7dfd80eef75..08c56509fca79d 100644
+--- a/src/sentry/seer/explorer/client.py
++++ b/src/sentry/seer/explorer/client.py
+@@ -32,6 +32,7 @@
+ )
+ from sentry.seer.models import SeerApiError, SeerPermissionError
+ from sentry.seer.seer_setup import has_seer_access_with_detail
++from sentry.seer.signed_seer_api import SeerViewerContext
+ from sentry.users.models.user import User
+ 
+ logger = logging.getLogger(__name__)
+@@ -207,6 +208,8 @@ def __init__(
+ 
+         self.enable_coding = enable_coding
+ 
++        self.viewer_context = self._build_viewer_context()
++
+         # Validate that category_key and category_value are provided together
+         if category_key == "" or category_value == "":
+             raise ValueError("category_key and category_value cannot be empty strings")
+@@ -218,6 +221,12 @@ def __init__(
+         if not has_access:
+             raise SeerPermissionError(error or "Access denied")
+ 
++    def _build_viewer_context(self) -> SeerViewerContext:
++        context = SeerViewerContext(organization_id=self.organization.id)
++        if self.user and hasattr(self.user, "id") and self.user.id is not None:
++            context["user_id"] = self.user.id
++        return context
++
+     def start_run(
+         self,
+         prompt: str,
+@@ -298,7 +307,7 @@ def start_run(
+         ):
+             chat_body["is_context_engine_enabled"] = True
+ 
+-        response = make_explorer_chat_request(chat_body)
++        response = make_explorer_chat_request(chat_body, viewer_context=self.viewer_context)
+ 
+         if response.status >= 400:
+             raise SeerApiError("Seer request failed", response.status)
+@@ -361,7 +370,7 @@ def continue_run(
+         ):
+             chat_body["is_context_engine_enabled"] = True
+ 
+-        response = make_explorer_chat_request(chat_body)
++        response = make_explorer_chat_request(chat_body, viewer_context=self.viewer_context)
+ 
+         if response.status >= 400:
+             raise SeerApiError("Seer request failed", response.status)
+@@ -485,7 +494,7 @@ def get_runs(
+         if end is not None:
+             runs_body["end"] = end
+ 
+-        response = make_explorer_runs_request(runs_body)
++        response = make_explorer_runs_request(runs_body, viewer_context=self.viewer_context)
+ 
+         if response.status >= 400:
+             raise SeerApiError("Seer request failed", response.status)
+@@ -533,7 +542,7 @@ def push_changes(
+             organization_id=self.organization.id,
+             payload=payload,
+         )
+-        response = make_explorer_update_request(update_body)
++        response = make_explorer_update_request(update_body, viewer_context=self.viewer_context)
+         if response.status >= 400:
+             raise SeerApiError("Seer request failed", response.status)
+ 
+diff --git a/src/sentry/seer/explorer/explorer_service_map_utils.py b/src/sentry/seer/explorer/explorer_service_map_utils.py
+index 91635ed43360fc..18020a9ec89197 100644
+--- a/src/sentry/seer/explorer/explorer_service_map_utils.py
++++ b/src/sentry/seer/explorer/explorer_service_map_utils.py
+@@ -21,7 +21,11 @@
+ from sentry.search.eap.types import SearchResolverConfig
+ from sentry.search.events.types import SnubaParams
+ from sentry.seer.models import SeerApiError
+-from sentry.seer.signed_seer_api import ServiceMapUpdateRequest, make_service_map_update_request
++from sentry.seer.signed_seer_api import (
++    SeerViewerContext,
++    ServiceMapUpdateRequest,
++    make_service_map_update_request,
++)
+ from sentry.snuba.referrer import Referrer
+ from sentry.snuba.spans_rpc import Spans
+ 
+@@ -308,6 +312,7 @@ def _send_to_seer(org_id: int, nodes: list[dict], edges: list[dict]) -> None:
+         },
+     )
+ 
+-    response = make_service_map_update_request(body, timeout=30)
++    viewer_context = SeerViewerContext(organization_id=org_id)
++    response = make_service_map_update_request(body, timeout=30, viewer_context=viewer_context)
+     if response.status >= 400:
+         raise SeerApiError("Seer service map update failed", response.status)
+diff --git a/src/sentry/tasks/llm_issue_detection/detection.py b/src/sentry/tasks/llm_issue_detection/detection.py
+index 3d326ddbe59b11..57a72692977bb8 100644
+--- a/src/sentry/tasks/llm_issue_detection/detection.py
++++ b/src/sentry/tasks/llm_issue_detection/detection.py
+@@ -321,10 +321,12 @@ def detect_llm_issues_for_project(project_id: int) -> None:
+         org_slug=organization_slug,
+     )
+ 
++    viewer_context = SeerViewerContext(organization_id=organization_id)
+     response = make_issue_detection_request(
+         seer_request,
+         timeout=SEER_TIMEOUT_S,
+         retries=0,
++        viewer_context=viewer_context,
+     )
+ 
+     if response.status == 202:
+diff --git a/src/sentry/tasks/seer.py b/src/sentry/tasks/seer.py
+index f197e35b314105..32fb9544bc8595 100644
+--- a/src/sentry/tasks/seer.py
++++ b/src/sentry/tasks/seer.py
+@@ -3,7 +3,11 @@
+ import logging
+ 
+ from sentry.seer.models import SeerApiError
+-from sentry.seer.signed_seer_api import RemoveRepositoryRequest, make_remove_repository_request
++from sentry.seer.signed_seer_api import (
++    RemoveRepositoryRequest,
++    SeerViewerContext,
++    make_remove_repository_request,
++)
+ from sentry.silo.base import SiloMode
+ from sentry.tasks.base import instrumented_task
+ from sentry.taskworker.namespaces import seer_tasks
+@@ -33,8 +37,9 @@ def cleanup_seer_repository_preferences(
+         repo_external_id=repo_external_id,
+     )
+ 
++    viewer_context = SeerViewerContext(organization_id=organization_id)
+     try:
+-        response = make_remove_repository_request(body)
++        response = make_remove_repository_request(body, viewer_context=viewer_context)
+         if response.status >= 400:
+             raise SeerApiError("Seer request failed", response.status)
+         logger.info(
+diff --git a/tests/sentry/event_manager/test_severity.py b/tests/sentry/event_manager/test_severity.py
+index e9f08ae53d6621..d8a3758e5aac40 100644
+--- a/tests/sentry/event_manager/test_severity.py
++++ b/tests/sentry/event_manager/test_severity.py
+@@ -88,6 +88,7 @@ def test_error_event_simple(self, mock_urlopen: MagicMock) -> None:
+             override_settings(SEER_API_SHARED_SECRET="some-secret"),
+         ):
+             _get_severity_score(event)
++            viewer_context_bytes = orjson.dumps({"organization_id": self.project.organization_id})
+             mock_urlopen.assert_called_with(
+                 "POST",
+                 "/v0/issues/severity-score",
+@@ -95,6 +96,10 @@ def test_error_event_simple(self, mock_urlopen: MagicMock) -> None:
+                 headers={
+                     "content-type": "application/json;charset=utf-8",
+                     "Authorization": f"Rpcsignature rpc0:{hmac.new(b'some-secret', orjson.dumps(payload), hashlib.sha256).hexdigest()}",
++                    "X-Viewer-Context": viewer_context_bytes.decode("utf-8"),
++                    "X-Viewer-Context-Signature": hmac.new(
++                        b"some-secret", viewer_context_bytes, hashlib.sha256
++                    ).hexdigest(),
+                 },
+                 timeout=options.get("issues.severity.seer-timeout", settings.SEER_SEVERITY_TIMEOUT),
+             )
+diff --git a/tests/sentry/feedback/usecases/ingest/test_create_feedback.py b/tests/sentry/feedback/usecases/ingest/test_create_feedback.py
+index dab78f08174c84..00dfcd8475234b 100644
+--- a/tests/sentry/feedback/usecases/ingest/test_create_feedback.py
++++ b/tests/sentry/feedback/usecases/ingest/test_create_feedback.py
+@@ -779,7 +779,10 @@ def test_create_feedback_issue_title(
+     create_feedback_issue(event, default_project, FeedbackCreationSource.NEW_FEEDBACK_ENVELOPE)
+ 
+     mock_get_feedback_title.assert_called_once_with(
+-        long_message, default_project.organization_id, False
++        long_message,
++        default_project.organization_id,
++        False,
++        viewer_context={"organization_id": default_project.organization_id},
+     )
+     assert mock_produce_occurrence_to_kafka.call_count == 1
+     call_args = mock_produce_occurrence_to_kafka.call_args
+@@ -812,7 +815,10 @@ def test_create_feedback_issue_title_from_seer(
+     create_feedback_issue(event, default_project, FeedbackCreationSource.NEW_FEEDBACK_ENVELOPE)
+ 
+     mock_get_feedback_title.assert_called_once_with(
+-        "The login button is broken and the UI is slow", default_project.organization_id, True
++        "The login button is broken and the UI is slow",
++        default_project.organization_id,
++        True,
++        viewer_context={"organization_id": default_project.organization_id},
+     )
+ 
+     assert mock_produce_occurrence_to_kafka.call_count == 1

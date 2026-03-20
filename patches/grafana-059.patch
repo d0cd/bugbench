@@ -1,0 +1,1532 @@
+diff --git a/.github/workflows/external-pr-weekly-digest.yml b/.github/workflows/external-pr-weekly-digest.yml
+index fa99237804066..1a5f397810565 100644
+--- a/.github/workflows/external-pr-weekly-digest.yml
++++ b/.github/workflows/external-pr-weekly-digest.yml
+@@ -79,20 +79,20 @@ jobs:
+         run: node --experimental-strip-types .github/workflows/scripts/pr-digest.mts fetch
+ 
+       - name: Process teams and send reports
++        if: steps.fetch-prs.outputs.external_prs == 'true'
+         env:
+           GH_TOKEN: ${{ github.token }}
+           OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
+           STALE_DAYS: ${{ env.STALE_THRESHOLD_DAYS }}
+           REPO: ${{ github.repository }}
+-          ALL_PRS: ${{ steps.fetch-prs.outputs.all_prs }}
+-          EXTERNAL_PRS: ${{ steps.fetch-prs.outputs.external_prs }}
++          DATA_FILE: ${{ steps.fetch-prs.outputs.data_file }}
+           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+           TEAM_FILTER: ${{ inputs.team_filter || '' }}
+           SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
+         run: node --experimental-strip-types .github/workflows/scripts/pr-digest.mts process
+ 
+       - name: No PRs summary
+-        if: steps.fetch-prs.outputs.external_prs == '[]'
++        if: steps.fetch-prs.outputs.external_prs != 'true'
+         run: |
+           echo "No open external PRs found."
+           echo "Skipping Slack notification."
+diff --git a/.github/workflows/scripts/pr-digest.mts b/.github/workflows/scripts/pr-digest.mts
+index e95a3f32357ad..f0a35daeb6b6c 100644
+--- a/.github/workflows/scripts/pr-digest.mts
++++ b/.github/workflows/scripts/pr-digest.mts
+@@ -1,7 +1,10 @@
+ import { execFileSync } from 'node:child_process';
++import { writeFileSync, readFileSync, mkdtempSync } from 'node:fs';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
+ 
+ import {
+-  loadConfig, requireEnv, log, setOutput, setOutputMultiline,
++  loadConfig, requireEnv, log, setOutput,
+   sanitizeInput, sanitizeForSlack, isValidIssueNumber,
+   parseCodeowners, matchFilesToCodeownersTeams,
+   validatePRClusterResponse, callOpenAI, sendSlackMessage, teamChannelEnv,
+@@ -58,10 +61,14 @@ function fetchPrs(): void {
+     (pr) => pr.labels.some((l) => l.name === 'pr/external'),
+   );
+ 
+-  setOutputMultiline('all_prs', JSON.stringify(allPrs));
+-  setOutputMultiline('external_prs', JSON.stringify(externalPrs));
++  const dataDir = mkdtempSync(join(tmpdir(), 'pr-digest-'));
++  const dataFile = join(dataDir, 'prs.json');
++  writeFileSync(dataFile, JSON.stringify(allPrs));
++  setOutput('data_file', dataFile);
++  setOutput('external_prs', JSON.stringify(externalPrs.length > 0 ? true : false));
+ 
+   console.log(`Total open PRs: ${allPrs.length} (External: ${externalPrs.length})`);
++  console.log(`Data written to: ${dataFile}`);
+ }
+ 
+ // =============================================================================
+@@ -132,9 +139,9 @@ async function processTeams(): Promise<void> {
+   const slackBotToken = process.env.SLACK_BOT_TOKEN ?? '';
+   const dryRun = process.env.DRY_RUN === 'true';
+   const teamFilter = process.env.TEAM_FILTER ?? '';
+-  const allPrsRaw = process.env.ALL_PRS ?? '[]';
++  const dataFile = requireEnv('DATA_FILE');
+ 
+-  const allPrs: PRData[] = JSON.parse(allPrsRaw);
++  const allPrs: PRData[] = JSON.parse(readFileSync(dataFile, 'utf-8'));
+   const config = loadConfig();
+   const codeownersEntries = parseCodeowners();
+   const link = (n: number) => prLink(repo, n);
+diff --git a/pkg/tsdb/influxdb/influxql/influxql.go b/pkg/tsdb/influxdb/influxql/influxql.go
+index de74004057278..fcdcfdc3992fc 100644
+--- a/pkg/tsdb/influxdb/influxql/influxql.go
++++ b/pkg/tsdb/influxdb/influxql/influxql.go
+@@ -202,7 +202,8 @@ func execute(ctx context.Context, tracer trace.Tracer, dsInfo *models.Datasource
+ 	res, err := dsInfo.HTTPClient.Do(request)
+ 	if err != nil {
+ 		return backend.DataResponse{
+-			Error: err,
++			Error:       err,
++			ErrorSource: backend.ErrorSourceDownstream,
+ 		}, err
+ 	}
+ 	defer func() {
+diff --git a/public/app/features/correlations/CorrelationsPageAppPlatform.test.tsx b/public/app/features/correlations/CorrelationsPageAppPlatform.test.tsx
+new file mode 100644
+index 0000000000000..56b5cf24a8847
+--- /dev/null
++++ b/public/app/features/correlations/CorrelationsPageAppPlatform.test.tsx
+@@ -0,0 +1,546 @@
++import { render, waitFor, screen, within, Matcher, getByRole } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++import { openMenu } from 'react-select-event';
++import { TestProvider } from 'test/helpers/TestProvider';
++import { MockDataSourceApi } from 'test/mocks/datasource_srv';
++import { getGrafanaContextMock } from 'test/mocks/getGrafanaContextMock';
++
++import { selectors } from '@grafana/e2e-selectors';
++import { DataSourceSrv, reportInteraction, setAppEvents, setDataSourceSrv, config } from '@grafana/runtime';
++import { DataSourceRef } from '@grafana/schema';
++import { appEvents } from 'app/core/app_events';
++import { contextSrv } from 'app/core/services/context_srv';
++import { configureStore } from 'app/store/configureStore';
++
++import { mockDataSource } from '../alerting/unified/mocks';
++
++import { CorrelationsPageAppPlatform } from './CorrelationsPageWrapper';
++import {
++  createCorrelationsScenario,
++  emptyCorrelationsScenario,
++  deleteCorrelationsScenario,
++  editCorrelationsScenario,
++} from './__mocks__/correlations.scenario';
++import { prePopulateCorrelations, setupMockCorrelations } from './__mocks__/fixtures';
++import { setupCorrelationsMswServer } from './__mocks__/server';
++import { MockDataSourceSrv } from './__mocks__/useCorrelations.mocks';
++
++const server = setupCorrelationsMswServer();
++
++const originalFeatureToggles = config.featureToggles;
++
++// Set app events up, otherwise plugin modules will fail to load
++setAppEvents(appEvents);
++
++const renderWithContext = async (datasources: ConstructorParameters<typeof MockDataSourceSrv>[0] = {}) => {
++  const grafanaContext = getGrafanaContextMock();
++  const dsServer = new MockDataSourceSrv(datasources) as unknown as DataSourceSrv;
++  dsServer.get = (name: string) => {
++    const dsApi = new MockDataSourceApi(name);
++    // Mock the QueryEditor component
++    dsApi.components = {
++      QueryEditor: () => <>{name} query editor</>,
++    };
++    return Promise.resolve(dsApi);
++  };
++
++  // the getInstanceSettings in MockDataSourceSrv finds by string only, not ref, so we build it out here
++  dsServer.getInstanceSettings = (ref: DataSourceRef | string) => {
++    const lookupName = typeof ref === 'string' ? ref : ref?.uid;
++    if (lookupName === undefined) {
++      return undefined;
++    } else {
++      return datasources[lookupName];
++    }
++  };
++
++  setDataSourceSrv(dsServer);
++
++  // the new render method doesn't seem to offer custom queries for now, so we can't change over yet
++  const renderResult = render(
++    <TestProvider store={configureStore({})} grafanaContext={grafanaContext}>
++      <CorrelationsPageAppPlatform />
++    </TestProvider>,
++    {
++      queries: {
++        /**
++         * Gets all the rows in the table having the given text in the given column
++         */
++        queryRowsByCellValue: (
++          container: HTMLElement,
++          columnName: Matcher,
++          textValue: Matcher
++        ): HTMLTableRowElement[] => {
++          const table = within(container).getByRole('table');
++          const headers = within(table).getAllByRole('columnheader');
++          const headerIndex = headers.findIndex((h) => {
++            return within(h).queryByText(columnName);
++          });
++
++          // the first rowgroup is the header
++          const tableBody = within(table).getAllByRole('rowgroup')[1];
++
++          return within(tableBody)
++            .getAllByRole<HTMLTableRowElement>('row')
++            .filter((row) => {
++              const rowCells = within(row).getAllByRole('cell');
++              const cell = rowCells[headerIndex];
++              return within(cell).queryByText(textValue);
++            });
++        },
++        /**
++         * Gets all the cells in the table for the given column name
++         */
++        queryCellsByColumnName: (container: HTMLElement, columnName: Matcher) => {
++          const table = within(container).getByRole('table');
++          const headers = within(table).getAllByRole('columnheader');
++          const headerIndex = headers.findIndex((h) => {
++            return within(h).queryByText(columnName);
++          });
++          const tbody = table.querySelector('tbody');
++          if (!tbody) {
++            return [];
++          }
++          return within(tbody)
++            .getAllByRole('row')
++            .map((r) => {
++              const cells = within(r).getAllByRole<HTMLTableCellElement>('cell');
++              return cells[headerIndex];
++            });
++        },
++        /**
++         * Gets the table header cell matching the given name
++         */
++        getHeaderByName: (container: HTMLElement, columnName: Matcher): HTMLTableCellElement => {
++          const table = within(container).getByRole('table');
++          const headers = within(table).getAllByRole<HTMLTableCellElement>('columnheader');
++          const header = headers.find((h) => {
++            return within(h).queryByText(columnName);
++          });
++          if (!header) {
++            throw new Error(`Could not find header with name ${columnName}`);
++          }
++          return header;
++        },
++      },
++    }
++  );
++
++  await waitFor(() => {
++    expect(screen.queryByText('Loading')).not.toBeInTheDocument();
++  });
++
++  return renderResult;
++};
++
++jest.mock('app/core/services/context_srv');
++
++const mocks = {
++  contextSrv: jest.mocked(contextSrv),
++  reportInteraction: jest.fn(),
++};
++
++jest.mock('@grafana/runtime', () => {
++  const runtime = jest.requireActual('@grafana/runtime');
++
++  return {
++    ...runtime,
++    reportInteraction: (...args: Parameters<typeof reportInteraction>) => {
++      mocks.reportInteraction(...args);
++    },
++  };
++});
++
++beforeAll(() => {
++  mocks.contextSrv.hasPermission.mockImplementation(() => true);
++  config.featureToggles.kubernetesCorrelations = true;
++});
++
++afterAll(() => {
++  jest.restoreAllMocks();
++  config.featureToggles = originalFeatureToggles;
++});
++
++describe('CorrelationsPage - App Platform', () => {
++  describe('With no correlations', () => {
++    beforeEach(async () => {
++      server.use(...emptyCorrelationsScenario, ...createCorrelationsScenario);
++
++      await renderWithContext({
++        lokiUID: mockDataSource(
++          {
++            uid: 'lokiUID',
++            name: 'loki',
++            readOnly: false,
++            jsonData: {},
++            type: 'datasource',
++          },
++          { logs: true }
++        ),
++        prometheusUID: mockDataSource(
++          {
++            uid: 'prometheusUID',
++            name: 'prometheus',
++            readOnly: false,
++            jsonData: {},
++            type: 'datasource',
++          },
++          { metrics: true, module: 'core:plugin/prometheus' }
++        ),
++      });
++    });
++
++    afterEach(() => {
++      mocks.reportInteraction.mockClear();
++    });
++
++    it('shows the first page of the wizard', async () => {
++      const CTAButton = await screen.findByRole('button', { name: /add correlation/i });
++      expect(CTAButton).toBeInTheDocument();
++
++      // insert form should not be present
++      expect(screen.queryByRole('button', { name: /next$/i })).not.toBeInTheDocument();
++
++      // "add new" button is the button on the top of the page, not visible when the CTA is rendered
++      expect(screen.queryByRole('button', { name: /add new$/i })).not.toBeInTheDocument();
++
++      // there's no table in the page
++      expect(screen.queryByRole('table')).not.toBeInTheDocument();
++
++      await userEvent.click(CTAButton);
++
++      // form's next button
++      expect(await screen.findByRole('button', { name: /next$/i })).toBeInTheDocument();
++    });
++
++    it('correctly adds first correlation', async () => {
++      const CTAButton = await screen.findByRole('button', { name: /add correlation/i });
++      expect(CTAButton).toBeInTheDocument();
++
++      // there's no table in the page, as we are adding the first correlation
++      expect(screen.queryByRole('table')).not.toBeInTheDocument();
++
++      await userEvent.click(CTAButton);
++
++      // step 1: label and description
++      await userEvent.clear(screen.getByRole('textbox', { name: /label/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /label/i }), 'A Label');
++      await userEvent.clear(screen.getByRole('textbox', { name: /description/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /description/i }), 'A Description');
++      await userEvent.click(await screen.findByRole('button', { name: /next$/i }));
++
++      // step 2:
++      // set target datasource picker value
++      await userEvent.click(screen.getByLabelText(/^target/i));
++      await userEvent.click(screen.getByText('prometheus'));
++      await userEvent.click(await screen.findByRole('button', { name: /next$/i }));
++
++      // step 3:
++      // set source datasource picker value
++      await userEvent.click(screen.getByLabelText(/^source/i));
++      await userEvent.click(screen.getByText('loki'));
++      await userEvent.click(await screen.findByRole('button', { name: /add$/i }));
++
++      await userEvent.clear(screen.getByRole('textbox', { name: /results field/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /results field/i }), 'Line');
++
++      // add transformation
++      await userEvent.click(screen.getByRole('button', { name: /add transformation/i }));
++      const typeFilterSelect = screen.getAllByLabelText('Type');
++      openMenu(typeFilterSelect[0]);
++      await userEvent.click(screen.getByText('Regular expression'));
++      await userEvent.type(screen.getByLabelText(/expression/i), 'test expression');
++
++      await userEvent.click(await screen.findByRole('button', { name: /add$/i }));
++
++      await waitFor(() => {
++        expect(mocks.reportInteraction).toHaveBeenCalledWith('grafana_correlations_added');
++      });
++
++      expect(await screen.findByRole('table')).toBeInTheDocument();
++    });
++  });
++
++  describe('With correlations', () => {
++    afterEach(() => {
++      mocks.reportInteraction.mockClear();
++    });
++
++    let queryRowsByCellValue: (columnName: Matcher, textValue: Matcher) => HTMLTableRowElement[];
++    let getHeaderByName: (columnName: Matcher) => HTMLTableCellElement;
++    let queryCellsByColumnName: (columnName: Matcher) => HTMLTableCellElement[];
++
++    beforeEach(async () => {
++      server.use(
++        ...emptyCorrelationsScenario,
++        ...createCorrelationsScenario,
++        ...deleteCorrelationsScenario,
++        ...editCorrelationsScenario
++      );
++
++      setupMockCorrelations();
++      prePopulateCorrelations();
++
++      const renderResult = await renderWithContext({
++        lokiUID: mockDataSource(
++          {
++            uid: 'lokiUID',
++            name: 'loki',
++            readOnly: false,
++            jsonData: {},
++            type: 'loki',
++          },
++          { logs: true }
++        ),
++        prometheusUID: mockDataSource(
++          {
++            uid: 'prometheusUID',
++            name: 'prometheus',
++            readOnly: false,
++            jsonData: {},
++            type: 'prometheus',
++          },
++          { metrics: true, module: 'core:plugin/prometheus' }
++        ),
++        elasticUID: mockDataSource(
++          {
++            uid: 'elasticUID',
++            name: 'elastic',
++            readOnly: false,
++            jsonData: {},
++            type: 'datasource',
++          },
++          {
++            metrics: true,
++            logs: true,
++            module: 'core:plugin/elasticsearch',
++          }
++        ),
++      });
++
++      queryRowsByCellValue = renderResult.queryRowsByCellValue;
++      queryCellsByColumnName = renderResult.queryCellsByColumnName;
++      getHeaderByName = renderResult.getHeaderByName;
++    });
++
++    it('shows a table with correlations', async () => {
++      expect(await screen.findByRole('table')).toBeInTheDocument();
++    });
++
++    it('correctly sorts by source', async () => {
++      // wait for table to appear
++      await screen.findByRole('table');
++
++      const sourceHeader = getByRole(getHeaderByName('Source'), 'button');
++      await userEvent.click(sourceHeader);
++      let cells = queryCellsByColumnName('Source');
++      cells.forEach((cell, i, allCells) => {
++        const prevCell = allCells[i - 1];
++        if (prevCell && prevCell.textContent) {
++          expect(cell.textContent?.localeCompare(prevCell.textContent)).toBeGreaterThanOrEqual(0);
++        }
++      });
++
++      await userEvent.click(sourceHeader);
++      cells = queryCellsByColumnName('Source');
++      cells.forEach((cell, i, allCells) => {
++        const prevCell = allCells[i - 1];
++        if (prevCell && prevCell.textContent) {
++          expect(cell.textContent?.localeCompare(prevCell.textContent)).toBeLessThanOrEqual(0);
++        }
++      });
++    });
++
++    it('correctly adds new correlation', async () => {
++      const addNewButton = await screen.findByRole('button', { name: /add new/i });
++      expect(addNewButton).toBeInTheDocument();
++      await userEvent.click(addNewButton);
++
++      // step 1:
++      await userEvent.clear(screen.getByRole('textbox', { name: /label/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /label/i }), 'A Label');
++      await userEvent.clear(screen.getByRole('textbox', { name: /description/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /description/i }), 'A Description');
++      await userEvent.click(await screen.findByRole('button', { name: /next$/i }));
++
++      // step 2:
++      // set target datasource picker value
++      await userEvent.click(screen.getByLabelText(/^target/i));
++      await userEvent.click(screen.getByText('elastic'));
++      await userEvent.click(await screen.findByRole('button', { name: /next$/i }));
++
++      // step 3:
++      // set source datasource picker value
++      await userEvent.click(screen.getByLabelText(/^source/i));
++      await userEvent.click(
++        within(screen.getByTestId(selectors.components.DataSourcePicker.dataSourceList)).getByText('prometheus')
++      );
++
++      await userEvent.clear(screen.getByRole('textbox', { name: /results field/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /results field/i }), 'Line');
++
++      await userEvent.click(screen.getByRole('button', { name: /add$/i }));
++
++      await waitFor(() => {
++        expect(mocks.reportInteraction).toHaveBeenCalledWith('grafana_correlations_added');
++      });
++
++      // the table showing correlations should have appeared
++      expect(await screen.findByRole('table')).toBeInTheDocument();
++    });
++
++    it('correctly closes the form when clicking on the close icon', async () => {
++      const addNewButton = await screen.findByRole('button', { name: /add new/i });
++      expect(addNewButton).toBeInTheDocument();
++      await userEvent.click(addNewButton);
++
++      await userEvent.click(screen.getByRole('button', { name: /close$/i }));
++
++      expect(screen.queryByRole('button', { name: /add$/i })).not.toBeInTheDocument();
++    });
++
++    it('correctly deletes correlations', async () => {
++      // A row with the correlation should exist
++      expect(await screen.findByRole('cell', { name: /loki to loki/i })).toBeInTheDocument();
++
++      const tableRows = queryRowsByCellValue('Source', 'loki');
++
++      const deleteButton = within(tableRows[0]).getByRole('button', { name: /delete correlation/i });
++
++      expect(deleteButton).toBeInTheDocument();
++
++      await userEvent.click(deleteButton);
++
++      const confirmButton = within(tableRows[0]).getByRole('button', { name: /delete$/i });
++      expect(confirmButton).toBeInTheDocument();
++
++      await userEvent.click(confirmButton);
++
++      await waitFor(() => {
++        expect(mocks.reportInteraction).toHaveBeenCalledWith('grafana_correlations_deleted');
++        expect(screen.queryByRole('cell', { name: /loki to loki$/i })).not.toBeInTheDocument();
++      });
++    });
++
++    it('correctly edits correlations', async () => {
++      // wait for table to appear
++      await screen.findByRole('table');
++
++      const tableRows = queryRowsByCellValue('Source', 'loki');
++
++      const rowExpanderButton = within(tableRows[0]).getByRole('button', { name: /toggle row expanded/i });
++      await userEvent.click(rowExpanderButton);
++
++      await waitFor(() => {
++        expect(mocks.reportInteraction).toHaveBeenCalledWith('grafana_correlations_details_expanded');
++      });
++
++      await userEvent.clear(screen.getByRole('textbox', { name: /label/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /label/i }), 'edited label');
++      await userEvent.clear(screen.getByRole('textbox', { name: /description/i }));
++      await userEvent.type(screen.getByRole('textbox', { name: /description/i }), 'edited description');
++
++      expect(screen.queryByRole('cell', { name: /edited label$/i })).not.toBeInTheDocument();
++
++      await userEvent.click(screen.getByRole('button', { name: /next$/i }));
++      await userEvent.click(screen.getByRole('button', { name: /next$/i }));
++
++      await userEvent.click(screen.getByRole('button', { name: /save$/i }));
++
++      await waitFor(() => {
++        expect(mocks.reportInteraction).toHaveBeenCalledWith('grafana_correlations_edited');
++      });
++
++      expect(await screen.findByRole('cell', { name: /edited label$/i }, { timeout: 5000 })).toBeInTheDocument();
++    });
++
++    it('correctly edits transformations', async () => {
++      // wait for table to appear
++      await screen.findByRole('table');
++
++      const tableRows = queryRowsByCellValue('Source', 'loki');
++
++      const rowExpanderButton = within(tableRows[0]).getByRole('button', { name: /toggle row expanded/i });
++      await userEvent.click(rowExpanderButton);
++
++      await userEvent.click(screen.getByRole('button', { name: /next$/i }));
++      await userEvent.click(screen.getByRole('button', { name: /next$/i }));
++
++      // select Logfmt, be sure expression field is disabled
++      let typeFilterSelect = screen.getAllByLabelText('Type');
++      openMenu(typeFilterSelect[0]);
++      await userEvent.click(screen.getByText('Logfmt'));
++
++      let expressionInput = screen.queryByLabelText(/expression/i);
++      expect(expressionInput).toBeInTheDocument();
++      expect(expressionInput).toBeDisabled();
++
++      // select Regex, be sure expression field is not disabled and contains the former expression
++      openMenu(typeFilterSelect[0]);
++      await userEvent.click(screen.getByText('Regular expression'));
++      expressionInput = screen.queryByLabelText(/expression/i);
++      expect(expressionInput).toBeInTheDocument();
++      expect(expressionInput).toBeEnabled();
++      expect(expressionInput).toHaveAttribute('value', 'url=http[s]?://(S*)');
++
++      // select Logfmt, delete, then add a new one to be sure the value is blank
++      openMenu(typeFilterSelect[0]);
++      await userEvent.click(screen.getByText('Logfmt'));
++      await userEvent.click(screen.getByRole('button', { name: /remove transformation/i }));
++      expressionInput = screen.queryByLabelText(/expression/i);
++      expect(expressionInput).not.toBeInTheDocument();
++
++      await userEvent.click(screen.getByRole('button', { name: /add transformation/i }));
++      typeFilterSelect = screen.getAllByLabelText('Type');
++      openMenu(typeFilterSelect[0]);
++      const menu = await screen.findByLabelText('Select options menu');
++      await userEvent.click(within(menu).getByText('Regular expression'));
++      expressionInput = screen.queryByLabelText(/expression/i);
++      expect(expressionInput).toBeInTheDocument();
++      expect(expressionInput).toBeEnabled();
++      expect(expressionInput).not.toHaveValue('url=http[s]?://(S*)');
++      await userEvent.click(screen.getByRole('button', { name: /save$/i }));
++      expect(screen.getByText('Please define an expression')).toBeInTheDocument();
++      await userEvent.type(screen.getByLabelText(/expression/i), 'test expression');
++      await userEvent.click(screen.getByRole('button', { name: /save$/i }));
++      await waitFor(() => {
++        expect(mocks.reportInteraction).toHaveBeenCalledWith('grafana_correlations_edited');
++      });
++    });
++  });
++
++  describe('With correlations with datasources the user cannot access', () => {
++    let queryCellsByColumnName: (columnName: Matcher) => HTMLTableCellElement[];
++    beforeEach(async () => {
++      server.use(...emptyCorrelationsScenario);
++
++      prePopulateCorrelations();
++
++      const renderResult = await renderWithContext({
++        lokiUID: mockDataSource(
++          {
++            uid: 'lokiUID',
++            name: 'lokiUID',
++            readOnly: false,
++            jsonData: {},
++            access: 'direct',
++            type: 'datasource',
++          },
++          {
++            logs: true,
++          }
++        ),
++      });
++      queryCellsByColumnName = renderResult.queryCellsByColumnName;
++    });
++
++    it("doesn't show correlations from source or target datasources the user doesn't have access to", async () => {
++      await screen.findByRole('table');
++      const labels = queryCellsByColumnName('Label');
++      expect(labels.length).toBe(1);
++      expect(labels[0].textContent).toBe('Loki to Loki');
++    });
++  });
++
++  //TODO add in provisioned correlations tests after discussing with app platform
++});
+diff --git a/public/app/features/correlations/CorrelationsPage.test.tsx b/public/app/features/correlations/CorrelationsPageLegacy.test.tsx
+similarity index 99%
+rename from public/app/features/correlations/CorrelationsPage.test.tsx
+rename to public/app/features/correlations/CorrelationsPageLegacy.test.tsx
+index 0417feffc8581..410b3c70e0a26 100644
+--- a/public/app/features/correlations/CorrelationsPage.test.tsx
++++ b/public/app/features/correlations/CorrelationsPageLegacy.test.tsx
+@@ -31,7 +31,7 @@ import {
+   createRemoveCorrelationResponse,
+   createUpdateCorrelationResponse,
+   MockDataSourceSrv,
+-} from './mocks/useCorrelations.mocks';
++} from './__mocks__/useCorrelations.mocks';
+ import { Correlation, CreateCorrelationParams, OmitUnion } from './types';
+ 
+ // Set app events up, otherwise plugin modules will fail to load
+@@ -212,7 +212,7 @@ afterAll(() => {
+   jest.restoreAllMocks();
+ });
+ 
+-describe('CorrelationsPage', () => {
++describe('CorrelationsPage - Legacy', () => {
+   describe('With no correlations', () => {
+     beforeEach(async () => {
+       await renderWithContext({
+diff --git a/public/app/features/correlations/CorrelationsPageWrapper.tsx b/public/app/features/correlations/CorrelationsPageWrapper.tsx
+index f511252be604b..690b6652422d8 100644
+--- a/public/app/features/correlations/CorrelationsPageWrapper.tsx
++++ b/public/app/features/correlations/CorrelationsPageWrapper.tsx
+@@ -22,7 +22,7 @@ export function CorrelationsPageLegacy() {
+   );
+ }
+ 
+-function CorrelationsPageAppPlatform() {
++export function CorrelationsPageAppPlatform() {
+   const [page, setPage] = useState(1);
+   const limit = 100;
+   const { currentData, isLoading, error, doesContinue } = useCorrelationsK8s(limit, page);
+diff --git a/public/app/features/correlations/__mocks__/correlations.scenario.ts b/public/app/features/correlations/__mocks__/correlations.scenario.ts
+new file mode 100644
+index 0000000000000..21812039779c1
+--- /dev/null
++++ b/public/app/features/correlations/__mocks__/correlations.scenario.ts
+@@ -0,0 +1,47 @@
++import { CorrelationSpec } from '@grafana/api-clients/rtkq/correlations/v0alpha1';
++
++import { fakeCorrelations, generateCorrMetadata } from './fixtures';
++import {
++  createCorrelationsHandler,
++  deleteCorrelationsHandler,
++  editCorrelationsHandler,
++  getCorrelationsHandler,
++} from './handlers';
++
++export const emptyCorrelationsScenario = [
++  getCorrelationsHandler({
++    kind: 'CorrelationList',
++    apiVersion: 'correlations.grafana.app/v0alpha1',
++    metadata: {},
++    items: [],
++  }),
++];
++
++const newCorrelation: CorrelationSpec = {
++  source: { group: 'loki', name: 'lokiUID' },
++  target: { group: 'loki', name: 'lokiUID' },
++  label: 'New Correlation',
++  type: 'query',
++  config: {
++    field: 'line',
++    target: {},
++    transformations: [{ type: 'regex', expression: 'url=http[s]?://(S*)', mapValue: 'path' }],
++  },
++};
++
++export const createCorrelationsScenario = [createCorrelationsHandler(generateCorrMetadata('0', newCorrelation))];
++
++export const deleteCorrelationsScenario = [
++  deleteCorrelationsHandler({
++    kind: 'CorrelationList',
++    apiVersion: 'correlations.grafana.app/v0alpha1',
++    metadata: {},
++    status: '200',
++    message: 'success',
++  }),
++];
++
++const editedCorr = { ...fakeCorrelations[0] };
++editedCorr.label = 'edited label';
++
++export const editCorrelationsScenario = [editCorrelationsHandler(generateCorrMetadata('0', editedCorr))];
+diff --git a/public/app/features/correlations/__mocks__/fixtures.ts b/public/app/features/correlations/__mocks__/fixtures.ts
+new file mode 100644
+index 0000000000000..3b75b30aa4258
+--- /dev/null
++++ b/public/app/features/correlations/__mocks__/fixtures.ts
+@@ -0,0 +1,78 @@
++import { Correlation, CorrelationSpec } from '@grafana/api-clients/rtkq/correlations/v0alpha1';
++
++export const generateCorrMetadata = (uid: string, correlation: CorrelationSpec) => {
++  let labels: Record<string, string> = {
++    'correlations.grafana.app/sourceDS-ref': `${correlation.source.group}.${correlation.source.name}`,
++  };
++
++  if (correlation.target?.group !== undefined && correlation.target?.name !== undefined) {
++    labels['correlations.grafana.app/targetDS-ref'] = `${correlation.target?.group}.${correlation.target?.name}`;
++  }
++
++  return {
++    kind: 'Correlation',
++    apiVersion: 'correlations.grafana.app/v0alpha1',
++    metadata: {
++      uid: uid,
++      name: uid,
++      namespace: 'default',
++      labels: labels,
++    },
++    spec: correlation,
++  };
++};
++
++export const fakeCorrelations: CorrelationSpec[] = [
++  {
++    source: { group: 'loki', name: 'lokiUID' },
++    target: { group: 'loki', name: 'lokiUID' },
++    label: 'Loki to Loki',
++    type: 'query',
++    config: {
++      field: 'line',
++      target: {},
++      transformations: [{ type: 'regex', expression: 'url=http[s]?://(S*)', mapValue: 'path' }],
++    },
++  },
++  {
++    source: { group: 'loki', name: 'lokiUID' },
++    target: { group: 'prometheus', name: 'prometheusUID' },
++    label: 'Loki to Prometheus',
++    type: 'query',
++    config: {
++      field: 'line',
++      target: {},
++      transformations: [{ type: 'regex', expression: 'url=http[s]?://(S*)', mapValue: 'path' }],
++    },
++  },
++  {
++    source: { group: 'prometheus', name: 'prometheusUID' },
++    target: { group: 'loki', name: 'lokiUID' },
++    label: 'Prometheus to Loki',
++    type: 'query',
++    config: { field: 'label', target: {} },
++  },
++  {
++    source: { group: 'prometheus', name: 'prometheusUID' },
++    target: { group: 'prometheus', name: 'prometheusUID' },
++    label: 'Prometheus to Prometheus',
++    type: 'query',
++    config: { field: 'label', target: {} },
++  },
++];
++
++export const setupMockCorrelations = () => {
++  mockCorrelationsMap.clear();
++};
++
++export let mockCorrelationsMap = new Map<string, Correlation>();
++
++export const resetFixtures = () => {
++  setupMockCorrelations();
++};
++
++export const prePopulateCorrelations = () => {
++  fakeCorrelations.forEach((fakeCorr, i) => {
++    mockCorrelationsMap.set(i.toString(), generateCorrMetadata(i.toString(), fakeCorr));
++  });
++};
+diff --git a/public/app/features/correlations/__mocks__/handlers.ts b/public/app/features/correlations/__mocks__/handlers.ts
+new file mode 100644
+index 0000000000000..301fa0e45c79a
+--- /dev/null
++++ b/public/app/features/correlations/__mocks__/handlers.ts
+@@ -0,0 +1,48 @@
++import { HttpResponse, http } from 'msw';
++
++import {
++  CreateCorrelationApiResponse,
++  ListCorrelationApiResponse,
++  DeleteCorrelationApiResponse,
++  UpdateCorrelationApiResponse,
++} from '@grafana/api-clients/rtkq/correlations/v0alpha1';
++
++import { mockCorrelationsMap } from './fixtures';
++
++export const getCorrelationsHandler = (data: ListCorrelationApiResponse) =>
++  http.get('/apis/correlations.grafana.app/v0alpha1/namespaces/:namespace/correlations', ({}) => {
++    const corrItems = Array.from(mockCorrelationsMap.entries()).map((corrData) => {
++      return corrData[1];
++    });
++    return HttpResponse.json({ ...data, items: corrItems });
++  });
++
++export const createCorrelationsHandler = (data: CreateCorrelationApiResponse) =>
++  http.post('/apis/correlations.grafana.app/v0alpha1/namespaces/:namespace/correlations', ({}) => {
++    if (data.metadata.uid) {
++      mockCorrelationsMap.set(data.metadata.uid, data);
++    }
++    return HttpResponse.json(data);
++  });
++
++export const deleteCorrelationsHandler = (data: DeleteCorrelationApiResponse) =>
++  http.delete('/apis/correlations.grafana.app/v0alpha1/namespaces/:namespace/correlations/:id', ({ params }) => {
++    const { id } = params;
++    if (id !== undefined && typeof id === 'string') {
++      mockCorrelationsMap.delete(id);
++    }
++    return HttpResponse.json(data);
++  });
++
++export const editCorrelationsHandler = (data: UpdateCorrelationApiResponse) =>
++  http.patch('/apis/correlations.grafana.app/v0alpha1/namespaces/:namespace/correlations/:id', ({ params }) => {
++    const { id } = params;
++    if (id !== undefined && typeof id === 'string') {
++      const existingCorr = mockCorrelationsMap.get(id);
++      if (existingCorr !== undefined) {
++        const updatedCorr = { ...existingCorr, ...data };
++        mockCorrelationsMap.set(id, updatedCorr);
++      }
++    }
++    return HttpResponse.json(data);
++  });
+diff --git a/public/app/features/correlations/__mocks__/server.ts b/public/app/features/correlations/__mocks__/server.ts
+new file mode 100644
+index 0000000000000..1ebdffd11d3c1
+--- /dev/null
++++ b/public/app/features/correlations/__mocks__/server.ts
+@@ -0,0 +1,25 @@
++import { setBackendSrv } from '@grafana/runtime';
++import { setupMockServer } from '@grafana/test-utils/server';
++import { backendSrv } from 'app/core/services/backend_srv';
++
++import { resetFixtures } from './fixtures';
++
++export function setupCorrelationsMswServer() {
++  const server = setupMockServer();
++
++  setBackendSrv(backendSrv);
++
++  beforeEach(() => {
++    resetFixtures();
++  });
++
++  afterEach(() => {
++    server.resetHandlers();
++  });
++
++  afterAll(() => {
++    server.close();
++  });
++
++  return server;
++}
+diff --git a/public/app/features/correlations/mocks/useCorrelations.mocks.ts b/public/app/features/correlations/__mocks__/useCorrelations.mocks.ts
+similarity index 100%
+rename from public/app/features/correlations/mocks/useCorrelations.mocks.ts
+rename to public/app/features/correlations/__mocks__/useCorrelations.mocks.ts
+diff --git a/public/app/features/correlations/useCorrelationsK8s.ts b/public/app/features/correlations/useCorrelationsK8s.ts
+index 181464e658343..958b596462daf 100644
+--- a/public/app/features/correlations/useCorrelationsK8s.ts
++++ b/public/app/features/correlations/useCorrelationsK8s.ts
+@@ -74,7 +74,6 @@ export const useCorrelationsK8s = (limit = 100, page: number) => {
+   const { currentData, isLoading, error } = useListCorrelationQuery({ limit: pagedLimit });
+   const startIdx = limit * (page - 1);
+   const pagedData = currentData?.items.slice(startIdx, startIdx + limit) ?? [];
+-
+   const enrichedCorrelations =
+     currentData !== undefined
+       ? pagedData
+diff --git a/public/app/features/dashboard-scene/serialization/sceneVariablesSetToVariables.ts b/public/app/features/dashboard-scene/serialization/sceneVariablesSetToVariables.ts
+index e9f65e66e6017..8fa6c309e3a9f 100644
+--- a/public/app/features/dashboard-scene/serialization/sceneVariablesSetToVariables.ts
++++ b/public/app/features/dashboard-scene/serialization/sceneVariablesSetToVariables.ts
+@@ -4,7 +4,6 @@ import {
+   MultiValueVariable,
+   SceneVariables,
+   sceneUtils,
+-  SceneVariable,
+ } from '@grafana/scenes';
+ import {
+   VariableModel,
+@@ -605,7 +604,3 @@ export function validateFiltersOrigin(filters?: SceneAdHocFilterWithLabels[]): A
+   // Only keep dashboard originated filters in the schema
+   return filters?.filter((f): f is AdHocFilterWithLabels => !f.origin || f.origin === 'dashboard') || [];
+ }
+-
+-export function isVariableEditable(variable: SceneVariable) {
+-  return variable.state.type !== 'system' && variable.state.origin === undefined;
+-}
+diff --git a/public/app/features/dashboard-scene/serialization/transformSceneToSaveModel.ts b/public/app/features/dashboard-scene/serialization/transformSceneToSaveModel.ts
+index 5e39de27589c3..ecf48ab2ddfee 100644
+--- a/public/app/features/dashboard-scene/serialization/transformSceneToSaveModel.ts
++++ b/public/app/features/dashboard-scene/serialization/transformSceneToSaveModel.ts
+@@ -43,6 +43,7 @@ import { TabItem } from '../scene/layout-tabs/TabItem';
+ import { TabsLayoutManager } from '../scene/layout-tabs/TabsLayoutManager';
+ import { PanelTimeRange } from '../scene/panel-timerange/PanelTimeRange';
+ import { DashboardLayoutManager } from '../scene/types/DashboardLayoutManager';
++import { isLinkEditable } from '../settings/links/utils';
+ import { dashboardSceneGraph } from '../utils/dashboardSceneGraph';
+ import { djb2Hash } from '../utils/djb2Hash';
+ import {
+@@ -160,7 +161,7 @@ export function transformSceneToSaveModel(scene: DashboardScene, isSnapshot = fa
+     fiscalYearStartMonth: timeRange.fiscalYearStartMonth,
+     weekStart: timeRange.weekStart ?? '',
+     tags: state.tags,
+-    links: state.links.filter((l) => l.origin === undefined),
++    links: state.links.filter(isLinkEditable),
+     graphTooltip,
+     liveNow,
+     schemaVersion: DASHBOARD_SCHEMA_VERSION,
+diff --git a/public/app/features/dashboard-scene/serialization/transformSceneToSaveModelSchemaV2.ts b/public/app/features/dashboard-scene/serialization/transformSceneToSaveModelSchemaV2.ts
+index d40f132ef5ecd..ed130b0f5f2ce 100644
+--- a/public/app/features/dashboard-scene/serialization/transformSceneToSaveModelSchemaV2.ts
++++ b/public/app/features/dashboard-scene/serialization/transformSceneToSaveModelSchemaV2.ts
+@@ -57,6 +57,7 @@ import {
+ import { DashboardDataLayerSet } from '../scene/DashboardDataLayerSet';
+ import { DashboardScene, DashboardSceneState } from '../scene/DashboardScene';
+ import { PanelTimeRange } from '../scene/panel-timerange/PanelTimeRange';
++import { isLinkEditable } from '../settings/links/utils';
+ import { dashboardSceneGraph } from '../utils/dashboardSceneGraph';
+ import { djb2Hash } from '../utils/djb2Hash';
+ import { getLibraryPanelBehavior, getPanelIdForVizPanel, getQueryRunnerFor, isLibraryPanel } from '../utils/utils';
+@@ -100,7 +101,7 @@ export function transformSceneToSaveModelSchemaV2(scene: DashboardScene, isSnaps
+     links: (sceneDash.links || [])
+       // Links with a `origin` property didn't come from the persisted JSON schema, so we also skip them
+       // from generating the JSON model from the scenes object.
+-      .filter((link) => link.origin === undefined)
++      .filter(isLinkEditable)
+       .map((link) => ({
+         title: link.title ?? defaultDashboardLink().title,
+         url: link.url ?? defaultDashboardLink().url,
+diff --git a/public/app/features/dashboard-scene/settings/DashboardLinksEditView.test.tsx b/public/app/features/dashboard-scene/settings/DashboardLinksEditView.test.tsx
+index 72ec912350588..7758c8c4d806d 100644
+--- a/public/app/features/dashboard-scene/settings/DashboardLinksEditView.test.tsx
++++ b/public/app/features/dashboard-scene/settings/DashboardLinksEditView.test.tsx
+@@ -12,6 +12,13 @@ import { activateFullSceneTree } from '../utils/test-utils';
+ import { DashboardLinksEditView } from './DashboardLinksEditView';
+ import { NEW_LINK } from './links/utils';
+ 
++jest.mock('@grafana/runtime', () => ({
++  ...jest.requireActual('@grafana/runtime'),
++  getDataSourceSrv: () => ({
++    getList: () => [{ meta: { id: 'test', name: 'Test Data Source' } }],
++  }),
++}));
++
+ function render(component: React.ReactNode) {
+   return RTLRender(<TestProvider>{component}</TestProvider>);
+ }
+@@ -282,6 +289,31 @@ describe('DashboardLinksEditView', () => {
+       expect(getByText('Edit link')).toBeInTheDocument();
+       expect(getByText('Back to list')).toBeInTheDocument();
+     });
++
++    it('should not show Provisioned by data source section when no links have origin', () => {
++      dashboard.setState({
++        links: [
++          { ...NEW_LINK, title: 'link-1' },
++          { ...NEW_LINK, title: 'link-2' },
++        ],
++      });
++      const { queryByText } = render(<settings.Component model={settings} />);
++
++      expect(queryByText('Provisioned by data source')).not.toBeInTheDocument();
++    });
++
++    it('should show Provisioned by data source section when links have origin', () => {
++      dashboard.setState({
++        links: [
++          { ...NEW_LINK, title: 'ds-link', origin: { type: 'datasource', group: 'test' } },
++          { ...NEW_LINK, title: 'user-link' },
++        ],
++      });
++      const { getByText } = render(<settings.Component model={settings} />);
++
++      expect(getByText('Provisioned by data source')).toBeInTheDocument();
++      expect(getByText('user-link')).toBeInTheDocument();
++    });
+   });
+ });
+ 
+diff --git a/public/app/features/dashboard-scene/settings/DashboardLinksEditView.tsx b/public/app/features/dashboard-scene/settings/DashboardLinksEditView.tsx
+index 7e9ac7ea1851f..c3c8ffd02da03 100644
+--- a/public/app/features/dashboard-scene/settings/DashboardLinksEditView.tsx
++++ b/public/app/features/dashboard-scene/settings/DashboardLinksEditView.tsx
+@@ -8,7 +8,8 @@ import { DashboardScene } from '../scene/DashboardScene';
+ import { NavToolbarActions } from '../scene/NavToolbarActions';
+ import { DashboardLinkForm } from '../settings/links/DashboardLinkForm';
+ import { DashboardLinkList } from '../settings/links/DashboardLinkList';
+-import { NEW_LINK } from '../settings/links/utils';
++import { ProvisionedLinksSection } from '../settings/links/ProvisionedLinksSection';
++import { NEW_LINK, isLinkEditable } from '../settings/links/utils';
+ import { getDashboardSceneFor } from '../utils/utils';
+ 
+ import { EditListViewSceneUrlSync } from './EditListViewSceneUrlSync';
+@@ -84,7 +85,7 @@ export class DashboardLinksEditView extends SceneObjectBase<DashboardLinksEditVi
+     const links = this.links;
+     let count = 0;
+     for (let i = 0; i < links.length; i++) {
+-      if (links[i].origin === undefined) {
++      if (isLinkEditable(links[i])) {
+         if (count === editableIndex) {
+           return i;
+         }
+@@ -104,7 +105,8 @@ function DashboardLinksEditViewRenderer({ model }: SceneComponentProps<Dashboard
+   const dashboard = getDashboardSceneFor(model);
+   const { links } = dashboard.useState();
+   const { navModel, pageNav } = useDashboardEditPageNav(dashboard, model.getUrlKey());
+-  const editableLinks = links.filter((link) => link.origin === undefined);
++  const defaultLinks = links.filter((link) => !isLinkEditable(link));
++  const editableLinks = links.filter(isLinkEditable);
+   const linkToEdit = editIndex !== undefined ? editableLinks[editIndex] : undefined;
+ 
+   if (linkToEdit) {
+@@ -131,6 +133,7 @@ function DashboardLinksEditViewRenderer({ model }: SceneComponentProps<Dashboard
+         onDuplicate={model.onDuplicate}
+         onOrderChange={model.onOrderChange}
+       />
++      {defaultLinks.length > 0 && <ProvisionedLinksSection links={defaultLinks} />}
+     </Page>
+   );
+ }
+diff --git a/public/app/features/dashboard-scene/settings/ProvisionedControlsSection.tsx b/public/app/features/dashboard-scene/settings/ProvisionedControlsSection.tsx
+new file mode 100644
+index 0000000000000..930cd0f9d6c1e
+--- /dev/null
++++ b/public/app/features/dashboard-scene/settings/ProvisionedControlsSection.tsx
+@@ -0,0 +1,104 @@
++import { css } from '@emotion/css';
++import classNames from 'classnames';
++import { ReactNode, useMemo, useState } from 'react';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { Trans, t } from '@grafana/i18n';
++import { getDataSourceSrv } from '@grafana/runtime';
++import { ControlSourceRef } from '@grafana/schema/apis/dashboard.grafana.app/v2';
++import { CollapsableSection, Icon, Stack, Text, Tooltip, useStyles2 } from '@grafana/ui';
++
++type Column = {
++  i18nKey: string;
++  defaultText: string;
++};
++
++type Props = {
++  columns: Column[];
++  children: ReactNode;
++};
++
++export function ProvisionedControlsSection({ columns, children }: Props) {
++  const [isOpen, setIsOpen] = useState(false);
++  const styles = useStyles2(getStyles);
++
++  return (
++    <div className={styles.container}>
++      <CollapsableSection label={<ProvisionedControlsSectionLabel />} isOpen={isOpen} onToggle={setIsOpen}>
++        <table className={classNames('filter-table', 'filter-table--hover', styles.table)} role="grid">
++          <thead>
++            <tr>
++              {columns.map((col) => (
++                <th key={col.i18nKey}>
++                  <Trans i18nKey={col.i18nKey}>{col.defaultText}</Trans>
++                </th>
++              ))}
++              <th className={styles.thNarrow} />
++            </tr>
++          </thead>
++          <tbody>{children}</tbody>
++        </table>
++      </CollapsableSection>
++    </div>
++  );
++}
++
++function ProvisionedControlsSectionLabel() {
++  const styles = useStyles2(getStyles);
++
++  return (
++    <Stack direction="row" gap={1} alignItems="center">
++      <Icon name="database" className={styles.iconMuted} />
++      <Text variant="h5">
++        <Trans i18nKey="dashboard-scene.provisioned-controls-section.label">Provisioned by data source</Trans>
++      </Text>
++    </Stack>
++  );
++}
++
++export function SourceIcon({ origin }: { origin: ControlSourceRef | undefined }) {
++  const styles = useStyles2(getStyles);
++  const pluginName = usePluginName(origin);
++
++  return (
++    <Tooltip content={getSourceTooltip(pluginName)}>
++      <Icon name="database" className={styles.iconMuted} aria-hidden />
++    </Tooltip>
++  );
++}
++
++function getSourceTooltip(pluginName: string | undefined): string {
++  if (pluginName) {
++    return t('dashboard-scene.provisioned-controls-section.tooltip', 'Added by the {{pluginName}} plugin', {
++      pluginName,
++    });
++  }
++  return t('dashboard-scene.provisioned-controls-section.tooltip-unknown', 'Added by a data source plugin');
++}
++
++function usePluginName(origin: ControlSourceRef | undefined): string | undefined {
++  return useMemo(() => {
++    if (!origin?.group) {
++      return undefined;
++    }
++
++    const list = getDataSourceSrv().getList({});
++    const ds = list.find((d) => d.meta.id === origin.group);
++    return ds?.meta.name ?? origin.group;
++  }, [origin?.group]);
++}
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  container: css({
++    marginTop: theme.spacing(3),
++  }),
++  table: css({
++    width: '100%',
++  }),
++  thNarrow: css({
++    width: '1%',
++  }),
++  iconMuted: css({
++    color: theme.colors.text.secondary,
++  }),
++});
+diff --git a/public/app/features/dashboard-scene/settings/VariablesEditView.test.tsx b/public/app/features/dashboard-scene/settings/VariablesEditView.test.tsx
+index d9236bb59e6c0..db914434c82ed 100644
+--- a/public/app/features/dashboard-scene/settings/VariablesEditView.test.tsx
++++ b/public/app/features/dashboard-scene/settings/VariablesEditView.test.tsx
+@@ -1,4 +1,7 @@
++import { render as RTLRender } from '@testing-library/react';
++import * as React from 'react';
+ import { of } from 'rxjs';
++import { TestProvider } from 'test/helpers/TestProvider';
+ 
+ import {
+   FieldType,
+@@ -20,6 +23,10 @@ import { activateFullSceneTree } from '../utils/test-utils';
+ 
+ import { VariablesEditView } from './VariablesEditView';
+ 
++function render(component: React.ReactNode) {
++  return RTLRender(<TestProvider>{component}</TestProvider>);
++}
++
+ setPluginImportUtils({
+   importPanelPlugin: (id: string) => Promise.resolve(getPanelPlugin({})),
+   getPanelPluginFromCache: (id: string) => undefined,
+@@ -205,6 +212,37 @@ describe('VariablesEditView', () => {
+     });
+   });
+ 
++  describe('Provisioned by data source section', () => {
++    let variableView: VariablesEditView;
++
++    beforeEach(async () => {
++      const result = await buildTestScene();
++      variableView = result.variableView;
++    });
++
++    it('should not show Provisioned by data source section when no variables have origin', () => {
++      const { queryByText } = render(<variableView.Component model={variableView} />);
++
++      expect(queryByText('Provisioned by data source')).not.toBeInTheDocument();
++    });
++
++    it('should show Provisioned by data source section when at least one variable has origin', async () => {
++      const variables = variableView.getVariableSet().state.variables;
++      const originVariable = new CustomVariable({
++        name: 'dsVar',
++        query: 'val1, val2',
++        value: 'val1',
++        text: 'val1',
++        origin: { type: 'datasource', group: 'prometheus' },
++      });
++      variableView.getVariableSet().setState({ variables: [...variables, originVariable] });
++
++      const { getByText } = render(<variableView.Component model={variableView} />);
++
++      expect(getByText('Provisioned by data source')).toBeInTheDocument();
++    });
++  });
++
+   describe('Dashboard Variables dependencies', () => {
+     let variableView: VariablesEditView;
+     let dashboard: DashboardScene;
+diff --git a/public/app/features/dashboard-scene/settings/VariablesEditView.tsx b/public/app/features/dashboard-scene/settings/VariablesEditView.tsx
+index 8372837436b84..e5ef7c009e530 100644
+--- a/public/app/features/dashboard-scene/settings/VariablesEditView.tsx
++++ b/public/app/features/dashboard-scene/settings/VariablesEditView.tsx
+@@ -13,6 +13,7 @@ import { createUsagesNetwork, transformUsagesToNetwork } from '../variables/util
+ 
+ import { EditListViewSceneUrlSync } from './EditListViewSceneUrlSync';
+ import { DashboardEditView, DashboardEditViewState, useDashboardEditPageNav } from './utils';
++import { ProvisionedVariablesSection } from './variables/ProvisionedVariablesSection';
+ import { VariableEditorForm } from './variables/VariableEditorForm';
+ import { VariableEditorList } from './variables/VariableEditorList';
+ import { VariablesUnknownTable } from './variables/VariablesUnknownTable';
+@@ -22,6 +23,7 @@ import {
+   WORD_CHARACTERS_REGEX,
+   getVariableDefault,
+   getVariableScene,
++  isVariableEditable,
+ } from './variables/utils';
+ 
+ export interface VariablesEditViewState extends DashboardEditViewState {
+@@ -227,6 +229,7 @@ function VariableEditorSettingsListView({ model }: SceneComponentProps<Variables
+   const { onDelete, onDuplicated, onOrderChanged, onEdit, onTypeChange, onGoBack, onAdd } = model;
+   const { variables } = model.getVariableSet().useState();
+   const { editIndex } = model.useState();
++  const defaultVariables = useMemo(() => variables.filter((v) => !isVariableEditable(v)), [variables]);
+   const usagesNetwork = useMemo(() => model.getUsagesNetwork(), [model]);
+   const usages = useMemo(() => model.getUsages(), [model]);
+   const saveModel = model.getSaveModel();
+@@ -261,6 +264,7 @@ function VariableEditorSettingsListView({ model }: SceneComponentProps<Variables
+         onAdd={onAdd}
+         onEdit={onEdit}
+       />
++      {defaultVariables.length > 0 && <ProvisionedVariablesSection variables={defaultVariables} />}
+       <VariablesUnknownTable variables={variables} dashboard={saveModel} />
+     </Page>
+   );
+diff --git a/public/app/features/dashboard-scene/settings/links/ProvisionedLinksSection.tsx b/public/app/features/dashboard-scene/settings/links/ProvisionedLinksSection.tsx
+new file mode 100644
+index 0000000000000..e6024730c5166
+--- /dev/null
++++ b/public/app/features/dashboard-scene/settings/links/ProvisionedLinksSection.tsx
+@@ -0,0 +1,58 @@
++import { css } from '@emotion/css';
++
++import { DashboardLink } from '@grafana/schema';
++import { Icon, Stack, TagList, useStyles2 } from '@grafana/ui';
++
++import { ProvisionedControlsSection, SourceIcon } from '../ProvisionedControlsSection';
++
++const LINK_COLUMNS = [
++  { i18nKey: 'dashboard-scene.dashboard-link-list.type', defaultText: 'Type' },
++  { i18nKey: 'dashboard-scene.dashboard-link-list.info', defaultText: 'Info' },
++];
++
++export function ProvisionedLinksSection({ links }: { links: DashboardLink[] }) {
++  const styles = useStyles2(getStyles);
++
++  return (
++    <ProvisionedControlsSection columns={LINK_COLUMNS}>
++      {links.map((link, index) => (
++        <tr key={`${link.title}-${index}`}>
++          <td role="gridcell">
++            <Icon name="external-link-alt" /> &nbsp; {link.type}
++          </td>
++          <td role="gridcell">
++            <Stack>
++              {link.title && <span className={styles.titleWrapper}>{link.title}</span>}
++              {link.type === 'link' && <span className={styles.urlWrapper}>{link.url}</span>}
++              {link.type === 'dashboards' && <TagList tags={link.tags ?? []} />}
++            </Stack>
++          </td>
++          <td role="gridcell" className={styles.sourceCell}>
++            <SourceIcon origin={link.origin} />
++          </td>
++        </tr>
++      ))}
++    </ProvisionedControlsSection>
++  );
++}
++
++const getStyles = () => ({
++  titleWrapper: css({
++    width: '20vw',
++    textOverflow: 'ellipsis',
++    overflow: 'hidden',
++    whiteSpace: 'nowrap',
++    display: 'inline-block',
++  }),
++  urlWrapper: css({
++    width: '40vw',
++    textOverflow: 'ellipsis',
++    overflow: 'hidden',
++    whiteSpace: 'nowrap',
++    display: 'inline-block',
++  }),
++  sourceCell: css({
++    width: '1%',
++    textAlign: 'center' as const,
++  }),
++});
+diff --git a/public/app/features/dashboard-scene/settings/links/utils.ts b/public/app/features/dashboard-scene/settings/links/utils.ts
+index 717a2bdaf1c79..18da1601801d6 100644
+--- a/public/app/features/dashboard-scene/settings/links/utils.ts
++++ b/public/app/features/dashboard-scene/settings/links/utils.ts
+@@ -1,6 +1,10 @@
+ import { IconName } from '@grafana/data';
+ import { DashboardLink } from '@grafana/schema';
+ 
++export function isLinkEditable(link: DashboardLink): boolean {
++  return link.origin === undefined;
++}
++
+ export const NEW_LINK: DashboardLink = {
+   icon: 'external link',
+   title: 'New link',
+diff --git a/public/app/features/dashboard-scene/settings/variables/ProvisionedVariablesSection.tsx b/public/app/features/dashboard-scene/settings/variables/ProvisionedVariablesSection.tsx
+new file mode 100644
+index 0000000000000..6c9583abf1af2
+--- /dev/null
++++ b/public/app/features/dashboard-scene/settings/variables/ProvisionedVariablesSection.tsx
+@@ -0,0 +1,58 @@
++import { css } from '@emotion/css';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { SceneVariable } from '@grafana/scenes';
++import { useStyles2 } from '@grafana/ui';
++
++import { ProvisionedControlsSection, SourceIcon } from '../ProvisionedControlsSection';
++
++import { getDefinition } from './utils';
++
++const VARIABLE_COLUMNS = [
++  { i18nKey: 'dashboard-scene.variable-editor-list.variable', defaultText: 'Variable' },
++  { i18nKey: 'dashboard-scene.variable-editor-list.definition', defaultText: 'Definition' },
++];
++
++export function ProvisionedVariablesSection({ variables }: { variables: SceneVariable[] }) {
++  const styles = useStyles2(getStyles);
++
++  return (
++    <ProvisionedControlsSection columns={VARIABLE_COLUMNS}>
++      {variables.map((variable, index) => {
++        const variableState = variable.state;
++
++        return (
++          <tr key={`${variableState.name}-${index}`}>
++            <td role="gridcell" className={styles.nameCell}>
++              {variableState.name}
++            </td>
++            <td role="gridcell" className={styles.definitionColumn}>
++              {getDefinition(variable)}
++            </td>
++            <td role="gridcell" className={styles.sourceCell}>
++              <SourceIcon origin={variableState.origin} />
++            </td>
++          </tr>
++        );
++      })}
++    </ProvisionedControlsSection>
++  );
++}
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  nameCell: css({
++    fontWeight: theme.typography.fontWeightMedium,
++    width: '20%',
++  }),
++  definitionColumn: css({
++    width: '70%',
++    overflow: 'hidden',
++    textOverflow: 'ellipsis',
++    whiteSpace: 'nowrap',
++    maxWidth: 0,
++  }),
++  sourceCell: css({
++    width: '1%',
++    textAlign: 'center' as const,
++  }),
++});
+diff --git a/public/app/features/dashboard-scene/settings/variables/VariableEditorList.tsx b/public/app/features/dashboard-scene/settings/variables/VariableEditorList.tsx
+index 17d83ff745dc2..d528b6c71b786 100644
+--- a/public/app/features/dashboard-scene/settings/variables/VariableEditorList.tsx
++++ b/public/app/features/dashboard-scene/settings/variables/VariableEditorList.tsx
+@@ -9,12 +9,12 @@ import { reportInteraction } from '@grafana/runtime';
+ import { SceneVariable, SceneVariableState } from '@grafana/scenes';
+ import { useStyles2, Stack, Button, EmptyState, TextLink } from '@grafana/ui';
+ 
+-import { isVariableEditable } from '../../serialization/sceneVariablesSetToVariables';
+ import { DashboardInteractions } from '../../utils/interactions';
+ import { VariablesDependenciesButton } from '../../variables/VariablesDependenciesButton';
+ import { UsagesToNetwork, VariableUsageTree } from '../../variables/utils';
+ 
+ import { VariableEditorListRow } from './VariableEditorListRow';
++import { isVariableEditable } from './utils';
+ 
+ export interface Props {
+   variables: Array<SceneVariable<SceneVariableState>>;
+@@ -39,13 +39,16 @@ export function VariableEditorList({
+ }: Props): ReactElement {
+   const styles = useStyles2(getStyles);
+ 
++  const editableVariables = variables.filter(isVariableEditable);
++  const editableToOriginalIndex = editableVariables.map((v) => variables.indexOf(v));
++
+   const onDragEnd = (result: DropResult) => {
+     if (!result.destination || !result.source) {
+       return;
+     }
+ 
+     reportInteraction('Variable drag and drop');
+-    onChangeOrder(result.source.index, result.destination.index);
++    onChangeOrder(editableToOriginalIndex[result.source.index], editableToOriginalIndex[result.destination.index]);
+   };
+ 
+   const onVariableAdd = () => {
+@@ -53,8 +56,6 @@ export function VariableEditorList({
+     DashboardInteractions.addVariableButtonClicked({ source: 'settings_pane' });
+   };
+ 
+-  const editableVariables = variables.filter(isVariableEditable);
+-
+   return editableVariables.length <= 0 ? (
+     <EmptyVariablesList onAdd={onVariableAdd} />
+   ) : (
+@@ -79,11 +80,7 @@ export function VariableEditorList({
+           <Droppable droppableId="variables-list" direction="vertical">
+             {(provided) => (
+               <tbody ref={provided.innerRef} {...provided.droppableProps}>
+-                {variables.map((variableScene, index) => {
+-                  if (!isVariableEditable(variableScene)) {
+-                    return null;
+-                  }
+-
++                {editableVariables.map((variableScene, index) => {
+                   const variableState = variableScene.state;
+                   return (
+                     <VariableEditorListRow
+diff --git a/public/app/features/dashboard-scene/settings/variables/utils.ts b/public/app/features/dashboard-scene/settings/variables/utils.ts
+index f93a5c41eb5af..e0ece5748b37e 100644
+--- a/public/app/features/dashboard-scene/settings/variables/utils.ts
++++ b/public/app/features/dashboard-scene/settings/variables/utils.ts
+@@ -322,3 +322,7 @@ export function validateVariableName(
+ 
+   return { isValid: true };
+ }
++
++export function isVariableEditable(variable: SceneVariable) {
++  return variable.state.type !== 'system' && variable.state.origin === undefined;
++}
+diff --git a/public/locales/en-US/grafana.json b/public/locales/en-US/grafana.json
+index 8878fb578e49a..2616bc8e030bd 100644
+--- a/public/locales/en-US/grafana.json
++++ b/public/locales/en-US/grafana.json
+@@ -6998,6 +6998,11 @@
+       },
+       "title-close": "Close"
+     },
++    "provisioned-controls-section": {
++      "label": "Provisioned by data source",
++      "tooltip": "Added by the {{pluginName}} plugin",
++      "tooltip-unknown": "Added by a data source plugin"
++    },
+     "provisioned-delete-modal": {
+       "cannot-be-deleted": "This dashboard is managed by Grafana provisioning and cannot be deleted. Remove the dashboard from the config file to delete it.",
+       "file-path": "File path: {{dashboardId}}",
+diff --git a/public/test/mocks/datasource_srv.ts b/public/test/mocks/datasource_srv.ts
+index 9179f7258b121..c175536276438 100644
+--- a/public/test/mocks/datasource_srv.ts
++++ b/public/test/mocks/datasource_srv.ts
+@@ -41,9 +41,9 @@ export class MockDataSourceApi extends DataSourceApi {
+     meta?: DataSourcePluginMeta,
+     public error: string | null = null
+   ) {
+-    const instaceSettings =
++    const instanceSettings =
+       typeof datasource === 'string' ? ({ name: datasource } as DataSourceInstanceSettings) : datasource;
+-    super(instaceSettings);
++    super(instanceSettings);
+     if (result) {
+       this.result = result;
+     }
+diff --git a/scripts/codeowners-manifest/README.md b/scripts/codeowners-manifest/README.md
+index 6d1c95b476508..7701100ee2175 100644
+--- a/scripts/codeowners-manifest/README.md
++++ b/scripts/codeowners-manifest/README.md
+@@ -47,3 +47,7 @@ By default these scripts will write the following files to the `/codeowners-mani
+ - `teams-by-filename.json` - Files mapped to their respective codeowners
+ - `filenames-by-team.json` - Codeowners mapped to their respective files
+ - `metadata.json` - Hashes for cache validation
++
++## Excluded paths
++
++For a list of excluded paths and filenames, see `jest.config.codeowner.js`.

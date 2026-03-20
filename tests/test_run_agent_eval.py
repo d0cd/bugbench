@@ -10,7 +10,13 @@ import yaml
 from click.testing import CliRunner
 
 from bugeval.cli import cli
-from bugeval.pr_eval_models import CaseToolState, CaseToolStatus, RunState, ToolDef, ToolType
+from bugeval.pr_eval_models import (
+    CaseToolStatus,
+    ToolDef,
+    ToolType,
+    is_case_done,
+    parse_case_ids,
+)
 from bugeval.run_agent_eval import _resolve_allowed_tools, process_case_agent
 from tests.conftest import make_case
 
@@ -109,7 +115,8 @@ def test_process_case_agent_cli_mode(tmp_path: Path) -> None:
     # Verify context_level is stamped into metadata.json for normalize
     import json
 
-    meta = json.loads((tmp_path / "raw" / "case-001-claude-code-cli" / "metadata.json").read_text())
+    raw = tmp_path / "raw" / "case-001-claude-code-cli-diff-only"
+    meta = json.loads((raw / "metadata.json").read_text())
     assert meta.get("context_level") == "diff-only"
 
 
@@ -286,7 +293,8 @@ def test_run_agent_eval_dry_run(tmp_path: Path) -> None:
     assert "done" in result.output
 
 
-def test_run_agent_eval_checkpoint_written(tmp_path: Path) -> None:
+def test_run_agent_eval_dry_run_no_raw_dir(tmp_path: Path) -> None:
+    """Dry-run mode doesn't write raw output (no actual agent call)."""
     runner = CliRunner()
     config_path = _make_config_yaml(
         tmp_path,
@@ -299,7 +307,7 @@ def test_run_agent_eval_checkpoint_written(tmp_path: Path) -> None:
     (patches_dir / "case-001.patch").write_text("--- a\n+++ b\n")
     run_dir = tmp_path / "results"
 
-    runner.invoke(
+    result = runner.invoke(
         cli,
         [
             "run-agent-eval",
@@ -314,12 +322,14 @@ def test_run_agent_eval_checkpoint_written(tmp_path: Path) -> None:
             "--dry-run",
         ],
     )
-    checkpoint = run_dir / "checkpoint.yaml"
-    assert checkpoint.exists()
+    assert result.exit_code == 0
+    assert "done" in result.output
 
 
-def test_run_agent_eval_checkpoint_resume_skips_done(tmp_path: Path) -> None:
-    """A done pair in the checkpoint should be skipped."""
+def test_run_agent_eval_resume_skips_done(tmp_path: Path) -> None:
+    """A case with existing metadata.json in raw/ should be skipped."""
+    import json
+
     runner = CliRunner()
     config_path = _make_config_yaml(
         tmp_path,
@@ -332,10 +342,10 @@ def test_run_agent_eval_checkpoint_resume_skips_done(tmp_path: Path) -> None:
     run_dir = tmp_path / "results"
     run_dir.mkdir()
 
-    # Pre-populate checkpoint with done state
-    rs = RunState()
-    rs.set(CaseToolState(case_id="case-001", tool="claude-code-cli", status=CaseToolStatus.done))
-    rs.save(run_dir / "checkpoint.yaml")
+    # Pre-populate raw dir with metadata.json to simulate completed case
+    raw_dir = run_dir / "raw" / "case-001-claude-code-cli-diff-only"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "metadata.json").write_text(json.dumps({"context_level": "diff-only"}))
 
     result = runner.invoke(
         cli,
@@ -790,9 +800,8 @@ def test_run_agent_eval_limit_slices_cases(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    checkpoint = run_dir / "checkpoint.yaml"
-    rs = RunState.load(checkpoint)
-    assert len(rs.states()) == 2
+    # Dry run outputs [done] for each processed case
+    assert result.output.count("[done]") == 2
 
 
 def test_run_agent_eval_fail_after_aborts(tmp_path: Path) -> None:
@@ -827,11 +836,12 @@ def test_run_agent_eval_fail_after_aborts(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0
-    checkpoint = run_dir / "checkpoint.yaml"
-    rs = RunState.load(checkpoint)
-    failed = [s for s in rs.states() if s.status == CaseToolStatus.failed]
-    # Circuit breaker fires after 2 failures — only 2 states written
-    assert len(failed) == 2
+    # Circuit breaker fires after 2 failures — count error.json markers
+    raw_dir = run_dir / "raw"
+    error_count = sum(
+        1 for d in raw_dir.iterdir() if d.is_dir() and (d / "error.json").exists()
+    )
+    assert error_count == 2
 
 
 def test_process_case_agent_diff_only_cli_skips_clone(tmp_path: Path) -> None:
@@ -953,7 +963,8 @@ def test_process_case_agent_saves_response_text(tmp_path: Path) -> None:
                 max_turns=5,
             )
 
-    response_text_file = tmp_path / "raw" / "case-001-claude-code-cli" / "response_text.txt"
+    raw = tmp_path / "raw" / "case-001-claude-code-cli-diff-only"
+    response_text_file = raw / "response_text.txt"
     assert response_text_file.exists()
     assert response_text_file.read_text() == "Here is my reasoning."
 
@@ -981,7 +992,8 @@ def test_process_case_agent_no_response_text_file_when_empty(tmp_path: Path) -> 
                 max_turns=5,
             )
 
-    response_text_file = tmp_path / "raw" / "case-001-claude-code-cli" / "response_text.txt"
+    raw = tmp_path / "raw" / "case-001-claude-code-cli-diff-only"
+    response_text_file = raw / "response_text.txt"
     assert not response_text_file.exists()
 
 
@@ -1008,7 +1020,7 @@ def test_process_case_agent_writes_prompt_txt(tmp_path: Path) -> None:
                 max_turns=5,
             )
 
-    prompt_file = tmp_path / "raw" / "case-001-claude-code-cli" / "prompt.txt"
+    prompt_file = tmp_path / "raw" / "case-001-claude-code-cli-diff-only" / "prompt.txt"
     assert prompt_file.exists()
     assert len(prompt_file.read_text()) > 0
 
@@ -1176,3 +1188,178 @@ def test_process_case_agent_allowed_tools_override(tmp_path: Path) -> None:
 
     call_kwargs = mock_local.call_args[1]
     assert call_kwargs["allowed_tools"] == "Read,Grep"
+
+
+# ---------------------------------------------------------------------------
+# is_case_done / parse_case_ids / write_error_marker
+# ---------------------------------------------------------------------------
+
+
+class TestIsCaseDone:
+    def test_not_done_empty_dir(self, tmp_path: Path) -> None:
+        assert not is_case_done(tmp_path, "case-001", "tool", "diff-only")
+
+    def test_done_when_metadata_exists(self, tmp_path: Path) -> None:
+        import json
+
+        raw = tmp_path / "raw" / "case-001-tool-diff-only"
+        raw.mkdir(parents=True)
+        (raw / "metadata.json").write_text(json.dumps({"ok": True}))
+        assert is_case_done(tmp_path, "case-001", "tool", "diff-only")
+
+    def test_not_done_when_only_error(self, tmp_path: Path) -> None:
+        import json
+
+        raw = tmp_path / "raw" / "case-001-tool-diff-only"
+        raw.mkdir(parents=True)
+        (raw / "error.json").write_text(json.dumps({"error": "fail"}))
+        assert not is_case_done(tmp_path, "case-001", "tool", "diff-only")
+
+    def test_pr_done_via_comments_json(self, tmp_path: Path) -> None:
+        import json
+
+        raw = tmp_path / "raw" / "case-001-coderabbit"
+        raw.mkdir(parents=True)
+        (raw / "comments.json").write_text(json.dumps([]))
+        assert is_case_done(tmp_path, "case-001", "coderabbit")
+
+    def test_pr_not_done_without_comments(self, tmp_path: Path) -> None:
+        assert not is_case_done(tmp_path, "case-001", "coderabbit")
+
+
+class TestParseCaseIds:
+    def test_comma_separated(self) -> None:
+        result = parse_case_ids("leo-001,leo-002,snarkVM-001")
+        assert result == ["leo-001", "leo-002", "snarkVM-001"]
+
+    def test_file_path(self, tmp_path: Path) -> None:
+        f = tmp_path / "ids.txt"
+        f.write_text("# pilot step 1\nleo-001\nleo-002\n\n# skip this\nsnarkVM-001\n")
+        result = parse_case_ids(f"@{f}")
+        assert result == ["leo-001", "leo-002", "snarkVM-001"]
+
+    def test_whitespace_handling(self) -> None:
+        result = parse_case_ids(" leo-001 , leo-002 ")
+        assert result == ["leo-001", "leo-002"]
+
+
+# ---------------------------------------------------------------------------
+# --case-ids CLI option
+# ---------------------------------------------------------------------------
+
+
+def test_run_agent_eval_case_ids_filter(tmp_path: Path) -> None:
+    """--case-ids should filter to only specified cases."""
+    runner = CliRunner()
+    config_path = _make_config_yaml(
+        tmp_path,
+        tools=[{"name": "claude-code-cli", "type": "agent", "cooldown_seconds": 0}],
+    )
+    cases_dir = tmp_path / "cases"
+    for i in range(1, 4):
+        _make_case_yaml(cases_dir, f"case-{i:03d}")
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    for i in range(1, 4):
+        (patches_dir / f"case-{i:03d}.patch").write_text("--- a\n+++ b\n")
+    run_dir = tmp_path / "results"
+
+    result = runner.invoke(
+        cli,
+        [
+            "run-agent-eval",
+            "--config",
+            str(config_path),
+            "--cases-dir",
+            str(cases_dir),
+            "--patches-dir",
+            str(patches_dir),
+            "--run-dir",
+            str(run_dir),
+            "--case-ids",
+            "case-001,case-003",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    # Only 2 cases should be processed
+    assert result.output.count("[done]") == 2
+
+
+def test_run_agent_eval_case_ids_file(tmp_path: Path) -> None:
+    """--case-ids with @file should read IDs from file."""
+    runner = CliRunner()
+    config_path = _make_config_yaml(
+        tmp_path,
+        tools=[{"name": "claude-code-cli", "type": "agent", "cooldown_seconds": 0}],
+    )
+    cases_dir = tmp_path / "cases"
+    for i in range(1, 4):
+        _make_case_yaml(cases_dir, f"case-{i:03d}")
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    for i in range(1, 4):
+        (patches_dir / f"case-{i:03d}.patch").write_text("--- a\n+++ b\n")
+    run_dir = tmp_path / "results"
+
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text("case-002\n")
+
+    result = runner.invoke(
+        cli,
+        [
+            "run-agent-eval",
+            "--config",
+            str(config_path),
+            "--cases-dir",
+            str(cases_dir),
+            "--patches-dir",
+            str(patches_dir),
+            "--run-dir",
+            str(run_dir),
+            "--case-ids",
+            f"@{ids_file}",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    assert result.output.count("[done]") == 1
+
+
+def test_run_agent_eval_case_ids_no_match(tmp_path: Path) -> None:
+    """--case-ids with no matching cases should exit cleanly."""
+    runner = CliRunner()
+    config_path = _make_config_yaml(
+        tmp_path,
+        tools=[{"name": "claude-code-cli", "type": "agent", "cooldown_seconds": 0}],
+    )
+    cases_dir = tmp_path / "cases"
+    _make_case_yaml(cases_dir)
+    run_dir = tmp_path / "results"
+
+    result = runner.invoke(
+        cli,
+        [
+            "run-agent-eval",
+            "--config",
+            str(config_path),
+            "--cases-dir",
+            str(cases_dir),
+            "--patches-dir",
+            str(tmp_path),
+            "--run-dir",
+            str(run_dir),
+            "--case-ids",
+            "nonexistent-001",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "No cases matched" in result.output
+
+
+def test_run_agent_eval_help_shows_case_ids() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["run-agent-eval", "--help"])
+    assert result.exit_code == 0
+    assert "--case-ids" in result.output

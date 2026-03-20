@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +12,7 @@ import yaml
 
 from bugeval.agent_cli_runner import run_claude_cli
 from bugeval.git_utils import GitError, run_git
-from bugeval.io import load_candidates, save_case
+from bugeval.io import extract_json_from_text, load_candidates, save_case
 from bugeval.models import (
     Candidate,
     Category,
@@ -129,11 +128,13 @@ def build_curation_prompt(candidate: Candidate, diff_context: str, git_log: str 
             ]
         )
 
-    lines.extend([
-        "",
-        "Analyze this PR and return the JSON. Look for bugs, code smells,"
-        " security issues, incomplete changes — anything a good reviewer would flag.",
-    ])
+    lines.extend(
+        [
+            "",
+            "Analyze this PR and return the JSON. Look for bugs, code smells,"
+            " security issues, incomplete changes — anything a good reviewer would flag.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -199,6 +200,8 @@ def parse_llm_response(
         pr_number=candidate.pr_number,
         reviewer_notes=candidate.reviewer_notes,
         reviewer_findings=candidate.reviewer_findings,
+        pr_title=candidate.title,
+        pr_body=candidate.body,
     )
 
 
@@ -213,23 +216,6 @@ def _generate_case_id(repo: str, output_dir: Path) -> str:
         except ValueError:
             pass
     return f"{prefix}{max_index + 1:03d}"
-
-
-def _extract_json_from_text(text: str) -> dict[str, Any] | None:
-    """Extract the first JSON object from a text response."""
-    # Strip code fences if present
-    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-    if fence_match:
-        text = fence_match.group(1)
-
-    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not brace_match:
-        return None
-
-    try:
-        return json.loads(brace_match.group(0))  # type: ignore[no-any-return]
-    except json.JSONDecodeError:
-        return None
 
 
 def curate_candidate(
@@ -255,7 +241,7 @@ def curate_candidate(
     )
     if agent_result.error:
         raise RuntimeError(agent_result.error)
-    data = _extract_json_from_text(agent_result.response_text or "")
+    data = extract_json_from_text(agent_result.response_text or "")
     if data is None:
         return None
     try:

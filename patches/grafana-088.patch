@@ -1,0 +1,2354 @@
+diff --git a/e2e-playwright/smoke-tests-suite/panels.spec.ts b/e2e-playwright/smoke-tests-suite/panels.spec.ts
+index d502afe4f776f..ef2037dcdf78c 100644
+--- a/e2e-playwright/smoke-tests-suite/panels.spec.ts
++++ b/e2e-playwright/smoke-tests-suite/panels.spec.ts
+@@ -32,11 +32,11 @@ test.describe(
+       });
+ 
+       const vizPicker = dashboardPage.getByGrafanaSelector(selectors.components.PanelEditor.toggleVizPicker);
+-      await expect(
+-        vizPicker.filter({ hasText: 'Back' }),
+-        'we should be viewing the viz picker already since this is a new panel'
+-      ).toBeVisible();
+-      await vizPicker.click({ force: true });
++
++      // when newVizSuggestions=true the viz picker may be auto-opened
++      if (await vizPicker.filter({ hasText: 'Back' }).isVisible()) {
++        await vizPicker.click({ force: true });
++      }
+ 
+       // Loop through every panel type and ensure no crash
+       for (const [_, panel] of Object.entries(panelTypes)) {
+diff --git a/eslint-suppressions.json b/eslint-suppressions.json
+index 630aa9e2b5018..179df2c138dc5 100644
+--- a/eslint-suppressions.json
++++ b/eslint-suppressions.json
+@@ -1688,11 +1688,6 @@
+       "count": 1
+     }
+   },
+-  "public/app/features/dashboard-scene/panel-edit/PanelDataPane/PanelDataPane.tsx": {
+-    "@typescript-eslint/consistent-type-assertions": {
+-      "count": 1
+-    }
+-  },
+   "public/app/features/dashboard-scene/saving/SaveDashboardForm.tsx": {
+     "no-restricted-syntax": {
+       "count": 1
+diff --git a/packages/grafana-data/src/types/featureToggles.gen.ts b/packages/grafana-data/src/types/featureToggles.gen.ts
+index 82ee4cc2b43a3..4bee60d88bdd9 100644
+--- a/packages/grafana-data/src/types/featureToggles.gen.ts
++++ b/packages/grafana-data/src/types/featureToggles.gen.ts
+@@ -1483,6 +1483,11 @@ export interface FeatureToggles {
+   */
+   multiPropsVariables?: boolean;
+   /**
++  * Enables support for section level variables (rows and tabs)
++  * @default false
++  */
++  dashboardSectionVariables?: boolean;
++  /**
+   * Enables the ASAP smoothing transformation for time series data
+   * @default false
+   */
+diff --git a/packages/grafana-schema/src/common/common.gen.ts b/packages/grafana-schema/src/common/common.gen.ts
+index 04475219dabcc..e3c9ff283fcdb 100644
+--- a/packages/grafana-schema/src/common/common.gen.ts
++++ b/packages/grafana-schema/src/common/common.gen.ts
+@@ -662,6 +662,7 @@ export interface VizLegendOptions {
+   calcs: Array<string>;
+   displayMode: LegendDisplayMode;
+   isVisible?: boolean;
++  limit?: number;
+   placement: LegendPlacement;
+   showLegend: boolean;
+   sortBy?: string;
+diff --git a/packages/grafana-schema/src/common/mudball.cue b/packages/grafana-schema/src/common/mudball.cue
+index 6aeca5ea925b4..f7aeaeda57b5e 100644
+--- a/packages/grafana-schema/src/common/mudball.cue
++++ b/packages/grafana-schema/src/common/mudball.cue
+@@ -253,6 +253,7 @@ VizLegendOptions: {
+ 	sortBy?:      string
+ 	sortDesc?:    bool
+ 	width?:       number
++	limit?:       number
+ 	calcs:        [...string]
+ } @cuetsy(kind="interface")
+ 
+diff --git a/packages/grafana-ui/src/components/List/AbstractList.tsx b/packages/grafana-ui/src/components/List/AbstractList.tsx
+index de1d360800f07..1cd81e90099bb 100644
+--- a/packages/grafana-ui/src/components/List/AbstractList.tsx
++++ b/packages/grafana-ui/src/components/List/AbstractList.tsx
+@@ -1,17 +1,24 @@
+ import { cx, css } from '@emotion/css';
+-import { PureComponent, type JSX } from 'react';
++import { useMemo, type JSX } from 'react';
++
++import { Trans } from '@grafana/i18n';
+ 
+ import { stylesFactory } from '../../themes/stylesFactory';
++import { Button } from '../Button/Button';
++
++import { useLimit } from './hooks';
+ 
+ export interface ListProps<T> {
+   items: T[];
+   renderItem: (item: T, index: number) => JSX.Element;
+   getItemKey?: (item: T) => string;
+   className?: string;
++  limit?: number;
+ }
+ 
+ interface AbstractListProps<T> extends ListProps<T> {
+   inline?: boolean;
++  limit?: number;
+ }
+ 
+ const getStyles = stylesFactory((inlineList = false) => ({
+@@ -29,25 +36,36 @@ const getStyles = stylesFactory((inlineList = false) => ({
+ /** @deprecated Use ul/li/arr.map directly instead */
+ // no point converting, this is deprecated
+ // eslint-disable-next-line react-prefer-function-component/react-prefer-function-component
+-export class AbstractList<T> extends PureComponent<AbstractListProps<T>> {
+-  constructor(props: AbstractListProps<T>) {
+-    super(props);
+-  }
+-
+-  render() {
+-    const { items, renderItem, getItemKey, className, inline } = this.props;
+-    const styles = getStyles(inline);
+-
+-    return (
+-      <ul className={cx(styles.list, className)}>
+-        {items.map((item, i) => {
+-          return (
+-            <li className={styles.item} key={getItemKey ? getItemKey(item) : i}>
+-              {renderItem(item, i)}
+-            </li>
+-          );
+-        })}
+-      </ul>
+-    );
+-  }
+-}
++export const AbstractList = <T,>({
++  items,
++  renderItem,
++  getItemKey,
++  className,
++  inline,
++  limit = 0,
++}: AbstractListProps<T>) => {
++  const styles = getStyles(inline);
++
++  const [curLimit, setLimit] = useLimit(limit);
++
++  const limitedItems = useMemo(() => (curLimit > 0 ? items.slice(0, curLimit) : items), [items, curLimit]);
++
++  return (
++    <ul className={cx(styles.list, className)}>
++      {limitedItems.map((item, i) => {
++        return (
++          <li className={styles.item} key={getItemKey ? getItemKey(item) : i}>
++            {renderItem(item, i)}
++          </li>
++        );
++      })}
++      {curLimit > 0 && items.length > curLimit && (
++        <li className={styles.item} key="__limit">
++          <Button fill="text" variant="primary" size="sm" onClick={() => setLimit(0)}>
++            <Trans i18nKey={'legend.container.show-all-series'}>...show all {{ total: items.length }} items</Trans>
++          </Button>
++        </li>
++      )}
++    </ul>
++  );
++};
+diff --git a/packages/grafana-ui/src/components/List/InlineList.tsx b/packages/grafana-ui/src/components/List/InlineList.tsx
+index c27df3f908499..de0680f0a7793 100644
+--- a/packages/grafana-ui/src/components/List/InlineList.tsx
++++ b/packages/grafana-ui/src/components/List/InlineList.tsx
+@@ -1,12 +1,8 @@
+-import { PureComponent } from 'react';
+-
+ import { ListProps, AbstractList } from './AbstractList';
+ 
+ /** @deprecated Use ul/li/arr.map directly instead */
+ // no point converting, this is deprecated
+ // eslint-disable-next-line react-prefer-function-component/react-prefer-function-component
+-export class InlineList<T> extends PureComponent<ListProps<T>> {
+-  render() {
+-    return <AbstractList inline {...this.props} />;
+-  }
+-}
++export const InlineList = <T,>(props: ListProps<T>) => {
++  return <AbstractList inline {...props} />;
++};
+diff --git a/packages/grafana-ui/src/components/List/List.tsx b/packages/grafana-ui/src/components/List/List.tsx
+index d4b86807a7b92..a0d2d7d23a100 100644
+--- a/packages/grafana-ui/src/components/List/List.tsx
++++ b/packages/grafana-ui/src/components/List/List.tsx
+@@ -1,5 +1,3 @@
+-import { PureComponent } from 'react';
+-
+ import { ListProps, AbstractList } from './AbstractList';
+ 
+ /**
+@@ -9,8 +7,6 @@ import { ListProps, AbstractList } from './AbstractList';
+  */
+ // no point converting, this is deprecated
+ // eslint-disable-next-line react-prefer-function-component/react-prefer-function-component
+-export class List<T> extends PureComponent<ListProps<T>> {
+-  render() {
+-    return <AbstractList {...this.props} />;
+-  }
+-}
++export const List = <T,>(props: ListProps<T>) => {
++  return <AbstractList {...props} />;
++};
+diff --git a/packages/grafana-ui/src/components/List/hooks.test.ts b/packages/grafana-ui/src/components/List/hooks.test.ts
+new file mode 100644
+index 0000000000000..ba9bdf8bd3616
+--- /dev/null
++++ b/packages/grafana-ui/src/components/List/hooks.test.ts
+@@ -0,0 +1,53 @@
++import { act, renderHook } from '@testing-library/react';
++
++import { useLimit } from './hooks';
++
++describe('useLimit', () => {
++  it('should return the correct limit', () => {
++    const { result } = renderHook(() => useLimit(10));
++    expect(result.current[0]).toBe(10);
++  });
++
++  it('should update the limit when the provided limit changes', () => {
++    const { result } = renderHook(() => useLimit(10));
++    act(() => {
++      result.current[1](20);
++    });
++    expect(result.current[0]).toBe(20);
++  });
++
++  it('should expose a setter function that can be used to update the limit', () => {
++    const { result } = renderHook(() => useLimit(10));
++    act(() => {
++      const setLimit = result.current[1];
++      setLimit((v) => v + 20);
++    });
++    expect(result.current[0]).toBe(30);
++  });
++
++  it('should not update the limit when the provided limit is the same', () => {
++    const { result, rerender } = renderHook(({ providedLimit }) => useLimit(providedLimit), {
++      initialProps: { providedLimit: 10 },
++    });
++    act(() => {
++      const setLimit = result.current[1];
++      setLimit(20);
++    });
++    expect(result.current[0]).toBe(20);
++    rerender({ providedLimit: 10 });
++    expect(result.current[0]).toBe(20);
++  });
++
++  it('should update the limit when the provided limit is the not the same and the current limit is the same', () => {
++    const { result, rerender } = renderHook(({ providedLimit }) => useLimit(providedLimit), {
++      initialProps: { providedLimit: 10 },
++    });
++    act(() => {
++      const setLimit = result.current[1];
++      setLimit(20);
++    });
++    expect(result.current[0]).toBe(20);
++    rerender({ providedLimit: 30 });
++    expect(result.current[0]).toBe(30);
++  });
++});
+diff --git a/packages/grafana-ui/src/components/List/hooks.ts b/packages/grafana-ui/src/components/List/hooks.ts
+new file mode 100644
+index 0000000000000..ef647be81c35a
+--- /dev/null
++++ b/packages/grafana-ui/src/components/List/hooks.ts
+@@ -0,0 +1,13 @@
++import { Dispatch, SetStateAction, useEffect, useRef, useState } from 'react';
++
++export function useLimit(providedLimit: number): [number, Dispatch<SetStateAction<number>>] {
++  const [curLimit, setLimit] = useState(providedLimit);
++  const lastProvidedLimit = useRef(providedLimit);
++  useEffect(() => {
++    if (lastProvidedLimit.current !== providedLimit && curLimit !== providedLimit) {
++      setLimit(providedLimit);
++      lastProvidedLimit.current = providedLimit;
++    }
++  }, [providedLimit, curLimit]);
++  return [curLimit, setLimit];
++}
+diff --git a/packages/grafana-ui/src/components/VizLegend/VizLegend.tsx b/packages/grafana-ui/src/components/VizLegend/VizLegend.tsx
+index 0a8dc48d3a926..565bb88ceb010 100644
+--- a/packages/grafana-ui/src/components/VizLegend/VizLegend.tsx
++++ b/packages/grafana-ui/src/components/VizLegend/VizLegend.tsx
+@@ -31,6 +31,7 @@ export function VizLegend<T>({
+   itemRenderer,
+   readonly,
+   isSortable,
++  limit,
+ }: LegendProps<T>) {
+   const { eventBus, onToggleSeriesVisibility, onToggleLegendSort } = usePanelContext();
+ 
+@@ -99,10 +100,11 @@ export function VizLegend<T>({
+           itemRenderer={itemRenderer}
+           readonly={readonly}
+           items={items}
++          limit={limit}
+         />
+       );
+     },
+-    [className, placement, onMouseOver, onMouseOut, onLegendLabelClick, itemRenderer, readonly]
++    [className, placement, onMouseOver, onMouseOut, onLegendLabelClick, itemRenderer, readonly, limit]
+   );
+ 
+   switch (displayMode) {
+@@ -121,6 +123,7 @@ export function VizLegend<T>({
+           itemRenderer={itemRenderer}
+           readonly={readonly}
+           isSortable={isSortable}
++          limit={limit}
+         />
+       );
+     case LegendDisplayMode.List:
+diff --git a/packages/grafana-ui/src/components/VizLegend/VizLegendList.tsx b/packages/grafana-ui/src/components/VizLegend/VizLegendList.tsx
+index 7bd8e345d9462..aed810908eb79 100644
+--- a/packages/grafana-ui/src/components/VizLegend/VizLegendList.tsx
++++ b/packages/grafana-ui/src/components/VizLegend/VizLegendList.tsx
+@@ -1,4 +1,5 @@
+ import { css, cx } from '@emotion/css';
++import { useMemo } from 'react';
+ 
+ import { GrafanaTheme2 } from '@grafana/data';
+ 
+@@ -23,6 +24,7 @@ export const VizLegendList = <T extends unknown>({
+   placement,
+   className,
+   readonly,
++  limit = 0,
+ }: Props<T>) => {
+   const styles = useStyles2(getStyles);
+ 
+@@ -39,6 +41,16 @@ export const VizLegendList = <T extends unknown>({
+     );
+   }
+ 
++  // split into left & right items when bottom/default legend, else everything goes in leftItems
++  const leftItems = useMemo(
++    () => (placement === 'right' ? items : items.filter((item) => item.yAxis === 1)),
++    [placement, items]
++  );
++  const rightItems = useMemo(
++    () => (placement === 'right' ? [] : items.filter((item) => item.yAxis !== 1)),
++    [placement, items]
++  );
++
+   const getItemKey = (item: VizLegendItem<T>) => `${item.getItemKey ? item.getItemKey() : item.label}`;
+ 
+   switch (placement) {
+@@ -49,15 +61,12 @@ export const VizLegendList = <T extends unknown>({
+ 
+       return (
+         <div className={cx(styles.rightWrapper, className)}>
+-          <List items={items} renderItem={renderItem} getItemKey={getItemKey} />
++          <List items={leftItems} renderItem={renderItem} getItemKey={getItemKey} limit={limit} />
+         </div>
+       );
+     }
+     case 'bottom':
+     default: {
+-      const leftItems = items.filter((item) => item.yAxis === 1);
+-      const rightItems = items.filter((item) => item.yAxis !== 1);
+-
+       const renderItem = (item: VizLegendItem<T>, index: number) => {
+         return <span className={styles.itemBottom}>{itemRenderer!(item, index)}</span>;
+       };
+@@ -66,12 +75,12 @@ export const VizLegendList = <T extends unknown>({
+         <div className={cx(styles.bottomWrapper, className)}>
+           {leftItems.length > 0 && (
+             <div className={styles.section}>
+-              <InlineList items={leftItems} renderItem={renderItem} getItemKey={getItemKey} />
++              <InlineList items={leftItems} renderItem={renderItem} getItemKey={getItemKey} limit={limit} />
+             </div>
+           )}
+           {rightItems.length > 0 && (
+             <div className={cx(styles.section, styles.sectionRight)}>
+-              <InlineList items={rightItems} renderItem={renderItem} getItemKey={getItemKey} />
++              <InlineList items={rightItems} renderItem={renderItem} getItemKey={getItemKey} limit={limit} />
+             </div>
+           )}
+         </div>
+diff --git a/packages/grafana-ui/src/components/VizLegend/VizLegendTable.tsx b/packages/grafana-ui/src/components/VizLegend/VizLegendTable.tsx
+index b654a2d3ac61e..4c142c137c188 100644
+--- a/packages/grafana-ui/src/components/VizLegend/VizLegendTable.tsx
++++ b/packages/grafana-ui/src/components/VizLegend/VizLegendTable.tsx
+@@ -1,10 +1,13 @@
+ import { css, cx } from '@emotion/css';
+-import type { JSX } from 'react';
++import { useMemo, type JSX } from 'react';
+ 
+ import { GrafanaTheme2 } from '@grafana/data';
++import { Trans } from '@grafana/i18n';
+ 
+ import { useStyles2 } from '../../themes/ThemeContext';
++import { Button } from '../Button/Button';
+ import { Icon } from '../Icon/Icon';
++import { useLimit } from '../List/hooks';
+ 
+ import { LegendTableItem } from './VizLegendTableItem';
+ import { VizLegendItem, VizLegendTableProps } from './types';
+@@ -27,6 +30,7 @@ export const VizLegendTable = <T extends unknown>({
+   onLabelMouseOut,
+   readonly,
+   isSortable,
++  limit = 0,
+ }: VizLegendTableProps<T>): JSX.Element => {
+   const styles = useStyles2(getStyles);
+   const header: Record<string, string> = {
+@@ -70,6 +74,10 @@ export const VizLegendTable = <T extends unknown>({
+     }
+   }
+ 
++  const [curLimit, setLimit] = useLimit(limit);
++
++  const limitedItems = useMemo(() => (curLimit > 0 ? items.slice(0, curLimit) : items), [items, curLimit]);
++
+   if (!itemRenderer) {
+     /* eslint-disable-next-line react/display-name */
+     itemRenderer = (item, index) => (
+@@ -110,7 +118,18 @@ export const VizLegendTable = <T extends unknown>({
+           ))}
+         </tr>
+       </thead>
+-      <tbody>{items.map(itemRenderer!)}</tbody>
++      <tbody>{limitedItems.map(itemRenderer!)}</tbody>
++      {curLimit > 0 && items.length > curLimit && (
++        <tfoot>
++          <tr>
++            <td colSpan={100} style={{ textAlign: 'right' }}>
++              <Button fill="text" variant="primary" size="sm" onClick={() => setLimit(0)}>
++                <Trans i18nKey={'legend.container.show-all-series'}>...show all {{ total: items.length }} items</Trans>
++              </Button>
++            </td>
++          </tr>
++        </tfoot>
++      )}
+     </table>
+   );
+ };
+diff --git a/packages/grafana-ui/src/components/VizLegend/types.ts b/packages/grafana-ui/src/components/VizLegend/types.ts
+index 3c0de880792a6..43f7f2f0c3279 100644
+--- a/packages/grafana-ui/src/components/VizLegend/types.ts
++++ b/packages/grafana-ui/src/components/VizLegend/types.ts
+@@ -27,6 +27,7 @@ export interface VizLegendBaseProps<T> {
+     event: React.MouseEvent<HTMLButtonElement> | React.FocusEvent<HTMLButtonElement>
+   ) => void;
+   readonly?: boolean;
++  limit?: number;
+ }
+ 
+ export interface VizLegendTableProps<T> extends VizLegendBaseProps<T> {
+diff --git a/packages/grafana-ui/src/components/uPlot/PlotLegend.tsx b/packages/grafana-ui/src/components/uPlot/PlotLegend.tsx
+index 13d2067ce3dd2..594fcd92a1152 100644
+--- a/packages/grafana-ui/src/components/uPlot/PlotLegend.tsx
++++ b/packages/grafana-ui/src/components/uPlot/PlotLegend.tsx
+@@ -40,8 +40,9 @@ export function hasVisibleLegendSeries(config: UPlotConfigBuilder, data: DataFra
+ }
+ 
+ export const PlotLegend = memo(
+-  ({ data, config, placement, calcs, displayMode, ...vizLayoutLegendProps }: PlotLegendProps) => {
++  ({ data, config, placement, calcs, displayMode, limit, ...vizLayoutLegendProps }: PlotLegendProps) => {
+     const theme = useTheme2();
++
+     const legendItems = config
+       .getSeries()
+       .map<VizLegendItem | undefined>((s) => {
+@@ -85,6 +86,7 @@ export const PlotLegend = memo(
+           sortBy={vizLayoutLegendProps.sortBy}
+           sortDesc={vizLayoutLegendProps.sortDesc}
+           isSortable={true}
++          limit={limit}
+         />
+       </VizLayout.Legend>
+     );
+diff --git a/packages/grafana-ui/src/options/builder/legend.tsx b/packages/grafana-ui/src/options/builder/legend.tsx
+index 366f13f9e440d..7271f681ede33 100644
+--- a/packages/grafana-ui/src/options/builder/legend.tsx
++++ b/packages/grafana-ui/src/options/builder/legend.tsx
+@@ -8,9 +8,11 @@ import { LegendDisplayMode, OptionsWithLegend } from '@grafana/schema';
+ export function addLegendOptions<T extends OptionsWithLegend>(
+   builder: PanelOptionsEditorBuilder<T>,
+   includeLegendCalcs = true,
+-  showLegend = true
++  showLegend = true,
++  vizLegendSeriesLimit = false
+ ) {
+   const category = [t('grafana-ui.builder.legend.category', 'Legend')];
++
+   builder
+     .addBooleanSwitch({
+       path: 'legend.showLegend',
+@@ -57,6 +59,16 @@ export function addLegendOptions<T extends OptionsWithLegend>(
+       showIf: (c) => c.legend.showLegend && c.legend.placement === 'right',
+     });
+ 
++  if (vizLegendSeriesLimit) {
++    builder.addNumberInput({
++      path: 'legend.limit',
++      name: t('grafana-ui.builder.legend.name-limit', 'Limit'),
++      category,
++      description: t('grafana-ui.builder.legend.description-limit', 'Limits how many items are shown by default'),
++      showIf: (c) => c.legend.showLegend,
++    });
++  }
++
+   if (includeLegendCalcs) {
+     builder.addCustomEditor<StatsPickerConfigSettings, string[]>({
+       id: 'legend.calcs',
+diff --git a/pkg/services/featuremgmt/registry.go b/pkg/services/featuremgmt/registry.go
+index ca590ef4a1cd9..82fb1778b80b7 100644
+--- a/pkg/services/featuremgmt/registry.go
++++ b/pkg/services/featuremgmt/registry.go
+@@ -2345,6 +2345,14 @@ var (
+ 			Owner:        grafanaDashboardsSquad,
+ 			Expression:   "false",
+ 		},
++		{
++			Name:         "dashboardSectionVariables",
++			Description:  "Enables support for section level variables (rows and tabs)",
++			Stage:        FeatureStageExperimental,
++			FrontendOnly: true,
++			Owner:        grafanaDashboardsSquad,
++			Expression:   "false",
++		},
+ 		{
+ 			Name:         "smoothingTransformation",
+ 			Description:  "Enables the ASAP smoothing transformation for time series data",
+diff --git a/pkg/services/featuremgmt/toggles_gen.csv b/pkg/services/featuremgmt/toggles_gen.csv
+index d3588faf65421..d9d5f9eafe7eb 100644
+--- a/pkg/services/featuremgmt/toggles_gen.csv
++++ b/pkg/services/featuremgmt/toggles_gen.csv
+@@ -243,7 +243,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-07-15,sharingDashboardImage,GA,@grafana/sharing-squad,false,false,true
+ 2025-06-17,preferLibraryPanelTitle,privatePreview,@grafana/dashboards-squad,false,false,false
+ 2025-06-25,newInfluxDSConfigPageDesign,privatePreview,@grafana/partner-datasources,false,false,false
+-2025-06-30,enableAppChromeExtensions,experimental,@grafana/plugins-platform-backend,false,false,true
++2025-06-29,enableAppChromeExtensions,experimental,@grafana/plugins-platform-backend,false,false,true
+ 2025-10-13,enableDashboardEmptyExtensions,experimental,@grafana/dashboards-squad,false,false,true
+ 2025-07-03,foldersAppPlatformAPI,experimental,@grafana/grafana-frontend-navigation,false,false,true
+ 2025-07-16,otelLogsFormatting,experimental,@grafana/observability-logs,false,false,true
+@@ -291,6 +291,7 @@ Created,Name,Stage,Owner,requiresDevMode,RequiresRestart,FrontendOnly
+ 2025-11-27,kubernetesAlertingHistorian,experimental,@grafana/alerting-squad,false,true,false
+ 2025-12-05,useMTPlugins,experimental,@grafana/plugins-platform-backend,false,false,true
+ 2025-12-09,multiPropsVariables,experimental,@grafana/dashboards-squad,false,false,true
++2026-03-02,dashboardSectionVariables,experimental,@grafana/dashboards-squad,false,false,true
+ 2026-01-05,smoothingTransformation,experimental,@grafana/datapro,false,false,true
+ 2026-01-06,secretsManagementAppPlatformAwsKeeper,experimental,@grafana/grafana-operator-experience-squad,false,false,false
+ 2026-01-07,profilesExemplars,experimental,@grafana/observability-traces-and-profiling,false,false,false
+diff --git a/pkg/services/featuremgmt/toggles_gen.json b/pkg/services/featuremgmt/toggles_gen.json
+index 0f82afa837ea7..cf9fd76c3178f 100644
+--- a/pkg/services/featuremgmt/toggles_gen.json
++++ b/pkg/services/featuremgmt/toggles_gen.json
+@@ -1324,6 +1324,20 @@
+         "expression": "false"
+       }
+     },
++    {
++      "metadata": {
++        "name": "dashboardSectionVariables",
++        "resourceVersion": "1772489275727",
++        "creationTimestamp": "2026-03-02T22:07:55Z"
++      },
++      "spec": {
++        "description": "Enables support for section level variables (rows and tabs)",
++        "stage": "experimental",
++        "codeowner": "@grafana/dashboards-squad",
++        "frontend": true,
++        "expression": "false"
++      }
++    },
+     {
+       "metadata": {
+         "name": "dashboardTemplates",
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelDataPane/NewAlertRuleButton.tsx b/public/app/features/dashboard-scene/panel-edit/PanelDataPane/NewAlertRuleButton.tsx
+index d037358629f6c..a024229f80d8e 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelDataPane/NewAlertRuleButton.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelDataPane/NewAlertRuleButton.tsx
+@@ -6,7 +6,7 @@ import { GrafanaTheme2, urlUtil } from '@grafana/data';
+ import { Trans, t } from '@grafana/i18n';
+ import { locationService, logInfo } from '@grafana/runtime';
+ import { VizPanel } from '@grafana/scenes';
+-import { Alert, Button, ButtonVariant, useStyles2 } from '@grafana/ui';
++import { Alert, Button, ButtonVariant, Tooltip, useStyles2 } from '@grafana/ui';
+ import { LogMessages } from 'app/features/alerting/unified/Analytics';
+ import { scenesPanelToRuleFormValues } from 'app/features/alerting/unified/utils/rule-form';
+ 
+@@ -19,6 +19,7 @@ interface ScenesNewRuleFromPanelButtonProps {
+   size?: 'xs' | 'sm' | 'md' | 'lg';
+   compactAlert?: boolean;
+   fill?: ButtonFill;
++  disabled?: boolean;
+ }
+ export const ScenesNewRuleFromPanelButton = ({
+   panel,
+@@ -27,12 +28,30 @@ export const ScenesNewRuleFromPanelButton = ({
+   size = 'md',
+   fill = 'solid',
+   compactAlert = false,
++  disabled = false,
+ }: ScenesNewRuleFromPanelButtonProps) => {
+   const styles = useStyles2(getStyles);
+   const location = useLocation();
+ 
+   const { loading, value: formValues } = useAsync(() => scenesPanelToRuleFormValues(panel), [panel]);
+ 
++  if (disabled) {
++    return (
++      <Tooltip
++        content={t(
++          'dashboard-scene.scenes-new-rule-from-panel-button.disabled-tooltip',
++          'Save the dashboard before creating alert rules'
++        )}
++      >
++        <span>
++          <Button disabled icon="bell" variant={variant} size={size} fill={fill} className={className}>
++            <Trans i18nKey="dashboard-scene.scenes-new-rule-from-panel-button.new-alert-rule">New alert rule</Trans>
++          </Button>
++        </span>
++      </Tooltip>
++    );
++  }
++
+   if (loading) {
+     return (
+       <Button disabled={true} variant={variant} size={size}>
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelDataPane/PanelDataPane.tsx b/public/app/features/dashboard-scene/panel-edit/PanelDataPane/PanelDataPane.tsx
+index 5051fc917354e..4818449141974 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelDataPane/PanelDataPane.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelDataPane/PanelDataPane.tsx
+@@ -24,6 +24,10 @@ import { PanelDataQueriesTab } from './PanelDataQueriesTab';
+ import { PanelDataTransformationsTab } from './PanelDataTransformationsTab';
+ import { PanelDataPaneTab, TabId } from './types';
+ 
++function isTabId(value: string): value is TabId {
++  return Object.values<string>(TabId).includes(value);
++}
++
+ export interface PanelDataPaneState extends SceneObjectState {
+   tabs: PanelDataPaneTab[];
+   tab: TabId;
+@@ -76,8 +80,8 @@ export class PanelDataPane extends SceneObjectBase<PanelDataPaneState> {
+     if (!values.tab) {
+       return;
+     }
+-    if (typeof values.tab === 'string') {
+-      this.setState({ tab: values.tab as TabId });
++    if (typeof values.tab === 'string' && isTabId(values.tab)) {
++      this.setState({ tab: values.tab });
+     }
+   }
+ }
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditControls.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditControls.tsx
+index 1af8fdfbdbdee..3f8e3d76e4d47 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditControls.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditControls.tsx
+@@ -4,7 +4,7 @@ import { GrafanaTheme2 } from '@grafana/data';
+ import { selectors } from '@grafana/e2e-selectors';
+ import { t } from '@grafana/i18n';
+ import { config } from '@grafana/runtime';
+-import { InlineSwitch, useStyles2 } from '@grafana/ui';
++import { Button, InlineSwitch, useStyles2 } from '@grafana/ui';
+ 
+ import { PanelEditor } from './PanelEditor';
+ 
+@@ -22,6 +22,19 @@ export function PanelEditControls({ panelEditor }: Props) {
+ 
+   return (
+     <div className={styles.container}>
++      {config.featureToggles.queryEditorNext && (
++        <Button
++          onClick={panelEditor.onToggleQueryEditorVersion}
++          tooltip=""
++          variant="primary"
++          fill="text"
++          icon={useQueryExperienceNext ? 'arrow-left' : 'rocket'}
++        >
++          {useQueryExperienceNext
++            ? t('dashboard-scene.panel-edit-controls.back-to-classic', 'Back to classic editor')
++            : t('dashboard-scene.panel-edit-controls.try-new-editor', 'Try new editor')}
++        </Button>
++      )}
+       <InlineSwitch
+         label={t('dashboard-scene.panel-edit-controls.table-view-label-table-view', 'Table view')}
+         showLabel={true}
+@@ -31,19 +44,6 @@ export function PanelEditControls({ panelEditor }: Props) {
+         aria-label={t('dashboard-scene.panel-edit-controls.table-view-aria-label-toggletableview', 'Toggle table view')}
+         data-testid={selectors.components.PanelEditor.toggleTableView}
+       />
+-      {config.featureToggles.queryEditorNext && (
+-        <InlineSwitch
+-          label={t('dashboard-scene.panel-edit-controls.query-editor-version', 'Query editor v2')}
+-          showLabel={true}
+-          id="query-editor-version"
+-          value={useQueryExperienceNext ?? true}
+-          onClick={panelEditor.onToggleQueryEditorVersion}
+-          aria-label={t(
+-            'dashboard-scene.panel-edit-controls.query-editor-version-toggle',
+-            'Toggle between query editor v1 and v2'
+-          )}
+-        />
+-      )}
+     </div>
+   );
+ }
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/AlertEditorRenderer.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/AlertEditorRenderer.tsx
+index e7b280da2b45d..91cfea4267d92 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/AlertEditorRenderer.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/AlertEditorRenderer.tsx
+@@ -4,13 +4,10 @@ import { Trans, t } from '@grafana/i18n';
+ import { EmptyState } from '@grafana/ui';
+ import { RulesTable } from 'app/features/alerting/unified/components/rules/RulesTable';
+ 
+-import { ScenesNewRuleFromPanelButton } from '../../PanelDataPane/NewAlertRuleButton';
+-
+-import { useAlertingContext, usePanelContext, useQueryEditorUIContext } from './QueryEditorContext';
++import { useAlertingContext, useQueryEditorUIContext } from './QueryEditorContext';
+ import { EMPTY_ALERT } from './types';
+ 
+ export function AlertEditorRenderer() {
+-  const { panel } = usePanelContext();
+   const { alertRules, isDashboardSaved } = useAlertingContext();
+   const { selectedAlert } = useQueryEditorUIContext();
+ 
+@@ -42,7 +39,6 @@ export function AlertEditorRenderer() {
+       <EmptyState
+         variant="not-found"
+         message={t('query-editor-next.alerts.no-alerts', 'No alert rules for this panel')}
+-        button={<ScenesNewRuleFromPanelButton panel={panel} size="sm" compactAlert />}
+       >
+         <Trans i18nKey="query-editor-next.alerts.no-alerts-description">
+           Create an alert rule to get notified when your data meets certain conditions.
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/NoOptionsIndicator.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/NoOptionsIndicator.tsx
+new file mode 100644
+index 0000000000000..e699d9c8b115b
+--- /dev/null
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/NoOptionsIndicator.tsx
+@@ -0,0 +1,69 @@
++import { css } from '@emotion/css';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { t } from '@grafana/i18n';
++import { Icon, Stack, useStyles2 } from '@grafana/ui';
++
++import { QUERY_EDITOR_COLORS } from '../constants';
++
++interface NoOptionsIndicatorProps {
++  name: string;
++}
++
++export function NoOptionsIndicator({ name }: NoOptionsIndicatorProps) {
++  const styles = useStyles2(getStyles);
++  return (
++    <div className={styles.wrapper}>
++      <Icon name="check-circle" size="lg" className={styles.icon} />
++      <Stack direction="column" gap={0.25}>
++        <span className={styles.title}>{t('transformation-editor.no-options.title', 'No options to configure')}</span>
++        <span className={styles.description}>
++          {t(
++            'transformation-editor.no-options.description',
++            '{{name}} will be applied automatically to your data unless the transformation is disabled.',
++            {
++              name,
++              interpolation: { escapeValue: false },
++            }
++          )}
++        </span>
++      </Stack>
++    </div>
++  );
++}
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  wrapper: css({
++    display: 'flex',
++    alignItems: 'center',
++    gap: theme.spacing(1.5),
++    padding: theme.spacing(2),
++    borderRadius: theme.shape.radius.default,
++    overflow: 'hidden',
++    position: 'relative',
++    background: `color-mix(in srgb, ${QUERY_EDITOR_COLORS.transformation} 10%, ${theme.colors.background.secondary} 100%)`,
++
++    '&::before': {
++      content: '""',
++      position: 'absolute',
++      left: 0,
++      top: 0,
++      bottom: 0,
++      width: 3,
++      background: QUERY_EDITOR_COLORS.transformation,
++    },
++  }),
++  icon: css({
++    color: QUERY_EDITOR_COLORS.transformation,
++    flexShrink: 0,
++  }),
++  title: css({
++    fontSize: theme.typography.body.fontSize,
++    fontWeight: theme.typography.fontWeightMedium,
++    color: theme.colors.text.primary,
++  }),
++  description: css({
++    fontSize: theme.typography.bodySmall.fontSize,
++    color: theme.colors.text.secondary,
++  }),
++});
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContent.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContent.tsx
+index 6798bade2073b..50087f7a879be 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContent.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContent.tsx
+@@ -9,21 +9,24 @@ import { QueryEditorBody } from './Body/QueryEditorBody';
+ import { QueryEditorFooter } from './Footer/QueryEditorFooter';
+ import { ContentHeaderSceneWrapper } from './Header/ContentHeader';
+ import { DatasourceHelpPanel } from './Header/DatasourceHelpPanel';
+-import { useQueryEditorUIContext } from './QueryEditorContext';
++import { useAlertingContext, useQueryEditorUIContext } from './QueryEditorContext';
+ 
+ export function QueryEditorContent() {
+   const styles = useStyles2(getStyles);
+ 
+   const { cardType, showingDatasourceHelp, pendingExpression, pendingTransformation } = useQueryEditorUIContext();
++  const { alertRules } = useAlertingContext();
+   const hasPendingPicker = !!pendingExpression || !!pendingTransformation;
+   const isAlertView = cardType === QueryEditorType.Alert;
++  const isAlertEmptyState = isAlertView && alertRules.length === 0;
+ 
++  const shouldShowHeader = !isAlertEmptyState;
+   const shouldShowFooter = !hasPendingPicker && !isAlertView;
+   const shouldShowDatasourceHelp = !hasPendingPicker && showingDatasourceHelp;
+ 
+   return (
+     <div className={styles.container}>
+-      <ContentHeaderSceneWrapper />
++      {shouldShowHeader && <ContentHeaderSceneWrapper />}
+       {shouldShowDatasourceHelp && <DatasourceHelpPanel />}
+       <QueryEditorBody />
+       {shouldShowFooter && <QueryEditorFooter />}
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContext.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContext.tsx
+index 61cc3d2f0d90b..aecddb678d9be 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContext.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContext.tsx
+@@ -20,6 +20,10 @@ export interface PendingExpression {
+   insertAfter: string;
+ }
+ 
++export interface PendingSavedQuery {
++  insertAfter: string;
++}
++
+ export interface PendingTransformation {
+   insertAfter?: string;
+   showPicker?: boolean;
+@@ -84,6 +88,8 @@ export interface QueryEditorUIState {
+   pendingExpression: PendingExpression | null;
+   setPendingExpression: (pending: PendingExpression | null) => void;
+   finalizePendingExpression: (type: ExpressionQueryType) => void;
++  pendingSavedQuery: PendingSavedQuery | null;
++  setPendingSavedQuery: (pending: PendingSavedQuery | null) => void;
+   pendingTransformation: PendingTransformation | null;
+   setPendingTransformation: (pending: PendingTransformation | null) => void;
+   finalizePendingTransformation: (transformationId: string) => void;
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContextWrapper.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContextWrapper.tsx
+index 980b684ec4ce8..7fbb5fd0ee57d 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContextWrapper.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorContextWrapper.tsx
+@@ -3,13 +3,14 @@ import { ReactNode, useCallback, useMemo, useState } from 'react';
+ import { DataSourceInstanceSettings, getDataSourceRef, LoadingState } from '@grafana/data';
+ import { SceneDataTransformer } from '@grafana/scenes';
+ import { DataQuery } from '@grafana/schema';
++import { useQueryLibraryContext } from 'app/features/explore/QueryLibrary/QueryLibraryContext';
+ import { ExpressionQuery } from 'app/features/expressions/types';
+ import { QueryGroupOptions } from 'app/types/query';
+ 
+ import { getQueryRunnerFor } from '../../../utils/utils';
+ import { PanelDataPaneNext } from '../PanelDataPaneNext';
+ 
+-import { PendingExpression, PendingTransformation, QueryEditorProvider } from './QueryEditorContext';
++import { PendingExpression, PendingSavedQuery, PendingTransformation, QueryEditorProvider } from './QueryEditorContext';
+ import { useAlertRulesForPanel } from './hooks/useAlertRulesForPanel';
+ import { usePendingExpression } from './hooks/usePendingExpression';
+ import { usePendingTransformation } from './hooks/usePendingTransformation';
+@@ -53,10 +54,13 @@ export function QueryEditorContextWrapper({
+   const [isQueryOptionsOpen, setIsQueryOptionsOpen] = useState(false);
+   const [focusedField, setFocusedField] = useState<QueryOptionField | null>(null);
+   const [showingDatasourceHelp, setShowingDatasourceHelp] = useState(false);
++  const [pendingSavedQueryState, setPendingSavedQueryState] = useState<PendingSavedQuery | null>(null);
+   const [transformTogglesState, setTransformTogglesState] = useState({
+     showHelp: false,
+     showDebug: false,
+   });
++  const { isDrawerOpen } = useQueryLibraryContext();
++  const pendingSavedQuery = isDrawerOpen ? pendingSavedQueryState : null;
+ 
+   const dataTransformer = panel.state.$data instanceof SceneDataTransformer ? panel.state.$data : null;
+   const transformations = useTransformations(dataTransformer);
+@@ -183,6 +187,8 @@ export function QueryEditorContextWrapper({
+         // Abandon pending flows when selecting a card
+         clearPendingExpression();
+         clearPendingTransformation();
++        // Clear pending saved query when selecting a query
++        setPendingSavedQueryState(null);
+       },
+       setSelectedTransformation: (transformation: Transformation | null) => {
+         setSelectedTransformationId(transformation?.transformId ?? null);
+@@ -191,10 +197,11 @@ export function QueryEditorContextWrapper({
+         setSelectedAlertId(null);
+         // Reset transformation-specific UI when switching transformations
+         setTransformTogglesState({ showHelp: false, showDebug: false });
+-
+         // Abandon pending flows when selecting a card
+         clearPendingExpression();
+         clearPendingTransformation();
++        // Clear pending saved query when selecting a transformation
++        setPendingSavedQueryState(null);
+       },
+       setSelectedAlert: (alert: AlertRule | null) => {
+         setSelectedAlertId(alert?.alertId ?? null);
+@@ -206,6 +213,8 @@ export function QueryEditorContextWrapper({
+         // Abandon pending flows when selecting a card
+         clearPendingExpression();
+         clearPendingTransformation();
++        // Clear pending saved query when selecting an alert
++        setPendingSavedQueryState(null);
+       },
+       queryOptions: {
+         options: queryOptions,
+@@ -232,14 +241,24 @@ export function QueryEditorContextWrapper({
+       setPendingExpression: (pending: PendingExpression | null) => {
+         if (pending) {
+           clearPendingTransformation();
++          setPendingSavedQueryState(null);
+         }
+         setPendingExpression(pending);
+       },
+       finalizePendingExpression,
++      pendingSavedQuery,
++      setPendingSavedQuery: (pending: PendingSavedQuery | null) => {
++        if (pending) {
++          clearPendingExpression();
++          clearPendingTransformation();
++        }
++        setPendingSavedQueryState(pending);
++      },
+       pendingTransformation,
+       setPendingTransformation: (pending: PendingTransformation | null) => {
+         if (pending) {
+           clearPendingExpression();
++          setPendingSavedQueryState(null);
+         }
+         setPendingTransformation(pending);
+       },
+@@ -264,6 +283,7 @@ export function QueryEditorContextWrapper({
+       setPendingExpression,
+       finalizePendingExpression,
+       clearPendingExpression,
++      pendingSavedQuery,
+       pendingTransformation,
+       setPendingTransformation,
+       finalizePendingTransformation,
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorRenderer.test.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorRenderer.test.tsx
+index 8e866dd406bd1..716c2bb5169dd 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorRenderer.test.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/QueryEditorRenderer.test.tsx
+@@ -118,6 +118,8 @@ describe('QueryEditorRenderer', () => {
+             pendingTransformation: null,
+             setPendingTransformation: jest.fn(),
+             finalizePendingTransformation: jest.fn(),
++            pendingSavedQuery: null,
++            setPendingSavedQuery: jest.fn(),
+           }}
+           actions={mockActions}
+         >
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/AddCardButton.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/AddCardButton.tsx
+index 2f5ebc33a689c..c5944336aafcd 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/AddCardButton.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/AddCardButton.tsx
+@@ -35,7 +35,8 @@ export const AddCardButton = ({ variant, afterId, onAdd, alwaysVisible = false }
+   const styles = useStyles2(getStyles, alwaysVisible);
+   const theme = useTheme2();
+   const { addQuery } = useActionsContext();
+-  const { setSelectedQuery, setPendingExpression, setPendingTransformation } = useQueryEditorUIContext();
++  const { setSelectedQuery, setPendingExpression, setPendingTransformation, setPendingSavedQuery } =
++    useQueryEditorUIContext();
+   const { openDrawer, queryLibraryEnabled } = useQueryLibraryContext();
+ 
+   const [menuOpen, setMenuOpen] = useState(false);
+@@ -75,12 +76,13 @@ export const AddCardButton = ({ variant, afterId, onAdd, alwaysVisible = false }
+           <Menu.Item
+             label={t('query-editor-next.sidebar.add-saved-query', 'Add saved query')}
+             icon="book-open"
+-            onClick={() =>
++            onClick={() => {
++              setPendingSavedQuery({ insertAfter: afterId ?? '' });
+               openDrawer({
+                 onSelectQuery: (query) => addAndSelectQuery(query),
+                 options: { context: CoreApp.PanelEditor },
+-              })
+-            }
++              });
++            }}
+           />
+         )}
+         <Menu.Item
+@@ -93,7 +95,16 @@ export const AddCardButton = ({ variant, afterId, onAdd, alwaysVisible = false }
+         />
+       </Menu>
+     ),
+-    [addAndSelectQuery, canReadQueries, openDrawer, queryLibraryEnabled, setPendingExpression, afterId, onAdd]
++    [
++      queryLibraryEnabled,
++      canReadQueries,
++      addAndSelectQuery,
++      setPendingSavedQuery,
++      afterId,
++      openDrawer,
++      setPendingExpression,
++      onAdd,
++    ]
+   );
+ 
+   const handleTransformationClick = useCallback(() => {
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/Alerts/AlertsView.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/Alerts/AlertsView.tsx
+index d7cf9542f0d0f..08bfc41397871 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/Alerts/AlertsView.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/Alerts/AlertsView.tsx
+@@ -1,14 +1,11 @@
+ import { css } from '@emotion/css';
+ 
+ import { GrafanaTheme2 } from '@grafana/data';
+-import { Icon, useStyles2, useTheme2 } from '@grafana/ui';
++import { useStyles2 } from '@grafana/ui';
+ 
+ import { ScenesNewRuleFromPanelButton } from '../../../../PanelDataPane/NewAlertRuleButton';
+-import { ActionItem } from '../../../Actions';
+-import { getAlertStateColor, QUERY_EDITOR_TYPE_CONFIG, QueryEditorType } from '../../../constants';
+-import { usePanelContext } from '../../QueryEditorContext';
++import { useAlertingContext, usePanelContext } from '../../QueryEditorContext';
+ import { AlertRule } from '../../types';
+-import { SidebarCard } from '../SidebarCard';
+ 
+ import { AlertCard } from './AlertCard';
+ 
+@@ -16,35 +13,18 @@ interface AlertsViewProps {
+   alertRules: AlertRule[];
+ }
+ 
+-const GHOST_ALERT_ITEM: ActionItem = {
+-  name: 'New alert rule',
+-  type: QueryEditorType.Alert,
+-  isHidden: false,
+-  alertState: null,
+-};
+-
+ export function AlertsView({ alertRules }: AlertsViewProps) {
+   const { panel } = usePanelContext();
++  const { isDashboardSaved } = useAlertingContext();
+ 
+-  const theme = useTheme2();
+   const styles = useStyles2(getStyles);
+ 
+   if (alertRules.length === 0) {
+     return (
+       <div className={styles.container}>
+-        <SidebarCard
+-          id="ghost-alert"
+-          isSelected={false}
+-          item={GHOST_ALERT_ITEM}
+-          onClick={() => {}} // Noop for the ghost alert
+-          variant="ghost"
+-        >
+-          <Icon
+-            name={QUERY_EDITOR_TYPE_CONFIG[QueryEditorType.Alert].icon}
+-            color={getAlertStateColor(theme, null)}
+-            size="sm"
+-          />
+-        </SidebarCard>
++        <div className={styles.buttonWrapper}>
++          <ScenesNewRuleFromPanelButton panel={panel} variant="primary" size="sm" disabled={!isDashboardSaved} />
++        </div>
+       </div>
+     );
+   }
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx
+index 44910e78e1f31..e8e7611eb8f18 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/DraggableList.tsx
+@@ -92,6 +92,9 @@ function getStyles(theme: GrafanaTheme2) {
+     }),
+     draggableItem: css({
+       marginBottom: theme.spacing(SIDEBAR_CARD_SPACING),
++      '&:last-child': {
++        marginBottom: 0,
++      },
+       '[data-dragging] &': {
+         pointerEvents: 'none',
+       },
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/GhostSidebarCard.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/GhostSidebarCard.tsx
+new file mode 100644
+index 0000000000000..8f2082f10bd01
+--- /dev/null
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/GhostSidebarCard.tsx
+@@ -0,0 +1,31 @@
++import { css } from '@emotion/css';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { useStyles2 } from '@grafana/ui';
++
++import { ActionItem } from '../../Actions';
++import { QueryEditorType, SIDEBAR_CARD_SPACING } from '../../constants';
++
++import { SidebarCard } from './SidebarCard';
++
++interface GhostSidebarCardProps {
++  id: string;
++  type: QueryEditorType;
++}
++
++export function GhostSidebarCard({ id, type }: GhostSidebarCardProps) {
++  const styles = useStyles2(getStyles);
++  const item: ActionItem = { name: '', type, isHidden: false };
++
++  return (
++    <div className={styles.wrapper}>
++      <SidebarCard id={id} isSelected={false} item={item} onClick={() => {}} variant="ghost">
++        {null}
++      </SidebarCard>
++    </div>
++  );
++}
++
++const getStyles = (theme: GrafanaTheme2) => ({
++  wrapper: css({ marginTop: theme.spacing(SIDEBAR_CARD_SPACING) }),
++});
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueriesAndTransformationsView.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueriesAndTransformationsView.tsx
+index ba14681570fb4..88385c8e3c120 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueriesAndTransformationsView.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueriesAndTransformationsView.tsx
+@@ -3,10 +3,12 @@ import { useCallback, useState } from 'react';
+ import { t } from '@grafana/i18n';
+ import { LoadingBar } from '@grafana/ui';
+ 
+-import { usePanelContext, useQueryRunnerContext } from '../QueryEditorContext';
++import { PENDING_CARD_ID, QueryEditorType } from '../../constants';
++import { usePanelContext, useQueryEditorUIContext, useQueryRunnerContext } from '../QueryEditorContext';
+ 
+ import { AddCardButton } from './AddCardButton';
+ import { DraggableList } from './DraggableList';
++import { GhostSidebarCard } from './GhostSidebarCard';
+ import { QueryCard } from './QueryCard';
+ import { QuerySidebarCollapsableHeader } from './QuerySidebarCollapsableHeader';
+ import { TransformationCard } from './TransformationCard';
+@@ -15,6 +17,7 @@ import { useSidebarDragAndDrop } from './useSidebarDragAndDrop';
+ export function QueriesAndTransformationsView() {
+   const { queries, isLoading } = useQueryRunnerContext();
+   const { transformations } = usePanelContext();
++  const { pendingExpression, pendingSavedQuery, pendingTransformation } = useQueryEditorUIContext();
+   const { onQueryDragEnd, onTransformationDragEnd } = useSidebarDragAndDrop();
+ 
+   const [queriesOpen, setQueriesOpen] = useState(true);
+@@ -50,6 +53,12 @@ export function QueriesAndTransformationsView() {
+           renderItem={(query) => <QueryCard query={query} />}
+           onDragEnd={onQueryDragEnd}
+         />
++        {pendingExpression && !pendingExpression.insertAfter && (
++          <GhostSidebarCard id={PENDING_CARD_ID.expression} type={QueryEditorType.Expression} />
++        )}
++        {pendingSavedQuery && !pendingSavedQuery.insertAfter && (
++          <GhostSidebarCard id={PENDING_CARD_ID.savedQuery} type={QueryEditorType.Query} />
++        )}
+       </QuerySidebarCollapsableHeader>
+       <QuerySidebarCollapsableHeader
+         label={t('query-editor-next.sidebar.transformations', 'Transformations')}
+@@ -66,6 +75,9 @@ export function QueriesAndTransformationsView() {
+             onDragEnd={onTransformationDragEnd}
+           />
+         )}
++        {pendingTransformation && !pendingTransformation.insertAfter && (
++          <GhostSidebarCard id={PENDING_CARD_ID.transformation} type={QueryEditorType.Transformation} />
++        )}
+       </QuerySidebarCollapsableHeader>
+     </>
+   );
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueryCard.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueryCard.tsx
+index 52a04dbb7416d..ecbe21efabd2a 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueryCard.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QueryCard.tsx
+@@ -4,17 +4,18 @@ import { DataSourceLogo } from 'app/features/datasources/components/picker/DataS
+ import { useDatasource } from 'app/features/datasources/hooks';
+ 
+ import { ActionItem } from '../../Actions';
+-import { QUERY_EDITOR_TYPE_CONFIG, QueryEditorType } from '../../constants';
++import { PENDING_CARD_ID, QUERY_EDITOR_TYPE_CONFIG, QueryEditorType } from '../../constants';
+ import { useActionsContext, useQueryEditorUIContext, useQueryRunnerContext } from '../QueryEditorContext';
+ import { getEditorType } from '../utils';
+ 
+ import { CardTitle } from './CardTitle';
++import { GhostSidebarCard } from './GhostSidebarCard';
+ import { SidebarCard } from './SidebarCard';
+ 
+ export const QueryCard = ({ query }: { query: DataQuery }) => {
+   const editorType = getEditorType(query);
+   const queryDsSettings = useDatasource(query.datasource);
+-  const { selectedQuery, setSelectedQuery } = useQueryEditorUIContext();
++  const { selectedQuery, setSelectedQuery, pendingExpression, pendingSavedQuery } = useQueryEditorUIContext();
+   const { duplicateQuery, deleteQuery, toggleQueryHide } = useActionsContext();
+   const { data } = useQueryRunnerContext();
+ 
+@@ -31,25 +32,33 @@ export const QueryCard = ({ query }: { query: DataQuery }) => {
+   };
+ 
+   return (
+-    <SidebarCard
+-      id={query.refId}
+-      isSelected={isSelected}
+-      item={item}
+-      onClick={() => setSelectedQuery(query)}
+-      onDelete={() => deleteQuery(query.refId)}
+-      onDuplicate={() => duplicateQuery(query.refId)}
+-      onToggleHide={() => toggleQueryHide(query.refId)}
+-    >
+-      {editorType === QueryEditorType.Query ? (
+-        <DataSourceLogo dataSource={queryDsSettings} size={14} />
+-      ) : (
+-        <Icon
+-          name={QUERY_EDITOR_TYPE_CONFIG[editorType].icon}
+-          color={QUERY_EDITOR_TYPE_CONFIG[editorType].color}
+-          size="sm"
+-        />
++    <>
++      <SidebarCard
++        id={query.refId}
++        isSelected={isSelected}
++        item={item}
++        onClick={() => setSelectedQuery(query)}
++        onDelete={() => deleteQuery(query.refId)}
++        onDuplicate={() => duplicateQuery(query.refId)}
++        onToggleHide={() => toggleQueryHide(query.refId)}
++      >
++        {editorType === QueryEditorType.Query ? (
++          <DataSourceLogo dataSource={queryDsSettings} size={14} />
++        ) : (
++          <Icon
++            name={QUERY_EDITOR_TYPE_CONFIG[editorType].icon}
++            color={QUERY_EDITOR_TYPE_CONFIG[editorType].color}
++            size="sm"
++          />
++        )}
++        <CardTitle title={query.refId} isHidden={isHidden} />
++      </SidebarCard>
++      {pendingExpression?.insertAfter === query.refId && (
++        <GhostSidebarCard id={PENDING_CARD_ID.expression} type={QueryEditorType.Expression} />
+       )}
+-      <CardTitle title={query.refId} isHidden={isHidden} />
+-    </SidebarCard>
++      {pendingSavedQuery?.insertAfter === query.refId && (
++        <GhostSidebarCard id={PENDING_CARD_ID.savedQuery} type={QueryEditorType.Query} />
++      )}
++    </>
+   );
+ };
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QuerySidebarCollapsableHeader.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QuerySidebarCollapsableHeader.tsx
+index 29c8ed8e85868..442f7b7b1c5be 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QuerySidebarCollapsableHeader.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/QuerySidebarCollapsableHeader.tsx
+@@ -40,11 +40,7 @@ export const QuerySidebarCollapsableHeader = ({
+       className={styles.collapsableSection}
+       contentClassName={styles.contentArea}
+     >
+-      <div className={styles.queryStackCardsContainer}>
+-        <Stack direction="column" gap={2.5}>
+-          {children}
+-        </Stack>
+-      </div>
++      <div className={styles.queryStackCardsContainer}>{children}</div>
+     </CollapsableSection>
+   );
+ };
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx
+index 952e4ddb56fa4..d334b7e1d8d3b 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/SidebarCard.tsx
+@@ -1,4 +1,4 @@
+-import { css, cx, keyframes } from '@emotion/css';
++import { css, cx } from '@emotion/css';
+ import { useCallback, useState } from 'react';
+ 
+ import { GrafanaTheme2 } from '@grafana/data';
+@@ -8,6 +8,7 @@ import { Icon, useStyles2 } from '@grafana/ui';
+ import { ActionItem, Actions } from '../../Actions';
+ import {
+   QUERY_EDITOR_COLORS,
++  QUERY_EDITOR_TYPE_CONFIG,
+   QueryEditorType,
+   SIDEBAR_CARD_HEIGHT,
+   SIDEBAR_CARD_INDENT,
+@@ -75,12 +76,15 @@ export const SidebarCard = ({
+   };
+ 
+   if (variant === 'ghost') {
++    const typeConfig = QUERY_EDITOR_TYPE_CONFIG[item.type];
+     return (
+       <div className={styles.wrapper} aria-hidden>
+         <div className={cx(styles.card, styles.ghostCard)}>
+           <div className={styles.cardContent}>
+-            <div className={styles.ghostCardIcon} />
+-            <div className={styles.ghostCardTitle} />
++            <Icon name={typeConfig.icon} color={typeConfig.color} size="sm" />
++            <span className={styles.ghostCardLabel}>
++              {t('query-editor-next.sidebar.new-type', 'New {{type}}', { type: typeConfig.getLabel() })}
++            </span>
+           </div>
+         </div>
+       </div>
+@@ -132,11 +136,6 @@ export const SidebarCard = ({
+   );
+ };
+ 
+-const ghostCardPulse = keyframes`
+-  from, to { opacity: 0.1; }
+-  50% { opacity: 0.8; }
+-`;
+-
+ function getStyles(
+   theme: GrafanaTheme2,
+   {
+@@ -283,41 +282,20 @@ function getStyles(
+     }),
+ 
+     ghostCard: css({
+-      border: `1px dashed ${theme.colors.border.medium}`,
+-      borderLeft: `3px solid ${theme.colors.border.medium}`,
++      border: `1px dashed ${borderColor}`,
++      borderLeft: `3px solid ${borderColor}`,
+       background: 'transparent',
+-      '&:hover': {
+-        background: theme.colors.emphasize(theme.colors.background.primary, 0.03),
+-        borderColor: theme.colors.border.strong,
+-        borderLeftColor: borderColor,
+-      },
+-      [theme.transitions.handleMotion('no-preference', 'reduce')]: {
+-        transition: theme.transitions.create(['background-color', 'border-color'], {
+-          duration: theme.transitions.duration.standard,
+-        }),
+-      },
+-    }),
+-
+-    ghostCardIcon: css({
+-      width: theme.spacing(2),
+-      height: theme.spacing(2),
+-      borderRadius: theme.shape.radius.default,
+-      background: theme.colors.border.weak,
+-      flexShrink: 0,
+-      [theme.transitions.handleMotion('no-preference')]: {
+-        animation: `${ghostCardPulse} 3s ease-in-out infinite`,
+-      },
++      cursor: 'default',
++      opacity: 0.7,
+     }),
+ 
+-    ghostCardTitle: css({
+-      height: theme.spacing(1.5),
+-      flex: 1,
+-      maxWidth: '70%',
+-      borderRadius: theme.shape.radius.default,
+-      background: theme.colors.border.weak,
+-      [theme.transitions.handleMotion('no-preference')]: {
+-        animation: `${ghostCardPulse} 3s ease-in-out infinite`,
+-      },
++    ghostCardLabel: css({
++      fontFamily: theme.typography.fontFamilyMonospace,
++      fontStyle: 'italic',
++      color: theme.colors.text.secondary,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
+     }),
+ 
+     errorIcon: css({
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/TransformationCard.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/TransformationCard.tsx
+index 886fb17bb2b5c..b20f6a0386537 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/TransformationCard.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/Sidebar/TransformationCard.tsx
+@@ -5,10 +5,11 @@ import { useActionsContext, useQueryEditorUIContext } from '../QueryEditorContex
+ import { Transformation } from '../types';
+ 
+ import { CardTitle } from './CardTitle';
++import { GhostSidebarCard } from './GhostSidebarCard';
+ import { SidebarCard } from './SidebarCard';
+ 
+ export const TransformationCard = ({ transformation }: { transformation: Transformation }) => {
+-  const { selectedTransformation, setSelectedTransformation } = useQueryEditorUIContext();
++  const { selectedTransformation, setSelectedTransformation, pendingTransformation } = useQueryEditorUIContext();
+   const { deleteTransformation, toggleTransformationDisabled } = useActionsContext();
+   const isSelected = selectedTransformation?.transformId === transformation.transformId;
+   const isHidden = !!transformation.transformConfig.disabled;
+@@ -21,20 +22,25 @@ export const TransformationCard = ({ transformation }: { transformation: Transfo
+   };
+ 
+   return (
+-    <SidebarCard
+-      isSelected={isSelected}
+-      id={transformation.transformId}
+-      item={item}
+-      onClick={() => setSelectedTransformation(transformation)}
+-      onDelete={() => deleteTransformation(transformation.transformId)}
+-      onToggleHide={() => toggleTransformationDisabled(transformation.transformId)}
+-    >
+-      <Icon
+-        name={QUERY_EDITOR_TYPE_CONFIG[QueryEditorType.Transformation].icon}
+-        color={QUERY_EDITOR_TYPE_CONFIG[QueryEditorType.Transformation].color}
+-        size="sm"
+-      />
+-      <CardTitle title={transformationName} isHidden={isHidden} />
+-    </SidebarCard>
++    <>
++      <SidebarCard
++        isSelected={isSelected}
++        id={transformation.transformId}
++        item={item}
++        onClick={() => setSelectedTransformation(transformation)}
++        onDelete={() => deleteTransformation(transformation.transformId)}
++        onToggleHide={() => toggleTransformationDisabled(transformation.transformId)}
++      >
++        <Icon
++          name={QUERY_EDITOR_TYPE_CONFIG[QueryEditorType.Transformation].icon}
++          color={QUERY_EDITOR_TYPE_CONFIG[QueryEditorType.Transformation].color}
++          size="sm"
++        />
++        <CardTitle title={transformationName} isHidden={isHidden} />
++      </SidebarCard>
++      {pendingTransformation?.insertAfter === transformation.transformId && (
++        <GhostSidebarCard id="__pending_transformation__" type={QueryEditorType.Transformation} />
++      )}
++    </>
+   );
+ };
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/TransformationEditor.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/TransformationEditor.tsx
+index c7bb7d33729d6..6a4b99e5f233f 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/TransformationEditor.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/TransformationEditor.tsx
+@@ -1,8 +1,9 @@
+ import { useCallback } from 'react';
+ 
+-import { DataTransformerConfig, DataFrame } from '@grafana/data';
++import { DataTransformerID, DataTransformerConfig, DataFrame } from '@grafana/data';
+ import { selectors } from '@grafana/e2e-selectors';
+ 
++import { NoOptionsIndicator } from './NoOptionsIndicator';
+ import { Transformation } from './types';
+ 
+ interface TransformationEditorProps {
+@@ -22,6 +23,10 @@ export function TransformationEditor({ transformation, inputData, onUpdate }: Tr
+     [transformConfig, onUpdate]
+   );
+ 
++  const showNoOptions =
++    transformConfig.id === DataTransformerID.seriesToRows ||
++    (transformConfig.id === DataTransformerID.merge && inputData.length > 1);
++
+   const Editor = registryItem!.editor!;
+ 
+   return (
+@@ -31,6 +36,7 @@ export function TransformationEditor({ transformation, inputData, onUpdate }: Tr
+         onChange={handleChange}
+         options={{ ...registryItem!.transformation.defaultOptions, ...transformConfig.options }}
+       />
++      {showNoOptions && <NoOptionsIndicator name={registryItem?.name ?? ''} />}
+     </div>
+   );
+ }
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/testUtils.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/testUtils.tsx
+index 1a18a8a10bc07..375571198ddb6 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/testUtils.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/QueryEditor/testUtils.tsx
+@@ -195,6 +195,8 @@ export function renderWithQueryEditorProvider(children: ReactElement, options: C
+     finalizePendingTransformation: jest.fn(),
+     selectedAlert: null,
+     setSelectedAlert: jest.fn(),
++    pendingSavedQuery: null,
++    setPendingSavedQuery: jest.fn(),
+     ...uiStateOverrides,
+   };
+ 
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.test.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.test.tsx
+index 58e753b437eba..7126102f29026 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.test.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.test.tsx
+@@ -13,6 +13,11 @@ import { useVizAndDataPaneLayout } from './hooks';
+ 
+ jest.mock('./hooks', () => ({
+   useVizAndDataPaneLayout: jest.fn(),
++  useQueryEditorBanner: jest.fn().mockReturnValue({ showBanner: false, dismissBanner: jest.fn() }),
++}));
++
++jest.mock('../QueryEditorBanner', () => ({
++  QueryEditorBanner: () => <div data-testid="query-editor-banner" />,
+ }));
+ 
+ jest.mock('./QueryEditor/QueryEditorContextWrapper', () => ({
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.tsx
+index 7945cf15f0e62..a22936310959e 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/VizAndDataPaneNext.tsx
+@@ -6,16 +6,18 @@ import { SceneComponentProps } from '@grafana/scenes';
+ import { useStyles2 } from '@grafana/ui';
+ 
+ import { PanelEditor } from '../PanelEditor';
++import { QueryEditorBanner } from '../QueryEditorBanner';
+ 
+ import { PanelDataPaneNext } from './PanelDataPaneNext';
+ import { QueryEditorContextWrapper } from './QueryEditor/QueryEditorContextWrapper';
+ import { QueryEditorSidebar } from './QueryEditor/Sidebar/QueryEditorSidebar';
+ import { SidebarSize } from './constants';
+-import { useVizAndDataPaneLayout } from './hooks';
++import { useQueryEditorBanner, useVizAndDataPaneLayout } from './hooks';
+ 
+ export function VizAndDataPaneNext({ model }: SceneComponentProps<PanelEditor>) {
+   const containerRef = useRef<HTMLDivElement>(null);
+-  const { scene, layout } = useVizAndDataPaneLayout(model, containerRef);
++  const { showBanner, dismissBanner } = useQueryEditorBanner();
++  const { scene, layout } = useVizAndDataPaneLayout(model, containerRef, showBanner);
+   const styles = useStyles2(getStyles, layout.sidebarSize);
+ 
+   const nextDataPane = scene.dataPane instanceof PanelDataPaneNext ? scene.dataPane : null;
+@@ -41,6 +43,14 @@ export function VizAndDataPaneNext({ model }: SceneComponentProps<PanelEditor>)
+       </div>
+       {nextDataPane && (
+         <QueryEditorContextWrapper dataPane={nextDataPane}>
++          {showBanner && (
++            <QueryEditorBanner
++              useQueryExperienceNext={model.state.useQueryExperienceNext ?? false}
++              onToggle={model.onToggleQueryEditorVersion}
++              onDismiss={dismissBanner}
++              className={styles.versionToggle}
++            />
++          )}
+           <div className={styles.sidebar}>
+             <div className={styles.sidebarContent}>
+               <QueryEditorSidebar sidebarSize={layout.sidebarSize} setSidebarSize={layout.setSidebarSize} />
+@@ -70,6 +80,14 @@ function getStyles(theme: GrafanaTheme2, sidebarSize: SidebarSize) {
+       overflow: 'hidden',
+       paddingBottom: theme.spacing(2),
+     }),
++    versionToggle: css({
++      gridArea: 'version-toggle',
++      minWidth: 0,
++      overflow: 'hidden',
++      ...(sidebarSize === SidebarSize.Mini && {
++        marginLeft: theme.spacing(2),
++      }),
++    }),
+     sidebar: css({
+       gridArea: 'sidebar',
+       position: 'relative',
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/constants.ts b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/constants.ts
+index 36d39426eb1a1..c7abfe52bf220 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/constants.ts
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/constants.ts
+@@ -28,6 +28,16 @@ export enum SidebarSize {
+ }
+ 
+ export const QUERY_EDITOR_SIDEBAR_SIZE_KEY = 'grafana.dashboard.query-editor-next.sidebar-size';
++export const QUERY_EDITOR_BANNER_DISMISSED_KEY = 'grafana.dashboard.query-editor-next.banner-dismissed';
++export const QUERY_EDITOR_BANNER_FEEDBACK_URL = 'https://forms.gle/54uCfRjxzjcXVysp8';
++
++export function getQueryEditorBannerColors(theme: GrafanaTheme2) {
++  return {
++    background: theme.isDark ? '#1D293D' : 'oklch(96.8% 0.007 247.896)',
++    border: theme.isDark ? '#314158' : theme.colors.border.medium,
++    accent: theme.isDark ? '#FF9830' : '#C47B20',
++  };
++}
+ 
+ export const QUERY_EDITOR_COLORS = {
+   query: '#FF8904',
+@@ -219,3 +229,9 @@ export const EXPRESSION_IMAGE_MAP: Record<ExpressionQueryType, { dark: string; l
+   [ExpressionQueryType.classic]: { dark: classicConditionDarkImage, light: classicConditionLightImage },
+   [ExpressionQueryType.threshold]: { dark: thresholdDarkImage, light: thresholdLightImage },
+ };
++
++export const PENDING_CARD_ID = {
++  expression: 'pending-expression',
++  savedQuery: 'pending-saved-query',
++  transformation: 'pending-transformation',
++} as const;
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.test.ts b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.test.ts
+index 76e7028a53abc..f5b4a3df0d98e 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.test.ts
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.test.ts
+@@ -8,10 +8,13 @@ jest.mock('@grafana/ui', () => ({
+   getDragStyles: jest.fn(),
+ }));
+ 
++jest.mock('@grafana/runtime', () => ({ config: { featureToggles: {} } }));
++
+ // Prevent heavy transitive imports (@grafana/scenes, @grafana/runtime) from loading.
+ jest.mock('./constants', () => ({
+   SidebarSize: { Mini: 'mini', Full: 'full' },
+   QUERY_EDITOR_SIDEBAR_SIZE_KEY: 'grafana.dashboard.query-editor-next.sidebar-size',
++  QUERY_EDITOR_BANNER_DISMISSED_KEY: 'grafana.dashboard.query-editor-next.banner-dismissed',
+ }));
+ jest.mock('../../edit-pane/shared', () => ({ useEditPaneCollapsed: jest.fn() }));
+ jest.mock('../../utils/utils', () => ({ getDashboardSceneFor: jest.fn() }));
+@@ -22,6 +25,7 @@ describe('buildVizAndDataPaneGrid', () => {
+     controlsEnabled: false,
+     hasDataPane: true,
+     isSidebarFullWidth: false,
++    showBanner: true,
+     vizRatio: 0.5,
+     sidebarRatio: 0.25,
+   };
+@@ -35,20 +39,29 @@ describe('buildVizAndDataPaneGrid', () => {
+   it('places the controls row above the viz when controls are enabled', () => {
+     const { gridTemplateAreas, gridTemplateRows } = buildVizAndDataPaneGrid({ ...base, controlsEnabled: true });
+ 
+-    expect(gridTemplateAreas).toBe('"controls controls"\n"viz viz"\n"sidebar data-pane"');
+-    expect(gridTemplateRows).toBe('auto 1fr 1fr');
++    expect(gridTemplateAreas).toBe(
++      '"controls controls"\n"viz viz"\n"version-toggle version-toggle"\n"sidebar data-pane"'
++    );
++    expect(gridTemplateRows).toBe('auto 1fr auto 1fr');
+   });
+ 
+   it('makes sidebar span every row when isSidebarFullWidth is true', () => {
+     const { gridTemplateAreas } = buildVizAndDataPaneGrid({ ...base, controlsEnabled: true, isSidebarFullWidth: true });
+ 
+-    expect(gridTemplateAreas).toBe('"sidebar controls"\n"sidebar viz"\n"sidebar data-pane"');
++    expect(gridTemplateAreas).toBe('"sidebar controls"\n"sidebar viz"\n"sidebar version-toggle"\n"sidebar data-pane"');
++  });
++
++  it('omits version-toggle row when showBanner is false', () => {
++    const { gridTemplateAreas, gridTemplateRows } = buildVizAndDataPaneGrid({ ...base, showBanner: false });
++
++    expect(gridTemplateAreas).toBe('"viz viz"\n"sidebar data-pane"');
++    expect(gridTemplateRows).toBe('1fr 1fr');
+   });
+ 
+   it('converts vizRatio to fractional row height — ratio / (1 - ratio)', () => {
+     // 0.5 → 1fr (equal split), 0.75 → 3fr (3x taller than data pane)
+-    expect(buildVizAndDataPaneGrid({ ...base, vizRatio: 0.5 }).gridTemplateRows).toBe('1fr 1fr');
+-    expect(buildVizAndDataPaneGrid({ ...base, vizRatio: 0.75 }).gridTemplateRows).toBe('3fr 1fr');
++    expect(buildVizAndDataPaneGrid({ ...base, vizRatio: 0.5 }).gridTemplateRows).toBe('1fr auto 1fr');
++    expect(buildVizAndDataPaneGrid({ ...base, vizRatio: 0.75 }).gridTemplateRows).toBe('3fr auto 1fr');
+   });
+ 
+   it('converts sidebarRatio 0.5 to equal columns (minmax(220px, 1fr) 1fr)', () => {
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.ts b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.ts
+index 8ccf38106154e..2ab50fd8f651e 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.ts
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditNext/hooks.ts
+@@ -1,7 +1,8 @@
+ import { css, cx } from '@emotion/css';
+ import { RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+-import { useLocalStorage } from 'react-use';
++import { useLocalStorage, useSessionStorage } from 'react-use';
+ 
++import { config } from '@grafana/runtime';
+ import { getDragStyles, useStyles2, useTheme2 } from '@grafana/ui';
+ import { MIN_SUGGESTIONS_PANE_WIDTH } from 'app/features/panel/suggestions/constants';
+ 
+@@ -11,7 +12,7 @@ import { PanelEditor } from '../PanelEditor';
+ import { useSnappingSplitter } from '../splitter/useSnappingSplitter';
+ import { useScrollReflowLimit } from '../useScrollReflowLimit';
+ 
+-import { QUERY_EDITOR_SIDEBAR_SIZE_KEY, SidebarSize } from './constants';
++import { QUERY_EDITOR_BANNER_DISMISSED_KEY, QUERY_EDITOR_SIDEBAR_SIZE_KEY, SidebarSize } from './constants';
+ 
+ const CONTROLS_ROW_HEIGHT = 'auto';
+ const MIN_SIDEBAR_RATIO = 0.1;
+@@ -120,6 +121,14 @@ export function useRatioResize({
+   return { handleRef, ratio, setRatio, className: cx(dragClass, className) };
+ }
+ 
++export function useQueryEditorBanner() {
++  const [dismissed, setDismissed] = useSessionStorage(QUERY_EDITOR_BANNER_DISMISSED_KEY, false);
++  const showBanner = Boolean(config.featureToggles.queryEditorNext) && !dismissed;
++  const dismissBanner = useCallback(() => setDismissed(true), [setDismissed]);
++
++  return { showBanner, dismissBanner };
++}
++
+ export function usePanelEditorShell(model: PanelEditor) {
+   const dashboard = getDashboardSceneFor(model);
+   const { optionsPane } = model.useState();
+@@ -169,7 +178,11 @@ export function getDefaultSidebarRatio(containerWidth: number): number {
+   return 0.25;
+ }
+ 
+-export function useVizAndDataPaneLayout(model: PanelEditor, containerRef: RefObject<HTMLDivElement>) {
++export function useVizAndDataPaneLayout(
++  model: PanelEditor,
++  containerRef: RefObject<HTMLDivElement>,
++  showBanner = false
++) {
+   const dashboard = getDashboardSceneFor(model);
+   const { dataPane, tableView } = model.useState();
+   const panel = model.getPanel();
+@@ -207,10 +220,11 @@ export function useVizAndDataPaneLayout(model: PanelEditor, containerRef: RefObj
+         controlsEnabled: Boolean(controls),
+         hasDataPane: Boolean(dataPane),
+         isSidebarFullWidth: sidebarSize === SidebarSize.Full,
++        showBanner,
+         vizRatio: vizResize.ratio,
+         sidebarRatio: sidebarResize.ratio,
+       }),
+-    [controls, dataPane, sidebarSize, vizResize.ratio, sidebarResize.ratio]
++    [controls, dataPane, sidebarSize, showBanner, vizResize.ratio, sidebarResize.ratio]
+   );
+ 
+   return {
+@@ -240,6 +254,7 @@ type VizAndDataPaneGridInput = {
+   controlsEnabled: boolean;
+   hasDataPane: boolean;
+   isSidebarFullWidth: boolean;
++  showBanner: boolean;
+   vizRatio: number;
+   sidebarRatio: number;
+ };
+@@ -248,6 +263,7 @@ export function buildVizAndDataPaneGrid({
+   controlsEnabled,
+   hasDataPane,
+   isSidebarFullWidth,
++  showBanner,
+   vizRatio,
+   sidebarRatio,
+ }: VizAndDataPaneGridInput) {
+@@ -266,6 +282,11 @@ export function buildVizAndDataPaneGrid({
+   grid.push(['viz', 'viz']);
+ 
+   if (hasDataPane) {
++    if (showBanner) {
++      rows.push('auto');
++      grid.push([isSidebarFullWidth ? 'sidebar' : 'version-toggle', 'version-toggle']);
++    }
++
+     rows.push('1fr');
+     grid.push(['sidebar', 'data-pane']);
+   }
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts b/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts
+index 836d6e2a2f267..a209b9a930e23 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditor.test.ts
+@@ -21,6 +21,7 @@ import * as libAPI from 'app/features/library-panels/state/api';
+ 
+ import { DashboardScene } from '../scene/DashboardScene';
+ import { LibraryPanelBehavior } from '../scene/LibraryPanelBehavior';
++import { UNCONFIGURED_PANEL_PLUGIN_ID } from '../scene/UnconfiguredPanel';
+ import { DashboardGridItem } from '../scene/layout-default/DashboardGridItem';
+ import { DefaultGridLayoutManager } from '../scene/layout-default/DefaultGridLayoutManager';
+ import { vizPanelToPanel } from '../serialization/transformSceneToSaveModel';
+@@ -374,10 +375,26 @@ describe('PanelEditor', () => {
+       });
+     });
+   });
++  describe('isVizPickerOpen', () => {
++    it('should not auto-open viz picker for new panels when newVizSuggestions=false', async () => {
++      config.featureToggles.newVizSuggestions = false;
++      const { panelEditor } = await setup({ isNewPanel: true });
++      const optionsPane = panelEditor.state.optionsPane;
++      expect(optionsPane?.state.isVizPickerOpen).toBe(false);
++    });
++
++    it('should auto-open viz picker for new panels when newVizSuggestions=true', async () => {
++      config.featureToggles.newVizSuggestions = true;
++      const { panelEditor } = await setup({ isNewPanel: true, pluginId: UNCONFIGURED_PANEL_PLUGIN_ID });
++      const optionsPane = panelEditor.state.optionsPane;
++      expect(optionsPane?.state.isVizPickerOpen).toBe(true);
++    });
++  });
+ });
+ 
+ interface SetupOptions {
+   isNewPanel?: boolean;
++  pluginId?: string;
+   pluginSkipDataQuery?: boolean;
+   repeatByVariable?: string;
+   skipWait?: boolean;
+@@ -385,7 +402,8 @@ interface SetupOptions {
+ }
+ 
+ async function setup(options: SetupOptions = {}) {
+-  const pluginToLoad = getPanelPlugin({ id: 'text', skipDataQuery: options.pluginSkipDataQuery });
++  const panelPluginId = options.pluginId ?? 'text';
++  const pluginToLoad = getPanelPlugin({ id: panelPluginId, skipDataQuery: options.pluginSkipDataQuery });
+   let pluginResolve = (plugin: PanelPlugin) => {};
+ 
+   pluginPromise = new Promise<PanelPlugin>((resolve) => {
+@@ -394,7 +412,7 @@ async function setup(options: SetupOptions = {}) {
+ 
+   const panel = new VizPanel({
+     key: 'panel-1',
+-    pluginId: 'text',
++    pluginId: panelPluginId,
+     title: 'original title',
+     $data: new SceneDataTransformer({
+       transformations: [],
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx
+index 8d9c405b93717..532f40a07de71 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditor.tsx
+@@ -238,7 +238,7 @@ export class PanelEditor extends SceneObjectBase<PanelEditorState> {
+         panelRef: this.state.panelRef,
+         searchQuery: '',
+         listMode: OptionFilter.All,
+-        isVizPickerOpen: this.state.isNewPanel,
++        isVizPickerOpen: panel.state.pluginId === UNCONFIGURED_PANEL_PLUGIN_ID,
+         isNewPanel: this.state.isNewPanel,
+       });
+ 
+diff --git a/public/app/features/dashboard-scene/panel-edit/PanelEditorRenderer.tsx b/public/app/features/dashboard-scene/panel-edit/PanelEditorRenderer.tsx
+index dc3a0654d782a..b5b16ebae3590 100644
+--- a/public/app/features/dashboard-scene/panel-edit/PanelEditorRenderer.tsx
++++ b/public/app/features/dashboard-scene/panel-edit/PanelEditorRenderer.tsx
+@@ -13,7 +13,9 @@ import { NavToolbarActions } from '../scene/NavToolbarActions';
+ import { UnlinkModal } from '../scene/UnlinkModal';
+ import { getDashboardSceneFor, getLibraryPanelBehavior } from '../utils/utils';
+ 
++import { useQueryEditorBanner } from './PanelEditNext/hooks';
+ import { PanelEditor } from './PanelEditor';
++import { QueryEditorBanner } from './QueryEditorBanner';
+ import { SaveLibraryVizPanelModal } from './SaveLibraryVizPanelModal';
+ import { useSnappingSplitter } from './splitter/useSnappingSplitter';
+ import { scrollReflowMediaCondition, useScrollReflowLimit } from './useScrollReflowLimit';
+@@ -86,6 +88,7 @@ function VizAndDataPane({ model }: SceneComponentProps<PanelEditor>) {
+   const libraryPanel = getLibraryPanelBehavior(panel);
+   const { controls } = dashboard.useState();
+   const styles = useStyles2(getStyles);
++  const { showBanner, dismissBanner } = useQueryEditorBanner();
+ 
+   const isScrollingLayout = useScrollReflowLimit();
+ 
+@@ -133,6 +136,14 @@ function VizAndDataPane({ model }: SceneComponentProps<PanelEditor>) {
+         {dataPane && (
+           <>
+             <div {...splitterProps} />
++            {showBanner && (
++              <QueryEditorBanner
++                useQueryExperienceNext={model.state.useQueryExperienceNext ?? false}
++                onToggle={model.onToggleQueryEditorVersion}
++                onDismiss={dismissBanner}
++                className={styles.bannerWrapper}
++              />
++            )}
+             <div
+               {...secondaryProps}
+               className={cx(secondaryProps.className, isScrollingLayout && styles.fullSizeEditor)}
+@@ -270,6 +281,10 @@ function getStyles(theme: GrafanaTheme2) {
+         rotate: '-90deg',
+       },
+     }),
++    bannerWrapper: css({
++      marginLeft: theme.spacing(2),
++      flexShrink: 0,
++    }),
+     vizWrapper: css({
+       height: '100%',
+       width: '100%',
+diff --git a/public/app/features/dashboard-scene/panel-edit/QueryEditorBanner.test.tsx b/public/app/features/dashboard-scene/panel-edit/QueryEditorBanner.test.tsx
+new file mode 100644
+index 0000000000000..101a85e7332e6
+--- /dev/null
++++ b/public/app/features/dashboard-scene/panel-edit/QueryEditorBanner.test.tsx
+@@ -0,0 +1,70 @@
++import { render, screen } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++
++import { QueryEditorBanner } from './QueryEditorBanner';
++
++const onToggle = jest.fn();
++const onDismiss = jest.fn();
++
++describe('QueryEditorBanner', () => {
++  beforeEach(() => {
++    onToggle.mockClear();
++    onDismiss.mockClear();
++  });
++
++  describe('classic editor (useQueryExperienceNext = false)', () => {
++    it('shows the upgrade title and "Try it out" button', () => {
++      render(<QueryEditorBanner useQueryExperienceNext={false} onToggle={onToggle} onDismiss={onDismiss} />);
++
++      expect(screen.getByText('New editor available!')).toBeInTheDocument();
++      expect(screen.getByRole('button', { name: /try it out/i })).toBeInTheDocument();
++    });
++
++    it('does not show new-editor-specific content', () => {
++      render(<QueryEditorBanner useQueryExperienceNext={false} onToggle={onToggle} onDismiss={onDismiss} />);
++
++      expect(screen.queryByText('Go back to classic')).not.toBeInTheDocument();
++    });
++
++    it('calls onToggle when "Try it out" is clicked', async () => {
++      render(<QueryEditorBanner useQueryExperienceNext={false} onToggle={onToggle} onDismiss={onDismiss} />);
++
++      await userEvent.click(screen.getByRole('button', { name: /try it out/i }));
++
++      expect(onToggle).toHaveBeenCalledTimes(1);
++    });
++  });
++
++  describe('new editor (useQueryExperienceNext = true)', () => {
++    it('shows the new editor title and "Go back to classic" button', () => {
++      render(<QueryEditorBanner useQueryExperienceNext={true} onToggle={onToggle} onDismiss={onDismiss} />);
++
++      expect(screen.getByText('New query editor!')).toBeInTheDocument();
++      expect(screen.getByRole('button', { name: /back to classic/i })).toBeInTheDocument();
++    });
++
++    it('does not show "Try it out" button', () => {
++      render(<QueryEditorBanner useQueryExperienceNext={true} onToggle={onToggle} onDismiss={onDismiss} />);
++
++      expect(screen.queryByRole('button', { name: /try it out/i })).not.toBeInTheDocument();
++    });
++
++    it('calls onToggle when "Go back to classic" is clicked', async () => {
++      render(<QueryEditorBanner useQueryExperienceNext={true} onToggle={onToggle} onDismiss={onDismiss} />);
++
++      await userEvent.click(screen.getByRole('button', { name: /back to classic/i }));
++
++      expect(onToggle).toHaveBeenCalledTimes(1);
++    });
++  });
++
++  describe('dismiss', () => {
++    it('calls onDismiss when dismiss button is clicked', async () => {
++      render(<QueryEditorBanner useQueryExperienceNext={false} onToggle={onToggle} onDismiss={onDismiss} />);
++
++      await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
++
++      expect(onDismiss).toHaveBeenCalledTimes(1);
++    });
++  });
++});
+diff --git a/public/app/features/dashboard-scene/panel-edit/QueryEditorBanner.tsx b/public/app/features/dashboard-scene/panel-edit/QueryEditorBanner.tsx
+new file mode 100644
+index 0000000000000..e8efa18bfec27
+--- /dev/null
++++ b/public/app/features/dashboard-scene/panel-edit/QueryEditorBanner.tsx
+@@ -0,0 +1,125 @@
++import { css, cx } from '@emotion/css';
++
++import { GrafanaTheme2 } from '@grafana/data';
++import { t } from '@grafana/i18n';
++import { Button, Icon, IconButton, LinkButton, useStyles2 } from '@grafana/ui';
++
++import { QUERY_EDITOR_BANNER_FEEDBACK_URL, getQueryEditorBannerColors } from './PanelEditNext/constants';
++
++interface Props {
++  useQueryExperienceNext: boolean;
++  onToggle: () => void;
++  onDismiss: () => void;
++  className?: string;
++}
++
++export function QueryEditorBanner({ useQueryExperienceNext, onToggle, onDismiss, className }: Props) {
++  const styles = useStyles2(getStyles);
++
++  return (
++    <div className={cx(styles.banner, className)}>
++      <div className={styles.left}>
++        <Icon name={useQueryExperienceNext ? 'rocket' : 'bolt'} size="md" className={styles.accentIcon} />
++        <span className={styles.title}>
++          {useQueryExperienceNext
++            ? t('dashboard-scene.query-editor-banner.downgrade-title', 'New query editor!')
++            : t('dashboard-scene.query-editor-banner.upgrade-title', 'New editor available!')}
++        </span>
++        <span className={styles.description}>
++          {useQueryExperienceNext
++            ? t(
++                'dashboard-scene.query-editor-banner.description-new',
++                'Welcome to the improved query editing experience.'
++              )
++            : t(
++                'dashboard-scene.query-editor-banner.description-classic',
++                'Try the improved query editing experience.'
++              )}
++        </span>
++      </div>
++      <div className={styles.right}>
++        {useQueryExperienceNext && (
++          <LinkButton
++            variant="primary"
++            fill="text"
++            size="sm"
++            icon="comment-alt"
++            href={QUERY_EDITOR_BANNER_FEEDBACK_URL}
++            target="_blank"
++            rel="noopener noreferrer"
++          >
++            {t('dashboard-scene.query-editor-banner.give-feedback', 'Give feedback')}
++          </LinkButton>
++        )}
++        {useQueryExperienceNext ? (
++          <Button variant="secondary" fill="text" size="sm" icon="arrow-left" onClick={onToggle}>
++            {t('dashboard-scene.query-editor-banner.go-back', 'Back to classic')}
++          </Button>
++        ) : (
++          <Button variant="primary" fill="text" size="sm" icon="rocket" onClick={onToggle}>
++            {t('dashboard-scene.query-editor-banner.try-it', 'Try it out')}
++          </Button>
++        )}
++        <IconButton
++          name="times"
++          size="md"
++          tooltip={t('dashboard-scene.query-editor-banner.dismiss', 'Dismiss')}
++          onClick={onDismiss}
++          className={styles.closeButton}
++          aria-label={t('dashboard-scene.query-editor-banner.dismiss', 'Dismiss')}
++        />
++      </div>
++    </div>
++  );
++}
++
++function getStyles(theme: GrafanaTheme2) {
++  const bannerColors = getQueryEditorBannerColors(theme);
++
++  return {
++    banner: css({
++      display: 'flex',
++      alignItems: 'center',
++      justifyContent: 'space-between',
++      padding: theme.spacing(0, 2),
++      height: theme.spacing(5),
++      backgroundColor: bannerColors.background,
++      border: `1px solid ${bannerColors.border}`,
++      borderRadius: theme.shape.radius.default,
++      flexShrink: 0,
++    }),
++    left: css({
++      display: 'flex',
++      alignItems: 'center',
++      gap: theme.spacing(1.5),
++      minWidth: 0,
++    }),
++    accentIcon: css({
++      color: bannerColors.accent,
++    }),
++    title: css({
++      color: bannerColors.accent,
++      fontWeight: theme.typography.fontWeightMedium,
++      whiteSpace: 'nowrap',
++    }),
++    description: css({
++      color: theme.colors.text.secondary,
++      whiteSpace: 'nowrap',
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++    }),
++    right: css({
++      display: 'flex',
++      alignItems: 'center',
++      gap: theme.spacing(1),
++      flexShrink: 0,
++      marginLeft: theme.spacing(2), // minimum gap when left content is wide
++    }),
++    closeButton: css({
++      color: theme.colors.text.secondary,
++      '&:hover': {
++        color: theme.colors.text.primary,
++      },
++    }),
++  };
++}
+diff --git a/public/app/plugins/panel/barchart/module.tsx b/public/app/plugins/panel/barchart/module.tsx
+index 28ba77d54768d..f7dd61f1c3b26 100644
+--- a/public/app/plugins/panel/barchart/module.tsx
++++ b/public/app/plugins/panel/barchart/module.tsx
+@@ -8,6 +8,7 @@ import {
+   VizOrientation,
+ } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { GraphTransform, GraphThresholdsStyleMode, StackingMode, VisibilityMode } from '@grafana/schema';
+ import { getGraphFieldOptions, commonOptionsBuilder } from '@grafana/ui';
+ import { optsWithHideZeros } from '@grafana/ui/internal';
+@@ -254,7 +255,7 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(BarChartPanel)
+     });
+ 
+     commonOptionsBuilder.addTooltipOptions(builder, false, false, optsWithHideZeros);
+-    commonOptionsBuilder.addLegendOptions(builder);
++    commonOptionsBuilder.addLegendOptions(builder, true, true, config.featureToggles.vizLegendSeriesLimit);
+     commonOptionsBuilder.addTextSizeOptions(builder, { withValue: true });
+   })
+   .setSuggestionsSupplier(barchartSuggestionsSupplier);
+diff --git a/public/app/plugins/panel/bargauge/module.tsx b/public/app/plugins/panel/bargauge/module.tsx
+index 8e7fd5ccae65d..fff09d2b18528 100644
+--- a/public/app/plugins/panel/bargauge/module.tsx
++++ b/public/app/plugins/panel/bargauge/module.tsx
+@@ -1,5 +1,6 @@
+ import { PanelPlugin, VizOrientation } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { BarGaugeDisplayMode, BarGaugeNamePlacement, BarGaugeSizing, BarGaugeValueMode } from '@grafana/schema';
+ import { commonOptionsBuilder, sharedSingleStatPanelChangedHandler } from '@grafana/ui';
+ 
+@@ -16,7 +17,7 @@ export const plugin = new PanelPlugin<Options>(BarGaugePanel)
+     const category = [t('bargauge.category-bar-gauge', 'Bar gauge')];
+     addStandardDataReduceOptions(builder);
+     addOrientationOption(builder, category);
+-    commonOptionsBuilder.addLegendOptions(builder, true, false);
++    commonOptionsBuilder.addLegendOptions(builder, true, false, config.featureToggles.vizLegendSeriesLimit);
+     commonOptionsBuilder.addTextSizeOptions(builder, { withTitle: true, withValue: true });
+ 
+     builder
+diff --git a/public/app/plugins/panel/candlestick/module.tsx b/public/app/plugins/panel/candlestick/module.tsx
+index 496013f2fb031..ba9552a0b925b 100644
+--- a/public/app/plugins/panel/candlestick/module.tsx
++++ b/public/app/plugins/panel/candlestick/module.tsx
+@@ -145,7 +145,7 @@ export const plugin = new PanelPlugin<Options, GraphFieldConfig>(CandlestickPane
+     });
+ 
+     commonOptionsBuilder.addTooltipOptions(builder, false, true);
+-    commonOptionsBuilder.addLegendOptions(builder);
++    commonOptionsBuilder.addLegendOptions(builder, true, true, config.featureToggles.vizLegendSeriesLimit);
+   })
+   .setDataSupport({ annotations: true, alertStates: true })
+   .setSuggestionsSupplier(candlestickSuggestionSupplier);
+diff --git a/public/app/plugins/panel/histogram/module.tsx b/public/app/plugins/panel/histogram/module.tsx
+index 3b3254d784e6d..38e655b0c6415 100644
+--- a/public/app/plugins/panel/histogram/module.tsx
++++ b/public/app/plugins/panel/histogram/module.tsx
+@@ -10,6 +10,7 @@ import {
+   DataFrameType,
+ } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { commonOptionsBuilder, getGraphFieldOptions, LegendDisplayMode } from '@grafana/ui';
+ import { StackingEditor } from '@grafana/ui/internal';
+ 
+@@ -77,7 +78,7 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(HistogramPanel)
+       });
+ 
+     commonOptionsBuilder.addTooltipOptions(builder);
+-    commonOptionsBuilder.addLegendOptions(builder);
++    commonOptionsBuilder.addLegendOptions(builder, true, true, config.featureToggles.vizLegendSeriesLimit);
+   })
+   .useFieldConfig({
+     standardOptions: {
+diff --git a/public/app/plugins/panel/piechart/module.tsx b/public/app/plugins/panel/piechart/module.tsx
+index b41e687f9f60f..70c0e2ac903b0 100644
+--- a/public/app/plugins/panel/piechart/module.tsx
++++ b/public/app/plugins/panel/piechart/module.tsx
+@@ -1,5 +1,6 @@
+ import { FieldColorModeId, FieldConfigProperty, PanelPlugin } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { SortOrder } from '@grafana/schema';
+ import { commonOptionsBuilder } from '@grafana/ui';
+ import { optsWithHideZeros } from '@grafana/ui/internal';
+@@ -77,7 +78,7 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(PieChartPanel)
+       });
+ 
+     commonOptionsBuilder.addTooltipOptions(builder, false, false, optsWithHideZeros);
+-    commonOptionsBuilder.addLegendOptions(builder, false);
++    commonOptionsBuilder.addLegendOptions(builder, false, true, config.featureToggles.vizLegendSeriesLimit);
+ 
+     builder.addMultiSelect({
+       name: t('piechart.name-legend-values', 'Legend values'),
+diff --git a/public/app/plugins/panel/state-timeline/module.tsx b/public/app/plugins/panel/state-timeline/module.tsx
+index 89acb33882584..3c2525fd02bf2 100644
+--- a/public/app/plugins/panel/state-timeline/module.tsx
++++ b/public/app/plugins/panel/state-timeline/module.tsx
+@@ -6,6 +6,7 @@ import {
+   PanelPlugin,
+ } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { AxisPlacement, VisibilityMode } from '@grafana/schema';
+ import { commonOptionsBuilder } from '@grafana/ui';
+ import { showDefaultSuggestion } from 'app/features/panel/suggestions/utils';
+@@ -154,7 +155,7 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(StateTimelinePanel)
+         },
+       });
+ 
+-    commonOptionsBuilder.addLegendOptions(builder, false);
++    commonOptionsBuilder.addLegendOptions(builder, false, true, config.featureToggles.vizLegendSeriesLimit);
+     commonOptionsBuilder.addTooltipOptions(builder);
+   })
+   .setSuggestionsSupplier(
+diff --git a/public/app/plugins/panel/status-history/module.tsx b/public/app/plugins/panel/status-history/module.tsx
+index f4ea47412ee21..05cfbf4f8557c 100644
+--- a/public/app/plugins/panel/status-history/module.tsx
++++ b/public/app/plugins/panel/status-history/module.tsx
+@@ -1,5 +1,6 @@
+ import { FieldColorModeId, FieldConfigProperty, FieldType, PanelPlugin } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { AxisPlacement, LegendDisplayMode, VisibilityMode } from '@grafana/schema';
+ import { commonOptionsBuilder } from '@grafana/ui';
+ 
+@@ -109,7 +110,7 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(StatusHistoryPanel)
+         },
+       });
+ 
+-    commonOptionsBuilder.addLegendOptions(builder, false);
++    commonOptionsBuilder.addLegendOptions(builder, false, true, config.featureToggles.vizLegendSeriesLimit);
+     commonOptionsBuilder.addTooltipOptions(builder);
+   })
+   .setSuggestionsSupplier((ds) => {
+diff --git a/public/app/plugins/panel/timeseries/module.tsx b/public/app/plugins/panel/timeseries/module.tsx
+index 22b0e3a715a91..42dc4cfc706b2 100644
+--- a/public/app/plugins/panel/timeseries/module.tsx
++++ b/public/app/plugins/panel/timeseries/module.tsx
+@@ -1,5 +1,6 @@
+ import { PanelPlugin } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { commonOptionsBuilder } from '@grafana/ui';
+ import { optsWithHideZeros } from '@grafana/ui/internal';
+ 
+@@ -15,7 +16,7 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(TimeSeriesPanel)
+   .useFieldConfig(getGraphFieldConfig(defaultGraphConfig))
+   .setPanelOptions((builder) => {
+     commonOptionsBuilder.addTooltipOptions(builder, false, true, optsWithHideZeros);
+-    commonOptionsBuilder.addLegendOptions(builder);
++    commonOptionsBuilder.addLegendOptions(builder, true, true, config.featureToggles.vizLegendSeriesLimit);
+ 
+     builder.addCustomEditor({
+       id: 'timezone',
+diff --git a/public/app/plugins/panel/trend/module.tsx b/public/app/plugins/panel/trend/module.tsx
+index 023c1ea8a0de8..bbeb5bf9dcbf1 100644
+--- a/public/app/plugins/panel/trend/module.tsx
++++ b/public/app/plugins/panel/trend/module.tsx
+@@ -1,5 +1,6 @@
+ import { Field, FieldType, PanelPlugin, VisualizationSuggestionScore } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { GraphDrawStyle } from '@grafana/schema';
+ import { commonOptionsBuilder } from '@grafana/ui';
+ import { optsWithHideZeros } from '@grafana/ui/internal';
+@@ -29,7 +30,7 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(TrendPanel)
+     });
+ 
+     commonOptionsBuilder.addTooltipOptions(builder, false, true, optsWithHideZeros);
+-    commonOptionsBuilder.addLegendOptions(builder);
++    commonOptionsBuilder.addLegendOptions(builder, true, true, config.featureToggles.vizLegendSeriesLimit);
+   })
+   .setSuggestionsSupplier((ds) => {
+     if (
+diff --git a/public/app/plugins/panel/xychart/module.tsx b/public/app/plugins/panel/xychart/module.tsx
+index 7b0a65a85b1f5..608b395a3d4fa 100644
+--- a/public/app/plugins/panel/xychart/module.tsx
++++ b/public/app/plugins/panel/xychart/module.tsx
+@@ -1,5 +1,6 @@
+ import { PanelPlugin } from '@grafana/data';
+ import { t } from '@grafana/i18n';
++import { config } from '@grafana/runtime';
+ import { commonOptionsBuilder } from '@grafana/ui';
+ 
+ import { SeriesEditor } from './SeriesEditor';
+@@ -38,6 +39,6 @@ export const plugin = new PanelPlugin<Options, FieldConfig>(XYChartPanel2)
+       });
+ 
+     commonOptionsBuilder.addTooltipOptions(builder, true);
+-    commonOptionsBuilder.addLegendOptions(builder);
++    commonOptionsBuilder.addLegendOptions(builder, true, true, config.featureToggles.vizLegendSeriesLimit);
+   })
+   .setSuggestionsSupplier(xychartSuggestionsSupplier);
+diff --git a/public/locales/en-US/grafana.json b/public/locales/en-US/grafana.json
+index 91a7fe0af1cc8..05995df117970 100644
+--- a/public/locales/en-US/grafana.json
++++ b/public/locales/en-US/grafana.json
+@@ -6876,10 +6876,10 @@
+       "title-delete-all-transformations": "Delete all transformations?"
+     },
+     "panel-edit-controls": {
+-      "query-editor-version": "Query editor v2",
+-      "query-editor-version-toggle": "Toggle between query editor v1 and v2",
++      "back-to-classic": "Back to classic editor",
+       "table-view-aria-label-toggletableview": "Toggle table view",
+-      "table-view-label-table-view": "Table view"
++      "table-view-label-table-view": "Table view",
++      "try-new-editor": "Try new editor"
+     },
+     "panel-editor": {
+       "text": {
+@@ -6925,6 +6925,16 @@
+     "query-editor": {
+       "query": "Query"
+     },
++    "query-editor-banner": {
++      "description-classic": "Try the improved query editing experience.",
++      "description-new": "Welcome to the improved query editing experience.",
++      "dismiss": "Dismiss",
++      "downgrade-title": "New query editor!",
++      "give-feedback": "Give feedback",
++      "go-back": "Back to classic",
++      "try-it": "Try it out",
++      "upgrade-title": "New editor available!"
++    },
+     "query-variable-editor-form": {
+       "description-examples": "Named capture groups can be used to separate the display text and value (<1>see examples</1> ).",
+       "description-optional": "Optional, if you want to extract part of a series name or metric node segment.",
+@@ -7048,6 +7058,7 @@
+     },
+     "scenes-new-rule-from-panel-button": {
+       "body-no-alerting-capable-query-found": "Cannot create alerts from this panel because no query to an alerting capable datasource is found.",
++      "disabled-tooltip": "Save the dashboard before creating alert rules",
+       "new-alert-rule": "New alert rule",
+       "title-no-alerting-capable-query-found": "No alerting capable query found"
+     },
+@@ -9467,11 +9478,13 @@
+       },
+       "legend": {
+         "category": "Legend",
++        "description-limit": "Limits how many items are shown by default",
+         "description-values": "Select values or calculations to show in legend",
+         "mode-options": {
+           "label-list": "List",
+           "label-table": "Table"
+         },
++        "name-limit": "Limit",
+         "name-mode": "Mode",
+         "name-placement": "Placement",
+         "name-values": "Values",
+@@ -10402,6 +10415,11 @@
+     "subtitle": "The LDAP integration in Grafana allows your Grafana users to log in with their LDAP credentials. Find out more in our <2><1>documentation</1></2>.",
+     "title": "Basic Settings"
+   },
++  "legend": {
++    "container": {
++      "show-all-series": "...show all {{total}} items"
++    }
++  },
+   "library-panel": {
+     "add-modal": {
+       "error": "Library panel with this name already exists",
+@@ -13447,6 +13465,7 @@
+       "footer-items-alert_one": "{{count}} alerts",
+       "footer-items-alert_other": "{{count}} alerts",
+       "loading-queries-transformations": "Loading queries and transformations",
++      "new-type": "New {{type}}",
+       "queries-expressions": "Queries & Expressions",
+       "toggle-size": "Toggle sidebar size",
+       "transformations": "Transformations",
+@@ -14706,6 +14725,12 @@
+       "no-data-found-in-response": "No data found in response"
+     }
+   },
++  "transformation-editor": {
++    "no-options": {
++      "description": "{{name}} will be applied automatically to your data unless the transformation is disabled.",
++      "title": "No options to configure"
++    }
++  },
+   "transformation-editor-renderer": {
+     "no-transformation-editor-title": "Transformation does not have an editor component"
+   },

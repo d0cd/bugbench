@@ -1,204 +1,149 @@
-diff --git a/synthesizer/program/src/closure/bytes.rs b/synthesizer/program/src/closure/bytes.rs
-index ca3c45b6f..1afb0e623 100644
---- a/synthesizer/program/src/closure/bytes.rs
-+++ b/synthesizer/program/src/closure/bytes.rs
-@@ -23,6 +23,9 @@ impl<N: Network, Instruction: InstructionTrait<N>> FromBytes for ClosureCore<N,
- 
-         // Read the inputs.
-         let num_inputs = u16::read_le(&mut reader)?;
-+        if num_inputs > u16::try_from(N::MAX_INPUTS).map_err(error)? {
-+            return Err(error(format!("Failed to deserialize a closure: too many inputs ({num_inputs})")));
-+        }
-         let mut inputs = Vec::with_capacity(num_inputs as usize);
-         for _ in 0..num_inputs {
-             inputs.push(Input::read_le(&mut reader)?);
-@@ -30,7 +33,7 @@ impl<N: Network, Instruction: InstructionTrait<N>> FromBytes for ClosureCore<N,
- 
-         // Read the instructions.
-         let num_instructions = u32::read_le(&mut reader)?;
--        if num_instructions > u32::try_from(N::MAX_INSTRUCTIONS).map_err(|e| error(e.to_string()))? {
-+        if num_instructions > u32::try_from(N::MAX_INSTRUCTIONS).map_err(error)? {
-             return Err(error(format!("Failed to deserialize a closure: too many instructions ({num_instructions})")));
-         }
-         let mut instructions = Vec::with_capacity(num_instructions as usize);
-@@ -40,6 +43,9 @@ impl<N: Network, Instruction: InstructionTrait<N>> FromBytes for ClosureCore<N,
- 
-         // Read the outputs.
-         let num_outputs = u16::read_le(&mut reader)?;
-+        if num_outputs > u16::try_from(N::MAX_OUTPUTS).map_err(error)? {
-+            return Err(error(format!("Failed to deserialize a closure: too many outputs ({num_outputs})")));
-+        }
-         let mut outputs = Vec::with_capacity(num_outputs as usize);
-         for _ in 0..num_outputs {
-             outputs.push(Output::read_le(&mut reader)?);
-@@ -47,12 +53,9 @@ impl<N: Network, Instruction: InstructionTrait<N>> FromBytes for ClosureCore<N,
- 
-         // Initialize a new closure.
-         let mut closure = Self::new(name);
--        inputs.into_iter().try_for_each(|input| closure.add_input(input)).map_err(|e| error(e.to_string()))?;
--        instructions
--            .into_iter()
--            .try_for_each(|instruction| closure.add_instruction(instruction))
--            .map_err(|e| error(e.to_string()))?;
--        outputs.into_iter().try_for_each(|output| closure.add_output(output)).map_err(|e| error(e.to_string()))?;
-+        inputs.into_iter().try_for_each(|input| closure.add_input(input)).map_err(error)?;
-+        instructions.into_iter().try_for_each(|instruction| closure.add_instruction(instruction)).map_err(error)?;
-+        outputs.into_iter().try_for_each(|output| closure.add_output(output)).map_err(error)?;
- 
-         Ok(closure)
+diff --git a/synthesizer/src/vm/finalize.rs b/synthesizer/src/vm/finalize.rs
+index 080a5414c..183b994c0 100644
+--- a/synthesizer/src/vm/finalize.rs
++++ b/synthesizer/src/vm/finalize.rs
+@@ -947,9 +947,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+         let bond_validator_addresses: HashSet<_> = execution
+             .transitions()
+             .filter_map(|transition| match transition.is_bond_validator() {
+-                // Check the first input of the transition for the validator address.
+-                true => match transition.inputs().first() {
+-                    Some(Input::Public(_, Some(Plaintext::Literal(Literal::Address(address), _)))) => Some(address),
++                // Get the first argument of the transition output if it is a `Future` with a `Plaintext` argument.
++                true => match transition.outputs().first() {
++                    Some(Output::Future(_, Some(future))) => future.arguments().first().and_then(|arg| match arg {
++                        Argument::Plaintext(Plaintext::Literal(Literal::Address(address), _)) => Some(*address),
++                        _ => None,
++                    }),
+                     _ => None,
+                 },
+                 false => None,
+@@ -1765,6 +1768,93 @@ finalize transfer_public:
+         assert_eq!(candidate_transactions[0].to_unconfirmed_transaction_id().unwrap(), deployment_transaction_id);
      }
-@@ -68,7 +71,7 @@ impl<N: Network, Instruction: InstructionTrait<N>> ToBytes for ClosureCore<N, In
-         // Write the number of inputs for the closure.
-         let num_inputs = self.inputs.len();
-         match num_inputs <= N::MAX_INPUTS {
--            true => u16::try_from(num_inputs).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u16::try_from(num_inputs).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_inputs} inputs as bytes"))),
-         }
  
-@@ -80,7 +83,7 @@ impl<N: Network, Instruction: InstructionTrait<N>> ToBytes for ClosureCore<N, In
-         // Write the number of instructions for the closure.
-         let num_instructions = self.instructions.len();
-         match num_instructions <= N::MAX_INSTRUCTIONS {
--            true => u32::try_from(num_instructions).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u32::try_from(num_instructions).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_instructions} instructions as bytes"))),
-         }
++    #[test]
++    fn test_bond_validator_above_maximum_fails() {
++        // Initialize an RNG.
++        let rng = &mut TestRng::default();
++
++        // Initialize the VM.
++        let vm = sample_vm();
++
++        // Initialize the validators with the maximum number of validators.
++        let validators =
++            sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize, rng);
++
++        // Initialize a new address.
++        let new_validator_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++        let new_validator_address = Address::try_from(&new_validator_private_key).unwrap();
++
++        // Construct the committee.
++        // Track the allocated amount.
++        let (committee_map, allocated_amount) =
++            sample_committee_map_and_allocated_amount(&validators, &IndexMap::new());
++
++        // Collect all of the addresses in a single place
++        let validator_addresses =
++            validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>();
++
++        // Construct the public balances, allocating the remaining supply.
++        let new_validator_balance = MIN_VALIDATOR_STAKE + 100_000_000;
++        let mut public_balances = sample_public_balances(
++            &validator_addresses,
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount - new_validator_balance,
++        );
++        // Set the public balance of the new validator to the minimum validator stake.
++        public_balances.insert(new_validator_address, new_validator_balance);
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &IndexMap::new());
++
++        // Construct the genesis block, which should pass.
++        let block = vm
++            .genesis_quorum(
++                validators.keys().next().unwrap(),
++                Committee::new_genesis(committee_map).unwrap(),
++                public_balances,
++                bonded_balances,
++                rng,
++            )
++            .unwrap();
++
++        // Add the block.
++        vm.add_next_block(&block).unwrap();
++
++        // Attempt to bond a new validator above the maximum number of validators.
++        let inputs = vec![
++            Value::<CurrentNetwork>::from_str(&validator_addresses.first().unwrap().to_string()).unwrap(), // Withdrawal address
++            Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap(),              // Amount
++            Value::<CurrentNetwork>::from_str("42u8").unwrap(),                                            // Commission
++        ];
++
++        // Execute.
++        let bond_validator_transaction = vm
++            .execute(
++                &new_validator_private_key,
++                ("credits.aleo", "bond_validator"),
++                inputs.into_iter(),
++                None,
++                1,
++                None,
++                rng,
++            )
++            .unwrap();
++
++        // Verify.
++        vm.check_transaction(&bond_validator_transaction, None, rng).unwrap();
++
++        // Speculate on the transactions.
++        let transactions = [bond_validator_transaction.clone()];
++        let (_, confirmed_transactions, _, _) =
++            vm.atomic_speculate(sample_finalize_state(1), None, vec![], &None.into(), transactions.iter()).unwrap();
++
++        // Assert that the transaction is rejected.
++        assert_eq!(confirmed_transactions.len(), 1);
++        assert_eq!(
++            confirmed_transactions[0],
++            reject(0, &bond_validator_transaction, confirmed_transactions[0].finalize_operations())
++        );
++    }
++
+     #[test]
+     fn test_atomic_finalize_many() {
+         let rng = &mut TestRng::default();
+diff --git a/synthesizer/src/vm/helpers/rewards.rs b/synthesizer/src/vm/helpers/rewards.rs
+index 3ffc3a740..24c03c4d4 100644
+--- a/synthesizer/src/vm/helpers/rewards.rs
++++ b/synthesizer/src/vm/helpers/rewards.rs
+@@ -54,7 +54,7 @@ pub fn staking_rewards<N: Network>(
+         .map(|(staker, (validator, stake))| {
+             // If the validator is not in the committee, skip the staker.
+             let Some((validator_stake, _is_open, commission_rate)) = committee.members().get(validator) else {
+-                error!("Validator {validator} is not in the committee - skipping {staker}");
++                trace!("Validator {validator} is not in the committee - skipping {staker}");
+                 return (*staker, (*validator, *stake));
+             };
  
-@@ -92,7 +95,7 @@ impl<N: Network, Instruction: InstructionTrait<N>> ToBytes for ClosureCore<N, In
-         // Write the number of outputs for the closure.
-         let num_outputs = self.outputs.len();
-         match num_outputs <= N::MAX_OUTPUTS {
--            true => u16::try_from(num_outputs).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u16::try_from(num_outputs).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_outputs} outputs as bytes"))),
-         }
- 
-diff --git a/synthesizer/program/src/finalize/bytes.rs b/synthesizer/program/src/finalize/bytes.rs
-index 2e57e995a..b61eee31f 100644
---- a/synthesizer/program/src/finalize/bytes.rs
-+++ b/synthesizer/program/src/finalize/bytes.rs
-@@ -23,6 +23,9 @@ impl<N: Network, Command: CommandTrait<N>> FromBytes for FinalizeCore<N, Command
- 
-         // Read the inputs.
-         let num_inputs = u16::read_le(&mut reader)?;
-+        if num_inputs > u16::try_from(N::MAX_INPUTS).map_err(error)? {
-+            return Err(error(format!("Failed to deserialize finalize: too many inputs ({num_inputs})")));
-+        }
-         let mut inputs = Vec::with_capacity(num_inputs as usize);
-         for _ in 0..num_inputs {
-             inputs.push(Input::read_le(&mut reader)?);
-@@ -30,7 +33,7 @@ impl<N: Network, Command: CommandTrait<N>> FromBytes for FinalizeCore<N, Command
- 
-         // Read the commands.
-         let num_commands = u16::read_le(&mut reader)?;
--        if num_commands > u16::try_from(N::MAX_COMMANDS).map_err(|e| error(e.to_string()))? {
-+        if num_commands > u16::try_from(N::MAX_COMMANDS).map_err(error)? {
-             return Err(error(format!("Failed to deserialize finalize: too many commands ({num_commands})")));
-         }
-         let mut commands = Vec::with_capacity(num_commands as usize);
-@@ -40,8 +43,8 @@ impl<N: Network, Command: CommandTrait<N>> FromBytes for FinalizeCore<N, Command
- 
-         // Initialize a new finalize.
-         let mut finalize = Self::new(name);
--        inputs.into_iter().try_for_each(|input| finalize.add_input(input)).map_err(|e| error(e.to_string()))?;
--        commands.into_iter().try_for_each(|command| finalize.add_command(command)).map_err(|e| error(e.to_string()))?;
-+        inputs.into_iter().try_for_each(|input| finalize.add_input(input)).map_err(error)?;
-+        commands.into_iter().try_for_each(|command| finalize.add_command(command)).map_err(error)?;
- 
-         Ok(finalize)
-     }
-@@ -57,7 +60,7 @@ impl<N: Network, Command: CommandTrait<N>> ToBytes for FinalizeCore<N, Command>
-         // Write the number of inputs for the finalize.
-         let num_inputs = self.inputs.len();
-         match num_inputs <= N::MAX_INPUTS {
--            true => u16::try_from(num_inputs).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u16::try_from(num_inputs).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_inputs} inputs as bytes"))),
-         }
- 
-@@ -69,7 +72,7 @@ impl<N: Network, Command: CommandTrait<N>> ToBytes for FinalizeCore<N, Command>
-         // Write the number of commands for the finalize.
-         let num_commands = self.commands.len();
-         match num_commands <= N::MAX_COMMANDS {
--            true => u16::try_from(num_commands).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u16::try_from(num_commands).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_commands} commands as bytes"))),
-         }
- 
-diff --git a/synthesizer/program/src/function/bytes.rs b/synthesizer/program/src/function/bytes.rs
-index 29f0c8194..64ddf4938 100644
---- a/synthesizer/program/src/function/bytes.rs
-+++ b/synthesizer/program/src/function/bytes.rs
-@@ -25,6 +25,9 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> Fro
- 
-         // Read the inputs.
-         let num_inputs = u16::read_le(&mut reader)?;
-+        if num_inputs > u16::try_from(N::MAX_INPUTS).map_err(error)? {
-+            return Err(error(format!("Failed to deserialize a function: too many inputs ({num_inputs})")));
-+        }
-         let mut inputs = Vec::with_capacity(num_inputs as usize);
-         for _ in 0..num_inputs {
-             inputs.push(Input::read_le(&mut reader)?);
-@@ -32,7 +35,7 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> Fro
- 
-         // Read the instructions.
-         let num_instructions = u32::read_le(&mut reader)?;
--        if num_instructions > u32::try_from(N::MAX_INSTRUCTIONS).map_err(|e| error(e.to_string()))? {
-+        if num_instructions > u32::try_from(N::MAX_INSTRUCTIONS).map_err(error)? {
-             return Err(error(format!("Failed to deserialize a function: too many instructions ({num_instructions})")));
-         }
-         let mut instructions = Vec::with_capacity(num_instructions as usize);
-@@ -42,6 +45,9 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> Fro
- 
-         // Read the outputs.
-         let num_outputs = u16::read_le(&mut reader)?;
-+        if num_outputs > u16::try_from(N::MAX_OUTPUTS).map_err(error)? {
-+            return Err(error(format!("Failed to deserialize a function: too many outputs ({num_outputs})")));
-+        }
-         let mut outputs = Vec::with_capacity(num_outputs as usize);
-         for _ in 0..num_outputs {
-             outputs.push(Output::read_le(&mut reader)?);
-@@ -57,12 +63,9 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> Fro
- 
-         // Initialize a new function.
-         let mut function = Self::new(name);
--        inputs.into_iter().try_for_each(|input| function.add_input(input)).map_err(|e| error(e.to_string()))?;
--        instructions
--            .into_iter()
--            .try_for_each(|instruction| function.add_instruction(instruction))
--            .map_err(|e| error(e.to_string()))?;
--        outputs.into_iter().try_for_each(|output| function.add_output(output)).map_err(|e| error(e.to_string()))?;
-+        inputs.into_iter().try_for_each(|input| function.add_input(input)).map_err(error)?;
-+        instructions.into_iter().try_for_each(|instruction| function.add_instruction(instruction)).map_err(error)?;
-+        outputs.into_iter().try_for_each(|output| function.add_output(output)).map_err(error)?;
-         finalize.map(|finalize| function.add_finalize(finalize));
- 
-         Ok(function)
-@@ -81,7 +84,7 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> ToB
-         // Write the number of inputs for the function.
-         let num_inputs = self.inputs.len();
-         match num_inputs <= N::MAX_INPUTS {
--            true => u16::try_from(num_inputs).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u16::try_from(num_inputs).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_inputs} inputs as bytes"))),
-         }
- 
-@@ -93,7 +96,7 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> ToB
-         // Write the number of instructions for the function.
-         let num_instructions = self.instructions.len();
-         match num_instructions <= N::MAX_INSTRUCTIONS {
--            true => u32::try_from(num_instructions).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u32::try_from(num_instructions).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_instructions} instructions as bytes"))),
-         }
- 
-@@ -105,7 +108,7 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> ToB
-         // Write the number of outputs for the function.
-         let num_outputs = self.outputs.len();
-         match num_outputs <= N::MAX_OUTPUTS {
--            true => u16::try_from(num_outputs).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?,
-+            true => u16::try_from(num_outputs).map_err(error)?.write_le(&mut writer)?,
-             false => return Err(error(format!("Failed to write {num_outputs} outputs as bytes"))),
-         }
- 
+diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
+index 87a6f7e2e..4403375f1 100644
+--- a/synthesizer/src/vm/mod.rs
++++ b/synthesizer/src/vm/mod.rs
+@@ -25,7 +25,7 @@ use crate::{cast_mut_ref, cast_ref, convert, process, Restrictions};
+ use console::{
+     account::{Address, PrivateKey},
+     network::prelude::*,
+-    program::{Identifier, Literal, Locator, Plaintext, ProgramID, ProgramOwner, Record, Value},
++    program::{Argument, Identifier, Literal, Locator, Plaintext, ProgramID, ProgramOwner, Record, Value},
+     types::{Field, Group, U64},
+ };
+ use ledger_block::{
+@@ -35,7 +35,7 @@ use ledger_block::{
+     Execution,
+     Fee,
+     Header,
+-    Input,
++    Output,
+     Ratifications,
+     Ratify,
+     Rejected,

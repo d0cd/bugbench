@@ -1,0 +1,186 @@
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/server/EmbeddedKeycloakServer.java b/test-framework/core/src/main/java/org/keycloak/testframework/server/EmbeddedKeycloakServer.java
+index 030e06e8ed64..b7c40a733c1b 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/server/EmbeddedKeycloakServer.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/server/EmbeddedKeycloakServer.java
+@@ -1,13 +1,10 @@
+ package org.keycloak.testframework.server;
+ 
+-import java.util.Optional;
+ import java.util.concurrent.TimeoutException;
+ 
+ import org.keycloak.Keycloak;
+ import org.keycloak.common.Version;
+-import org.keycloak.it.utils.Maven;
+-
+-import org.eclipse.aether.artifact.Artifact;
++import org.keycloak.testframework.util.MavenProjectUtil;
+ 
+ public class EmbeddedKeycloakServer implements KeycloakServer {
+ 
+@@ -20,10 +17,8 @@ public void start(KeycloakServerConfigBuilder keycloakServerConfigBuilder, boole
+         this.tlsEnabled = tlsEnabled;
+ 
+         for(KeycloakDependency dependency : keycloakServerConfigBuilder.toDependencies()) {
+-            var version = Optional.ofNullable(Maven.getArtifact(dependency.getGroupId(), dependency.getArtifactId()))
+-                    .map(Artifact::getVersion)
+-                    .orElse("");
+-            builder.addDependency(dependency.getGroupId(), dependency.getArtifactId(), version);
++            KeycloakDependency updatedDependency = MavenProjectUtil.updateDependencyDetails(dependency);
++            builder.addDependency(updatedDependency.getGroupId(), updatedDependency.getArtifactId(), updatedDependency.getVersion());
+         }
+ 
+         keycloak = builder.start(keycloakServerConfigBuilder.toArgs());
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/server/KeycloakDependency.java b/test-framework/core/src/main/java/org/keycloak/testframework/server/KeycloakDependency.java
+index 9eed2fddba26..20044de2dba7 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/server/KeycloakDependency.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/server/KeycloakDependency.java
+@@ -49,6 +49,12 @@ public Builder setArtifactId(String artifactId) {
+             return this;
+         }
+ 
++        @Override
++        public Builder setVersion(String version) {
++            super.setVersion(version);
++            return this;
++        }
++
+         @Override
+         public KeycloakDependency build() {
+             return new KeycloakDependency(this);
+diff --git a/test-framework/core/src/main/java/org/keycloak/testframework/util/MavenProjectUtil.java b/test-framework/core/src/main/java/org/keycloak/testframework/util/MavenProjectUtil.java
+index 577e4dcbd1e6..2ebd7120f4bf 100644
+--- a/test-framework/core/src/main/java/org/keycloak/testframework/util/MavenProjectUtil.java
++++ b/test-framework/core/src/main/java/org/keycloak/testframework/util/MavenProjectUtil.java
+@@ -5,17 +5,19 @@
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.Optional;
+ import java.util.stream.Stream;
+ 
+ import org.keycloak.it.utils.Maven;
++import org.keycloak.testframework.server.KeycloakDependency;
+ 
+ import io.quarkus.bootstrap.resolver.maven.BootstrapMavenContext;
+ import io.quarkus.bootstrap.resolver.maven.workspace.LocalProject;
++import org.eclipse.aether.artifact.Artifact;
+ import org.jboss.shrinkwrap.api.ShrinkWrap;
+ import org.jboss.shrinkwrap.api.exporter.ZipExporter;
+ import org.jboss.shrinkwrap.api.spec.JavaArchive;
+ 
+-
+ public final class MavenProjectUtil {
+ 
+     private static LocalProject rootModuleProject;
+@@ -48,6 +50,32 @@ public static LocalProject getCurrentModule() {
+         return ctx.getCurrentProject();
+     }
+ 
++    public static KeycloakDependency updateDependencyDetails(KeycloakDependency dependency) {
++        KeycloakDependency.Builder updatedDependency = new KeycloakDependency.Builder()
++                .hotDeployable(dependency.isHotDeployable())
++                .dependencyCurrentProject(dependency.dependencyCurrentProject());
++
++        if (dependency.dependencyCurrentProject()) {
++            LocalProject localProject = getCurrentModule();
++
++            updatedDependency
++                    .setGroupId(localProject.getGroupId())
++                    .setArtifactId(localProject.getArtifactId())
++                    .setVersion(localProject.getVersion());
++        } else {
++            String version = Optional.ofNullable(Maven.getArtifact(dependency.getGroupId(), dependency.getArtifactId()))
++                    .map(Artifact::getVersion)
++                    .orElse("");
++
++            updatedDependency
++                    .setGroupId(dependency.getGroupId())
++                    .setArtifactId(dependency.getArtifactId())
++                    .setVersion(version);
++        }
++
++        return updatedDependency.build();
++    }
++
+     /**
+      * Builds and exports a JAR from compiled classes and resources.
+      *
+diff --git a/test-framework/docs/RUNNING_TESTS.md b/test-framework/docs/RUNNING_TESTS.md
+index 558ec27c3539..447982b65030 100644
+--- a/test-framework/docs/RUNNING_TESTS.md
++++ b/test-framework/docs/RUNNING_TESTS.md
+@@ -37,6 +37,11 @@ When using `distribution` mode it is possible to leave the Keycloak server runni
+ tests quickly without waiting for the server to start again. This will also restart the server if the test requires
+ different server config. To enable re-use use the `KC_TEST_SERVER_REUSE=true` option.
+ 
++### Hot deployment
++
++When using `distribution` mode, hot deployment can be enabled with `KC_TEST_SERVER_HOT_DEPLOY=true`. This affects
++how dependencies are deployed to the server. See [WRITING_TESTS](WRITING_TESTS.md#hot-deployment) for details.
++
+ ### `kcw`
+ 
+ When using the `remote` mode if Keycloak is not already running the test framework will output the required server
+diff --git a/test-framework/docs/WRITING_TESTS.md b/test-framework/docs/WRITING_TESTS.md
+index fc2a81853ec9..ffe7cbc96d72 100644
+--- a/test-framework/docs/WRITING_TESTS.md
++++ b/test-framework/docs/WRITING_TESTS.md
+@@ -119,6 +119,58 @@ public static class MyClient implements ClientConfig {
+ 
+ Only dependencies (including transitive dependencies) defined by the suppliers can be injected into config classes. 
+ 
++### Server configuration
++
++Additionally, also the Keycloak server can be configured. For example, start-up options can be set, features enabled,
++and dependencies added. Adding a dependency is how a specific provider can be deployed.
++
++```java
++static class ServerConfig implements KeycloakServerConfig {
++    @Override
++    public KeycloakServerConfigBuilder configure(KeycloakServerConfigBuilder config) {
++        return config.features(Profile.Feature.AUTHORIZATION)
++                .option("metrics-enabled", "true")
++                .dependency("org.bouncycastle", "bc-fips");
++    }
++}
++```
++
++The code above instructs Keycloak to enable the authorization feature, turn on metrics collection and adds the
++BouncyCastle FIPS cryptography library as a runtime dependency.
++
++#### Hot deployment
++
++If the `distribution` mode is used while testing a dependency currently being developed in the local project,
++enable hot deployment. This scenario would be typical for Keycloak extension developers.
++
++```java
++static class ServerConfig implements KeycloakServerConfig {
++    @Override
++    public KeycloakServerConfigBuilder configure(KeycloakServerConfigBuilder config) {
++        return config.dependency("org.example", "very-cool-extension", true);
++    }
++}
++```
++
++The third parameter marks the dependency above as hot deployable. When tests run with `KC_TEST_SERVER_HOT_DEPLOY=true`,
++all hot deployable dependencies are loaded from compiled sources instead of from the maven repository, eliminating
++the need to build the dependency first.
++
++If the tests are in the same Maven module as the provider:
++
++```java
++static class ServerConfig implements KeycloakServerConfig {
++    @Override
++    public KeycloakServerConfigBuilder configure(KeycloakServerConfigBuilder config) {
++        return config.dependencyCurrentProject();
++    }
++}
++```
++
++This automatically deploys the current project's compiled classes.
++
++NOTE: hot deployment is exclusive to the `distribution` mode. `embedded` mode does it by design.
++
+ ## Realm cleanup
+ 
+ The test framework aims to re-use as much as possible to reduce execution time. This is especially relevant to 

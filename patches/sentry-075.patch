@@ -1,0 +1,917 @@
+diff --git a/eslint.config.ts b/eslint.config.ts
+index 9d4ee8ca785076..a03504088f41a5 100644
+--- a/eslint.config.ts
++++ b/eslint.config.ts
+@@ -383,6 +383,11 @@ export default typescript.config([
+             'JSXExpressionContainer > CallExpression[callee.type="ArrowFunctionExpression"], JSXExpressionContainer > CallExpression[callee.type="FunctionExpression"], JSXSpreadAttribute > CallExpression[callee.type="ArrowFunctionExpression"], JSXSpreadAttribute > CallExpression[callee.type="FunctionExpression"]',
+           message: 'Do not use IIFEs inside JSX.',
+         },
++        {
++          selector: 'ImportDeclaration[source.value=/^!!type-loader!/]',
++          message:
++            "Use dynamic import for type-loader imports (for example: `import('!!type-loader!@sentry/scraps/alert')`), not `import ... from '!!type-loader!...'`.",
++        },
+         // Forbid absolute URLs in Link's to=. Use ExternalLink instead.
+         {
+           selector:
+diff --git a/migrations_lockfile.txt b/migrations_lockfile.txt
+index 69e840a3bad57b..488b6648d68726 100644
+--- a/migrations_lockfile.txt
++++ b/migrations_lockfile.txt
+@@ -33,7 +33,7 @@ replays: 0007_organizationmember_replay_access
+ 
+ seer: 0002_add_default_coding_agent
+ 
+-sentry: 1050_projectkeymapping_uniq_constraint
++sentry: 1051_rename_controloutbox_region_name_to_cell_name
+ 
+ social_auth: 0003_social_auth_json_field
+ 
+diff --git a/package.json b/package.json
+index 65ad83cedd2c76..7975c853a16781 100644
+--- a/package.json
++++ b/package.json
+@@ -258,7 +258,9 @@
+       "@sentry-internal/node-cpu-profiler",
+       "@sentry/cli",
+       "core-js",
+-      "esbuild"
++      "esbuild",
++      "odiff-bin",
++      "unrs-resolver"
+     ]
+   },
+   "optionalDependencies": {
+diff --git a/src/sentry/hybridcloud/models/outbox.py b/src/sentry/hybridcloud/models/outbox.py
+index d72dd09db64ae5..0b76a433b532f7 100644
+--- a/src/sentry/hybridcloud/models/outbox.py
++++ b/src/sentry/hybridcloud/models/outbox.py
+@@ -459,23 +459,22 @@ class Meta:
+ 
+ # Outboxes bound from control silo -> region silo
+ class ControlOutboxBase(OutboxBase):
+-    sharding_columns = ("region_name", "shard_scope", "shard_identifier")
++    sharding_columns = ("cell_name", "shard_scope", "shard_identifier")
+     coalesced_columns = (
+-        "region_name",
++        "cell_name",
+         "shard_scope",
+         "shard_identifier",
+         "category",
+         "object_identifier",
+     )
+ 
+-    # TODO(cells): rename to cell_name
+-    region_name = models.CharField(max_length=REGION_NAME_LENGTH)
++    cell_name = models.CharField(max_length=REGION_NAME_LENGTH, db_column="region_name")
+ 
+     def send_signal(self) -> None:
+         process_control_outbox.send(
+             sender=OutboxCategory(self.category),
+             payload=self.payload,
+-            region_name=self.region_name,
++            region_name=self.cell_name,
+             object_identifier=self.object_identifier,
+             shard_identifier=self.shard_identifier,
+             shard_scope=self.shard_scope,
+@@ -497,7 +496,7 @@ class Meta:
+         indexes = (
+             models.Index(
+                 fields=(
+-                    "region_name",
++                    "cell_name",
+                     "shard_scope",
+                     "shard_identifier",
+                     "category",
+@@ -506,13 +505,13 @@ class Meta:
+             ),
+             models.Index(
+                 fields=(
+-                    "region_name",
++                    "cell_name",
+                     "shard_scope",
+                     "shard_identifier",
+                     "scheduled_for",
+                 )
+             ),
+-            models.Index(fields=("region_name", "shard_scope", "shard_identifier", "id")),
++            models.Index(fields=("cell_name", "shard_scope", "shard_identifier", "id")),
+         )
+ 
+ 
+diff --git a/src/sentry/hybridcloud/outbox/base.py b/src/sentry/hybridcloud/outbox/base.py
+index fbc843422b3979..d6dfe4a40db025 100644
+--- a/src/sentry/hybridcloud/outbox/base.py
++++ b/src/sentry/hybridcloud/outbox/base.py
+@@ -405,7 +405,7 @@ def outboxes_for_update(self, shard_identifier: int | None = None) -> list[Contr
+         this behavior.
+         """
+         return self.category.as_control_outboxes(
+-            region_names=self.outbox_region_names(),
++            cell_names=self.outbox_region_names(),
+             model=self,
+             payload=self.payload_for_update(),
+             shard_identifier=shard_identifier,
+diff --git a/src/sentry/hybridcloud/outbox/category.py b/src/sentry/hybridcloud/outbox/category.py
+index f96906557b1ea8..01ed68ef9beda2 100644
+--- a/src/sentry/hybridcloud/outbox/category.py
++++ b/src/sentry/hybridcloud/outbox/category.py
+@@ -157,7 +157,7 @@ def as_region_outbox(
+ 
+     def as_control_outboxes(
+         self,
+-        region_names: Collection[str],
++        cell_names: Collection[str],
+         model: Any | None = None,
+         payload: dict[str, Any] | None = None,
+         shard_identifier: int | None = None,
+@@ -180,10 +180,10 @@ def as_control_outboxes(
+                 shard_identifier=shard_identifier,
+                 category=self,
+                 object_identifier=object_identifier,
+-                region_name=region_name,
++                cell_name=cell_name,
+                 payload=payload,
+             )
+-            for region_name in region_names
++            for cell_name in cell_names
+         ]
+ 
+     def infer_identifiers(
+diff --git a/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py b/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py
+index ec3fbd03b00db4..c695bf60873cd2 100644
+--- a/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py
++++ b/src/sentry/hybridcloud/services/control_organization_provisioning/impl.py
+@@ -49,7 +49,7 @@ def create_organization_provisioning_outbox(
+ ) -> ControlOutbox:
+     payload = org_provision_payload.dict() if org_provision_payload is not None else None
+     return ControlOutbox(
+-        region_name=region_name,
++        cell_name=region_name,
+         shard_scope=OutboxScope.PROVISION_SCOPE,
+         category=OutboxCategory.PROVISION_ORGANIZATION,
+         shard_identifier=organization_id,
+diff --git a/src/sentry/integrations/models/integration.py b/src/sentry/integrations/models/integration.py
+index de3bf68b66e1b0..9d833f9d95f487 100644
+--- a/src/sentry/integrations/models/integration.py
++++ b/src/sentry/integrations/models/integration.py
+@@ -98,7 +98,7 @@ def outboxes_for_update(identifier: int) -> list[ControlOutbox]:
+                 shard_identifier=identifier,
+                 object_identifier=identifier,
+                 category=OutboxCategory.INTEGRATION_UPDATE,
+-                region_name=region_name,
++                cell_name=region_name,
+             )
+             for region_name in find_regions_for_orgs(org_ids)
+         ]
+diff --git a/src/sentry/migrations/1051_rename_controloutbox_region_name_to_cell_name.py b/src/sentry/migrations/1051_rename_controloutbox_region_name_to_cell_name.py
+new file mode 100644
+index 00000000000000..d33c4e6ea5e118
+--- /dev/null
++++ b/src/sentry/migrations/1051_rename_controloutbox_region_name_to_cell_name.py
+@@ -0,0 +1,89 @@
++# Generated by Django 5.2.11 on 2026-03-10 19:30
++
++from django.db import migrations, models
++
++from sentry.new_migrations.migrations import CheckedMigration
++
++
++class Migration(CheckedMigration):
++    # This flag is used to mark that a migration shouldn't be automatically run in production.
++    # This should only be used for operations where it's safe to run the migration after your
++    # code has deployed. So this should not be used for most operations that alter the schema
++    # of a table.
++    # Here are some things that make sense to mark as post deployment:
++    # - Large data migrations. Typically we want these to be run manually so that they can be
++    #   monitored and not block the deploy for a long period of time while they run.
++    # - Adding indexes to large tables. Since this can take a long time, we'd generally prefer to
++    #   run this outside deployments so that we don't block them. Note that while adding an index
++    #   is a schema change, it's completely safe to run the operation after the code has deployed.
++    # Once deployed, run these manually via: https://develop.sentry.dev/database-migrations/#migration-deployment
++
++    is_post_deployment = False
++
++    dependencies = [
++        ("sentry", "1050_projectkeymapping_uniq_constraint"),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name="controloutbox",
++            name="region_name",
++            field=models.CharField(db_column="region_name", max_length=48),
++        ),
++        migrations.RenameField(
++            model_name="controloutbox",
++            old_name="region_name",
++            new_name="cell_name",
++        ),
++        # The indexes reference the same DB column (region_name via db_column), so
++        # the actual SQL is identical before and after — no drop/recreate needed.
++        migrations.SeparateDatabaseAndState(
++            state_operations=[
++                migrations.RemoveIndex(
++                    model_name="controloutbox",
++                    name="sentry_cont_region__1c1c72_idx",
++                ),
++                migrations.RemoveIndex(
++                    model_name="controloutbox",
++                    name="sentry_cont_region__0c4512_idx",
++                ),
++                migrations.RemoveIndex(
++                    model_name="controloutbox",
++                    name="sentry_cont_region__a95d82_idx",
++                ),
++                migrations.AddIndex(
++                    model_name="controloutbox",
++                    index=models.Index(
++                        fields=[
++                            "cell_name",
++                            "shard_scope",
++                            "shard_identifier",
++                            "category",
++                            "object_identifier",
++                        ],
++                        name="sentry_cont_region__1c1c72_idx",
++                    ),
++                ),
++                migrations.AddIndex(
++                    model_name="controloutbox",
++                    index=models.Index(
++                        fields=[
++                            "cell_name",
++                            "shard_scope",
++                            "shard_identifier",
++                            "scheduled_for",
++                        ],
++                        name="sentry_cont_region__0c4512_idx",
++                    ),
++                ),
++                migrations.AddIndex(
++                    model_name="controloutbox",
++                    index=models.Index(
++                        fields=["cell_name", "shard_scope", "shard_identifier", "id"],
++                        name="sentry_cont_region__a95d82_idx",
++                    ),
++                ),
++            ],
++            database_operations=[],
++        ),
++    ]
+diff --git a/src/sentry/models/apiapplication.py b/src/sentry/models/apiapplication.py
+index 20a7bdd384df57..51fb04e74552eb 100644
+--- a/src/sentry/models/apiapplication.py
++++ b/src/sentry/models/apiapplication.py
+@@ -130,7 +130,7 @@ def outboxes_for_update(self) -> list[ControlOutbox]:
+                 shard_identifier=self.id,
+                 object_identifier=self.id,
+                 category=OutboxCategory.API_APPLICATION_UPDATE,
+-                region_name=region_name,
++                cell_name=region_name,
+             )
+             for region_name in find_all_cell_names()
+         ]
+diff --git a/src/sentry/models/authprovider.py b/src/sentry/models/authprovider.py
+index ab5b800d0bfc58..ed2c9113dc1274 100644
+--- a/src/sentry/models/authprovider.py
++++ b/src/sentry/models/authprovider.py
+@@ -160,7 +160,7 @@ def outboxes_for_reset_idp_flags(self) -> list[ControlOutbox]:
+                 shard_identifier=self.organization_id,
+                 category=OutboxCategory.RESET_IDP_FLAGS,
+                 object_identifier=self.organization_id,
+-                region_name=region_name,
++                cell_name=region_name,
+             )
+             for region_name in find_regions_for_orgs([self.organization_id])
+         ]
+@@ -208,7 +208,7 @@ def outboxes_for_mark_invalid_sso(self, user_id: int) -> list[ControlOutbox]:
+                 shard_identifier=self.organization_id,
+                 category=OutboxCategory.MARK_INVALID_SSO,
+                 object_identifier=user_id,
+-                region_name=region_name,
++                cell_name=region_name,
+             )
+             for region_name in find_regions_for_orgs([self.organization_id])
+         ]
+diff --git a/src/sentry/notifications/notifications/activity/release.py b/src/sentry/notifications/notifications/activity/release.py
+index 02693eaa02d95e..baf2174584c9b8 100644
+--- a/src/sentry/notifications/notifications/activity/release.py
++++ b/src/sentry/notifications/notifications/activity/release.py
+@@ -33,6 +33,7 @@ class ReleaseActivityNotification(ActivityNotification):
+     metrics_key = "release_activity"
+     notification_setting_type_enum = NotificationSettingEnum.DEPLOY
+     template_path = "sentry/emails/activity/release"
++    max_subject_projects = 2
+ 
+     def __init__(self, activity: Activity) -> None:
+         super().__init__(activity)
+@@ -110,10 +111,18 @@ def get_projects(self, recipient: Actor) -> set[Project]:
+         )
+         return set(projects)
+ 
++    def get_subject_project_text(self, project_slugs: Sequence[str]) -> str:
++        visible_project_slugs = list(project_slugs[: self.max_subject_projects])
++        remaining_projects = len(project_slugs) - len(visible_project_slugs)
++        projects_text = ", ".join(visible_project_slugs)
++        if remaining_projects > 0:
++            projects_text = f"{projects_text} +{remaining_projects} more"
++        return projects_text
++
+     def get_recipient_context(
+         self, recipient: Actor, extra_context: Mapping[str, Any]
+     ) -> MutableMapping[str, Any]:
+-        projects = self.get_projects(recipient)
++        projects = sorted(self.get_projects(recipient), key=lambda project: project.slug)
+         release_links = [
+             self.organization.absolute_url(
+                 f"/organizations/{self.organization.slug}/releases/{self.version}/?project={p.id}",
+@@ -129,9 +138,14 @@ def get_recipient_context(
+             **super().get_recipient_context(recipient, extra_context),
+             "projects": list(zip(projects, release_links, resolved_issue_counts)),
+             "project_count": len(projects),
++            "subject_project_slugs": [project.slug for project in projects],
+         }
+ 
+     def get_subject(self, context: Mapping[str, Any] | None = None) -> str:
++        project_slugs = context.get("subject_project_slugs", []) if context else []
++        if project_slugs:
++            projects_text = self.get_subject_project_text(project_slugs)
++            return f"Deployed {projects_text} version {self.version_parsed} to {self.environment}"
+         return f"Deployed version {self.version_parsed} to {self.environment}"
+ 
+     @property
+diff --git a/src/sentry/organizations/services/organization/impl.py b/src/sentry/organizations/services/organization/impl.py
+index 043150c01c333b..13ae31a6a4b353 100644
+--- a/src/sentry/organizations/services/organization/impl.py
++++ b/src/sentry/organizations/services/organization/impl.py
+@@ -828,7 +828,7 @@ def schedule_signal(
+                 ControlOutbox(
+                     shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+                     shard_identifier=organization_id,
+-                    region_name=region_name,
++                    cell_name=region_name,
+                     category=OutboxCategory.SEND_SIGNAL,
+                     object_identifier=ControlOutbox.next_object_identifier(),
+                     payload=payload,
+diff --git a/src/sentry/sentry_apps/logic.py b/src/sentry/sentry_apps/logic.py
+index 92b64538b45b4b..a11c23414ceee4 100644
+--- a/src/sentry/sentry_apps/logic.py
++++ b/src/sentry/sentry_apps/logic.py
+@@ -238,9 +238,7 @@ def _update_service_hooks_via_outbox(self) -> None:
+                         shard_identifier=self.sentry_app.id,
+                         object_identifier=installation.id,
+                         category=OutboxCategory.SERVICE_HOOK_UPDATE,
+-                        region_name=installation_org_id_to_region_name[
+-                            installation.organization_id
+-                        ],
++                        cell_name=installation_org_id_to_region_name[installation.organization_id],
+                     ).save()
+                     logger.info(
+                         "_update_service_hooks_via_outbox.created_outbox_entry",
+diff --git a/src/sentry/sentry_apps/models/sentry_app.py b/src/sentry/sentry_apps/models/sentry_app.py
+index 6fe8f6580747b3..48e6e8631f0a85 100644
+--- a/src/sentry/sentry_apps/models/sentry_app.py
++++ b/src/sentry/sentry_apps/models/sentry_app.py
+@@ -217,9 +217,9 @@ def outboxes_for_update(self) -> list[ControlOutbox]:
+                 shard_identifier=self.id,
+                 object_identifier=self.id,
+                 category=OutboxCategory.SENTRY_APP_UPDATE,
+-                region_name=region_name,
++                cell_name=cell_name,
+             )
+-            for region_name in find_all_cell_names()
++            for cell_name in find_all_cell_names()
+         ]
+ 
+     def outboxes_for_delete(self) -> list[ControlOutbox]:
+@@ -229,10 +229,10 @@ def outboxes_for_delete(self) -> list[ControlOutbox]:
+                 shard_identifier=self.id,
+                 object_identifier=self.id,
+                 category=OutboxCategory.SENTRY_APP_DELETE,
+-                region_name=region_name,
++                cell_name=cell_name,
+                 payload={"slug": self.slug},
+             )
+-            for region_name in find_all_cell_names()
++            for cell_name in find_all_cell_names()
+         ]
+ 
+     def regions_with_installations(self) -> set[str]:
+diff --git a/src/sentry/sentry_apps/models/sentry_app_installation.py b/src/sentry/sentry_apps/models/sentry_app_installation.py
+index 155d265977b428..31f80e02cf30c0 100644
+--- a/src/sentry/sentry_apps/models/sentry_app_installation.py
++++ b/src/sentry/sentry_apps/models/sentry_app_installation.py
+@@ -163,7 +163,7 @@ def outboxes_for_delete(self) -> list[ControlOutbox]:
+                 shard_identifier=self.api_application_id or 0,
+                 object_identifier=self.id,
+                 category=OutboxCategory.SENTRY_APP_INSTALLATION_DELETE,
+-                region_name=region_name,
++                cell_name=region_name,
+                 payload={
+                     "sentry_app_id": self.sentry_app_id,
+                     "organization_id": self.organization_id,
+diff --git a/src/sentry/spans/buffer.py b/src/sentry/spans/buffer.py
+index 9c56a281f42da2..8ad77d4fa858b5 100644
+--- a/src/sentry/spans/buffer.py
++++ b/src/sentry/spans/buffer.py
+@@ -761,6 +761,13 @@ def _add_spans(key: SegmentKey, raw_data: bytes) -> bool:
+                         category=DataCategory.SPAN_INDEXED,
+                         quantity=dropped,
+                     )
++            elif not payloads.get(key):
++                # BUG DETECTION: Segment was in the flush queue but both the data
++                # (span-buf:s:*) and metadata (span-buf:ic:*) keys are missing.
++                # This means the Redis keys expired before the flusher could process
++                # them, resulting in silent data loss. The spans were already committed
++                # from the ingest Kafka topic, so they cannot be recovered.
++                metrics.incr("spans.buffer.segment_expired_before_flush")
+ 
+         for key, spans in payloads.items():
+             if not spans:
+diff --git a/src/sentry/users/models/authenticator.py b/src/sentry/users/models/authenticator.py
+index 3259739d0dfa84..17d8717e33cfaf 100644
+--- a/src/sentry/users/models/authenticator.py
++++ b/src/sentry/users/models/authenticator.py
+@@ -186,7 +186,7 @@ class Meta:
+     def outboxes_for_update(self, shard_identifier: int | None = None) -> list[ControlOutboxBase]:
+         regions = find_regions_for_user(self.user_id)
+         return OutboxCategory.USER_UPDATE.as_control_outboxes(
+-            region_names=regions,
++            cell_names=regions,
+             shard_identifier=self.user_id,
+             object_identifier=self.user_id,
+         )
+diff --git a/src/sentry/users/models/identity.py b/src/sentry/users/models/identity.py
+index 752432ef49f1c4..6e349b80970c14 100644
+--- a/src/sentry/users/models/identity.py
++++ b/src/sentry/users/models/identity.py
+@@ -226,7 +226,7 @@ def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
+                     shard_identifier=self.user_id,
+                     object_identifier=self.id,
+                     category=OutboxCategory.IDENTITY_UPDATE,
+-                    region_name=region_name,
++                    cell_name=region_name,
+                 ).save()
+             return super().delete(*args, **kwargs)
+ 
+diff --git a/src/sentry/users/models/user.py b/src/sentry/users/models/user.py
+index cc657aac7817d8..f51caad84b29da 100644
+--- a/src/sentry/users/models/user.py
++++ b/src/sentry/users/models/user.py
+@@ -376,7 +376,7 @@ def outboxes_for_user_update(
+             user_regions = find_regions_for_user(identifier)
+ 
+         return OutboxCategory.USER_UPDATE.as_control_outboxes(
+-            region_names=user_regions,
++            cell_names=user_regions,
+             object_identifier=identifier,
+             shard_identifier=identifier,
+         )
+@@ -621,7 +621,7 @@ def handle_async_replication(self, region_name: str, shard_identifier: int) -> N
+                 is_active=self.is_active,
+                 email=self.email,
+             ),
+-            region_name=region_name,
++            cell_name=region_name,
+         )
+ 
+ 
+diff --git a/src/sentry/users/models/user_avatar.py b/src/sentry/users/models/user_avatar.py
+index db2e86e4faf621..0027db7b8efcc8 100644
+--- a/src/sentry/users/models/user_avatar.py
++++ b/src/sentry/users/models/user_avatar.py
+@@ -57,7 +57,7 @@ class Meta:
+     def outboxes_for_update(self, shard_identifier: int | None = None) -> list[ControlOutboxBase]:
+         regions = find_regions_for_user(self.user_id)
+         return OutboxCategory.USER_UPDATE.as_control_outboxes(
+-            region_names=regions,
++            cell_names=regions,
+             shard_identifier=self.user_id,
+             object_identifier=self.user_id,
+         )
+diff --git a/src/sentry/users/models/useremail.py b/src/sentry/users/models/useremail.py
+index c2eeda323cd127..e32c6c6faba858 100644
+--- a/src/sentry/users/models/useremail.py
++++ b/src/sentry/users/models/useremail.py
+@@ -82,7 +82,7 @@ def outboxes_for_update(self, shard_identifier: int | None = None) -> list[Contr
+         return [
+             outbox
+             for outbox in OutboxCategory.USER_UPDATE.as_control_outboxes(
+-                region_names=regions,
++                cell_names=regions,
+                 shard_identifier=self.user_id,
+                 object_identifier=self.user_id,
+             )
+diff --git a/src/sentry/users/models/userpermission.py b/src/sentry/users/models/userpermission.py
+index 7e143ce95acddb..8aa86f9cc4feec 100644
+--- a/src/sentry/users/models/userpermission.py
++++ b/src/sentry/users/models/userpermission.py
+@@ -47,7 +47,7 @@ def outboxes_for_update(self, shard_identifier: int | None = None) -> list[Contr
+         return [
+             outbox
+             for outbox in OutboxCategory.USER_UPDATE.as_control_outboxes(
+-                region_names=regions,
++                cell_names=regions,
+                 shard_identifier=self.user_id,
+                 object_identifier=self.user_id,
+             )
+diff --git a/src/sentry/users/models/userrole.py b/src/sentry/users/models/userrole.py
+index 72279322149eb1..ab80a4b6f000a2 100644
+--- a/src/sentry/users/models/userrole.py
++++ b/src/sentry/users/models/userrole.py
+@@ -49,7 +49,7 @@ def outboxes_for_update(self, shard_identifier: int | None = None) -> list[Contr
+             outbox
+             for user_id in self.users.values_list("id", flat=True)
+             for outbox in OutboxCategory.USER_UPDATE.as_control_outboxes(
+-                region_names=regions,
++                cell_names=regions,
+                 shard_identifier=user_id,
+                 object_identifier=user_id,
+             )
+@@ -69,7 +69,7 @@ class UserRoleUser(ControlOutboxProducingModel):
+     def outboxes_for_update(self, shard_identifier: int | None = None) -> list[ControlOutboxBase]:
+         regions = list(find_all_cell_names())
+         return OutboxCategory.USER_UPDATE.as_control_outboxes(
+-            region_names=regions,
++            cell_names=regions,
+             shard_identifier=self.user_id,
+             object_identifier=self.user_id,
+         )
+diff --git a/src/sentry/utils/email/message_builder.py b/src/sentry/utils/email/message_builder.py
+index e296d74f1b67a0..1a6c592106f8fd 100644
+--- a/src/sentry/utils/email/message_builder.py
++++ b/src/sentry/utils/email/message_builder.py
+@@ -190,7 +190,8 @@ def build(
+         reference = self.reference
+         if isinstance(reference, Activity):
+             reference = reference.group
+-            subject = f"Re: {subject}"
++            if reference is not None:
++                subject = f"Re: {subject}"
+ 
+         if isinstance(reference, Group):
+             thread, created = GroupEmailThread.objects.get_or_create(
+diff --git a/src/sentry/web/frontend/mailgun_inbound_webhook.py b/src/sentry/web/frontend/mailgun_inbound_webhook.py
+index ec151ee27f2e23..5784ec44d75196 100644
+--- a/src/sentry/web/frontend/mailgun_inbound_webhook.py
++++ b/src/sentry/web/frontend/mailgun_inbound_webhook.py
+@@ -83,7 +83,7 @@ def post(self, request: HttpRequest) -> HttpResponse:
+             shard_identifier=org_id or 0,
+             category=OutboxCategory.ISSUE_COMMENT_UPDATE,
+             object_identifier=ControlOutbox.next_object_identifier(),
+-            region_name=region_name,
++            cell_name=region_name,
+             payload=outbox_payload,
+         )
+         outbox.save()
+diff --git a/static/app/views/alerts/rules/metric/eapMetricsField.tsx b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+index 7c2a5c4396c7c6..ac23bf880f8692 100644
+--- a/static/app/views/alerts/rules/metric/eapMetricsField.tsx
++++ b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+@@ -125,11 +125,13 @@ export default function EAPMetricsField({
+         trailingItems: (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+index 59324a865d1bbe..32ec8af6080ff4 100644
+--- a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
++++ b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+@@ -129,11 +129,13 @@ export function MetricsVisualize() {
+         trailingItems: (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx b/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
+index 6fb1579070b4df..510e13cfaaee0c 100644
+--- a/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
++++ b/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
+@@ -107,7 +107,11 @@ function useMetricsQueryKey({
+             traceMetric.unit
+           );
+         } else if (traceMetric.unit === NONE_UNIT) {
++          newSearch.addOp('(');
+           newSearch.addFilterValue('!has', TraceMetricKnownFieldKey.METRIC_UNIT);
++          newSearch.addOp('OR');
++          newSearch.addFilterValue(TraceMetricKnownFieldKey.METRIC_UNIT, NONE_UNIT);
++          newSearch.addOp(')');
+         }
+       }
+     }
+diff --git a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+index c5d25c5c55b965..57a8ec6b8d6c85 100644
+--- a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
++++ b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+@@ -99,11 +99,13 @@ export function MetricSelector({
+         trailingItems: () => (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/tests/sentry/deletions/tasks/test_hybrid_cloud.py b/tests/sentry/deletions/tasks/test_hybrid_cloud.py
+index 20b0b85d122c0c..2c863b3ac59b23 100644
+--- a/tests/sentry/deletions/tasks/test_hybrid_cloud.py
++++ b/tests/sentry/deletions/tasks/test_hybrid_cloud.py
+@@ -151,7 +151,7 @@ def setup_deletable_objects(
+ 
+     for region_name in find_regions_for_user(u_id):
+         shard = ControlOutbox(
+-            shard_scope=OutboxScope.USER_SCOPE, shard_identifier=u_id, region_name=region_name
++            shard_scope=OutboxScope.USER_SCOPE, shard_identifier=u_id, cell_name=region_name
+         )
+         if send_tombstones:
+             shard.drain_shard()
+diff --git a/tests/sentry/hybridcloud/models/test_outbox.py b/tests/sentry/hybridcloud/models/test_outbox.py
+index 6a09c911772910..c55283d7f3d1cd 100644
+--- a/tests/sentry/hybridcloud/models/test_outbox.py
++++ b/tests/sentry/hybridcloud/models/test_outbox.py
+@@ -98,7 +98,7 @@ def test_control_sharding_keys(self) -> None:
+                 inst.save()
+ 
+         shards = {
+-            (row["shard_scope"], row["shard_identifier"], row["region_name"])
++            (row["shard_scope"], row["shard_identifier"], row["cell_name"])
+             for row in ControlOutbox.find_scheduled_shards()
+         }
+ 
+@@ -606,7 +606,7 @@ def setUp(self) -> None:
+         for shard_id, (shard_count, region_name) in shard_counts.items():
+             for i in range(shard_count):
+                 ControlOutbox(
+-                    region_name=region_name,
++                    cell_name=region_name,
+                     shard_scope=OutboxScope.AUDIT_LOG_SCOPE,
+                     shard_identifier=shard_id,
+                     category=OutboxCategory.AUDIT_LOG_EVENT,
+@@ -620,19 +620,19 @@ def test_calculate_sharding_depths(self) -> None:
+         assert shard_depths == [
+             dict(
+                 shard_identifier=2,
+-                region_name="us",
++                cell_name="us",
+                 shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                 depth=7,
+             ),
+             dict(
+                 shard_identifier=1,
+-                region_name="eu",
++                cell_name="eu",
+                 shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                 depth=4,
+             ),
+             dict(
+                 shard_identifier=3,
+-                region_name="us",
++                cell_name="us",
+                 shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                 depth=1,
+             ),
+@@ -643,7 +643,7 @@ def test_calculate_sharding_depths(self) -> None:
+         assert shard_depths == [
+             dict(
+                 shard_identifier=2,
+-                region_name="us",
++                cell_name="us",
+                 shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                 depth=7,
+             )
+diff --git a/tests/sentry/mail/activity/test_release.py b/tests/sentry/mail/activity/test_release.py
+index 54e4e6cede2666..64d9e863375023 100644
+--- a/tests/sentry/mail/activity/test_release.py
++++ b/tests/sentry/mail/activity/test_release.py
+@@ -1,6 +1,7 @@
+ from django.core import mail
+ 
+ from sentry.integrations.types import ExternalProviderEnum, ExternalProviders
++from sentry.mail.notifications import build_subject_prefix
+ from sentry.models.activity import Activity
+ from sentry.models.environment import Environment
+ from sentry.models.release import Release
+@@ -23,6 +24,9 @@
+ 
+ 
+ class ReleaseTestCase(ActivityTestCase):
++    def get_prefixed_subject(self, subject: str) -> str:
++        return f"{build_subject_prefix(self.project).rstrip()} {subject}"
++
+     def setUp(self) -> None:
+         super().setUp()
+ 
+@@ -152,6 +156,7 @@ def test_simple(self) -> None:
+         # make sure this only includes projects user has access to
+         assert len(user_context["projects"]) == 1
+         assert user_context["projects"][0][0] == self.project
++        assert email.title == f"Deployed version {email.version_parsed} to {self.environment.name}"
+ 
+         with self.tasks():
+             email.send()
+@@ -165,6 +170,11 @@ def test_simple(self) -> None:
+             self.user3.email,
+             self.user5.email,
+         }
++        expected_subject = self.get_prefixed_subject(
++            f"Deployed {self.project.slug} version {email.version_parsed} to {self.environment.name}"
++        )
++        assert {msg.subject for msg in mail.outbox} == {expected_subject}
++        assert all(not msg.subject.startswith("Re:") for msg in mail.outbox)
+ 
+     def test_prevent_duplicate_projects(self) -> None:
+         email = ReleaseActivityNotification(
+@@ -185,6 +195,76 @@ def test_prevent_duplicate_projects(self) -> None:
+         assert len(user_context["projects"]) == 1
+         assert user_context["projects"][0][0] == self.project
+ 
++    def test_subject_uses_recipient_visible_projects(self) -> None:
++        mail.outbox.clear()
++        self.create_team_membership(user=self.user1, team=self.team2)
++
++        email = ReleaseActivityNotification(
++            Activity(
++                project=self.project,
++                user_id=self.user1.id,
++                type=ActivityType.RELEASE.value,
++                data={"version": self.release.version, "deploy_id": self.deploy.id},
++            )
++        )
++
++        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
++        expected_project_slugs = sorted([self.project.slug, self.project2.slug])
++
++        assert [
++            project.slug for project, _, _ in user_context["projects"]
++        ] == expected_project_slugs
++        assert user_context["subject_project_slugs"] == expected_project_slugs
++
++        with self.tasks():
++            email.send()
++
++        subjects_by_recipient = {message.to[0]: message.subject for message in mail.outbox}
++
++        assert subjects_by_recipient[self.user1.email] == self.get_prefixed_subject(
++            f"Deployed {', '.join(expected_project_slugs)} version {email.version_parsed} to {self.environment.name}"
++        )
++        assert subjects_by_recipient[self.user3.email] == self.get_prefixed_subject(
++            f"Deployed {self.project.slug} version {email.version_parsed} to {self.environment.name}"
++        )
++        assert all(not subject.startswith("Re:") for subject in subjects_by_recipient.values())
++
++    def test_subject_caps_projects_at_two(self) -> None:
++        mail.outbox.clear()
++        team3 = self.create_team(organization=self.org)
++        project3 = self.create_project(
++            organization=self.org,
++            teams=[team3],
++            name="AAA Third",
++            slug="aaa-third",
++        )
++        self.release.add_project(project3)
++        self.create_team_membership(user=self.user1, team=self.team2)
++        self.create_team_membership(user=self.user1, team=team3)
++
++        email = ReleaseActivityNotification(
++            Activity(
++                project=self.project,
++                user_id=self.user1.id,
++                type=ActivityType.RELEASE.value,
++                data={"version": self.release.version, "deploy_id": self.deploy.id},
++            )
++        )
++
++        expected_project_slugs = sorted([self.project.slug, self.project2.slug, project3.slug])
++        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
++
++        assert user_context["subject_project_slugs"] == expected_project_slugs
++
++        with self.tasks():
++            email.send()
++
++        subjects_by_recipient = {message.to[0]: message.subject for message in mail.outbox}
++
++        assert subjects_by_recipient[self.user1.email] == self.get_prefixed_subject(
++            f"Deployed {expected_project_slugs[0]}, {expected_project_slugs[1]} +1 more version {email.version_parsed} to {self.environment.name}"
++        )
++
+     def test_does_not_generate_on_no_release(self) -> None:
+         email = ReleaseActivityNotification(
+             Activity(
+diff --git a/tests/sentry/sentry_apps/models/test_sentryapp.py b/tests/sentry/sentry_apps/models/test_sentryapp.py
+index 7566f172a94ab9..edc1ed12a6d114 100644
+--- a/tests/sentry/sentry_apps/models/test_sentryapp.py
++++ b/tests/sentry/sentry_apps/models/test_sentryapp.py
+@@ -91,7 +91,7 @@ def test_save_outbox_update(self) -> None:
+         outboxes = ControlOutbox.objects.filter(category=OutboxCategory.SENTRY_APP_UPDATE).all()
+         assert len(outboxes) == 2
+         assert outboxes[0].shard_identifier == self.sentry_app.id
+-        assert outboxes[0].region_name
++        assert outboxes[0].cell_name
+ 
+     def test_regions_with_installations(self) -> None:
+         self.us_org = self.create_organization(name="us test name", region="us")
+diff --git a/tests/sentry/sentry_apps/test_sentry_app_updater.py b/tests/sentry/sentry_apps/test_sentry_app_updater.py
+index b3e06ba377bb7b..1eb7e3f59727b7 100644
+--- a/tests/sentry/sentry_apps/test_sentry_app_updater.py
++++ b/tests/sentry/sentry_apps/test_sentry_app_updater.py
+@@ -308,7 +308,7 @@ def test_update_service_hooks_with_outbox_feature_enabled(self) -> None:
+         # Verify the outbox entry has correct data
+         entry = outbox_entries[0]
+         assert entry.object_identifier == installation.id
+-        assert entry.region_name is not None
++        assert entry.cell_name is not None
+ 
+         with outbox_runner():
+             pass
+@@ -368,7 +368,7 @@ def test_update_service_hooks_outbox_entries_created(self) -> None:
+         # Verify the outbox entry has correct data
+         entry = outbox_entries[0]
+         assert entry.object_identifier == installation.id
+-        assert entry.region_name is not None
++        assert entry.cell_name is not None
+ 
+         with outbox_runner():
+             pass
+diff --git a/tests/sentry/utils/email/test_message_builder.py b/tests/sentry/utils/email/test_message_builder.py
+index c310f73093ea8d..14e6caf7b88c01 100644
+--- a/tests/sentry/utils/email/test_message_builder.py
++++ b/tests/sentry/utils/email/test_message_builder.py
+@@ -5,6 +5,7 @@
+ from django.core.mail.message import EmailMultiAlternatives
+ 
+ from sentry import options
++from sentry.models.activity import Activity
+ from sentry.models.groupemailthread import GroupEmailThread
+ from sentry.silo.base import SiloMode
+ from sentry.testutils.cases import TestCase
+@@ -258,6 +259,31 @@ def test_reply_reference(self, make_msgid: MagicMock) -> None:
+             "msgid should not have changed"
+         )
+ 
++    @patch("sentry.utils.email.message_builder.make_msgid")
++    def test_group_less_activity_reference_does_not_prefix_subject(
++        self, make_msgid: MagicMock
++    ) -> None:
++        make_msgid.return_value = "abc123"
++
++        msg = MessageBuilder(
++            subject="Test",
++            body="hello world",
++            html_body="<b>hello world</b>",
++            reference=Activity(project=self.project),
++        )
++        msg.send(["foo@example.com"])
++
++        assert len(mail.outbox) == 1
++
++        out = mail.outbox[0]
++        assert isinstance(out, EmailMultiAlternatives)
++        assert out.to == ["foo@example.com"]
++        assert out.subject == "Test"
++        assert out.extra_headers["Message-Id"] == "abc123"
++        assert "In-Reply-To" not in out.extra_headers
++        assert "References" not in out.extra_headers
++        assert GroupEmailThread.objects.count() == 0
++
+     def test_get_built_messages(self) -> None:
+         msg = MessageBuilder(
+             subject="Test",

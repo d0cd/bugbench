@@ -210,6 +210,29 @@ def test_parse_raw_dir_name_new_agent_tools() -> None:
     assert _parse_raw_dir_name("repo-003-codex-cli-mini") == ("repo-003", "codex-cli-mini")
 
 
+def test_parse_raw_dir_name_with_context_level() -> None:
+    """New-format dir names with context level suffix are parsed correctly."""
+    from bugeval.normalize import _parse_raw_dir_name
+
+    assert _parse_raw_dir_name("leo-001-claude-cli-sonnet-diff-only") == (
+        "leo-001",
+        "claude-cli-sonnet",
+    )
+    assert _parse_raw_dir_name("snarkVM-042-greptile-diff+repo") == (
+        "snarkVM-042",
+        "greptile",
+    )
+    assert _parse_raw_dir_name("case-001-anthropic-api-diff+repo+domain") == (
+        "case-001",
+        "anthropic-api",
+    )
+    # Old format still works
+    assert _parse_raw_dir_name("leo-001-claude-cli-sonnet") == (
+        "leo-001",
+        "claude-cli-sonnet",
+    )
+
+
 def _make_config_yaml(tmp_path: Path) -> Path:
     config_data = {
         "github": {"eval_org": "provable-eval"},

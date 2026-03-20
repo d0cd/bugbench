@@ -1,0 +1,99 @@
+diff --git a/pkg/services/authz/rbac/service.go b/pkg/services/authz/rbac/service.go
+index f0753a8ac8ae8..91eef34f937b6 100644
+--- a/pkg/services/authz/rbac/service.go
++++ b/pkg/services/authz/rbac/service.go
+@@ -722,12 +722,12 @@ func (s *Service) getAnonymousPermissions(ctx context.Context, ns types.Namespac
+ 	return res.(map[string]bool), nil
+ }
+ 
+-// Renderer is granted permissions to read all dashboards and folders, and no other permissions
++// Renderer permissions are not stored in the database and are instead derived from the action being checked.
+ func (s *Service) getRendererPermissions(ctx context.Context, action string) (map[string]bool, error) {
+ 	_, span := s.tracer.Start(ctx, "authz_direct_db.service.getRendererPermissions")
+ 	defer span.End()
+ 
+-	if action == "dashboards:read" || action == "folders:read" || action == "datasources:read" {
++	if action == "dashboards:read" || action == "folders:read" || action == "datasources:read" || action == "datasources:query" {
+ 		return map[string]bool{"*": true}, nil
+ 	}
+ 	return map[string]bool{}, nil
+diff --git a/pkg/tests/apis/alerting/notifications/receivers/receiver_test.go b/pkg/tests/apis/alerting/notifications/receivers/receiver_test.go
+index 730b0745d9f8f..0ee0cd65c60c6 100644
+--- a/pkg/tests/apis/alerting/notifications/receivers/receiver_test.go
++++ b/pkg/tests/apis/alerting/notifications/receivers/receiver_test.go
+@@ -811,7 +811,7 @@ func TestIntegrationInUseMetadata(t *testing.T) {
+ 	parentRoute.Routes = []*definitions.Route{&route1, &route2}
+ 	amConfig.AlertmanagerConfig.Route.Routes = append(amConfig.AlertmanagerConfig.Route.Routes, &parentRoute)
+ 
+-	persistInitialConfig(t, amConfig)
++	persistInitialConfig(t, amConfig, helper.Org1.Admin)
+ 
+ 	postGroupRaw, err := testData.ReadFile(path.Join("test-data", "rulegroup-1.json"))
+ 	require.NoError(t, err)
+@@ -1161,7 +1161,7 @@ func TestIntegrationReferentialIntegrity(t *testing.T) {
+ 	var amConfig definitions.PostableUserConfig
+ 	require.NoError(t, json.Unmarshal(alertmanagerRaw, &amConfig))
+ 
+-	persistInitialConfig(t, amConfig)
++	persistInitialConfig(t, amConfig, helper.Org1.Admin)
+ 
+ 	postGroupRaw, err := testData.ReadFile(path.Join("test-data", "rulegroup-1.json"))
+ 	require.NoError(t, err)
+@@ -1529,12 +1529,10 @@ func TestIntegrationReceiverListSelector(t *testing.T) {
+ 
+ // persistInitialConfig helps create an initial config with new receivers using legacy json. Config API blocks receiver
+ // modifications, so we need to use k8s API to create new receivers before posting the config.
+-func persistInitialConfig(t *testing.T, amConfig definitions.PostableUserConfig) {
++func persistInitialConfig(t *testing.T, amConfig definitions.PostableUserConfig, user apis.User) {
+ 	ctx := context.Background()
+ 
+-	helper := getTestHelper(t)
+-
+-	receiverClient, err := v0alpha1.NewReceiverClientFromGenerator(helper.Org1.Admin.GetClientRegistry())
++	receiverClient, err := v0alpha1.NewReceiverClientFromGenerator(user.GetClientRegistry())
+ 	require.NoError(t, err)
+ 	for _, receiver := range amConfig.AlertmanagerConfig.Receivers {
+ 		if receiver.Name == "empty" {
+@@ -1569,7 +1567,7 @@ func persistInitialConfig(t *testing.T, amConfig definitions.PostableUserConfig)
+ 		}
+ 	}
+ 
+-	test_common.UpdateDefaultRoute(t, helper.Org1.Admin, amConfig.AlertmanagerConfig.Route)
++	test_common.UpdateDefaultRoute(t, user, amConfig.AlertmanagerConfig.Route)
+ }
+ 
+ func createIntegration(t *testing.T, integrationType schema.IntegrationType) v0alpha1.ReceiverIntegration {
+diff --git a/public/app/core/components/AppChrome/TopBar/ProfileButton.test.tsx b/public/app/core/components/AppChrome/TopBar/ProfileButton.test.tsx
+index ed89c5456dd2f..cf9c8a9aeb99a 100644
+--- a/public/app/core/components/AppChrome/TopBar/ProfileButton.test.tsx
++++ b/public/app/core/components/AppChrome/TopBar/ProfileButton.test.tsx
+@@ -6,6 +6,13 @@ import { config } from '@grafana/runtime';
+ 
+ import { ProfileButton } from './ProfileButton';
+ 
++// Mock the news feed to avoid real network requests that can cause flaky
++// moment.js deprecation warnings when parsing RSS pubDate values.
++jest.mock('app/plugins/panel/news/feed', () => ({
++  ...jest.requireActual('app/plugins/panel/news/feed'),
++  loadFeed: jest.fn().mockResolvedValue({ items: [] }),
++}));
++
+ describe('ProfileButton', () => {
+   let mainView: HTMLDivElement;
+   let user: ReturnType<typeof userEvent.setup>;
+diff --git a/public/app/plugins/datasource/elasticsearch/ElasticsearchVariableEditor.tsx b/public/app/plugins/datasource/elasticsearch/ElasticsearchVariableEditor.tsx
+index 8317f1a2f5e9f..92f236bd8a063 100644
+--- a/public/app/plugins/datasource/elasticsearch/ElasticsearchVariableEditor.tsx
++++ b/public/app/plugins/datasource/elasticsearch/ElasticsearchVariableEditor.tsx
+@@ -46,7 +46,10 @@ const FieldMapping = (props: FieldMappingProps) => {
+ 
+   // Track the actual query content to avoid re-querying when only meta changes
+   const queryRef = useRef(query);
+-  queryRef.current = query;
++
++  useEffect(() => {
++    queryRef.current = query;
++  });
+ 
+   // Only re-run the query when the query content changes, not when meta (valueField/textField) changes
+   const queryKey = useMemo(

@@ -1,114 +1,2492 @@
-diff --git a/compiler/ast/src/expressions/ternary.rs b/compiler/ast/src/expressions/ternary.rs
-index 43c32eb748..0cf6b0be5b 100644
---- a/compiler/ast/src/expressions/ternary.rs
-+++ b/compiler/ast/src/expressions/ternary.rs
-@@ -31,7 +31,7 @@ pub struct TernaryExpression {
+diff --git a/ast-passes/src/canonicalization/canonicalizer.rs b/ast-passes/src/canonicalization/canonicalizer.rs
+index 09a827a963..4c42d32407 100644
+--- a/ast-passes/src/canonicalization/canonicalizer.rs
++++ b/ast-passes/src/canonicalization/canonicalizer.rs
+@@ -376,6 +376,7 @@ impl Canonicalizer {
+                 Statement::Definition(DefinitionStatement {
+                     declaration_type: definition.declaration_type.clone(),
+                     variable_names: definition.variable_names.clone(),
++                    parened: definition.parened,
+                     type_,
+                     value,
+                     span: definition.span.clone(),
+@@ -524,6 +525,7 @@ impl ReconstructingReducer for Canonicalizer {
+     fn reduce_type(&mut self, _type_: &Type, new: Type, span: &Span) -> Result<Type> {
+         match new.clone() {
+             Type::Array(base, dims) if dims.is_empty() => Ok(Type::Array(base, dims)),
++            Type::Array(_, dims) if dims.is_zero() => Err(AstError::invalid_array_dimension_size(span).into()),
+             // Reduce `ArrayDimensions` into nested `Array` types.
+             Type::Array(base, dims) => {
+                 let mut iter = dims.0.into_iter().rev();
+@@ -533,6 +535,7 @@ impl ReconstructingReducer for Canonicalizer {
+                 Ok(iter.fold(base, |ty, dim| ctor(Box::new(ty), dim)))
+             }
+             Type::SelfType if !self.in_circuit => Err(AstError::big_self_outside_of_circuit(span).into()),
++            Type::Tuple(types) if types.len() == 1 => Err(AstError::invalid_tuple_dimension_size(span).into()),
+             _ => Ok(new),
+         }
+     }
+@@ -586,6 +589,10 @@ impl ReconstructingReducer for Canonicalizer {
+             )));
+         }
  
- impl fmt::Display for TernaryExpression {
-     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
--        write!(f, "if {} ? {} : {}", self.condition, self.if_true, self.if_false)
-+        write!(f, "({} ? {} : {})", self.condition, self.if_true, self.if_false)
++        if elements.is_empty() {
++            return Err(AstError::invalid_array_dimension_size(span).into());
++        }
++
+         Ok(Expression::ArrayInline(ArrayInlineExpression {
+             elements,
+             span: span.clone(),
+@@ -597,10 +604,6 @@ impl ReconstructingReducer for Canonicalizer {
+         array_init: &ArrayInitExpression,
+         element: Expression,
+     ) -> Result<ArrayInitExpression> {
+-        if array_init.dimensions.is_zero() {
+-            return Err(AstError::invalid_array_dimension_size(&array_init.span).into());
+-        }
+-
+         let mk_expr = |element, dim| ArrayInitExpression {
+             element,
+             dimensions: ArrayDimensions::single(dim),
+@@ -613,6 +616,31 @@ impl ReconstructingReducer for Canonicalizer {
+         Ok(iter.fold(init, |elem, dim| mk_expr(Box::new(Expression::ArrayInit(elem)), dim)))
+     }
+ 
++    fn reduce_definition(
++        &mut self,
++        definition: &DefinitionStatement,
++        variable_names: Vec<VariableName>,
++        type_: Option<Type>,
++        value: Expression,
++    ) -> Result<DefinitionStatement> {
++        match &type_ {
++            Some(Type::Tuple(elements)) if elements.len() != 1 => {}
++            _ if definition.parened => {
++                return Err(AstError::invalid_parens_around_single_variable(&definition.span).into());
++            }
++            _ => {}
++        }
++
++        Ok(DefinitionStatement {
++            declaration_type: definition.declaration_type.clone(),
++            variable_names,
++            parened: definition.parened,
++            type_,
++            value,
++            span: definition.span.clone(),
++        })
++    }
++
+     fn reduce_assign(
+         &mut self,
+         assign: &AssignStatement,
+diff --git a/ast/src/reducer/reconstructing_reducer.rs b/ast/src/reducer/reconstructing_reducer.rs
+index 73ea29f35c..939180a96a 100644
+--- a/ast/src/reducer/reconstructing_reducer.rs
++++ b/ast/src/reducer/reconstructing_reducer.rs
+@@ -286,6 +286,7 @@ pub trait ReconstructingReducer {
+         Ok(DefinitionStatement {
+             declaration_type: definition.declaration_type.clone(),
+             variable_names,
++            parened: definition.parened,
+             type_,
+             value,
+             span: definition.span.clone(),
+diff --git a/ast/src/statements/definition/mod.rs b/ast/src/statements/definition/mod.rs
+index b73ae7b28b..fe4ccba13d 100644
+--- a/ast/src/statements/definition/mod.rs
++++ b/ast/src/statements/definition/mod.rs
+@@ -33,6 +33,8 @@ pub struct DefinitionStatement {
+     pub declaration_type: Declare,
+     /// The bindings / variable names to declare.
+     pub variable_names: Vec<VariableName>,
++    /// Tracks whether the variable(s) are in parens.
++    pub parened: bool,
+     /// The types of the bindings, if specified, or inferred otherwise.
+     pub type_: Option<Type>,
+     /// An initializer value for the bindings.
+diff --git a/errors/README.md b/errors/README.md
+index ce05b1ed5d..aa15119ea8 100644
+--- a/errors/README.md
++++ b/errors/README.md
+@@ -13,7 +13,7 @@ The common section of this crate contains a few sub files:
+ - [Backtraced Error](./src/common/backtraced.rs): Which contains the information needed to create a backtraceable error for Leo.
+ - [Formatted Error](./src/common/formatted.rs): Which contains the information needed to create a formatted error for Leo.
+ - [Macros](./src/common/macros.rs): Which contains the logic to make creating errors easy through a DSL. It also figures out the error codes for each error via a **top down** method. Meaning all new errors should be added to the bottom of the file. You can specify whether an error is formatted or backtraced through a decorator above a function name, where the formatted ones require a Span as an argument by default. The body takes any additional arguments you want provided to the function, the message, and the optional help message for the error. The additional arguments are just specified to implement traits to avoid as many type conversions in other Leo crates.
+-- [Span](./src/common/span.rs): Which contains the span object used throughout the other Leo crates(with the exception of the Input crate see more [below](#input)).
++- [Span](./src/common/span.rs): Which contains the span object used throughout the other Leo crates (with the exception of the Input crate see more [below](#input)).
+ - [Tendril JSON](./src/common/tendril_json.rs): Which contains the common logic for how to searlize a StrTendril from the tendril crate.
+ - [Traits](./src/common/traits.rs): Which contains the common traits in errors to make defining errors easier.
+ 
+diff --git a/errors/src/ast/ast_errors.rs b/errors/src/ast/ast_errors.rs
+index fa2c6b6f81..031bc6f87f 100644
+--- a/errors/src/ast/ast_errors.rs
++++ b/errors/src/ast/ast_errors.rs
+@@ -130,4 +130,20 @@ create_errors!(
+         msg: format!("failed to convert ast to a json value {}", error),
+         help: None,
+     }
++
++    /// For when a user tries to define a tuple dimension of 1.
++    @formatted
++    invalid_tuple_dimension_size {
++        args: (),
++        msg: "tuples of 1 element are not allowed",
++        help: None,
++    }
++
++    /// For when a user puts parens around a single defined variable.
++    @formatted
++    invalid_parens_around_single_variable {
++        args: (),
++        msg: "do not put parens around single variable names",
++        help: None,
++    }
+ );
+diff --git a/grammar/README.md b/grammar/README.md
+index 557f748a55..105de2cbe4 100644
+--- a/grammar/README.md
++++ b/grammar/README.md
+@@ -625,25 +625,6 @@ identifier = letter *( letter / decimal-digit / "_" )
+ Go to: _[letter](#user-content-letter)_;
+ 
+ 
+-A package name consists of one or more segments separated by single dashes,
+-where each segment is a non-empty sequence of
+-lowercase letters and (decimal) digits.
+-Similarly to an identifier, a package name must not be a keyword
+-and must not be or start with `aleo1`.
+-
+-<a name="package-name"></a>
+-```abnf
+-package-name = lowercase-letter *( lowercase-letter / decimal-digit )
+-               *( "-" 1*( lowercase-letter / decimal-digit ) )
+-               ; but not a keyword or a boolean literal or aleo1...
+-```
+-
+-Go to: _[lowercase-letter](#user-content-lowercase-letter)_;
+-
+-
+-Note that, grammatically, identifiers are also package names.
+-They are disambiguated from context, based on the syntactic grammar.
+-
+ Annotations have names, which are identifiers immediately preceded by `@`.
+ 
+ <a name="annotation-name"></a>
+@@ -918,12 +899,11 @@ is a token, as defined by the following rule.
+ token = keyword
+       / identifier
+       / atomic-literal
+-      / package-name
+       / annotation-name
+       / symbol
+ ```
+ 
+-Go to: _[annotation-name](#user-content-annotation-name), [atomic-literal](#user-content-atomic-literal), [identifier](#user-content-identifier), [keyword](#user-content-keyword), [package-name](#user-content-package-name), [symbol](#user-content-symbol)_;
++Go to: _[annotation-name](#user-content-annotation-name), [atomic-literal](#user-content-atomic-literal), [identifier](#user-content-identifier), [keyword](#user-content-keyword), [symbol](#user-content-symbol)_;
+ 
+ 
+ Tokens, comments, and whitespace are lexemes, i.e. lexical units.
+@@ -1795,33 +1775,33 @@ An import declaration consists of the `import` keyword
+ followed by a package path, which may be one of the following:
+ a single wildcard;
+ an identifier, optionally followed by a local renamer;
+-a package name followed by a path, recursively;
++an identifier followed by a path, recursively;
+ or a parenthesized list of package paths,
+ which are "fan out" of the initial path.
+ Note that we allow the last element of the parenthesized list
+ to be followed by a comma, for convenience.
+-The package path in the import declaration must start with a package name
++The package path in the import declaration must start with an identifier
+ (e.g. it cannot be a `*`):
+ the rule for import declaration expresses this requirement
+-by using an explicit package name before the package path.
++by using an explicit identifier before the package path.
+ 
+ <a name="import-declaration"></a>
+ ```abnf
+-import-declaration = %s"import" package-name "." package-path ";"
++import-declaration = %s"import" identifier "." package-path ";"
+ ```
+ 
+-Go to: _[package-name](#user-content-package-name), [package-path](#user-content-package-path)_;
++Go to: _[identifier](#user-content-identifier), [package-path](#user-content-package-path)_;
+ 
+ 
+ <a name="package-path"></a>
+ ```abnf
+ package-path = "*"
+              / identifier [ %s"as" identifier ]
+-             / package-name "." package-path
++             / identifier "." package-path
+              / "(" package-path *( "," package-path ) [","] ")"
+ ```
+ 
+-Go to: _[identifier](#user-content-identifier), [package-name](#user-content-package-name), [package-path](#user-content-package-path)_;
++Go to: _[identifier](#user-content-identifier), [package-path](#user-content-package-path)_;
+ 
+ 
+ A type alias declaration defines an identifier to stand for a type.
+diff --git a/grammar/abnf-grammar.txt b/grammar/abnf-grammar.txt
+index dcb7cdc51c..af4bd430a1 100644
+--- a/grammar/abnf-grammar.txt
++++ b/grammar/abnf-grammar.txt
+@@ -447,19 +447,6 @@ hexadecimal-digit = decimal-digit / "a" / "b" / "c" / "d" / "e" / "f"
+ identifier = letter *( letter / decimal-digit / "_" )
+              ; but not a keyword or a boolean literal or aleo1...
+ 
+-; A package name consists of one or more segments separated by single dashes,
+-; where each segment is a non-empty sequence of
+-; lowercase letters and (decimal) digits.
+-; Similarly to an identifier, a package name must not be a keyword
+-; and must not be or start with `aleo1`.
+-
+-package-name = lowercase-letter *( lowercase-letter / decimal-digit )
+-               *( "-" 1*( lowercase-letter / decimal-digit ) )
+-               ; but not a keyword or a boolean literal or aleo1...
+-
+-; Note that, grammatically, identifiers are also package names.
+-; They are disambiguated from context, based on the syntactic grammar.
+-
+ ; Annotations have names, which are identifiers immediately preceded by `@`.
+ 
+ annotation-name = "@" identifier
+@@ -606,7 +593,6 @@ symbol = "!" / "&" / "&&" / "||"
+ token = keyword
+       / identifier
+       / atomic-literal
+-      / package-name
+       / annotation-name
+       / symbol
+ 
+@@ -1063,21 +1049,21 @@ circuit-declaration = %s"circuit" identifier
+ ; followed by a package path, which may be one of the following:
+ ; a single wildcard;
+ ; an identifier, optionally followed by a local renamer;
+-; a package name followed by a path, recursively;
++; an identifier followed by a path, recursively;
+ ; or a parenthesized list of package paths,
+ ; which are "fan out" of the initial path.
+ ; Note that we allow the last element of the parenthesized list
+ ; to be followed by a comma, for convenience.
+-; The package path in the import declaration must start with a package name
++; The package path in the import declaration must start with an identifier
+ ; (e.g. it cannot be a `*`):
+ ; the rule for import declaration expresses this requirement
+-; by using an explicit package name before the package path.
++; by using an explicit identifier before the package path.
+ 
+-import-declaration = %s"import" package-name "." package-path ";"
++import-declaration = %s"import" identifier "." package-path ";"
+ 
+ package-path = "*"
+              / identifier [ %s"as" identifier ]
+-             / package-name "." package-path
++             / identifier "." package-path
+              / "(" package-path *( "," package-path ) [","] ")"
+ 
+ ; A type alias declaration defines an identifier to stand for a type.
+diff --git a/parser/src/parser/file.rs b/parser/src/parser/file.rs
+index 3d6e473b2f..59cc7752db 100644
+--- a/parser/src/parser/file.rs
++++ b/parser/src/parser/file.rs
+@@ -149,59 +149,21 @@ impl ParserContext<'_> {
+     /// Returns an [`Identifier`] AST node if the next tokens represent a valid package name.
+     pub fn parse_package_name(&mut self) -> Result<Identifier> {
+         // Build the package name, starting with valid characters up to a dash `-` (Token::Minus).
+-        let mut base = self.expect_loose_identifier()?;
+-
+-        // Build the rest of the package name including dashes.
+-        loop {
+-            match &self.peek_token().as_ref() {
+-                Token::Minus => {
+-                    let span = self.expect(Token::Minus)?;
+-                    base.span = base.span + span;
+-                    let next = self.expect_loose_identifier()?;
+-                    base.name = Symbol::intern(&format!("{}-{}", base.name, next.name));
+-                    base.span = base.span + next.span;
+-                }
+-                Token::Int(_) => {
+-                    let (num, span) = self.eat_int().unwrap();
+-                    base.name = Symbol::intern(&format!("{}{}", base.name, num.value));
+-                    base.span = base.span + span;
+-                }
+-                Token::Ident(_) => {
+-                    let next = self.expect_ident()?;
+-                    base.name = Symbol::intern(&format!("{}{}", base.name, next.name));
+-                    base.span = base.span + next.span;
+-                }
+-                x if KEYWORD_TOKENS.contains(x) => {
+-                    let next = self.expect_loose_identifier()?;
+-                    base.name = Symbol::intern(&format!("{}{}", base.name, next.name));
+-                    base.span = base.span + next.span;
+-                }
+-                _ => break,
+-            }
+-        }
++        let base = self.expect_loose_identifier()?;
+ 
+         // Return an error if the package name contains a keyword.
+         if let Some(token) = KEYWORD_TOKENS.iter().find(|x| x.keyword_to_symbol() == Some(base.name)) {
+             self.emit_err(ParserError::unexpected_str(token, "package name", &base.span));
+         }
+ 
+-        // Return an error if the package name contains invalid characters.
+-        if !base
+-            .name
+-            .as_str()
+-            .chars()
+-            .all(|x| x.is_ascii_lowercase() || x.is_ascii_digit() || x == '-' || x == '_')
+-        {
+-            self.emit_err(ParserError::invalid_package_name(&base.span));
+-        }
+-
+         // Return the package name.
+         Ok(base)
+     }
+ 
+     /// Returns an [`ImportTree`] AST node if the next tokens represent a valid package import
+     /// with accesses.
+-    fn parse_import_tree(&mut self) -> Result<ImportTree> {
++    // Public soely foro writing import parsing tests.
++    pub fn parse_import_tree(&mut self) -> Result<ImportTree> {
+         // Parse the first part of the path.
+         let first_name = self.parse_package_name()?;
+         let start = first_name.span.clone();
+diff --git a/parser/src/parser/statement.rs b/parser/src/parser/statement.rs
+index 91c1d2a21c..d988363c33 100644
+--- a/parser/src/parser/statement.rs
++++ b/parser/src/parser/statement.rs
+@@ -295,11 +295,14 @@ impl ParserContext<'_> {
+         let declare = self.expect_oneof(&[Token::Let, Token::Const])?;
+ 
+         // Parse variable names.
+-        let variable_names = if self.peek_is_left_par() {
+-            self.parse_paren_comma_list(|p| p.parse_variable_name(&declare).map(Some))
+-                .map(|(vars, ..)| vars)?
++        let (variable_names, parened) = if self.peek_is_left_par() {
++            (
++                self.parse_paren_comma_list(|p| p.parse_variable_name(&declare).map(Some))
++                    .map(|(vars, ..)| vars)?,
++                true,
++            )
+         } else {
+-            vec![self.parse_variable_name(&declare)?]
++            (vec![self.parse_variable_name(&declare)?], false)
+         };
+ 
+         // Parse an optional type ascription.
+@@ -320,6 +323,7 @@ impl ParserContext<'_> {
+                 _ => unreachable!("parse_definition_statement_ shouldn't produce this"),
+             },
+             variable_names,
++            parened,
+             type_,
+             value: expr,
+         })
+diff --git a/parser/src/test.rs b/parser/src/test.rs
+index af9b221600..2a95cd4654 100644
+--- a/parser/src/test.rs
++++ b/parser/src/test.rs
+@@ -111,6 +111,27 @@ impl Namespace for ParseExpressionNamespace {
      }
  }
  
-diff --git a/compiler/passes/src/static_single_assignment/rename_program.rs b/compiler/passes/src/static_single_assignment/rename_program.rs
-index 6057650016..773d015209 100644
---- a/compiler/passes/src/static_single_assignment/rename_program.rs
-+++ b/compiler/passes/src/static_single_assignment/rename_program.rs
-@@ -56,14 +56,15 @@ impl ProgramReconstructor for StaticSingleAssigner<'_> {
-             .fold(last_return_expression, |acc, (guard, expr)| match guard {
-                 None => unreachable!("All return statements except for the last one must have a guard."),
-                 // Note that type checking guarantees that all expressions in return statements in the function body have the same type.
--                Some(guard) => match (acc, expr) {
-+                Some(guard) => match (expr, acc) {
-                     // If the function returns tuples, fold the return expressions into a tuple of ternary expressions.
--                    (Expression::Tuple(acc_tuple), Expression::Tuple(expr_tuple)) => {
-+                    // Note that `expr` and `acc` are correspond to the `if` and `else` cases of the ternary expression respectively.
-+                    (Expression::Tuple(expr_tuple), Expression::Tuple(acc_tuple)) => {
-                         Expression::Tuple(TupleExpression {
--                            elements: acc_tuple
-+                            elements: expr_tuple
-                                 .elements
-                                 .into_iter()
--                                .zip_eq(expr_tuple.elements.into_iter())
-+                                .zip_eq(acc_tuple.elements.into_iter())
-                                 .map(|(if_true, if_false)| {
-                                     Expression::Ternary(TernaryExpression {
-                                         condition: Box::new(guard.clone()),
-@@ -77,10 +78,11 @@ impl ProgramReconstructor for StaticSingleAssigner<'_> {
-                         })
++struct ParseImportNamespace;
++
++impl Namespace for ParseImportNamespace {
++    fn parse_type(&self) -> ParseType {
++        ParseType::ContinuousLines
++    }
++
++    fn run_test(&self, test: Test) -> Result<Value, String> {
++        create_session_if_not_set_then(|_| {
++            let tokenizer = tokenize(test)?;
++            if all_are_comments(&tokenizer) {
++                return Ok(yaml_or_fail(Statement::Expression(ExpressionStatement {
++                    expression: implicit_value_expr(),
++                    span: Span::default(),
++                })));
++            }
++            with_handler(tokenizer, |p| p.parse_import_statement()).map(yaml_or_fail)
++        })
++    }
++}
++
+ struct ParseStatementNamespace;
+ 
+ impl Namespace for ParseStatementNamespace {
+@@ -215,10 +236,11 @@ impl Runner for TestRunner {
+     fn resolve_namespace(&self, name: &str) -> Option<Box<dyn Namespace>> {
+         Some(match name {
+             "Parse" => Box::new(ParseNamespace),
+-            "ParseStatement" => Box::new(ParseStatementNamespace),
++            "ParseImport" => Box::new(ParseImportNamespace),
+             "ParseExpression" => Box::new(ParseExpressionNamespace),
+-            "Token" => Box::new(TokenNamespace),
++            "ParseStatement" => Box::new(ParseStatementNamespace),
+             "Serialize" => Box::new(SerializeNamespace),
++            "Token" => Box::new(TokenNamespace),
+             _ => return None,
+         })
+     }
+diff --git a/parser/src/tokenizer/lexer.rs b/parser/src/tokenizer/lexer.rs
+index 93ce3a49bf..37e899a03f 100644
+--- a/parser/src/tokenizer/lexer.rs
++++ b/parser/src/tokenizer/lexer.rs
+@@ -396,7 +396,11 @@ impl Token {
+                         return (0, None);
                      }
-                     // Otherwise, fold the return expressions into a single ternary expression.
--                    (acc, expr) => Expression::Ternary(TernaryExpression {
-+                    // Note that `expr` and `acc` are correspond to the `if` and `else` cases of the ternary expression respectively.
-+                    (expr, acc) => Expression::Ternary(TernaryExpression {
-                         condition: Box::new(guard),
--                        if_true: Box::new(acc),
--                        if_false: Box::new(expr),
-+                        if_true: Box::new(expr),
-+                        if_false: Box::new(acc),
-                         span: Default::default(),
-                     }),
-                 },
-diff --git a/compiler/passes/src/static_single_assignment/static_single_assigner.rs b/compiler/passes/src/static_single_assignment/static_single_assigner.rs
-index b4649a92b3..6c199eb8f0 100644
---- a/compiler/passes/src/static_single_assignment/static_single_assigner.rs
-+++ b/compiler/passes/src/static_single_assignment/static_single_assigner.rs
-@@ -38,6 +38,7 @@ pub struct StaticSingleAssigner<'a> {
-     /// A stack of condition `Expression`s visited up to the current point in the AST.
-     pub(crate) condition_stack: Vec<Expression>,
-     /// A list containing tuples of guards and expressions associated with early `ReturnStatement`s.
-+    /// Note that early returns are inserted in the order they are encountered during a pre-order traversal of the AST.
-     pub(crate) early_returns: Vec<(Option<Expression>, Expression)>,
+                     let eol = input.windows(2).skip(2).position(|x| x[0] == b'*' && x[1] == b'/');
+-                    let len = if let Some(eol) = eol { eol + 4 } else { input.len() };
++                    let len = if let Some(eol) = eol {
++                        eol + 4
++                    } else {
++                        return (0, None);
++                    };
+                     return (len, Some(Token::CommentBlock(input_tendril.subtendril(0, len as u32))));
+                 } else if let Some(len) = eat(input, "/=") {
+                     return (len, Some(Token::DivEq));
+diff --git a/span/src/span.rs b/span/src/span.rs
+index 0003518e10..45e9a6da8d 100644
+--- a/span/src/span.rs
++++ b/span/src/span.rs
+@@ -38,18 +38,18 @@ pub struct Span {
+     /// The path to the Leo file containing the error.
+     pub path: Arc<String>,
+     #[serde(with = "crate::tendril_json")]
+-    /// The content of the file between the above boundries.
++    /// The content of the file between the above boundaries.
+     pub content: StrTendril,
  }
  
-diff --git a/tests/expectations/compiler/function/conditional_return.out b/tests/expectations/compiler/function/conditional_return.out
-index a57da13fd5..3ed267e322 100644
---- a/tests/expectations/compiler/function/conditional_return.out
-+++ b/tests/expectations/compiler/function/conditional_return.out
-@@ -6,4 +6,4 @@ outputs:
-       - initial_input_ast: ae0703890dbea144e675f85228e958d6903df0d1ebd88f16a531624270205cc2
-     initial_ast: 3dac7cf725df154640f7ea5979ac102b14916dc88215a69f555752f1e8051eec
-     unrolled_ast: 3dac7cf725df154640f7ea5979ac102b14916dc88215a69f555752f1e8051eec
--    ssa_ast: 4245cbfd9ba6af41aaffaa237c46d126d54f558b04bc7abb36751f47b0cb0c24
-+    ssa_ast: b92c41b537132f3b09078850939b343fb275836ce8f4890b74f3a4390b9a6c41
-diff --git a/tests/expectations/compiler/statements/assign.out b/tests/expectations/compiler/statements/assign.out
-index a0676ca67d..00dd337d9a 100644
---- a/tests/expectations/compiler/statements/assign.out
-+++ b/tests/expectations/compiler/statements/assign.out
-@@ -6,4 +6,4 @@ outputs:
-       - initial_input_ast: 9f519c84609aa8fc9c90d398fdb30fe75df106dc0347ab1e3d7e947b2ab1b724
-     initial_ast: 90d7b657319b7b4c7151826d74e891f1c2e9722ea96527002a5b541a8bf33107
-     unrolled_ast: 90d7b657319b7b4c7151826d74e891f1c2e9722ea96527002a5b541a8bf33107
--    ssa_ast: 74be6b9acdcf67a3ac2f593b6437867c6661fe139bd40e48c26bb56fd0ddd732
-+    ssa_ast: abfbbb6c7005dc4102e1cacb6e8c1f8c8477896cbbeb9fa86c7c8d27a65a76e1
-diff --git a/tests/expectations/compiler/statements/multiple_returns.out b/tests/expectations/compiler/statements/multiple_returns.out
-index 8598df7d86..ceae0280ec 100644
---- a/tests/expectations/compiler/statements/multiple_returns.out
-+++ b/tests/expectations/compiler/statements/multiple_returns.out
-@@ -7,4 +7,4 @@ outputs:
-       - initial_input_ast: 05aec88bcd0cad7448814728a983f3ff8cb52f9dc5f9bd464e130f18c4ae1033
-     initial_ast: 72f2d64a55e6db776ee3af263fe200d8dd806e4f20e27696012e49f6987a8609
-     unrolled_ast: 72f2d64a55e6db776ee3af263fe200d8dd806e4f20e27696012e49f6987a8609
--    ssa_ast: 1792d3a73c33221886da3e41cbf14dfe10b2d7181fba0c609f43db043643416d
-+    ssa_ast: 073290d894ce45effb6c829253cf0e36a7efeeac4cef28b286d781f49e903277
-diff --git a/tests/expectations/compiler/statements/mutate.out b/tests/expectations/compiler/statements/mutate.out
-index 805d641190..d1591beb4f 100644
---- a/tests/expectations/compiler/statements/mutate.out
-+++ b/tests/expectations/compiler/statements/mutate.out
-@@ -7,4 +7,4 @@ outputs:
-       - initial_input_ast: 965f2de6d6d4b0d3b2bf32e29ca196835aec7ca5803f9c6a33b8987185a5c233
-     initial_ast: 97eb6d68a9c10827d6420dc9013f0c391291bfb52df42439f9fb9fa30abb6a93
-     unrolled_ast: 97eb6d68a9c10827d6420dc9013f0c391291bfb52df42439f9fb9fa30abb6a93
--    ssa_ast: 44792534cd773c5072884b90803b2ddfa50041039f2459fa1e3e48a074a1413d
-+    ssa_ast: e28d175aae45224d73f23adf2624c0e7873169c234528ba1b399f12977044129
-diff --git a/tests/expectations/compiler/tuple/function_early_return.out b/tests/expectations/compiler/tuple/function_early_return.out
-index 2d4c79facb..5b7737dcf5 100644
---- a/tests/expectations/compiler/tuple/function_early_return.out
-+++ b/tests/expectations/compiler/tuple/function_early_return.out
-@@ -6,4 +6,4 @@ outputs:
-       - initial_input_ast: 2839953e7e597fbba9a151db4849720b37a3b4394bf9de22a09410013a18c9f7
-     initial_ast: eb6dfd0a82152f03c56709e72e4a7403b1b7a8636268a3ac70e98349299e88ec
-     unrolled_ast: eb6dfd0a82152f03c56709e72e4a7403b1b7a8636268a3ac70e98349299e88ec
--    ssa_ast: 5a016f84e71e78451062d81982bfb89a6a762f02529d515ed1acf27a94a4161f
-+    ssa_ast: dde4e8447e34c663a78a96b7f1e603fbf44578b5c4abbad858c2b784d27e42e6
+ impl Span {
+-    /// Generate a new span from where:
+-    /// - the Leo line starts.
+-    /// - the Leo line stops.
+-    /// - the Leo column starts.
+-    /// - the Leo column stops.
+-    /// - the path to the Leo file.
+-    /// - the content of those specified bounds.
++    /// Generate a new span from:
++    /// - Where the Leo line starts.
++    /// - Where the Leo line stops.
++    /// - Where the Leo column starts.
++    /// - Where the Leo column stops.
++    /// - The path to the Leo file.
++    /// - The content of those specified bounds.
+     pub fn new(
+         line_start: usize,
+         line_stop: usize,
+@@ -96,7 +96,6 @@ impl Serialize for Span {
+     }
+ }
+ 
+-/// Conversion from a pest span where the leo-input library uses these.
+ impl fmt::Display for Span {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         if self.line_start == self.line_stop {
+@@ -111,6 +110,7 @@ impl fmt::Display for Span {
+     }
+ }
+ 
++/// Conversion from a pest span where the leo-input library uses these.
+ impl<'ast> From<PestSpan<'ast>> for Span {
+     fn from(span: PestSpan) -> Self {
+         let start = span.start_pos().line_col();
+diff --git a/span/src/span_json.rs b/span/src/span_json.rs
+index 8a6d1262ec..7befdb4cb8 100644
+--- a/span/src/span_json.rs
++++ b/span/src/span_json.rs
+@@ -23,7 +23,7 @@ use serde::ser::SerializeMap;
+ use serde::{Deserializer, Serializer};
+ use std::fmt;
+ 
+-/// The AST contains a few tuple-like enum variants the contain spans
++/// The AST contains a few tuple-like enum variants that contain spans.
+ /// #[derive(Serialize, Deserialize)] outputs these fields as anonmyous
+ /// mappings, which makes them difficult to remove from the JSON AST.
+ /// This function provides a custom serialization that maps the keyword
+diff --git a/tests/expectations/parser/parser/expression/literal/comment.leo.out b/tests/expectations/parser/parser/expression/literal/comment.leo.out
+index 9f4cc8a518..0b21f6a280 100644
+--- a/tests/expectations/parser/parser/expression/literal/comment.leo.out
++++ b/tests/expectations/parser/parser/expression/literal/comment.leo.out
+@@ -1,22 +1,12 @@
+ ---
+-namespace: Token
++namespace: Parse
+ expectation: Pass
+ outputs:
+-  - "'// test1' @ 1:1-9"
+-  - "'// test2' @ 1:1-9"
+-  - "'//test3' @ 1:1-8"
+-  - "'/' @ 1:1-2,'/' @ 1:3-4,'test4' @ 1:5-10"
+-  - "'/* test5 */' @ 1:1-12"
+-  - "'/*' @ 1:1-3"
+-  - "'test' @ 1:1-5,'6' @ 1:6-7,'*' @ 1:8-9,'/' @ 1:9-10"
+-  - "'/* test 7' @ 1:1-10"
+-  - "'*' @ 1:1-2,'/' @ 1:2-3"
+-  - "'/*test8 */' @ 1:1-11"
+-  - "'/* test9*/' @ 1:1-11"
+-  - "'/*test10*/' @ 1:1-11"
+-  - "'/*/**/' @ 1:1-7"
+-  - "'/**/' @ 1:1-5"
+-  - "'/*//*/' @ 1:1-7"
+-  - "'/** /*/' @ 1:1-8"
+-  - "'/** **/' @ 1:1-8"
+-  - "'/*' @ 1:1-3"
++  - name: ""
++    expected_input: []
++    import_statements: []
++    imports: {}
++    aliases: {}
++    circuits: {}
++    global_consts: {}
++    functions: {}
+diff --git a/tests/expectations/parser/parser/import/alias.leo.out b/tests/expectations/parser/parser/import/alias.leo.out
+new file mode 100644
+index 0000000000..0aed27aec6
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/alias.leo.out
+@@ -0,0 +1,25 @@
++---
++namespace: ParseImport
++expectation: Pass
++outputs:
++  - tree:
++      base:
++        - "{\"name\":\"a\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":9,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b as bar;\\\"}\"}"
++        - "{\"name\":\"b\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":10,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b as bar;\\\"}\"}"
++      kind:
++        Leaf:
++          alias: "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":15,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b as bar;\\\"}\"}"
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 18
++        path: ""
++        content: import a.b as bar;
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 18
++      path: ""
++      content: import a.b as bar;
+diff --git a/tests/expectations/parser/parser/import/basic.leo.out b/tests/expectations/parser/parser/import/basic.leo.out
+new file mode 100644
+index 0000000000..02412948b5
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/basic.leo.out
+@@ -0,0 +1,46 @@
++---
++namespace: ParseImport
++expectation: Pass
++outputs:
++  - tree:
++      base:
++        - "{\"name\":\"a\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":9,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b;\\\"}\"}"
++        - "{\"name\":\"b\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":10,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b;\\\"}\"}"
++      kind:
++        Leaf:
++          alias: ~
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 11
++        path: ""
++        content: import a.b;
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 11
++      path: ""
++      content: import a.b;
++  - tree:
++      base:
++        - "{\"name\":\"AB\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":10,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import AB.c;\\\"}\"}"
++        - "{\"name\":\"c\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":11,\\\"col_stop\\\":12,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import AB.c;\\\"}\"}"
++      kind:
++        Leaf:
++          alias: ~
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 12
++        path: ""
++        content: import AB.c;
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 12
++      path: ""
++      content: import AB.c;
+diff --git a/tests/expectations/parser/parser/import/import_empty_list_fail.leo.out b/tests/expectations/parser/parser/import/import_empty_list_fail.leo.out
+index 50ad5ede20..6b6c98c602 100644
+--- a/tests/expectations/parser/parser/import/import_empty_list_fail.leo.out
++++ b/tests/expectations/parser/parser/import/import_empty_list_fail.leo.out
+@@ -1,5 +1,6 @@
+ ---
+-namespace: Parse
++namespace: ParseImport
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370002]: Cannot import empty list\n    --> test:3:10\n     |\n   3 | import a.();\n     |          ^^\nError [EPAR0370002]: Cannot import empty list\n    --> test:5:10\n     |\n   5 | import a.();\n     |          ^^"
++  - "Error [EPAR0370002]: Cannot import empty list\n    --> test:1:10\n     |\n   1 | import a.();\n     |          ^^"
++  - "Error [EPAR0370002]: Cannot import empty list\n    --> test:1:10\n     |\n   1 | import a.();\n     |          ^^"
+diff --git a/tests/expectations/parser/parser/import/invalid.leo.out b/tests/expectations/parser/parser/import/invalid.leo.out
+new file mode 100644
+index 0000000000..6a622f4188
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/invalid.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: ParseImport
++expectation: Fail
++outputs:
++  - "did not consume all input: 'import' @ 2:1-7\n'*' @ 2:8-9\n';' @ 2:9-10\n"
+diff --git a/tests/expectations/parser/parser/import/invalid_chars_fail.leo.out b/tests/expectations/parser/parser/import/invalid_chars_fail.leo.out
+index e44abfa775..a533f14747 100644
+--- a/tests/expectations/parser/parser/import/invalid_chars_fail.leo.out
++++ b/tests/expectations/parser/parser/import/invalid_chars_fail.leo.out
+@@ -1,5 +1,6 @@
+ ---
+-namespace: Parse
++namespace: ParseImport
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370012]: package names must be lowercase alphanumeric ascii with underscores and singular dashes\n    --> test:3:8\n     |\n   3 | import AB.c;\n     |        ^^\nError [EPAR0370012]: package names must be lowercase alphanumeric ascii with underscores and singular dashes\n    --> test:5:8\n     |\n   5 | import AB.c;\n     |        ^^"
++  - "Error [EPAR0370009]: unexpected string: expected 'package name', got 'import'\n    --> test:1:1\n     |\n   1 | import AB.c;\n     | ^^^^^^"
++  - "Error [EPAR0370009]: unexpected string: expected 'package name', got 'import'\n    --> test:1:1\n     |\n   1 | import AB.c;\n     | ^^^^^^"
+diff --git a/tests/expectations/parser/parser/import/keyword_fail.leo.out b/tests/expectations/parser/parser/import/keyword_fail.leo.out
+index c229c8167f..45f5f6c351 100644
+--- a/tests/expectations/parser/parser/import/keyword_fail.leo.out
++++ b/tests/expectations/parser/parser/import/keyword_fail.leo.out
+@@ -1,5 +1,6 @@
+ ---
+-namespace: Parse
++namespace: ParseImport
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370009]: unexpected string: expected 'package name', got 'function'\n    --> test:3:8\n     |\n   3 | import function.a;\n     |        ^^^^^^^^\nError [EPAR0370009]: unexpected string: expected 'package name', got 'import'\n    --> test:5:8\n     |\n   5 | import import.a;\n     |        ^^^^^^"
++  - "Error [EPAR0370009]: unexpected string: expected 'package name', got 'function'\n    --> test:1:8\n     |\n   1 | import function.a;\n     |        ^^^^^^^^"
++  - "Error [EPAR0370009]: unexpected string: expected 'package name', got 'import'\n    --> test:1:8\n     |\n   1 | import import.a;\n     |        ^^^^^^"
+diff --git a/tests/expectations/parser/parser/import/many_import.leo.out b/tests/expectations/parser/parser/import/many_import.leo.out
+new file mode 100644
+index 0000000000..731114c76a
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/many_import.leo.out
+@@ -0,0 +1,130 @@
++---
++namespace: ParseImport
++expectation: Pass
++outputs:
++  - tree:
++      base:
++        - "{\"name\":\"tes_import\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import tes_import.(\\\"}\"}"
++      kind:
++        Nested:
++          tree:
++            - base:
++                - "{\"name\":\"Point\",\"span\":\"{\\\"line_start\\\":2,\\\"line_stop\\\":2,\\\"col_start\\\":1,\\\"col_stop\\\":6,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"Point,\\\"}\"}"
++              kind:
++                Leaf:
++                  alias: ~
++              span:
++                line_start: 2
++                line_stop: 2
++                col_start: 1
++                col_stop: 6
++                path: ""
++                content: "Point,"
++            - base:
++                - "{\"name\":\"foo\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":1,\\\"col_stop\\\":4,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"foo,\\\"}\"}"
++              kind:
++                Leaf:
++                  alias: ~
++              span:
++                line_start: 3
++                line_stop: 3
++                col_start: 1
++                col_stop: 4
++                path: ""
++                content: "foo,"
++      span:
++        line_start: 1
++        line_stop: 4
++        col_start: 8
++        col_stop: 2
++        path: ""
++        content: "import tes_import.(\n     ...\n     ...\n);"
++    span:
++      line_start: 1
++      line_stop: 4
++      col_start: 8
++      col_stop: 2
++      path: ""
++      content: "import tes_import.(\n     ...\n     ...\n);"
++  - tree:
++      base:
++        - "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.(\\\"}\"}"
++      kind:
++        Nested:
++          tree:
++            - base:
++                - "{\"name\":\"Bar\",\"span\":\"{\\\"line_start\\\":2,\\\"line_stop\\\":2,\\\"col_start\\\":1,\\\"col_stop\\\":4,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"Bar,\\\"}\"}"
++              kind:
++                Leaf:
++                  alias: ~
++              span:
++                line_start: 2
++                line_stop: 2
++                col_start: 1
++                col_stop: 4
++                path: ""
++                content: "Bar,"
++            - base:
++                - "{\"name\":\"baz\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":1,\\\"col_stop\\\":4,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"baz.(Baz, Bazzar),\\\"}\"}"
++              kind:
++                Nested:
++                  tree:
++                    - base:
++                        - "{\"name\":\"Baz\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":6,\\\"col_stop\\\":9,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"baz.(Baz, Bazzar),\\\"}\"}"
++                      kind:
++                        Leaf:
++                          alias: ~
++                      span:
++                        line_start: 3
++                        line_stop: 3
++                        col_start: 6
++                        col_stop: 9
++                        path: ""
++                        content: "baz.(Baz, Bazzar),"
++                    - base:
++                        - "{\"name\":\"Bazzar\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":11,\\\"col_stop\\\":17,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"baz.(Baz, Bazzar),\\\"}\"}"
++                      kind:
++                        Leaf:
++                          alias: ~
++                      span:
++                        line_start: 3
++                        line_stop: 3
++                        col_start: 11
++                        col_stop: 17
++                        path: ""
++                        content: "baz.(Baz, Bazzar),"
++              span:
++                line_start: 3
++                line_stop: 3
++                col_start: 1
++                col_stop: 18
++                path: ""
++                content: "baz.(Baz, Bazzar),"
++            - base:
++                - "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":4,\\\"line_stop\\\":4,\\\"col_start\\\":1,\\\"col_stop\\\":4,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"bat.bat.Bat,\\\"}\"}"
++                - "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":4,\\\"line_stop\\\":4,\\\"col_start\\\":5,\\\"col_stop\\\":8,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"bat.bat.Bat,\\\"}\"}"
++                - "{\"name\":\"Bat\",\"span\":\"{\\\"line_start\\\":4,\\\"line_stop\\\":4,\\\"col_start\\\":9,\\\"col_stop\\\":12,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"bat.bat.Bat,\\\"}\"}"
++              kind:
++                Leaf:
++                  alias: ~
++              span:
++                line_start: 4
++                line_stop: 4
++                col_start: 1
++                col_stop: 12
++                path: ""
++                content: "bat.bat.Bat,"
++      span:
++        line_start: 1
++        line_stop: 5
++        col_start: 8
++        col_stop: 2
++        path: ""
++        content: "import bar.(\n     ...\n     ...\n     ...\n);"
++    span:
++      line_start: 1
++      line_stop: 5
++      col_start: 8
++      col_stop: 2
++      path: ""
++      content: "import bar.(\n     ...\n     ...\n     ...\n);"
+diff --git a/tests/expectations/parser/parser/import/many_import_star.leo.out b/tests/expectations/parser/parser/import/many_import_star.leo.out
+new file mode 100644
+index 0000000000..ff2a51d9b8
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/many_import_star.leo.out
+@@ -0,0 +1,137 @@
++---
++namespace: ParseImport
++expectation: Pass
++outputs:
++  - tree:
++      base:
++        - "{\"name\":\"test_import\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import test_import.*; // local import\\\"}\"}"
++      kind:
++        Glob:
++          span:
++            line_start: 1
++            line_stop: 1
++            col_start: 20
++            col_stop: 21
++            path: ""
++            content: import test_import.*; // local import
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 21
++        path: ""
++        content: import test_import.*; // local import
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 21
++      path: ""
++      content: import test_import.*; // local import
++  - tree:
++      base:
++        - "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.*;         // imports directory import\\\"}\"}"
++      kind:
++        Glob:
++          span:
++            line_start: 1
++            line_stop: 1
++            col_start: 12
++            col_stop: 13
++            path: ""
++            content: import bar.*;         // imports directory import
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 13
++        path: ""
++        content: import bar.*;         // imports directory import
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 13
++      path: ""
++      content: import bar.*;         // imports directory import
++  - tree:
++      base:
++        - "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.baz.*;     // imports directory import\\\"}\"}"
++        - "{\"name\":\"baz\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":12,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.baz.*;     // imports directory import\\\"}\"}"
++      kind:
++        Glob:
++          span:
++            line_start: 1
++            line_stop: 1
++            col_start: 16
++            col_stop: 17
++            path: ""
++            content: import bar.baz.*;     // imports directory import
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 17
++        path: ""
++        content: import bar.baz.*;     // imports directory import
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 17
++      path: ""
++      content: import bar.baz.*;     // imports directory import
++  - tree:
++      base:
++        - "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.bat.bat.*; // imports directory import\\\"}\"}"
++        - "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":12,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.bat.bat.*; // imports directory import\\\"}\"}"
++        - "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":16,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.bat.bat.*; // imports directory import\\\"}\"}"
++      kind:
++        Glob:
++          span:
++            line_start: 1
++            line_stop: 1
++            col_start: 20
++            col_stop: 21
++            path: ""
++            content: import bar.bat.bat.*; // imports directory import
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 21
++        path: ""
++        content: import bar.bat.bat.*; // imports directory import
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 21
++      path: ""
++      content: import bar.bat.bat.*; // imports directory import
++  - tree:
++      base:
++        - "{\"name\":\"car\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import car.*;         // imports directory import\\\"}\"}"
++      kind:
++        Glob:
++          span:
++            line_start: 1
++            line_stop: 1
++            col_start: 12
++            col_stop: 13
++            path: ""
++            content: import car.*;         // imports directory import
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 13
++        path: ""
++        content: import car.*;         // imports directory import
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 13
++      path: ""
++      content: import car.*;         // imports directory import
+diff --git a/tests/expectations/parser/parser/import/names.leo.out b/tests/expectations/parser/parser/import/names.leo.out
+new file mode 100644
+index 0000000000..b0cedd3e09
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/names.leo.out
+@@ -0,0 +1,67 @@
++---
++namespace: ParseImport
++expectation: Pass
++outputs:
++  - tree:
++      base:
++        - "{\"name\":\"a0_f\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":12,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a0_f.foo;\\\"}\"}"
++        - "{\"name\":\"foo\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":13,\\\"col_stop\\\":16,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a0_f.foo;\\\"}\"}"
++      kind:
++        Leaf:
++          alias: ~
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 16
++        path: ""
++        content: import a0_f.foo;
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 16
++      path: ""
++      content: import a0_f.foo;
++  - tree:
++      base:
++        - "{\"name\":\"a_9\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a_9.bar;\\\"}\"}"
++        - "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":12,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a_9.bar;\\\"}\"}"
++      kind:
++        Leaf:
++          alias: ~
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 15
++        path: ""
++        content: import a_9.bar;
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 15
++      path: ""
++      content: import a_9.bar;
++  - tree:
++      base:
++        - "{\"name\":\"hello_world\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello_world.hello;\\\"}\"}"
++        - "{\"name\":\"hello\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":20,\\\"col_stop\\\":25,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello_world.hello;\\\"}\"}"
++      kind:
++        Leaf:
++          alias: ~
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 25
++        path: ""
++        content: import hello_world.hello;
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 25
++      path: ""
++      content: import hello_world.hello;
+diff --git a/tests/expectations/parser/parser/import/names_underscore.leo.out b/tests/expectations/parser/parser/import/names_underscore.leo.out
+new file mode 100644
+index 0000000000..25c42ab9f4
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/names_underscore.leo.out
+@@ -0,0 +1,25 @@
++---
++namespace: ParseImport
++expectation: Pass
++outputs:
++  - tree:
++      base:
++        - "{\"name\":\"hello_world\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello_world.foo;\\\"}\"}"
++        - "{\"name\":\"foo\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":20,\\\"col_stop\\\":23,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello_world.foo;\\\"}\"}"
++      kind:
++        Leaf:
++          alias: ~
++      span:
++        line_start: 1
++        line_stop: 1
++        col_start: 8
++        col_stop: 23
++        path: ""
++        content: import hello_world.foo;
++    span:
++      line_start: 1
++      line_stop: 1
++      col_start: 8
++      col_stop: 23
++      path: ""
++      content: import hello_world.foo;
+diff --git a/tests/expectations/parser/parser/import/star.leo.out b/tests/expectations/parser/parser/import/star.leo.out
+new file mode 100644
+index 0000000000..222dd3bfb4
+--- /dev/null
++++ b/tests/expectations/parser/parser/import/star.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: ParseImport
++expectation: Fail
++outputs:
++  - "Error [EPAR0370005]: expected ; -- got '-'\n    --> test:1:12\n     |\n   1 | import test-import.*;\n     |            ^"
+diff --git a/tests/expectations/parser/parser/serialize/linear_regression.leo.out b/tests/expectations/parser/parser/serialize/linear_regression.leo.out
+index 91a060a842..f9cb892e7f 100644
+--- a/tests/expectations/parser/parser/serialize/linear_regression.leo.out
++++ b/tests/expectations/parser/parser/serialize/linear_regression.leo.out
+@@ -95,6 +95,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"num_points\",\"span\":\"{\\\"line_start\\\":23,\\\"line_stop\\\":23,\\\"col_start\\\":13,\\\"col_stop\\\":23,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let num_points = 5i32;\\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -106,6 +107,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"x_sum\",\"span\":\"{\\\"line_start\\\":25,\\\"line_stop\\\":25,\\\"col_start\\\":13,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let x_sum = 0i32; \\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -117,6 +119,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"y_sum\",\"span\":\"{\\\"line_start\\\":26,\\\"line_stop\\\":26,\\\"col_start\\\":13,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let y_sum = 0i32; \\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -128,6 +131,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"xy_sum\",\"span\":\"{\\\"line_start\\\":27,\\\"line_stop\\\":27,\\\"col_start\\\":13,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let xy_sum = 0i32; \\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -139,6 +143,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"x2_sum\",\"span\":\"{\\\"line_start\\\":28,\\\"line_stop\\\":28,\\\"col_start\\\":13,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let x2_sum = 0i32; \\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -289,6 +294,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"numerator\",\"span\":\"{\\\"line_start\\\":35,\\\"line_stop\\\":35,\\\"col_start\\\":13,\\\"col_stop\\\":22,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let numerator = (num_points * xy_sum) - (x_sum * y_sum); \\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Binary:
+@@ -312,6 +318,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"denominator\",\"span\":\"{\\\"line_start\\\":36,\\\"line_stop\\\":36,\\\"col_start\\\":13,\\\"col_stop\\\":24,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let denominator = (num_points * x2_sum) - (x_sum * x_sum);\\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Binary:
+@@ -335,6 +342,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"slope\",\"span\":\"{\\\"line_start\\\":37,\\\"line_stop\\\":37,\\\"col_start\\\":13,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let slope = numerator / denominator;\\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Binary:
+@@ -368,6 +376,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"num_points\",\"span\":\"{\\\"line_start\\\":42,\\\"line_stop\\\":42,\\\"col_start\\\":13,\\\"col_stop\\\":23,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let num_points = 5i32; \\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -379,6 +388,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"x_sum\",\"span\":\"{\\\"line_start\\\":44,\\\"line_stop\\\":44,\\\"col_start\\\":13,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let x_sum = 0i32;\\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -390,6 +400,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"y_sum\",\"span\":\"{\\\"line_start\\\":45,\\\"line_stop\\\":45,\\\"col_start\\\":13,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let y_sum = 0i32;\\\"}\"}"
++                      parened: false
+                       type_: ~
+                       value:
+                         Value:
+@@ -500,6 +511,7 @@ outputs:
+                 variable_names:
+                   - mutable: true
+                     identifier: "{\"name\":\"points\",\"span\":\"{\\\"line_start\\\":56,\\\"line_stop\\\":56,\\\"col_start\\\":7,\\\"col_stop\\\":13,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"  let points: [Point; 5] = [\\\"}\"}"
++                parened: false
+                 type_:
+                   Array:
+                     - Identifier: "{\"name\":\"Point\",\"span\":\"{\\\"line_start\\\":56,\\\"line_stop\\\":56,\\\"col_start\\\":16,\\\"col_stop\\\":21,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"  let points: [Point; 5] = [\\\"}\"}"
+@@ -622,6 +634,7 @@ outputs:
+                 variable_names:
+                   - mutable: true
+                     identifier: "{\"name\":\"reg\",\"span\":\"{\\\"line_start\\\":63,\\\"line_stop\\\":63,\\\"col_start\\\":7,\\\"col_stop\\\":10,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"  let reg = LinearRegression::new(points);\\\"}\"}"
++                parened: false
+                 type_: ~
+                 value:
+                   Call:
+@@ -639,6 +652,7 @@ outputs:
+                 variable_names:
+                   - mutable: true
+                     identifier: "{\"name\":\"slope\",\"span\":\"{\\\"line_start\\\":64,\\\"line_stop\\\":64,\\\"col_start\\\":7,\\\"col_stop\\\":12,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"  let slope = reg.slope();\\\"}\"}"
++                parened: false
+                 type_: ~
+                 value:
+                   Call:
+@@ -655,6 +669,7 @@ outputs:
+                 variable_names:
+                   - mutable: true
+                     identifier: "{\"name\":\"offset\",\"span\":\"{\\\"line_start\\\":65,\\\"line_stop\\\":65,\\\"col_start\\\":7,\\\"col_stop\\\":13,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"  let offset = reg.offset(slope);\\\"}\"}"
++                parened: false
+                 type_: ~
+                 value:
+                   Call:
+diff --git a/tests/expectations/parser/parser/serialize/palindrome.leo.out b/tests/expectations/parser/parser/serialize/palindrome.leo.out
+index 6ecc69d502..2b42f7d562 100644
+--- a/tests/expectations/parser/parser/serialize/palindrome.leo.out
++++ b/tests/expectations/parser/parser/serialize/palindrome.leo.out
+@@ -56,6 +56,7 @@ outputs:
+                 variable_names:
+                   - mutable: false
+                     identifier: "{\"name\":\"str_len\",\"span\":\"{\\\"line_start\\\":11,\\\"line_stop\\\":11,\\\"col_start\\\":11,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    const str_len = 20u32; // saving const for convenience\\\"}\"}"
++                parened: false
+                 type_: ~
+                 value:
+                   Value:
+@@ -67,6 +68,7 @@ outputs:
+                 variable_names:
+                   - mutable: true
+                     identifier: "{\"name\":\"result\",\"span\":\"{\\\"line_start\\\":14,\\\"line_stop\\\":14,\\\"col_start\\\":9,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    let result = true;\\\"}\"}"
++                parened: false
+                 type_: ~
+                 value:
+                   Value:
+@@ -76,6 +78,7 @@ outputs:
+                 variable_names:
+                   - mutable: true
+                     identifier: "{\"name\":\"processed\",\"span\":\"{\\\"line_start\\\":15,\\\"line_stop\\\":15,\\\"col_start\\\":9,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    let processed = 0u8;\\\"}\"}"
++                parened: false
+                 type_: ~
+                 value:
+                   Value:
+@@ -103,6 +106,7 @@ outputs:
+                         variable_names:
+                           - mutable: true
+                             identifier: "{\"name\":\"start_sym\",\"span\":\"{\\\"line_start\\\":18,\\\"line_stop\\\":18,\\\"col_start\\\":13,\\\"col_stop\\\":22,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let start_sym = str[start];\\\"}\"}"
++                        parened: false
+                         type_: ~
+                         value:
+                           Access:
+@@ -129,6 +133,7 @@ outputs:
+                                 variable_names:
+                                   - mutable: true
+                                     identifier: "{\"name\":\"skipped\",\"span\":\"{\\\"line_start\\\":20,\\\"line_stop\\\":20,\\\"col_start\\\":17,\\\"col_stop\\\":24,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"            let skipped = 0u8;\\\"}\"}"
++                                parened: false
+                                 type_: ~
+                                 value:
+                                   Value:
+@@ -140,6 +145,7 @@ outputs:
+                                 variable_names:
+                                   - mutable: true
+                                     identifier: "{\"name\":\"end_empty\",\"span\":\"{\\\"line_start\\\":21,\\\"line_stop\\\":21,\\\"col_start\\\":17,\\\"col_stop\\\":26,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"            let end_empty = 0u8;\\\"}\"}"
++                                parened: false
+                                 type_: ~
+                                 value:
+                                   Value:
+@@ -151,6 +157,7 @@ outputs:
+                                 variable_names:
+                                   - mutable: true
+                                     identifier: "{\"name\":\"end_sym\",\"span\":\"{\\\"line_start\\\":22,\\\"line_stop\\\":22,\\\"col_start\\\":17,\\\"col_stop\\\":24,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"            let end_sym = ' ';\\\"}\"}"
++                                parened: false
+                                 type_: ~
+                                 value:
+                                   Value:
+diff --git a/tests/expectations/parser/parser/serialize/pedersen_hash.leo.out b/tests/expectations/parser/parser/serialize/pedersen_hash.leo.out
+index 9ac6f544ab..5d6bad730c 100644
+--- a/tests/expectations/parser/parser/serialize/pedersen_hash.leo.out
++++ b/tests/expectations/parser/parser/serialize/pedersen_hash.leo.out
+@@ -64,6 +64,7 @@ outputs:
+                       variable_names:
+                         - mutable: true
+                           identifier: "{\"name\":\"digest\",\"span\":\"{\\\"line_start\\\":12,\\\"line_stop\\\":12,\\\"col_start\\\":13,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"        let digest: group = 0group;\\\"}\"}"
++                      parened: false
+                       type_: Group
+                       value:
+                         Value:
+@@ -143,6 +144,7 @@ outputs:
+                 variable_names:
+                   - mutable: false
+                     identifier: "{\"name\":\"pedersen\",\"span\":\"{\\\"line_start\\\":24,\\\"line_stop\\\":24,\\\"col_start\\\":11,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    const pedersen = PedersenHash::new(parameters);\\\"}\"}"
++                parened: false
+                 type_: ~
+                 value:
+                   Call:
+diff --git a/tests/expectations/parser/parser/statement/definition.leo.out b/tests/expectations/parser/parser/statement/definition.leo.out
+index e0fd3ff4bc..21a9a0351c 100644
+--- a/tests/expectations/parser/parser/statement/definition.leo.out
++++ b/tests/expectations/parser/parser/statement/definition.leo.out
+@@ -14,6 +14,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: let x = expr;
++      parened: false
+       type_: ~
+       value:
+         Identifier: "{\"name\":\"expr\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":9,\\\"col_stop\\\":13,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"let x = expr;\\\"}\"}"
+@@ -36,6 +37,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: let x = ();
++      parened: false
+       type_: ~
+       value:
+         TupleInit:
+@@ -66,6 +68,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: let x = x+y;
++      parened: false
+       type_: ~
+       value:
+         Binary:
+@@ -100,6 +103,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x = (x,y);"
++      parened: false
+       type_: ~
+       value:
+         TupleInit:
+@@ -132,6 +136,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: let x = x();
++      parened: false
+       type_: ~
+       value:
+         Call:
+@@ -164,6 +169,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: const x = expr;
++      parened: false
+       type_: ~
+       value:
+         Identifier: "{\"name\":\"expr\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":11,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"const x = expr;\\\"}\"}"
+@@ -186,6 +192,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: const x = ();
++      parened: false
+       type_: ~
+       value:
+         TupleInit:
+@@ -216,6 +223,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: const x = x+y;
++      parened: false
+       type_: ~
+       value:
+         Binary:
+@@ -250,6 +258,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: "const x = (x,y);"
++      parened: false
+       type_: ~
+       value:
+         TupleInit:
+@@ -282,6 +291,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: const x = x();
++      parened: false
+       type_: ~
+       value:
+         Call:
+@@ -314,6 +324,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x: u32 = expr;"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -337,6 +348,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x: u32 = ();"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -368,6 +380,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x: u32 = x+y;"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -403,6 +416,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x: u32 = (x,y);"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -436,6 +450,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x: u32 = x();"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -469,6 +484,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: "const x: u32 = expr;"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -492,6 +508,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: "const x: u32 = ();"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -523,6 +540,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: "const x: u32 = x+y;"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -558,6 +576,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: "const x: u32 = (x,y);"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -591,6 +610,7 @@ outputs:
+             col_stop: 8
+             path: ""
+             content: "const x: u32 = x();"
++      parened: false
+       type_:
+         IntegerType: U32
+       value:
+@@ -633,6 +653,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y) = expr;"
++      parened: true
+       type_: ~
+       value:
+         Identifier: "{\"name\":\"expr\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":14,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"let (x, y) = expr;\\\"}\"}"
+@@ -664,6 +685,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y) = ();"
++      parened: true
+       type_: ~
+       value:
+         TupleInit:
+@@ -703,6 +725,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y) = x+y;"
++      parened: true
+       type_: ~
+       value:
+         Binary:
+@@ -746,6 +769,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y) = (x,y);"
++      parened: true
+       type_: ~
+       value:
+         TupleInit:
+@@ -787,6 +811,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y) = x();"
++      parened: true
+       type_: ~
+       value:
+         Call:
+@@ -828,6 +853,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y) = expr;"
++      parened: true
+       type_: ~
+       value:
+         Identifier: "{\"name\":\"expr\",\"span\":\"{\\\"line_start\\\":1,\\\"line_stop\\\":1,\\\"col_start\\\":16,\\\"col_stop\\\":20,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"const (x, y) = expr;\\\"}\"}"
+@@ -859,6 +885,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y) = ();"
++      parened: true
+       type_: ~
+       value:
+         TupleInit:
+@@ -898,6 +925,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y) = x+y;"
++      parened: true
+       type_: ~
+       value:
+         Binary:
+@@ -941,6 +969,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y) = (x,y);"
++      parened: true
+       type_: ~
+       value:
+         TupleInit:
+@@ -982,6 +1011,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y) = x();"
++      parened: true
+       type_: ~
+       value:
+         Call:
+@@ -1023,6 +1053,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y): u32 = expr;"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1055,6 +1086,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y): u32 = ();"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1095,6 +1127,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y): u32 = x+y;"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1139,6 +1172,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y): u32 = (x,y);"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1181,6 +1215,7 @@ outputs:
+             col_stop: 10
+             path: ""
+             content: "let (x, y): u32 = x();"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1223,6 +1258,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y): u32 = expr;"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1255,6 +1291,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y): u32 = ();"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1295,6 +1332,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y): u32 = x+y;"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1339,6 +1377,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y): u32 = (x,y);"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1381,6 +1420,7 @@ outputs:
+             col_stop: 12
+             path: ""
+             content: "const (x, y): u32 = x();"
++      parened: true
+       type_:
+         IntegerType: U32
+       value:
+@@ -1423,6 +1463,7 @@ outputs:
+             col_stop: 9
+             path: ""
+             content: "let (x,y,) = ();"
++      parened: true
+       type_: ~
+       value:
+         TupleInit:
+@@ -1453,6 +1494,7 @@ outputs:
+             col_stop: 7
+             path: ""
+             content: "let (x,) = ();"
++      parened: true
+       type_: ~
+       value:
+         TupleInit:
+@@ -1483,6 +1525,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x: [char; _] = \"Hello, World!\";"
++      parened: false
+       type_:
+         Array:
+           - Char
+@@ -1529,6 +1572,7 @@ outputs:
+             col_stop: 6
+             path: ""
+             content: "let x: [[u8; 2]; 2] = [[0,0], [0,0]];"
++      parened: false
+       type_:
+         Array:
+           - Array:
+diff --git a/tests/parser/expression/literal/comment.leo b/tests/parser/expression/literal/comment.leo
+index 3dc0ab4360..7a56501b3f 100644
+--- a/tests/parser/expression/literal/comment.leo
++++ b/tests/parser/expression/literal/comment.leo
+@@ -1,5 +1,5 @@
+ /*
+-namespace: Token
++namespace: Parse
+ expectation: Pass
+ */
+ 
+@@ -9,11 +9,13 @@ expectation: Pass
+ 
+ //test3
+ 
+-/ / test4
++// test4
+ 
+ /* test5 */
++
+ /*
+ test 6 */
++
+ /* test 7
+ */
+ 
+@@ -32,5 +34,3 @@ test 6 */
+ /** /*/
+ 
+ /** **/
+-
+-/*
+\ No newline at end of file
+diff --git a/unused/tests/parser/import/alias.leo b/tests/parser/import/alias.leo
+similarity index 65%
+rename from unused/tests/parser/import/alias.leo
+rename to tests/parser/import/alias.leo
+index 5913a203b0..ba0956bd77 100644
+--- a/unused/tests/parser/import/alias.leo
++++ b/tests/parser/import/alias.leo
+@@ -1,5 +1,5 @@
+ /*
+-namespace: Parse
++namespace: ParseImport
+ expectation: Pass
+ */
+ 
+diff --git a/tests/parser/import/basic.leo b/tests/parser/import/basic.leo
+new file mode 100644
+index 0000000000..11f4b70672
+--- /dev/null
++++ b/tests/parser/import/basic.leo
+@@ -0,0 +1,8 @@
++/*
++namespace: ParseImport
++expectation: Pass
++*/
++
++import a.b;
++
++import AB.c;
+\ No newline at end of file
+diff --git a/tests/parser/import/import_empty_list_fail.leo b/tests/parser/import/import_empty_list_fail.leo
+index 4e8bbe7b80..ca14b5fe0d 100644
+--- a/tests/parser/import/import_empty_list_fail.leo
++++ b/tests/parser/import/import_empty_list_fail.leo
+@@ -1,5 +1,5 @@
+ /*
+-namespace: Parse
++namespace: ParseImport
+ expectation: Fail
+ */
+ 
+diff --git a/unused/tests/parser/import/invalid.leo b/tests/parser/import/invalid.leo
+similarity index 57%
+rename from unused/tests/parser/import/invalid.leo
+rename to tests/parser/import/invalid.leo
+index 245ef87b12..ab4f073b5f 100644
+--- a/unused/tests/parser/import/invalid.leo
++++ b/tests/parser/import/invalid.leo
+@@ -1,5 +1,5 @@
+ /*
+-namespace: Parse
++namespace: ParseImport
+ expectation: Fail
+ */
+ 
+diff --git a/tests/parser/import/invalid_chars_fail.leo b/tests/parser/import/invalid_chars_fail.leo
+deleted file mode 100644
+index 47cf2bcb72..0000000000
+--- a/tests/parser/import/invalid_chars_fail.leo
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/*
+-namespace: Parse
+-expectation: Fail
+-*/
+-
+-import AB.c;
+-
+-import AB.c;
+diff --git a/tests/parser/import/keyword_fail.leo b/tests/parser/import/keyword_fail.leo
+index 11b5456b79..fd12e8c7ff 100644
+--- a/tests/parser/import/keyword_fail.leo
++++ b/tests/parser/import/keyword_fail.leo
+@@ -1,5 +1,5 @@
+ /*
+-namespace: Parse
++namespace: ParseImport
+ expectation: Fail
+ */
+ 
+diff --git a/unused/tests/parser/import/many_import.leo b/tests/parser/import/many_import.leo
+similarity index 51%
+rename from unused/tests/parser/import/many_import.leo
+rename to tests/parser/import/many_import.leo
+index 47b104aa34..a9cf5fa9b2 100644
+--- a/unused/tests/parser/import/many_import.leo
++++ b/tests/parser/import/many_import.leo
+@@ -1,14 +1,14 @@
+ /*
+-namespace: Parse
++namespace: ParseImport
+ expectation: Pass
+ */
+ 
+-import test-import.( // local import
++import tes_import.(
+     Point,
+     foo,
+ );
+ 
+-import bar.( // imports directory import
++import bar.(
+     Bar,
+     baz.(Baz, Bazzar),
+     bat.bat.Bat,
+diff --git a/unused/tests/parser/import/many_import_star.leo b/tests/parser/import/many_import_star.leo
+similarity index 77%
+rename from unused/tests/parser/import/many_import_star.leo
+rename to tests/parser/import/many_import_star.leo
+index 276deb7fcb..2a4fa63366 100644
+--- a/unused/tests/parser/import/many_import_star.leo
++++ b/tests/parser/import/many_import_star.leo
+@@ -1,11 +1,14 @@
+ /*
+-namespace: Parse
++namespace: ParseImport
+ expectation: Pass
+ */
+ 
+-import test-import.*; // local import
++import test_import.*; // local import
+ 
+ import bar.*;         // imports directory import
++
+ import bar.baz.*;     // imports directory import
++
+ import bar.bat.bat.*; // imports directory import
++
+ import car.*;         // imports directory import
+diff --git a/tests/parser/import/names.leo b/tests/parser/import/names.leo
+new file mode 100644
+index 0000000000..6538138cbb
+--- /dev/null
++++ b/tests/parser/import/names.leo
+@@ -0,0 +1,10 @@
++/*
++namespace: ParseImport
++expectation: Pass
++*/
++
++import a0_f.foo;
++
++import a_9.bar;
++
++import hello_world.hello;
+diff --git a/unused/tests/parser/import/names_underscore.leo b/tests/parser/import/names_underscore.leo
+similarity index 68%
+rename from unused/tests/parser/import/names_underscore.leo
+rename to tests/parser/import/names_underscore.leo
+index 8bc3ebefaf..d730848799 100644
+--- a/unused/tests/parser/import/names_underscore.leo
++++ b/tests/parser/import/names_underscore.leo
+@@ -1,5 +1,5 @@
+ /*
+-namespace: Parse
++namespace: ParseImport
+ expectation: Pass
+ */
+ 
+diff --git a/tests/parser/import/star.leo b/tests/parser/import/star.leo
+new file mode 100644
+index 0000000000..e7da78de66
+--- /dev/null
++++ b/tests/parser/import/star.leo
+@@ -0,0 +1,6 @@
++/*
++namespace: ParseImport
++expectation: Fail
++*/
++
++import test-import.*;
+diff --git a/unused/tests/parser/import/alias.leo.out b/unused/tests/parser/import/alias.leo.out
+deleted file mode 100644
+index a221eb06c6..0000000000
+--- a/unused/tests/parser/import/alias.leo.out
++++ /dev/null
+@@ -1,40 +0,0 @@
+----
+-namespace: Parse
+-expectation: Pass
+-outputs:
+-  - name: ""
+-    expected_input: []
+-    import_statements:
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"a\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":8,\\\"col_stop\\\":9,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b as bar;\\\"}\"}"
+-            access:
+-              Symbol:
+-                symbol: "{\"name\":\"b\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":10,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b as bar;\\\"}\"}"
+-                alias: "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":15,\\\"col_stop\\\":18,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b as bar;\\\"}\"}"
+-                span:
+-                  line_start: 3
+-                  line_stop: 3
+-                  col_start: 10
+-                  col_stop: 18
+-                  path: ""
+-                  content: import a.b as bar;
+-            span:
+-              line_start: 3
+-              line_stop: 3
+-              col_start: 8
+-              col_stop: 18
+-              path: ""
+-              content: import a.b as bar;
+-        span:
+-          line_start: 3
+-          line_stop: 3
+-          col_start: 8
+-          col_stop: 18
+-          path: ""
+-          content: import a.b as bar;
+-    imports: {}
+-    aliases: {}
+-    circuits: {}
+-    global_consts: {}
+-    functions: {}
+diff --git a/unused/tests/parser/import/basic.leo b/unused/tests/parser/import/basic.leo
+deleted file mode 100644
+index f0fabaab79..0000000000
+--- a/unused/tests/parser/import/basic.leo
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/*
+-namespace: Parse
+-expectation: Pass
+-*/
+-
+-import a.b;
+\ No newline at end of file
+diff --git a/unused/tests/parser/import/basic.leo.out b/unused/tests/parser/import/basic.leo.out
+deleted file mode 100644
+index e59ba7eaff..0000000000
+--- a/unused/tests/parser/import/basic.leo.out
++++ /dev/null
+@@ -1,40 +0,0 @@
+----
+-namespace: Parse
+-expectation: Pass
+-outputs:
+-  - name: ""
+-    expected_input: []
+-    import_statements:
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"a\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":8,\\\"col_stop\\\":9,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b;\\\"}\"}"
+-            access:
+-              Symbol:
+-                symbol: "{\"name\":\"b\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":10,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a.b;\\\"}\"}"
+-                alias: ~
+-                span:
+-                  line_start: 3
+-                  line_stop: 3
+-                  col_start: 10
+-                  col_stop: 11
+-                  path: ""
+-                  content: import a.b;
+-            span:
+-              line_start: 3
+-              line_stop: 3
+-              col_start: 8
+-              col_stop: 11
+-              path: ""
+-              content: import a.b;
+-        span:
+-          line_start: 3
+-          line_stop: 3
+-          col_start: 8
+-          col_stop: 11
+-          path: ""
+-          content: import a.b;
+-    imports: {}
+-    aliases: {}
+-    circuits: {}
+-    global_consts: {}
+-    functions: {}
+diff --git a/unused/tests/parser/import/invalid.leo.out b/unused/tests/parser/import/invalid.leo.out
+deleted file mode 100644
+index b71e40aa89..0000000000
+--- a/unused/tests/parser/import/invalid.leo.out
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-namespace: Parse
+-expectation: Fail
+-outputs:
+-  - "Error [EPAR0370005]: expected . -- got ';'\n    --> test:3:18\n     |\n   3 | import foo as bar;\n     |                  ^"
+diff --git a/unused/tests/parser/import/many_import.leo.out b/unused/tests/parser/import/many_import.leo.out
+deleted file mode 100644
+index 503368ee35..0000000000
+--- a/unused/tests/parser/import/many_import.leo.out
++++ /dev/null
+@@ -1,138 +0,0 @@
+----
+-namespace: Parse
+-expectation: Pass
+-outputs:
+-  - name: ""
+-    expected_input: []
+-    import_statements:
+-      - package_or_packages:
+-          Packages:
+-            name: "{\"name\":\"test-import\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import test-import.( // local import\\\"}\"}"
+-            accesses:
+-              - Symbol:
+-                  symbol: "{\"name\":\"Point\",\"span\":\"{\\\"line_start\\\":4,\\\"line_stop\\\":4,\\\"col_start\\\":5,\\\"col_stop\\\":10,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    Point,\\\"}\"}"
+-                  alias: ~
+-                  span:
+-                    line_start: 4
+-                    line_stop: 4
+-                    col_start: 5
+-                    col_stop: 10
+-                    path: ""
+-                    content: "    Point,"
+-              - Symbol:
+-                  symbol: "{\"name\":\"foo\",\"span\":\"{\\\"line_start\\\":5,\\\"line_stop\\\":5,\\\"col_start\\\":5,\\\"col_stop\\\":8,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    foo,\\\"}\"}"
+-                  alias: ~
+-                  span:
+-                    line_start: 5
+-                    line_stop: 5
+-                    col_start: 5
+-                    col_stop: 8
+-                    path: ""
+-                    content: "    foo,"
+-            span:
+-              line_start: 3
+-              line_stop: 6
+-              col_start: 8
+-              col_stop: 2
+-              path: ""
+-              content: "import test-import.( // local import\n     ...\n     ...\n);"
+-        span:
+-          line_start: 3
+-          line_stop: 6
+-          col_start: 8
+-          col_stop: 2
+-          path: ""
+-          content: "import test-import.( // local import\n     ...\n     ...\n);"
+-      - package_or_packages:
+-          Packages:
+-            name: "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":8,\\\"line_stop\\\":8,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.( // imports directory import\\\"}\"}"
+-            accesses:
+-              - Symbol:
+-                  symbol: "{\"name\":\"Bar\",\"span\":\"{\\\"line_start\\\":9,\\\"line_stop\\\":9,\\\"col_start\\\":5,\\\"col_stop\\\":8,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    Bar,\\\"}\"}"
+-                  alias: ~
+-                  span:
+-                    line_start: 9
+-                    line_stop: 9
+-                    col_start: 5
+-                    col_stop: 8
+-                    path: ""
+-                    content: "    Bar,"
+-              - Multiple:
+-                  name: "{\"name\":\"baz\",\"span\":\"{\\\"line_start\\\":10,\\\"line_stop\\\":10,\\\"col_start\\\":5,\\\"col_stop\\\":8,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    baz.(Baz, Bazzar),\\\"}\"}"
+-                  accesses:
+-                    - Symbol:
+-                        symbol: "{\"name\":\"Baz\",\"span\":\"{\\\"line_start\\\":10,\\\"line_stop\\\":10,\\\"col_start\\\":10,\\\"col_stop\\\":13,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    baz.(Baz, Bazzar),\\\"}\"}"
+-                        alias: ~
+-                        span:
+-                          line_start: 10
+-                          line_stop: 10
+-                          col_start: 10
+-                          col_stop: 13
+-                          path: ""
+-                          content: "    baz.(Baz, Bazzar),"
+-                    - Symbol:
+-                        symbol: "{\"name\":\"Bazzar\",\"span\":\"{\\\"line_start\\\":10,\\\"line_stop\\\":10,\\\"col_start\\\":15,\\\"col_stop\\\":21,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    baz.(Baz, Bazzar),\\\"}\"}"
+-                        alias: ~
+-                        span:
+-                          line_start: 10
+-                          line_stop: 10
+-                          col_start: 15
+-                          col_stop: 21
+-                          path: ""
+-                          content: "    baz.(Baz, Bazzar),"
+-                  span:
+-                    line_start: 10
+-                    line_stop: 10
+-                    col_start: 5
+-                    col_stop: 22
+-                    path: ""
+-                    content: "    baz.(Baz, Bazzar),"
+-              - SubPackage:
+-                  name: "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":11,\\\"line_stop\\\":11,\\\"col_start\\\":5,\\\"col_stop\\\":8,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    bat.bat.Bat,\\\"}\"}"
+-                  access:
+-                    SubPackage:
+-                      name: "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":11,\\\"line_stop\\\":11,\\\"col_start\\\":9,\\\"col_stop\\\":12,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    bat.bat.Bat,\\\"}\"}"
+-                      access:
+-                        Symbol:
+-                          symbol: "{\"name\":\"Bat\",\"span\":\"{\\\"line_start\\\":11,\\\"line_stop\\\":11,\\\"col_start\\\":13,\\\"col_stop\\\":16,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"    bat.bat.Bat,\\\"}\"}"
+-                          alias: ~
+-                          span:
+-                            line_start: 11
+-                            line_stop: 11
+-                            col_start: 13
+-                            col_stop: 16
+-                            path: ""
+-                            content: "    bat.bat.Bat,"
+-                      span:
+-                        line_start: 11
+-                        line_stop: 11
+-                        col_start: 9
+-                        col_stop: 16
+-                        path: ""
+-                        content: "    bat.bat.Bat,"
+-                  span:
+-                    line_start: 11
+-                    line_stop: 11
+-                    col_start: 5
+-                    col_stop: 16
+-                    path: ""
+-                    content: "    bat.bat.Bat,"
+-            span:
+-              line_start: 8
+-              line_stop: 12
+-              col_start: 8
+-              col_stop: 2
+-              path: ""
+-              content: "import bar.( // imports directory import\n     ...\n     ...\n     ...\n);"
+-        span:
+-          line_start: 8
+-          line_stop: 12
+-          col_start: 8
+-          col_stop: 2
+-          path: ""
+-          content: "import bar.( // imports directory import\n     ...\n     ...\n     ...\n);"
+-    imports: {}
+-    aliases: {}
+-    circuits: {}
+-    global_consts: {}
+-    functions: {}
+diff --git a/unused/tests/parser/import/many_import_star.leo.out b/unused/tests/parser/import/many_import_star.leo.out
+deleted file mode 100644
+index 2e89b6a0d4..0000000000
+--- a/unused/tests/parser/import/many_import_star.leo.out
++++ /dev/null
+@@ -1,172 +0,0 @@
+----
+-namespace: Parse
+-expectation: Pass
+-outputs:
+-  - name: ""
+-    expected_input: []
+-    import_statements:
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"test-import\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import test-import.*; // local import\\\"}\"}"
+-            access:
+-              Star:
+-                span:
+-                  line_start: 3
+-                  line_stop: 3
+-                  col_start: 20
+-                  col_stop: 21
+-                  path: ""
+-                  content: import test-import.*; // local import
+-            span:
+-              line_start: 3
+-              line_stop: 3
+-              col_start: 8
+-              col_stop: 21
+-              path: ""
+-              content: import test-import.*; // local import
+-        span:
+-          line_start: 3
+-          line_stop: 3
+-          col_start: 8
+-          col_stop: 21
+-          path: ""
+-          content: import test-import.*; // local import
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":5,\\\"line_stop\\\":5,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.*;         // imports directory import\\\"}\"}"
+-            access:
+-              Star:
+-                span:
+-                  line_start: 5
+-                  line_stop: 5
+-                  col_start: 12
+-                  col_stop: 13
+-                  path: ""
+-                  content: import bar.*;         // imports directory import
+-            span:
+-              line_start: 5
+-              line_stop: 5
+-              col_start: 8
+-              col_stop: 13
+-              path: ""
+-              content: import bar.*;         // imports directory import
+-        span:
+-          line_start: 5
+-          line_stop: 5
+-          col_start: 8
+-          col_stop: 13
+-          path: ""
+-          content: import bar.*;         // imports directory import
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":6,\\\"line_stop\\\":6,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.baz.*;     // imports directory import\\\"}\"}"
+-            access:
+-              SubPackage:
+-                name: "{\"name\":\"baz\",\"span\":\"{\\\"line_start\\\":6,\\\"line_stop\\\":6,\\\"col_start\\\":12,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.baz.*;     // imports directory import\\\"}\"}"
+-                access:
+-                  Star:
+-                    span:
+-                      line_start: 6
+-                      line_stop: 6
+-                      col_start: 16
+-                      col_stop: 17
+-                      path: ""
+-                      content: import bar.baz.*;     // imports directory import
+-                span:
+-                  line_start: 6
+-                  line_stop: 6
+-                  col_start: 12
+-                  col_stop: 17
+-                  path: ""
+-                  content: import bar.baz.*;     // imports directory import
+-            span:
+-              line_start: 6
+-              line_stop: 6
+-              col_start: 8
+-              col_stop: 17
+-              path: ""
+-              content: import bar.baz.*;     // imports directory import
+-        span:
+-          line_start: 6
+-          line_stop: 6
+-          col_start: 8
+-          col_stop: 17
+-          path: ""
+-          content: import bar.baz.*;     // imports directory import
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":7,\\\"line_stop\\\":7,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.bat.bat.*; // imports directory import\\\"}\"}"
+-            access:
+-              SubPackage:
+-                name: "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":7,\\\"line_stop\\\":7,\\\"col_start\\\":12,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.bat.bat.*; // imports directory import\\\"}\"}"
+-                access:
+-                  SubPackage:
+-                    name: "{\"name\":\"bat\",\"span\":\"{\\\"line_start\\\":7,\\\"line_stop\\\":7,\\\"col_start\\\":16,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import bar.bat.bat.*; // imports directory import\\\"}\"}"
+-                    access:
+-                      Star:
+-                        span:
+-                          line_start: 7
+-                          line_stop: 7
+-                          col_start: 20
+-                          col_stop: 21
+-                          path: ""
+-                          content: import bar.bat.bat.*; // imports directory import
+-                    span:
+-                      line_start: 7
+-                      line_stop: 7
+-                      col_start: 16
+-                      col_stop: 21
+-                      path: ""
+-                      content: import bar.bat.bat.*; // imports directory import
+-                span:
+-                  line_start: 7
+-                  line_stop: 7
+-                  col_start: 12
+-                  col_stop: 21
+-                  path: ""
+-                  content: import bar.bat.bat.*; // imports directory import
+-            span:
+-              line_start: 7
+-              line_stop: 7
+-              col_start: 8
+-              col_stop: 21
+-              path: ""
+-              content: import bar.bat.bat.*; // imports directory import
+-        span:
+-          line_start: 7
+-          line_stop: 7
+-          col_start: 8
+-          col_stop: 21
+-          path: ""
+-          content: import bar.bat.bat.*; // imports directory import
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"car\",\"span\":\"{\\\"line_start\\\":8,\\\"line_stop\\\":8,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import car.*;         // imports directory import\\\"}\"}"
+-            access:
+-              Star:
+-                span:
+-                  line_start: 8
+-                  line_stop: 8
+-                  col_start: 12
+-                  col_stop: 13
+-                  path: ""
+-                  content: import car.*;         // imports directory import
+-            span:
+-              line_start: 8
+-              line_stop: 8
+-              col_start: 8
+-              col_stop: 13
+-              path: ""
+-              content: import car.*;         // imports directory import
+-        span:
+-          line_start: 8
+-          line_stop: 8
+-          col_start: 8
+-          col_stop: 13
+-          path: ""
+-          content: import car.*;         // imports directory import
+-    imports: {}
+-    aliases: {}
+-    circuits: {}
+-    global_consts: {}
+-    functions: {}
+diff --git a/unused/tests/parser/import/names.leo b/unused/tests/parser/import/names.leo
+deleted file mode 100644
+index a37f401735..0000000000
+--- a/unused/tests/parser/import/names.leo
++++ /dev/null
+@@ -1,8 +0,0 @@
+-/*
+-namespace: Parse
+-expectation: Pass
+-*/
+-
+-import a0-f.foo;
+-import a-9.bar;
+-import hello-world.hello;
+diff --git a/unused/tests/parser/import/names.leo.out b/unused/tests/parser/import/names.leo.out
+deleted file mode 100644
+index 1bf21bcd9d..0000000000
+--- a/unused/tests/parser/import/names.leo.out
++++ /dev/null
+@@ -1,96 +0,0 @@
+----
+-namespace: Parse
+-expectation: Pass
+-outputs:
+-  - name: ""
+-    expected_input: []
+-    import_statements:
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"a0-f\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":8,\\\"col_stop\\\":12,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a0-f.foo;\\\"}\"}"
+-            access:
+-              Symbol:
+-                symbol: "{\"name\":\"foo\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":13,\\\"col_stop\\\":16,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a0-f.foo;\\\"}\"}"
+-                alias: ~
+-                span:
+-                  line_start: 3
+-                  line_stop: 3
+-                  col_start: 13
+-                  col_stop: 16
+-                  path: ""
+-                  content: import a0-f.foo;
+-            span:
+-              line_start: 3
+-              line_stop: 3
+-              col_start: 8
+-              col_stop: 16
+-              path: ""
+-              content: import a0-f.foo;
+-        span:
+-          line_start: 3
+-          line_stop: 3
+-          col_start: 8
+-          col_stop: 16
+-          path: ""
+-          content: import a0-f.foo;
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"a-9\",\"span\":\"{\\\"line_start\\\":4,\\\"line_stop\\\":4,\\\"col_start\\\":8,\\\"col_stop\\\":11,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a-9.bar;\\\"}\"}"
+-            access:
+-              Symbol:
+-                symbol: "{\"name\":\"bar\",\"span\":\"{\\\"line_start\\\":4,\\\"line_stop\\\":4,\\\"col_start\\\":12,\\\"col_stop\\\":15,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import a-9.bar;\\\"}\"}"
+-                alias: ~
+-                span:
+-                  line_start: 4
+-                  line_stop: 4
+-                  col_start: 12
+-                  col_stop: 15
+-                  path: ""
+-                  content: import a-9.bar;
+-            span:
+-              line_start: 4
+-              line_stop: 4
+-              col_start: 8
+-              col_stop: 15
+-              path: ""
+-              content: import a-9.bar;
+-        span:
+-          line_start: 4
+-          line_stop: 4
+-          col_start: 8
+-          col_stop: 15
+-          path: ""
+-          content: import a-9.bar;
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"hello-world\",\"span\":\"{\\\"line_start\\\":5,\\\"line_stop\\\":5,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello-world.hello;\\\"}\"}"
+-            access:
+-              Symbol:
+-                symbol: "{\"name\":\"hello\",\"span\":\"{\\\"line_start\\\":5,\\\"line_stop\\\":5,\\\"col_start\\\":20,\\\"col_stop\\\":25,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello-world.hello;\\\"}\"}"
+-                alias: ~
+-                span:
+-                  line_start: 5
+-                  line_stop: 5
+-                  col_start: 20
+-                  col_stop: 25
+-                  path: ""
+-                  content: import hello-world.hello;
+-            span:
+-              line_start: 5
+-              line_stop: 5
+-              col_start: 8
+-              col_stop: 25
+-              path: ""
+-              content: import hello-world.hello;
+-        span:
+-          line_start: 5
+-          line_stop: 5
+-          col_start: 8
+-          col_stop: 25
+-          path: ""
+-          content: import hello-world.hello;
+-    imports: {}
+-    aliases: {}
+-    circuits: {}
+-    global_consts: {}
+-    functions: {}
+diff --git a/unused/tests/parser/import/names_underscore.leo.out b/unused/tests/parser/import/names_underscore.leo.out
+deleted file mode 100644
+index df3f7dfc8d..0000000000
+--- a/unused/tests/parser/import/names_underscore.leo.out
++++ /dev/null
+@@ -1,40 +0,0 @@
+----
+-namespace: Parse
+-expectation: Pass
+-outputs:
+-  - name: ""
+-    expected_input: []
+-    import_statements:
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"hello_world\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello_world.foo;\\\"}\"}"
+-            access:
+-              Symbol:
+-                symbol: "{\"name\":\"foo\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":20,\\\"col_stop\\\":23,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import hello_world.foo;\\\"}\"}"
+-                alias: ~
+-                span:
+-                  line_start: 3
+-                  line_stop: 3
+-                  col_start: 20
+-                  col_stop: 23
+-                  path: ""
+-                  content: import hello_world.foo;
+-            span:
+-              line_start: 3
+-              line_stop: 3
+-              col_start: 8
+-              col_stop: 23
+-              path: ""
+-              content: import hello_world.foo;
+-        span:
+-          line_start: 3
+-          line_stop: 3
+-          col_start: 8
+-          col_stop: 23
+-          path: ""
+-          content: import hello_world.foo;
+-    imports: {}
+-    aliases: {}
+-    circuits: {}
+-    global_consts: {}
+-    functions: {}
+diff --git a/unused/tests/parser/import/star.leo b/unused/tests/parser/import/star.leo
+deleted file mode 100644
+index c5363d15a0..0000000000
+--- a/unused/tests/parser/import/star.leo
++++ /dev/null
+@@ -1,6 +0,0 @@
+-/*
+-namespace: Parse
+-expectation: Pass
+-*/
+-
+-import test-import.*;
+diff --git a/unused/tests/parser/import/star.leo.out b/unused/tests/parser/import/star.leo.out
+deleted file mode 100644
+index 1b7fc65ae5..0000000000
+--- a/unused/tests/parser/import/star.leo.out
++++ /dev/null
+@@ -1,38 +0,0 @@
+----
+-namespace: Parse
+-expectation: Pass
+-outputs:
+-  - name: ""
+-    expected_input: []
+-    import_statements:
+-      - package_or_packages:
+-          Package:
+-            name: "{\"name\":\"test-import\",\"span\":\"{\\\"line_start\\\":3,\\\"line_stop\\\":3,\\\"col_start\\\":8,\\\"col_stop\\\":19,\\\"path\\\":\\\"\\\",\\\"content\\\":\\\"import test-import.*;\\\"}\"}"
+-            access:
+-              Star:
+-                span:
+-                  line_start: 3
+-                  line_stop: 3
+-                  col_start: 20
+-                  col_stop: 21
+-                  path: ""
+-                  content: import test-import.*;
+-            span:
+-              line_start: 3
+-              line_stop: 3
+-              col_start: 8
+-              col_stop: 21
+-              path: ""
+-              content: import test-import.*;
+-        span:
+-          line_start: 3
+-          line_stop: 3
+-          col_start: 8
+-          col_stop: 21
+-          path: ""
+-          content: import test-import.*;
+-    imports: {}
+-    aliases: {}
+-    circuits: {}
+-    global_consts: {}
+-    functions: {}

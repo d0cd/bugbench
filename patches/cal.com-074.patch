@@ -1,0 +1,537 @@
+diff --git a/packages/app-store/umami/components/EventTypeAppCardInterface.tsx b/packages/app-store/umami/components/EventTypeAppCardInterface.tsx
+index 9af6bb7b3ee63e..6bbb3447a8d292 100644
+--- a/packages/app-store/umami/components/EventTypeAppCardInterface.tsx
++++ b/packages/app-store/umami/components/EventTypeAppCardInterface.tsx
+@@ -30,7 +30,7 @@ const EventTypeAppCard: EventTypeAppCardComponent = function EventTypeAppCard({
+           disabled={disabled}
+           name="Script URL"
+           value={scriptURL}
+-          defaultValue="https://us.umami.is/script.js"
++          defaultValue="https://cloud.umami.is/script.js"
+           placeholder="Enter the script source URL"
+           onChange={(e) => {
+             setAppData("SCRIPT_URL", e.target.value);
+diff --git a/packages/app-store/umami/zod.ts b/packages/app-store/umami/zod.ts
+index 83716cb0a572f0..9318935021de14 100644
+--- a/packages/app-store/umami/zod.ts
++++ b/packages/app-store/umami/zod.ts
+@@ -5,7 +5,7 @@ import { eventTypeAppCardZod } from "@calcom/app-store/eventTypeAppCardZod";
+ export const appDataSchema = eventTypeAppCardZod.merge(
+   z.object({
+     SITE_ID: z.string().optional(),
+-    SCRIPT_URL: z.string().optional(),
++    SCRIPT_URL: z.string().optional().default("https://cloud.umami.is/script.js").or(z.undefined()),
+   })
+ );
+ 
+diff --git a/packages/lib/CalendarService.test.ts b/packages/lib/CalendarService.test.ts
+new file mode 100644
+index 00000000000000..55e1f8d7af3aae
+--- /dev/null
++++ b/packages/lib/CalendarService.test.ts
+@@ -0,0 +1,400 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++import { createEvent as createIcsEvent } from "ics";
++import { createCalendarObject, updateCalendarObject } from "tsdav";
++
++vi.mock("ics", () => ({
++  createEvent: vi.fn(),
++}));
++
++vi.mock("tsdav", () => ({
++  createAccount: vi.fn(),
++  fetchCalendars: vi.fn(),
++  fetchCalendarObjects: vi.fn(),
++  createCalendarObject: vi.fn().mockResolvedValue({ ok: true }),
++  updateCalendarObject: vi.fn().mockResolvedValue({ status: 200 }),
++  deleteCalendarObject: vi.fn(),
++  getBasicAuthHeaders: vi.fn().mockReturnValue({}),
++}));
++
++vi.mock("@calcom/lib/logger", () => ({
++  default: {
++    getSubLogger: () => ({
++      debug: vi.fn(),
++      error: vi.fn(),
++      warn: vi.fn(),
++    }),
++  },
++}));
++
++vi.mock("@calcom/lib/crypto", () => ({
++  symmetricDecrypt: vi.fn().mockImplementation((text) => {
++    if (typeof text === "object") {
++      return JSON.stringify(text);
++    }
++    return text;
++  }),
++}));
++
++vi.mock("./CalEventParser", () => ({
++  getLocation: vi.fn().mockReturnValue("Test Location"),
++  getRichDescription: vi.fn().mockReturnValue("Test Description"),
++}));
++
++import type { CalendarServiceEvent } from "@calcom/types/Calendar";
++
++import BaseCalendarService from "./CalendarService";
++
++const createMockEvent = (overrides: Partial<CalendarServiceEvent> = {}): CalendarServiceEvent => ({
++  type: "caldav",
++  title: "Test Event",
++  startTime: "2023-01-01T10:00:00Z",
++  endTime: "2023-01-01T11:00:00Z",
++  organizer: {
++    name: "Test",
++    email: "test@example.com",
++    timeZone: "UTC",
++    language: { translate: ((key: string) => key) as never, locale: "en" },
++  },
++  attendees: [],
++  calendarDescription: "Test Description",
++  ...overrides,
++});
++
++class TestCalendarService extends BaseCalendarService {
++  constructor() {
++    super(
++      {
++        id: 1,
++        type: "caldav_calendar",
++        delegationCredentialId: null,
++        user: { email: "test@example.com" },
++        userId: 1,
++        teamId: null,
++        appId: "caldav",
++        invalid: false,
++        key: {
++          username: "test",
++          password: "test",
++          url: "https://caldav.example.com",
++        },
++      },
++      "caldav",
++      "https://caldav.example.com"
++    );
++  }
++
++  async listCalendars() {
++    return [
++      {
++        externalId: "https://caldav.example.com/calendar/",
++        name: "Test Calendar",
++        primary: true,
++        readOnly: false,
++        email: "test@example.com",
++        integrationName: "caldav",
++        credentialId: 1,
++      },
++    ];
++  }
++
++  async testUpdateEvent(uid: string, event: CalendarServiceEvent, externalCalendarId: string) {
++    return this.updateEvent(uid, event);
++  }
++}
++
++describe("CalendarService - SCHEDULE-AGENT injection", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++  });
++
++  describe("injectScheduleAgent", () => {
++    it("should inject SCHEDULE-AGENT=CLIENT into ATTENDEE lines", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nMETHOD:PUBLISH\r\nATTENDEE;CN=Guest:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain("ATTENDEE;CN=Guest;SCHEDULE-AGENT=CLIENT:mailto:guest@example.com");
++      expect(unfolded).not.toContain("METHOD:PUBLISH");
++    });
++
++    it("should inject SCHEDULE-AGENT=CLIENT into ORGANIZER lines", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nORGANIZER;CN=Test:mailto:test@example.com\r\nATTENDEE;CN=Guest:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain("ORGANIZER;CN=Test;SCHEDULE-AGENT=CLIENT:mailto:test@example.com");
++      expect(unfolded).toContain("ATTENDEE;CN=Guest;SCHEDULE-AGENT=CLIENT:mailto:guest@example.com");
++    });
++
++    it("should not duplicate SCHEDULE-AGENT if already present", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nATTENDEE;SCHEDULE-AGENT=SERVER;CN=Guest:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++
++      const scheduleAgentCount = (iCalString.match(/SCHEDULE-AGENT/g) || []).length;
++      expect(scheduleAgentCount).toBe(1);
++    });
++
++    it("should handle quoted colons in CN parameter", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nATTENDEE;CN="John: CEO":mailto:john@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain('ATTENDEE;CN="John: CEO";SCHEDULE-AGENT=CLIENT:mailto:john@example.com');
++    });
++
++    it("should remove METHOD:PUBLISH per RFC 4791", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nMETHOD:PUBLISH\r\nATTENDEE;CN=Guest:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++
++      expect(iCalString).not.toContain("METHOD:PUBLISH");
++    });
++
++    it("should handle case-insensitive ATTENDEE matching", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nattendee;cn=Guest:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain("SCHEDULE-AGENT=CLIENT");
++    });
++  });
++
++  describe("RFC 5545 Line Folding", () => {
++    it("should fold long lines at 75 octets", async () => {
++      const service = new TestCalendarService();
++      const longName = "A".repeat(60);
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nATTENDEE;CN=${longName}:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const lines = iCalString.split("\r\n");
++
++      lines.forEach((line) => {
++        const byteLength = new TextEncoder().encode(line).length;
++        expect(byteLength).toBeLessThanOrEqual(75);
++      });
++    });
++
++    it("should handle UTF-8 multi-byte characters correctly", async () => {
++      const service = new TestCalendarService();
++      const unicodeName = "\u4E2D".repeat(30);
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nORGANIZER;CN=${unicodeName}:mailto:test@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const lines = iCalString.split("\r\n");
++
++      lines.forEach((line) => {
++        const byteLength = new TextEncoder().encode(line).length;
++        expect(byteLength).toBeLessThanOrEqual(75);
++      });
++
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++      expect(unfolded).toContain("SCHEDULE-AGENT=CLIENT");
++    });
++
++    it("should handle folded input lines correctly", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nATTENDEE;CN=Very Long Name That Will Be\r\n  Folded:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain("SCHEDULE-AGENT=CLIENT");
++    });
++  });
++
++  describe("updateEvent", () => {
++    it("should inject SCHEDULE-AGENT=CLIENT on update", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nATTENDEE;CN=Guest:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      (service as unknown as Record<string, unknown>).getEventsByUID = vi.fn().mockResolvedValue([
++        {
++          uid: "test-uid",
++          url: "https://caldav.example.com/calendar/test.ics",
++          etag: '"etag123"',
++        },
++      ]);
++
++      const event = createMockEvent({ uid: "test-uid" });
++
++      await service.testUpdateEvent("test-uid", event, "https://caldav.example.com/calendar/");
++
++      const calledArg = vi.mocked(updateCalendarObject).mock.calls[0][0];
++      const data = calledArg.calendarObject.data;
++      const unfolded = data.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain("SCHEDULE-AGENT=CLIENT");
++    });
++  });
++
++  describe("Edge cases", () => {
++    it("should handle ATTENDEE with multiple parameters", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Guest:mailto:guest@example.com\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain("PARTSTAT=NEEDS-ACTION");
++      expect(unfolded).toContain("RSVP=TRUE");
++      expect(unfolded).toContain("SCHEDULE-AGENT=CLIENT");
++    });
++
++    it("should handle ATTENDEE with http URI", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nATTENDEE;CN=Guest:http://example.com/user\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++      const unfolded = iCalString.replace(/\r?\n[ \t]/g, "");
++
++      expect(unfolded).toContain("ATTENDEE;CN=Guest;SCHEDULE-AGENT=CLIENT:http://example.com/user");
++    });
++
++    it("should preserve other iCal properties unchanged", async () => {
++      const service = new TestCalendarService();
++      const mockIcsOutput = `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Cal.com//NONSGML//EN\r\nATTENDEE;CN=Guest:mailto:guest@example.com\r\nDTSTART:20230101T100000Z\r\nDTEND:20230101T110000Z\r\nEND:VCALENDAR`;
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: mockIcsOutput,
++      });
++
++      const event = createMockEvent();
++
++      await service.createEvent(event, 1);
++
++      const calledArg = vi.mocked(createCalendarObject).mock.calls[0][0];
++      const iCalString = calledArg.iCalString;
++
++      expect(iCalString).toContain("VERSION:2.0");
++      expect(iCalString).toContain("PRODID:-//Cal.com//NONSGML//EN");
++      expect(iCalString).toContain("DTSTART:20230101T100000Z");
++      expect(iCalString).toContain("DTEND:20230101T110000Z");
++    });
++
++    it("should handle empty iCalString gracefully", async () => {
++      const service = new TestCalendarService();
++      vi.mocked(createIcsEvent).mockReturnValue({
++        error: null as unknown as Error,
++        value: "",
++      });
++
++      const event = createMockEvent();
++
++      await expect(service.createEvent(event, 1)).rejects.toThrow();
++    });
++  });
++});
+diff --git a/packages/lib/CalendarService.ts b/packages/lib/CalendarService.ts
+index 04effe1d9e6033..b36253d20159fd 100644
+--- a/packages/lib/CalendarService.ts
++++ b/packages/lib/CalendarService.ts
+@@ -98,6 +98,80 @@ const getDuration = (start: string, end: string): DurationObject => ({
+   minutes: dayjs(end).diff(dayjs(start), "minute"),
+ });
+ 
++/** Folds lines per RFC 5545 (max 75 octets, UTF-8 aware) */
++const foldLine = (line: string): string => {
++  const encoder = new TextEncoder();
++  if (encoder.encode(line).length <= 75) return line;
++
++  const result: string[] = [];
++  let segment = "";
++  let byteCount = 0;
++
++  for (const char of line) {
++    const charBytes = encoder.encode(char).length;
++    const limit = result.length === 0 ? 75 : 74;
++
++    if (byteCount + charBytes > limit) {
++      result.push(segment);
++      segment = char;
++      byteCount = charBytes;
++    } else {
++      segment += char;
++      byteCount += charBytes;
++    }
++  }
++  if (segment) result.push(segment);
++  return result.join("\r\n ");
++};
++
++/** Finds the value separator colon, skipping colons inside quoted strings */
++const findValueColon = (str: string): number => {
++  let inQuotes = false;
++  for (let i = 0; i < str.length; i++) {
++    if (str[i] === '"') inQuotes = !inQuotes;
++    if (str[i] === ":" && !inQuotes) return i;
++  }
++  return -1;
++};
++
++/** Checks if SCHEDULE-AGENT parameter exists in the params portion */
++const hasScheduleAgent = (params: string): boolean =>
++  /;SCHEDULE-AGENT=/i.test(params) || /^SCHEDULE-AGENT=/i.test(params);
++
++/**
++ * Injects SCHEDULE-AGENT=CLIENT into ORGANIZER and ATTENDEE properties.
++ * Prevents CalDAV servers from sending duplicate invitation emails (RFC 6638).
++ */
++const injectScheduleAgent = (iCalString: string): string => {
++  // Remove METHOD:PUBLISH per RFC 4791 Section 4.1
++  let result = iCalString.replace(/METHOD:[^\r\n]+[\r\n]+/g, "");
++
++  // Process ORGANIZER and ATTENDEE lines (handles folded lines)
++  result = result.replace(
++    /^(ORGANIZER|ATTENDEE)((?:[^\r\n]|\r?\n[ \t])*)(\r?\n(?![ \t]))/gim,
++    (match, property, rest, lineEnding) => {
++      const unfolded = rest.replace(/\r?\n[ \t]/g, "");
++
++      // Try to find colon via :mailto:/:http: pattern first
++      const valueMatch = unfolded.match(/:(mailto:|http:|https:|urn:)/i);
++      const colonIndex = valueMatch?.index ?? findValueColon(unfolded);
++
++      if (colonIndex === -1) return match;
++
++      const params = unfolded.slice(0, colonIndex);
++      const value = unfolded.slice(colonIndex);
++
++      if (hasScheduleAgent(params)) {
++        return foldLine(property + unfolded) + lineEnding;
++      }
++
++      return foldLine(property + params + ";SCHEDULE-AGENT=CLIENT" + value) + lineEnding;
++    }
++  );
++
++  return result;
++};
++
+ const mapAttendees = (attendees: AttendeeInCalendarEvent[] | TeamMember[]): Attendee[] =>
+   attendees.map(({ email, name }) => ({ name, email, partstat: "NEEDS-ACTION" }));
+ 
+@@ -187,8 +261,7 @@ export default abstract class BaseCalendarService implements Calendar {
+                 url: calendar.externalId,
+               },
+               filename: `${uid}.ics`,
+-              // according to https://datatracker.ietf.org/doc/html/rfc4791#section-4.1, Calendar object resources contained in calendar collections MUST NOT specify the iCalendar METHOD property.
+-              iCalString: iCalString.replace(/METHOD:[^\r\n]+\r\n/g, ""),
++              iCalString: injectScheduleAgent(iCalString),
+               headers: this.headers,
+             })
+           )
+@@ -255,8 +328,7 @@ export default abstract class BaseCalendarService implements Calendar {
+           return updateCalendarObject({
+             calendarObject: {
+               url: calendarEvent.url,
+-              // ensures compliance with standard iCal string (known as iCal2.0 by some) required by various providers
+-              data: iCalString?.replace(/METHOD:[^\r\n]+\r\n/g, ""),
++              data: injectScheduleAgent(iCalString ?? ""),
+               etag: calendarEvent?.etag,
+             },
+             headers: this.headers,

@@ -1,111 +1,182 @@
-diff --git a/src/network/peers.rs b/src/network/peers.rs
-index 4bf97a1ef..3b4177942 100644
---- a/src/network/peers.rs
-+++ b/src/network/peers.rs
-@@ -80,13 +80,13 @@ pub struct Peers<N: Network, E: Environment> {
-     /// The set of candidate peer IPs.
-     candidate_peers: HashSet<SocketAddr>,
-     /// The map of peers to a map of block hashes and when they've seen that block.
--    seen_blocks: HashMap<SocketAddr, HashMap<N::BlockHash, i64>>,
-+    seen_blocks: HashMap<SocketAddr, HashMap<N::BlockHash, SystemTime>>,
-     /// The map of peers to their first-seen port number, number of attempts, and timestamp of the last inbound connection request.
-     seen_inbounds: HashMap<SocketAddr, ((u16, u32), SystemTime)>,
-     /// The map of peers to the timestamp of their last outbound connection request.
-     seen_outbounds: HashMap<SocketAddr, SystemTime>,
-     /// The map of peers to a map of transaction ids and when they've seen that transaction.
--    seen_transactions: HashMap<SocketAddr, HashMap<N::TransactionID, i64>>,
-+    seen_transactions: HashMap<SocketAddr, HashMap<N::TransactionID, SystemTime>>,
- }
+diff --git a/Cargo.toml b/Cargo.toml
+index 3e4da41f8..c0d196ef0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -56,7 +56,7 @@ name = "snarkos"
+ path = "snarkos/main.rs"
  
- impl<N: Network, E: Environment> Peers<N, E> {
-@@ -415,58 +415,41 @@ impl<N: Network, E: Environment> Peers<N, E> {
-     /// Sends the given message to every connected peer, except for the sender.
-     ///
-     async fn propagate(&mut self, sender: SocketAddr, message: &Message<N, E>) {
--        const BLOCK_BROADCAST_INTERVAL: i64 = 180; // 3 minutes.
--        const TRANSACTION_BROADCAST_INTERVAL: i64 = 180; // 3 minutes.
--
--        let now = chrono::Utc::now().timestamp();
--
-         // Iterate through all peers that are not the sender.
-         for peer in self.connected_peers().iter() {
--            match message {
--                Message::UnconfirmedBlock(block) => {
--                    // Retrieve the map for the peer.
--                    match self.seen_blocks.get_mut(peer) {
--                        Some(seen_blocks) => {
--                            if let Some(last_seen) = seen_blocks.get(&block.hash()) {
--                                // Ensure sufficient time has passed before needing to send the block.
--                                if now.saturating_sub(*last_seen) < BLOCK_BROADCAST_INTERVAL {
--                                    continue;
--                                }
--                            }
--                            // Update the timestamp for the peer and sent block.
--                            seen_blocks.insert(block.hash(), now);
--                        }
--                        None => {
--                            // Insert an entry for the peer.
--                            self.seen_blocks.insert(*peer, [(block.hash(), now)].into());
--                        }
--                    };
--                }
--                Message::UnconfirmedTransaction(transaction) => {
--                    // Retrieve the map for the particular peer.
--                    match self.seen_transactions.get_mut(peer) {
--                        Some(seen_transactions) => {
--                            if let Some(last_seen) = seen_transactions.get(&transaction.transaction_id()) {
--                                // Ensure sufficient time has passed before needing to send the transaction.
--                                if now.saturating_sub(*last_seen) < TRANSACTION_BROADCAST_INTERVAL {
--                                    continue;
--                                }
--                            }
--                            // Update the timestamp for the peer and sent transaction.
--                            seen_transactions.insert(transaction.transaction_id(), now);
--                        }
--                        None => {
--                            // Insert an entry for the peer.
--                            self.seen_transactions.insert(*peer, [(transaction.transaction_id(), now)].into());
--                        }
--                    };
--                }
--                _ => {}
--            }
--
-+            // Ensure the sender is not this peer.
-             if peer != &sender {
--                trace!("Preparing to propagate '{}' to {}", message.name(), peer);
--                self.send(*peer, message).await;
-+                // Ensure sufficient time has passed before needing to send the message.
-+                let is_ready_to_send = match message {
-+                    Message::UnconfirmedBlock(block) => {
-+                        // Retrieve the last seen timestamp of this block for this peer.
-+                        let seen_blocks = self.seen_blocks.entry(*peer).or_insert_with(Default::default);
-+                        let last_seen = seen_blocks.entry(block.hash()).or_insert(SystemTime::UNIX_EPOCH);
-+                        let is_ready_to_send = last_seen.elapsed().unwrap().as_secs() < E::RADIO_SILENCE_IN_SECS;
-+
-+                        // Update the timestamp for the peer and sent block.
-+                        seen_blocks.insert(block.hash(), SystemTime::now());
-+                        is_ready_to_send
-+                    }
-+                    Message::UnconfirmedTransaction(transaction) => {
-+                        // Retrieve the last seen timestamp of this transaction for this peer.
-+                        let seen_transactions = self.seen_transactions.entry(*peer).or_insert_with(Default::default);
-+                        let last_seen = seen_transactions
-+                            .entry(transaction.transaction_id())
-+                            .or_insert(SystemTime::UNIX_EPOCH);
-+                        let is_ready_to_send = last_seen.elapsed().unwrap().as_secs() < E::RADIO_SILENCE_IN_SECS;
-+
-+                        // Update the timestamp for the peer and sent transaction.
-+                        seen_transactions.insert(transaction.transaction_id(), SystemTime::now());
-+                        is_ready_to_send
-+                    }
-+                    _ => true,
-+                };
-+                // Send the message if it is ready.
-+                if is_ready_to_send {
-+                    trace!("Preparing to propagate '{}' to {}", message.name(), peer);
-+                    self.send(*peer, message).await;
-+                }
-             }
+ [features]
+-metrics = [ "snarkos-node-metrics", "snarkos-node/metrics" ]
++default = [ "snarkos-node-metrics", "snarkos-node/metrics", "snarkos-cli/metrics" ]
+ history = [ "snarkos-node/history" ]
+ test_targets = [ "snarkos-cli/test_targets" ]
+ 
+diff --git a/cli/Cargo.toml b/cli/Cargo.toml
+index 6dd5f1223..be61eed43 100644
+--- a/cli/Cargo.toml
++++ b/cli/Cargo.toml
+@@ -17,7 +17,7 @@ license = "Apache-2.0"
+ edition = "2021"
+ 
+ [features]
+-default = [ "snarkos-node/metrics" ]
++metrics = [ "dep:metrics", "snarkos-node/metrics" ]
+ test_targets = [ "snarkvm/test_targets" ]
+ 
+ [dependencies.aleo-std]
+@@ -50,6 +50,7 @@ features = [ "serde", "rayon" ]
+ package = "snarkos-node-metrics"
+ path = "../node/metrics"
+ version = "=3.2.0"
++optional = true
+ 
+ [dependencies.num_cpus]
+ version = "1"
+diff --git a/cli/src/commands/start.rs b/cli/src/commands/start.rs
+index d0ddc6cc6..056cb472c 100644
+--- a/cli/src/commands/start.rs
++++ b/cli/src/commands/start.rs
+@@ -137,9 +137,11 @@ pub struct Start {
+     pub logfile: PathBuf,
+ 
+     /// Enables the metrics exporter
++    #[cfg(feature = "metrics")]
+     #[clap(default_value = "false", long = "metrics")]
+     pub metrics: bool,
+     /// Specify the IP address and port for the metrics exporter
++    #[cfg(feature = "metrics")]
+     #[clap(long = "metrics-ip")]
+     pub metrics_ip: Option<SocketAddr>,
+ 
+@@ -587,6 +589,7 @@ impl Start {
+         crate::helpers::check_validator_machine(node_type);
+ 
+         // Initialize the metrics.
++        #[cfg(feature = "metrics")]
+         if self.metrics {
+             metrics::initialize_metrics(self.metrics_ip);
          }
+diff --git a/node/bft/src/helpers/storage.rs b/node/bft/src/helpers/storage.rs
+index 2ab097ba6..ddb6bdcd9 100644
+--- a/node/bft/src/helpers/storage.rs
++++ b/node/bft/src/helpers/storage.rs
+@@ -22,11 +22,13 @@ use snarkvm::{
+         narwhal::{BatchCertificate, BatchHeader, Transmission, TransmissionID},
+     },
+     prelude::{Address, Field, Network, Result, anyhow, bail, ensure},
++    utilities::{cfg_into_iter, cfg_sorted_by},
+ };
+ 
+ use indexmap::{IndexMap, IndexSet, map::Entry};
+ use lru::LruCache;
+ use parking_lot::RwLock;
++use rayon::iter::{IntoParallelIterator, ParallelIterator};
+ use std::{
+     collections::{HashMap, HashSet},
+     num::NonZeroUsize,
+@@ -377,30 +379,25 @@ impl<N: Network> Storage<N> {
+     /// Returns the certificates that have not yet been included in the ledger.
+     /// Note that the order of this set is by round and then insertion.
+     pub(crate) fn get_pending_certificates(&self) -> IndexSet<BatchCertificate<N>> {
+-        let mut pending_certificates = IndexSet::new();
+-
+         // Obtain the read locks.
+         let rounds = self.rounds.read();
+         let certificates = self.certificates.read();
+ 
+         // Iterate over the rounds.
+-        for (_, certificates_for_round) in rounds.clone().sorted_by(|a, _, b, _| a.cmp(b)) {
+-            // Iterate over the certificates for the round.
+-            for (certificate_id, _, _) in certificates_for_round {
+-                // Skip the certificate if it already exists in the ledger.
+-                if self.ledger.contains_certificate(&certificate_id).unwrap_or(false) {
+-                    continue;
+-                }
+-
+-                // Add the certificate to the pending certificates.
+-                match certificates.get(&certificate_id).cloned() {
+-                    Some(certificate) => pending_certificates.insert(certificate),
+-                    None => continue,
+-                };
+-            }
+-        }
+-
+-        pending_certificates
++        cfg_sorted_by!(rounds.clone(), |a, _, b, _| a.cmp(b))
++            .flat_map(|(_, certificates_for_round)| {
++                // Iterate over the certificates for the round.
++                cfg_into_iter!(certificates_for_round).filter_map(|(certificate_id, _, _)| {
++                    // Skip the certificate if it already exists in the ledger.
++                    if self.ledger.contains_certificate(&certificate_id).unwrap_or(false) {
++                        None
++                    } else {
++                        // Add the certificate to the pending certificates.
++                        certificates.get(&certificate_id).cloned()
++                    }
++                })
++            })
++            .collect()
      }
+ 
+     /// Checks the given `batch_header` for validity, returning the missing transmissions from storage.
+diff --git a/node/tcp/Cargo.toml b/node/tcp/Cargo.toml
+index eb42bfea5..7054e2fd3 100644
+--- a/node/tcp/Cargo.toml
++++ b/node/tcp/Cargo.toml
+@@ -25,31 +25,31 @@ async-trait = "0.1"
+ bytes = "1"
+ parking_lot = "0.12"
+ 
+-  [dependencies.futures-util]
+-  version = "0.3"
+-  features = [ "sink" ]
+-
+-  [dependencies.metrics]
+-  package = "snarkos-node-metrics"
+-  path = "../metrics"
+-  version = "=3.2.0"
+-  optional = true
+-
+-  [dependencies.once_cell]
+-  version = "1"
+-  features = [ "parking_lot" ]
+-
+-  [dependencies.tokio]
+-  version = "1.28"
+-  features = [ "io-util", "net", "parking_lot", "rt", "sync", "time" ]
+-
+-  [dependencies.tokio-util]
+-  version = "0.7"
+-  features = [ "codec" ]
+-
+-  [dependencies.tracing]
+-  version = "0.1"
+-  default-features = false
++[dependencies.futures-util]
++version = "0.3"
++features = [ "sink" ]
++
++[dependencies.metrics]
++package = "snarkos-node-metrics"
++path = "../metrics"
++version = "=3.2.0"
++optional = true
++
++[dependencies.once_cell]
++version = "1"
++features = [ "parking_lot" ]
++
++[dependencies.tokio]
++version = "1.28"
++features = [ "io-util", "net", "parking_lot", "rt", "sync", "time" ]
++
++[dependencies.tokio-util]
++version = "0.7"
++features = [ "codec" ]
++
++[dependencies.tracing]
++version = "0.1"
++default-features = false
+ 
+ [dev-dependencies.tokio]
+ version = "1.28"

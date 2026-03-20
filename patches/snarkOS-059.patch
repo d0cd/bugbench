@@ -1,30 +1,685 @@
-diff --git a/node/src/beacon/mod.rs b/node/src/beacon/mod.rs
-index 65f330847..d862da436 100644
---- a/node/src/beacon/mod.rs
-+++ b/node/src/beacon/mod.rs
-@@ -118,6 +118,12 @@ impl<N: Network, C: ConsensusStorage<N>> Beacon<N, C> {
-         let consensus = Consensus::new(ledger.clone(), dev.is_some())?;
-         lap!(timer, "Initialize consensus");
+diff --git a/Cargo.lock b/Cargo.lock
+index 23015c255..13f03ad1f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3361,6 +3361,7 @@ dependencies = [
+  "futures",
+  "indexmap 2.5.0",
+  "itertools 0.12.1",
++ "lru",
+  "mockall",
+  "open",
+  "parking_lot",
+@@ -3420,6 +3421,7 @@ dependencies = [
+  "lru",
+  "parking_lot",
+  "rand",
++ "rayon",
+  "snarkos-node-metrics",
+  "snarkvm",
+  "tokio",
+diff --git a/cli/src/commands/developer/scan.rs b/cli/src/commands/developer/scan.rs
+index 45a7af4c1..c12c3f812 100644
+--- a/cli/src/commands/developer/scan.rs
++++ b/cli/src/commands/developer/scan.rs
+@@ -148,7 +148,7 @@ impl Scan {
+             }
+             (Some(start), None, None) => {
+                 // Request the latest block height from the endpoint.
+-                let endpoint = format!("{}/{network}/latest/height", self.endpoint);
++                let endpoint = format!("{}/{network}/block/height/latest", self.endpoint);
+                 let latest_height = u32::from_str(&ureq::get(&endpoint).call()?.into_string()?)?;
  
-+        // Initialize the block generation time.
-+        let block_generation_time = Arc::new(AtomicU64::new(2));
-+        // Retrieve the unspent records.
-+        let unspent_records = ledger.find_unspent_records(account.view_key())?;
-+        lap!(timer, "Retrieve the unspent records");
+                 // Print a warning message if the user is attempting to scan the whole chain.
+@@ -161,7 +161,7 @@ impl Scan {
+             (None, Some(end), None) => Ok((0, end)),
+             (None, None, Some(last)) => {
+                 // Request the latest block height from the endpoint.
+-                let endpoint = format!("{}/{network}/latest/height", self.endpoint);
++                let endpoint = format!("{}/{network}/block/height/latest", self.endpoint);
+                 let latest_height = u32::from_str(&ureq::get(&endpoint).call()?.into_string()?)?;
+ 
+                 Ok((latest_height.saturating_sub(last), latest_height))
+diff --git a/node/bft/Cargo.toml b/node/bft/Cargo.toml
+index a49f26f36..8c498cc9f 100644
+--- a/node/bft/Cargo.toml
++++ b/node/bft/Cargo.toml
+@@ -51,6 +51,9 @@ features = [ "thread-pool" ]
+ version = "2.1"
+ features = [ "serde", "rayon" ]
+ 
++[dependencies.lru]
++version = "0.12.1"
 +
-         // Initialize the node router.
-         let router = Router::new(
-             node_ip,
-@@ -130,12 +136,6 @@ impl<N: Network, C: ConsensusStorage<N>> Beacon<N, C> {
-         .await?;
-         lap!(timer, "Initialize the router");
+ [dependencies.metrics]
+ package = "snarkos-node-metrics"
+ path = "../metrics"
+diff --git a/node/bft/ledger-service/Cargo.toml b/node/bft/ledger-service/Cargo.toml
+index a4bd826f8..af9bf1b77 100644
+--- a/node/bft/ledger-service/Cargo.toml
++++ b/node/bft/ledger-service/Cargo.toml
+@@ -18,7 +18,7 @@ edition = "2021"
  
--        // Initialize the block generation time.
--        let block_generation_time = Arc::new(AtomicU64::new(2));
--        // Retrieve the unspent records.
--        let unspent_records = ledger.find_unspent_records(account.view_key())?;
--        lap!(timer, "Retrieve the unspent records");
+ [features]
+ default = [ ]
+-ledger = [ "lru", "parking_lot", "rand", "tokio", "tracing" ]
++ledger = [ "lru", "parking_lot", "rand", "rayon", "tokio", "tracing" ]
+ ledger-write = [ ]
+ metrics = [ "dep:metrics", "snarkvm/metrics" ]
+ mock = [ "parking_lot", "tracing" ]
+@@ -52,6 +52,10 @@ optional = true
+ version = "0.8"
+ optional = true
+ 
++[dependencies.rayon]
++version = "1"
++optional = true
++
+ [dependencies.snarkvm]
+ workspace = true
+ 
+diff --git a/node/bft/ledger-service/src/ledger.rs b/node/bft/ledger-service/src/ledger.rs
+index 3647aa2de..adb6fe00b 100644
+--- a/node/bft/ledger-service/src/ledger.rs
++++ b/node/bft/ledger-service/src/ledger.rs
+@@ -23,13 +23,15 @@ use snarkvm::{
+         puzzle::{Solution, SolutionID},
+         store::ConsensusStorage,
+     },
+-    prelude::{Address, Field, FromBytes, Network, Result, bail},
++    prelude::{Address, Field, FromBytes, Network, Result, bail, cfg_into_iter},
+ };
+ 
+ use indexmap::IndexMap;
+ use lru::LruCache;
+ use parking_lot::{Mutex, RwLock};
++use rayon::prelude::*;
+ use std::{
++    collections::BTreeMap,
+     fmt,
+     io::Read,
+     ops::Range,
+@@ -41,12 +43,15 @@ use std::{
+ 
+ /// The capacity of the LRU holding the recently queried committees.
+ const COMMITTEE_CACHE_SIZE: usize = 16;
++/// The capacity of the cache holding the highest blocks.
++const BLOCK_CACHE_SIZE: usize = 10;
+ 
+ /// A core ledger service.
+ #[allow(clippy::type_complexity)]
+ pub struct CoreLedgerService<N: Network, C: ConsensusStorage<N>> {
+     ledger: Ledger<N, C>,
+     committee_cache: Arc<Mutex<LruCache<u64, Committee<N>>>>,
++    block_cache: Arc<RwLock<BTreeMap<u32, Block<N>>>>,
+     latest_leader: Arc<RwLock<Option<(u64, Address<N>)>>>,
+     shutdown: Arc<AtomicBool>,
+ }
+@@ -55,7 +60,8 @@ impl<N: Network, C: ConsensusStorage<N>> CoreLedgerService<N, C> {
+     /// Initializes a new core ledger service.
+     pub fn new(ledger: Ledger<N, C>, shutdown: Arc<AtomicBool>) -> Self {
+         let committee_cache = Arc::new(Mutex::new(LruCache::new(COMMITTEE_CACHE_SIZE.try_into().unwrap())));
+-        Self { ledger, committee_cache, latest_leader: Default::default(), shutdown }
++        let block_cache = Arc::new(RwLock::new(BTreeMap::new()));
++        Self { ledger, committee_cache, block_cache, latest_leader: Default::default(), shutdown }
+     }
+ }
+ 
+@@ -120,13 +126,21 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
+ 
+     /// Returns the block for the given block height.
+     fn get_block(&self, height: u32) -> Result<Block<N>> {
++        // First, check if the block is in the block cache.
++        // Using `try_read` to avoid blocking the thread: https://github.com/rayon-rs/rayon/issues/1205
++        if let Some(block_cache) = self.block_cache.try_read() {
++            if let Some(block) = block_cache.get(&height) {
++                return Ok(block.clone());
++            }
++        }
++        // If no block is found in the cache, then retrieve the block from the ledger.
+         self.ledger.get_block(height)
+     }
+ 
+     /// Returns the blocks in the given block range.
+     /// The range is inclusive of the start and exclusive of the end.
+     fn get_blocks(&self, heights: Range<u32>) -> Result<Vec<Block<N>>> {
+-        self.ledger.get_blocks(heights)
++        cfg_into_iter!(heights).map(|height| self.get_block(height)).collect()
+     }
+ 
+     /// Returns the solution for the given solution ID.
+@@ -365,6 +379,15 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
+         }
+         // Advance to the next block.
+         self.ledger.advance_to_next_block(block)?;
++        // Add the block to the block cache.
++        {
++            let mut block_cache = self.block_cache.write();
++            block_cache.insert(block.height(), block.clone());
++            // Prune the block cache if it exceeds the maximum size.
++            if block_cache.len() > BLOCK_CACHE_SIZE {
++                block_cache.pop_first();
++            }
++        }
+         // Update BFT metrics.
+         #[cfg(feature = "metrics")]
+         {
+diff --git a/node/bft/src/helpers/storage.rs b/node/bft/src/helpers/storage.rs
+index c86fb180e..2ab097ba6 100644
+--- a/node/bft/src/helpers/storage.rs
++++ b/node/bft/src/helpers/storage.rs
+@@ -25,9 +25,11 @@ use snarkvm::{
+ };
+ 
+ use indexmap::{IndexMap, IndexSet, map::Entry};
++use lru::LruCache;
+ use parking_lot::RwLock;
+ use std::{
+     collections::{HashMap, HashSet},
++    num::NonZeroUsize,
+     sync::{
+         Arc,
+         atomic::{AtomicU32, AtomicU64, Ordering},
+@@ -81,6 +83,8 @@ pub struct StorageInner<N: Network> {
+     /* Once per batch */
+     /// The map of `round` to a list of `(certificate ID, batch ID, author)` entries.
+     rounds: RwLock<IndexMap<u64, IndexSet<(Field<N>, Field<N>, Address<N>)>>>,
++    /// A cache of `certificate ID` to unprocessed `certificate`.
++    unprocessed_certificates: RwLock<LruCache<Field<N>, BatchCertificate<N>>>,
+     /// The map of `certificate ID` to `certificate`.
+     certificates: RwLock<IndexMap<Field<N>, BatchCertificate<N>>>,
+     /// The map of `batch ID` to `round`.
+@@ -100,6 +104,8 @@ impl<N: Network> Storage<N> {
+         let committee = ledger.current_committee().expect("Ledger is missing a committee.");
+         // Retrieve the current round.
+         let current_round = committee.starting_round().max(1);
++        // Set the unprocessed certificates cache size.
++        let unprocessed_cache_size = NonZeroUsize::new((N::MAX_CERTIFICATES * 2) as usize).unwrap();
+ 
+         // Return the storage.
+         let storage = Self(Arc::new(StorageInner {
+@@ -109,6 +115,7 @@ impl<N: Network> Storage<N> {
+             gc_round: Default::default(),
+             max_gc_rounds,
+             rounds: Default::default(),
++            unprocessed_certificates: RwLock::new(LruCache::new(unprocessed_cache_size)),
+             certificates: Default::default(),
+             batch_ids: Default::default(),
+             transmissions,
+@@ -219,9 +226,9 @@ impl<N: Network> Storage<N> {
+             // Remove the GC round(s) from storage.
+             for gc_round in current_gc_round..=next_gc_round {
+                 // Iterate over the certificates for the GC round.
+-                for certificate in self.get_certificates_for_round(gc_round).iter() {
++                for id in self.get_certificate_ids_for_round(gc_round).into_iter() {
+                     // Remove the certificate from storage.
+-                    self.remove_certificate(certificate.id());
++                    self.remove_certificate(id);
+                 }
+             }
+             // Update the GC round.
+@@ -248,6 +255,12 @@ impl<N: Network> Storage<N> {
+         self.rounds.read().get(&round).map_or(false, |set| set.iter().any(|(_, _, a)| a == &author))
+     }
+ 
++    /// Returns `true` if the storage contains the specified `certificate ID`.
++    pub fn contains_unprocessed_certificate(&self, certificate_id: Field<N>) -> bool {
++        // Check if the certificate ID exists in storage.
++        self.unprocessed_certificates.read().contains(&certificate_id)
++    }
++
+     /// Returns `true` if the storage contains the specified `batch ID`.
+     pub fn contains_batch(&self, batch_id: Field<N>) -> bool {
+         // Check if the batch ID exists in storage.
+@@ -293,6 +306,13 @@ impl<N: Network> Storage<N> {
+         self.certificates.read().get(&certificate_id).cloned()
+     }
+ 
++    /// Returns the unprocessed certificate for the given `certificate ID`.
++    /// If the certificate ID does not exist in storage, `None` is returned.
++    pub fn get_unprocessed_certificate(&self, certificate_id: Field<N>) -> Option<BatchCertificate<N>> {
++        // Get the unprocessed certificate.
++        self.unprocessed_certificates.read().peek(&certificate_id).cloned()
++    }
++
+     /// Returns the certificate for the given `round` and `author`.
+     /// If the round does not exist in storage, `None` is returned.
+     /// If the author for the round does not exist in storage, `None` is returned.
+@@ -324,6 +344,36 @@ impl<N: Network> Storage<N> {
+         }
+     }
+ 
++    /// Returns the certificate IDs for the given `round`.
++    /// If the round does not exist in storage, `None` is returned.
++    pub fn get_certificate_ids_for_round(&self, round: u64) -> IndexSet<Field<N>> {
++        // The genesis round does not have batch certificates.
++        if round == 0 {
++            return Default::default();
++        }
++        // Retrieve the certificates.
++        if let Some(entries) = self.rounds.read().get(&round) {
++            entries.iter().map(|(certificate_id, _, _)| *certificate_id).collect()
++        } else {
++            Default::default()
++        }
++    }
++
++    /// Returns the certificate authors for the given `round`.
++    /// If the round does not exist in storage, `None` is returned.
++    pub fn get_certificate_authors_for_round(&self, round: u64) -> HashSet<Address<N>> {
++        // The genesis round does not have batch certificates.
++        if round == 0 {
++            return Default::default();
++        }
++        // Retrieve the certificates.
++        if let Some(entries) = self.rounds.read().get(&round) {
++            entries.iter().map(|(_, _, author)| *author).collect()
++        } else {
++            Default::default()
++        }
++    }
++
+     /// Returns the certificates that have not yet been included in the ledger.
+     /// Note that the order of this set is by round and then insertion.
+     pub(crate) fn get_pending_certificates(&self) -> IndexSet<BatchCertificate<N>> {
+@@ -574,6 +624,8 @@ impl<N: Network> Storage<N> {
+         let transmission_ids = certificate.transmission_ids().clone();
+         // Insert the certificate.
+         self.certificates.write().insert(certificate_id, certificate);
++        // Remove the unprocessed certificate.
++        self.unprocessed_certificates.write().pop(&certificate_id);
+         // Insert the batch ID.
+         self.batch_ids.write().insert(batch_id, round);
+         // Insert the certificate ID for each of the transmissions into storage.
+@@ -585,6 +637,18 @@ impl<N: Network> Storage<N> {
+         );
+     }
+ 
++    /// Inserts the given unprocessed `certificate` into storage.
++    ///
++    /// This is a temporary storage, which is cleared again when calling `insert_certificate_atomic`.
++    pub fn insert_unprocessed_certificate(&self, certificate: BatchCertificate<N>) -> Result<()> {
++        // Ensure the certificate round is above the GC round.
++        ensure!(certificate.round() > self.gc_round(), "Certificate round is at or below the GC round");
++        // Insert the certificate.
++        self.unprocessed_certificates.write().put(certificate.id(), certificate);
++
++        Ok(())
++    }
++
+     /// Removes the given `certificate ID` from storage.
+     ///
+     /// This method triggers updates to the `rounds`, `certificates`, `batch_ids`, and `transmissions` maps.
+@@ -622,6 +686,8 @@ impl<N: Network> Storage<N> {
+         }
+         // Remove the certificate.
+         self.certificates.write().swap_remove(&certificate_id);
++        // Remove the unprocessed certificate.
++        self.unprocessed_certificates.write().pop(&certificate_id);
+         // Remove the batch ID.
+         self.batch_ids.write().swap_remove(&batch_id);
+         // Remove the transmission entries in the certificate from storage.
+diff --git a/node/bft/src/primary.rs b/node/bft/src/primary.rs
+index 0d09b6262..1c8793c93 100644
+--- a/node/bft/src/primary.rs
++++ b/node/bft/src/primary.rs
+@@ -728,10 +728,10 @@ impl<N: Network> Primary<N> {
+         }
+ 
+         // If the peer is ahead, use the batch header to sync up to the peer.
+-        let mut transmissions = self.sync_with_batch_header_from_peer::<false>(peer_ip, &batch_header).await?;
++        let mut missing_transmissions = self.sync_with_batch_header_from_peer::<false>(peer_ip, &batch_header).await?;
+ 
+         // Check that the transmission ids match and are not fee transactions.
+-        if let Err(err) = cfg_iter_mut!(transmissions).try_for_each(|(transmission_id, transmission)| {
++        if let Err(err) = cfg_iter_mut!(missing_transmissions).try_for_each(|(transmission_id, transmission)| {
+             // If the transmission is not well-formed, then return early.
+             self.ledger.ensure_transmission_is_well_formed(*transmission_id, transmission)
+         }) {
+@@ -751,7 +751,7 @@ impl<N: Network> Primary<N> {
+         // Ensure the batch header from the peer is valid.
+         let (storage, header) = (self.storage.clone(), batch_header.clone());
+         let missing_transmissions =
+-            spawn_blocking!(storage.check_batch_header(&header, transmissions, Default::default()))?;
++            spawn_blocking!(storage.check_batch_header(&header, missing_transmissions, Default::default()))?;
+         // Inserts the missing transmissions into the workers.
+         self.insert_missing_transmissions_into_workers(peer_ip, missing_transmissions.into_iter())?;
+ 
+@@ -916,9 +916,18 @@ impl<N: Network> Primary<N> {
+         peer_ip: SocketAddr,
+         certificate: BatchCertificate<N>,
+     ) -> Result<()> {
++        // Ensure the batch certificate is from an authorized validator.
++        if !self.gateway.is_authorized_validator_ip(peer_ip) {
++            // Proceed to disconnect the validator.
++            self.gateway.disconnect(peer_ip);
++            bail!("Malicious peer - Received a batch certificate from an unauthorized validator IP ({peer_ip})");
++        }
+         // Ensure storage does not already contain the certificate.
+         if self.storage.contains_certificate(certificate.id()) {
+             return Ok(());
++        // Otherwise, ensure ephemeral storage contains the certificate.
++        } else if !self.storage.contains_unprocessed_certificate(certificate.id()) {
++            self.storage.insert_unprocessed_certificate(certificate.clone())?;
+         }
+ 
+         // Retrieve the batch certificate author.
+@@ -928,12 +937,6 @@ impl<N: Network> Primary<N> {
+         // Retrieve the batch certificate committee ID.
+         let committee_id = certificate.committee_id();
+ 
+-        // Ensure the batch certificate is from an authorized validator.
+-        if !self.gateway.is_authorized_validator_ip(peer_ip) {
+-            // Proceed to disconnect the validator.
+-            self.gateway.disconnect(peer_ip);
+-            bail!("Malicious peer - Received a batch certificate from an unauthorized validator IP ({peer_ip})");
+-        }
+         // Ensure the batch certificate is not from the current primary.
+         if self.gateway.account().address() == author {
+             bail!("Received a batch certificate for myself ({author})");
+@@ -947,10 +950,8 @@ impl<N: Network> Primary<N> {
+ 
+         // Retrieve the committee lookback.
+         let committee_lookback = self.ledger.get_committee_lookback_for_round(certificate_round)?;
+-        // Retrieve the certificates.
+-        let certificates = self.storage.get_certificates_for_round(certificate_round);
+-        // Construct a set over the authors.
+-        let authors = certificates.iter().map(BatchCertificate::author).collect();
++        // Retrieve the certificate authors.
++        let authors = self.storage.get_certificate_authors_for_round(certificate_round);
+         // Check if the certificates have reached the quorum threshold.
+         let is_quorum = committee_lookback.is_quorum_threshold_reached(&authors);
+ 
+@@ -1027,13 +1028,13 @@ impl<N: Network> Primary<N> {
+                             if current_round == 0 {
+                                 break;
+                             }
+-                            // Retrieve the certificates.
+-                            let certificates = self_.storage.get_certificates_for_round(current_round);
+-                            // Retrieve the primary certificate.
+-                            certificate =
+-                                certificates.into_iter().find(|certificate| certificate.author() == primary_address);
++                            // Retrieve the primary certificates.
++                            if let Some(primary_certificate) =
++                                self_.storage.get_certificate_for_round_with_author(current_round, primary_address)
++                            {
++                                certificate = Some(primary_certificate);
+                             // If the primary certificate was not found, decrement the round.
+-                            if certificate.is_none() {
++                            } else {
+                                 current_round = current_round.saturating_sub(1);
+                             }
+                         }
+@@ -1210,17 +1211,16 @@ impl<N: Network> Primary<N> {
+                 let next_round = self_.current_round().saturating_add(1);
+                 // Determine if the quorum threshold is reached for the current round.
+                 let is_quorum_threshold_reached = {
+-                    // Retrieve the certificates for the next round.
+-                    let certificates = self_.storage.get_certificates_for_round(next_round);
++                    // Retrieve the certificate authors for the next round.
++                    let authors = self_.storage.get_certificate_authors_for_round(next_round);
+                     // If there are no certificates, then skip this check.
+-                    if certificates.is_empty() {
++                    if authors.is_empty() {
+                         continue;
+                     }
+                     let Ok(committee_lookback) = self_.ledger.get_committee_lookback_for_round(next_round) else {
+                         warn!("Failed to retrieve the committee lookback for round {next_round}");
+                         continue;
+                     };
+-                    let authors = certificates.iter().map(BatchCertificate::author).collect();
+                     committee_lookback.is_quorum_threshold_reached(&authors)
+                 };
+                 // Attempt to increment to the next round if the quorum threshold is reached.
+@@ -1541,8 +1541,7 @@ impl<N: Network> Primary<N> {
+ 
+         // Determine if quorum threshold is reached on the batch round.
+         let is_quorum_threshold_reached = {
+-            let certificates = self.storage.get_certificates_for_round(batch_round);
+-            let authors = certificates.iter().map(BatchCertificate::author).collect();
++            let authors = self.storage.get_certificate_authors_for_round(batch_round);
+             let committee_lookback = self.ledger.get_committee_lookback_for_round(batch_round)?;
+             committee_lookback.is_quorum_threshold_reached(&authors)
+         };
+@@ -1671,14 +1670,23 @@ impl<N: Network> Primary<N> {
+     ) -> Result<HashSet<BatchCertificate<N>>> {
+         // Initialize a list for the missing certificates.
+         let mut fetch_certificates = FuturesUnordered::new();
++        // Initialize a set for the missing certificates.
++        let mut missing_certificates = HashSet::default();
+         // Iterate through the certificate IDs.
+         for certificate_id in certificate_ids {
+             // Check if the certificate already exists in the ledger.
+             if self.ledger.contains_certificate(certificate_id)? {
+                 continue;
+             }
+-            // If we do not have the certificate, request it.
+-            if !self.storage.contains_certificate(*certificate_id) {
++            // Check if the certificate already exists in storage.
++            if self.storage.contains_certificate(*certificate_id) {
++                continue;
++            }
++            // If we have not fully processed the certificate yet, store it.
++            if let Some(certificate) = self.storage.get_unprocessed_certificate(*certificate_id) {
++                missing_certificates.insert(certificate);
++            } else {
++                // If we do not have the certificate, request it.
+                 trace!("Primary - Found a new certificate ID for round {round} from '{peer_ip}'");
+                 // TODO (howardwu): Limit the number of open requests we send to a peer.
+                 // Send an certificate request to the peer.
+@@ -1695,8 +1703,6 @@ impl<N: Network> Primary<N> {
+             ),
+         }
+ 
+-        // Initialize a set for the missing certificates.
+-        let mut missing_certificates = HashSet::with_capacity(fetch_certificates.len());
+         // Wait for all of the missing certificates to be fetched.
+         while let Some(result) = fetch_certificates.next().await {
+             // Insert the missing certificate into the set.
+@@ -2061,8 +2067,7 @@ mod tests {
+         store_certificate_chain(&primary, &accounts, round, &mut rng);
+ 
+         // Get transmissions from previous certificates.
+-        let previous_certificate_ids: IndexSet<_> =
+-            primary.storage.get_certificates_for_round(prev_round).iter().map(|cert| cert.id()).collect();
++        let previous_certificate_ids: IndexSet<_> = primary.storage.get_certificate_ids_for_round(prev_round);
+ 
+         // Track the number of transmissions in the previous round.
+         let mut num_transmissions_in_previous_round = 0;
+@@ -2605,8 +2610,7 @@ mod tests {
+         store_certificate_chain(&primary, &accounts, round, &mut rng);
+ 
+         // Get transmissions from previous certificates.
+-        let previous_certificate_ids: IndexSet<_> =
+-            primary.storage.get_certificates_for_round(prev_round).iter().map(|cert| cert.id()).collect();
++        let previous_certificate_ids: IndexSet<_> = primary.storage.get_certificate_ids_for_round(prev_round);
+ 
+         // Generate a solution and a transaction.
+         let (solution_commitment, solution) = sample_unconfirmed_solution(&mut rng);
+diff --git a/node/bft/src/sync/mod.rs b/node/bft/src/sync/mod.rs
+index 9f4642124..a99ef2699 100644
+--- a/node/bft/src/sync/mod.rs
++++ b/node/bft/src/sync/mod.rs
+@@ -314,11 +314,20 @@ impl<N: Network> Sync<N> {
+         // Determine if we can sync the ledger without updating the BFT first.
+         if current_height <= max_gc_height {
+             // Try to advance the ledger *to tip* without updating the BFT.
+-            while let Some(block) = self.block_sync.process_next_block(current_height) {
++            while let Some(block) = self.block_sync.peek_next_block(current_height) {
+                 info!("Syncing the ledger to block {}...", block.height());
+-                self.sync_ledger_with_block_without_bft(block).await?;
+-                // Update the current height.
+-                current_height += 1;
++                // Sync the ledger with the block without BFT.
++                match self.sync_ledger_with_block_without_bft(block).await {
++                    Ok(_) => {
++                        // Update the current height if sync succeeds.
++                        current_height += 1;
++                    }
++                    Err(e) => {
++                        // Mark the current height as processed in block_sync.
++                        self.block_sync.remove_block_response(current_height);
++                        return Err(e);
++                    }
++                }
+             }
+             // Sync the storage with the ledger if we should transition to the BFT sync.
+             if current_height > max_gc_height {
+@@ -329,12 +338,20 @@ impl<N: Network> Sync<N> {
+         }
+ 
+         // Try to advance the ledger with sync blocks.
+-        while let Some(block) = self.block_sync.process_next_block(current_height) {
++        while let Some(block) = self.block_sync.peek_next_block(current_height) {
+             info!("Syncing the BFT to block {}...", block.height());
+             // Sync the storage with the block.
+-            self.sync_storage_with_block(block).await?;
+-            // Update the current height.
+-            current_height += 1;
++            match self.sync_storage_with_block(block).await {
++                Ok(_) => {
++                    // Update the current height if sync succeeds.
++                    current_height += 1;
++                }
++                Err(e) => {
++                    // Mark the current height as processed in block_sync.
++                    self.block_sync.remove_block_response(current_height);
++                    return Err(e);
++                }
++            }
+         }
+         Ok(())
+     }
+@@ -355,6 +372,8 @@ impl<N: Network> Sync<N> {
+             self_.storage.sync_height_with_block(block.height());
+             // Sync the round with the block.
+             self_.storage.sync_round_with_block(block.round());
++            // Mark the block height as processed in block_sync.
++            self_.block_sync.remove_block_response(block.height());
+ 
+             Ok(())
+         })
+@@ -502,6 +521,8 @@ impl<N: Network> Sync<N> {
+                     .await??;
+                     // Remove the block height from the latest block responses.
+                     latest_block_responses.remove(&block_height);
++                    // Mark the block height as processed in block_sync.
++                    self.block_sync.remove_block_response(block_height);
+                 }
+             } else {
+                 debug!(
+diff --git a/node/sync/src/block_sync.rs b/node/sync/src/block_sync.rs
+index 00b405c9e..dd8663485 100644
+--- a/node/sync/src/block_sync.rs
++++ b/node/sync/src/block_sync.rs
+@@ -322,11 +322,25 @@ impl<N: Network> BlockSync<N> {
+         Ok(())
+     }
+ 
+-    /// Returns the next block to process, if one is ready.
++    /// Returns the next block for the given `next_height` if the request is complete,
++    /// or `None` otherwise. This does not remove the block from the `responses` map.
+     #[inline]
+-    pub fn process_next_block(&self, next_height: u32) -> Option<Block<N>> {
+-        // Try to advance the ledger with a block from the sync pool.
+-        self.remove_block_response(next_height)
++    pub fn peek_next_block(&self, next_height: u32) -> Option<Block<N>> {
++        // Acquire the requests write lock.
++        // Note: This lock must be held across the entire scope, due to asynchronous block responses
++        // from multiple peers that may be received concurrently.
++        let requests = self.requests.read();
++
++        // Determine if the request is complete.
++        let is_request_complete =
++            requests.get(&next_height).map(|(_, _, peer_ips)| peer_ips.is_empty()).unwrap_or(true);
++
++        // If the request is not complete, return early.
++        if !is_request_complete {
++            return None;
++        }
++
++        self.responses.read().get(&next_height).cloned()
+     }
+ 
+     /// Attempts to advance with blocks from the sync pool.
+@@ -351,20 +365,33 @@ impl<N: Network> BlockSync<N> {
+ 
+     /// Handles the block responses from the sync pool.
+     fn try_advancing_with_block_responses(&self, mut current_height: u32) {
+-        while let Some(block) = self.remove_block_response(current_height + 1) {
++        while let Some(block) = self.peek_next_block(current_height + 1) {
+             // Ensure the block height matches.
+             if block.height() != current_height + 1 {
+                 warn!("Block height mismatch: expected {}, found {}", current_height + 1, block.height());
+                 break;
+             }
+-            // Check the next block.
+-            if let Err(error) = self.canon.check_next_block(&block) {
+-                warn!("The next block ({}) is invalid - {error}", block.height());
+-                break;
+-            }
+-            // Attempt to advance to the next block.
+-            if let Err(error) = self.canon.advance_to_next_block(&block) {
+-                warn!("{error}");
++
++            // Try to check the next block and advance to it.
++            let advanced = match self.canon.check_next_block(&block) {
++                Ok(_) => match self.canon.advance_to_next_block(&block) {
++                    Ok(_) => true,
++                    Err(err) => {
++                        warn!("Failed to advance to next block ({}): {err}", block.height());
++                        false
++                    }
++                },
++                Err(err) => {
++                    warn!("The next block ({}) is invalid - {err}", block.height());
++                    false
++                }
++            };
++
++            // Remove the block response.
++            self.remove_block_response(current_height + 1);
++
++            // If advancing failed, exit the loop.
++            if !advanced {
+                 break;
+             }
+             // Update the latest height.
+@@ -609,32 +636,25 @@ impl<N: Network> BlockSync<N> {
+         self.request_timestamps.write().remove(&height);
+     }
+ 
+-    /// Removes and returns the block response for the given height, if the request is complete.
+-    fn remove_block_response(&self, height: u32) -> Option<Block<N>> {
++    /// Removes the block response for the given height
++    /// This may only be called after `peek_next_block`, which checked if the request for the given height was complete.
++    pub fn remove_block_response(&self, height: u32) {
+         // Acquire the requests write lock.
+         // Note: This lock must be held across the entire scope, due to asynchronous block responses
+         // from multiple peers that may be received concurrently.
+         let mut requests = self.requests.write();
 -
-         // Initialize the node.
-         let mut node = Self {
-             account,
+-        // Determine if the request is complete.
+-        let is_request_complete = requests.get(&height).map(|(_, _, peer_ips)| peer_ips.is_empty()).unwrap_or(true);
+-
+-        // If the request is not complete, return early.
+-        if !is_request_complete {
+-            return None;
+-        }
+         // Remove the request entry for the given height.
+         requests.remove(&height);
+         // Remove the request timestamp entry for the given height.
+         self.request_timestamps.write().remove(&height);
+         // Remove the response entry for the given height.
+-        self.responses.write().remove(&height)
++        self.responses.write().remove(&height);
+     }
+ 
+     /// Removes the block request for the given peer IP, if it exists.
+     #[allow(dead_code)]
+     fn remove_block_request_to_peer(&self, peer_ip: &SocketAddr, height: u32) {
+-        let mut can_revoke = self.responses.read().get(&height).is_none();
++        let mut can_revoke = self.peek_next_block(height).is_none();
+ 
+         // Remove the peer IP from the request entry. If the request entry is now empty,
+         // and the response entry for this height is also empty, then remove the request entry altogether.

@@ -1,248 +1,921 @@
-diff --git a/Cargo.toml b/Cargo.toml
-index 2f4f887ef..9bc3dbc45 100644
---- a/Cargo.toml
-+++ b/Cargo.toml
-@@ -175,7 +175,7 @@ dev_skip_checks = [
- save_r1cs_hashes = [ "snarkvm-circuit/save_r1cs_hashes" ]
- test_exports = [ "snarkvm-algorithms/test_exports" ]
- test_targets = [ "snarkvm-console/test_targets" ]
--test_consensus_heights = [ "snarkvm-console/test_consensus_heights", "snarkvm-synthesizer/test_consensus_heights" ]
-+test_consensus_heights = [ "snarkvm-console/test_consensus_heights" ]
- 
- [workspace.dependencies.snarkvm-algorithms]
- path = "algorithms"
-diff --git a/ledger/query/src/query/rest.rs b/ledger/query/src/query/rest.rs
-index ef5cb781f..4c417d7ac 100644
---- a/ledger/query/src/query/rest.rs
-+++ b/ledger/query/src/query/rest.rs
-@@ -33,19 +33,12 @@ use std::str::FromStr;
- #[derive(Clone)]
- pub struct RestQuery<N: Network> {
-     base_url: http::Uri,
--    /// `true` if the api version is already contained in the base URL.
--    has_api_version: bool,
-     _marker: std::marker::PhantomData<N>,
- }
- 
- impl<N: Network> From<http::Uri> for RestQuery<N> {
-     fn from(base_url: http::Uri) -> Self {
--        // Avoid trailing slash when checking the version
--        let path = base_url.path().strip_suffix('/').unwrap_or(base_url.path());
--
--        let has_api_version = path.ends_with(Self::API_V1) || path.ends_with(Self::API_V2);
--
--        Self { base_url, has_api_version, _marker: Default::default() }
-+        Self { base_url, _marker: Default::default() }
-     }
- }
- 
-@@ -161,10 +154,6 @@ impl<N: Network> QueryTrait<N> for RestQuery<N> {
- }
- 
- impl<N: Network> RestQuery<N> {
--    const API_V1: &str = "v1";
--    const API_V2: &str = "v2";
--
--    /// Returns the transaction for the given transaction ID.
-     pub fn get_transaction(&self, transaction_id: &N::TransactionID) -> Result<Transaction<N>> {
-         self.get_request(&format!("transaction/{transaction_id}"))
-     }
-@@ -195,15 +184,12 @@ impl<N: Network> RestQuery<N> {
-         // This function is only called internally but check for additional sanity.
-         ensure!(!route.starts_with('/'), "path cannot start with a slash");
- 
--        // Add the API version if it is not already contained in the base URL.
--        let api_version = if self.has_api_version { "" } else { "v2/" };
--
-         // Work around a bug in the `http` crate where empty paths will be set to '/' but other paths are not appended with a slash.
-         // See [this issue](https://github.com/hyperium/http/issues/507).
-         let path = if self.base_url.path().ends_with('/') {
--            format!("{base_url}{api_version}{network}/{route}", base_url = self.base_url, network = N::SHORT_NAME)
-+            format!("{base_url}{network}/{route}", base_url = self.base_url, network = N::SHORT_NAME)
-         } else {
--            format!("{base_url}/{api_version}{network}/{route}", base_url = self.base_url, network = N::SHORT_NAME)
-+            format!("{base_url}/{network}/{route}", base_url = self.base_url, network = N::SHORT_NAME)
-         };
- 
-         Ok(path)
-@@ -226,16 +212,17 @@ impl<N: Network> RestQuery<N> {
-         if response.status().is_success() {
-             response.body_mut().read_json().with_context(|| format!("Failed to parse JSON response from {endpoint}"))
-         } else {
--            let content_type = response
-+            // v2 will return the error in JSON format.
-+            let is_v2 = response
-                 .headers()
--                .get("Content-Type")
--                .ok_or_else(|| anyhow!("Endpoint return error without ContentType"))?
--                .to_str()
--                .with_context(|| "Endpoint returned invalid ContentType")?;
-+                .get(http::header::CONTENT_TYPE)
-+                .and_then(|ct| ct.to_str().ok())
-+                .map(|ct| ct.contains("json"))
-+                .unwrap_or(false);
- 
-             // Convert returned error into an `anyhow::Error`.
-             // Depending on the API version, the error is either encoded as a string or as a JSON.
--            if content_type.contains("json") {
-+            if is_v2 {
-                 let error: RestError = response
-                     .body_mut()
-                     .read_json()
-@@ -263,12 +250,26 @@ impl<N: Network> RestQuery<N> {
-         if response.status().is_success() {
-             response.json().await.with_context(|| format!("Failed to parse JSON response from {endpoint}"))
-         } else {
--            // Convert returned error into an `anyhow::Error`.
--            let error: RestError = response
--                .json()
--                .await
--                .with_context(|| format!("Failed to parse JSON error response from {endpoint}"))?;
--            Err(error.parse().context(format!("Failed to fetch from {endpoint}")))
-+            // v2 will return the error in JSON format.
-+            let is_v2 = response
-+                .headers()
-+                .get(http::header::CONTENT_TYPE)
-+                .and_then(|ct| ct.to_str().ok())
-+                .map(|ct| ct.contains("json"))
-+                .unwrap_or(false);
+diff --git a/circuit/types/integers/src/lib.rs b/circuit/types/integers/src/lib.rs
+index 779f6ee76..cff2947d2 100644
+--- a/circuit/types/integers/src/lib.rs
++++ b/circuit/types/integers/src/lib.rs
+@@ -28,6 +28,7 @@ pub mod compare;
+ pub mod div_checked;
+ pub mod div_wrapped;
+ pub mod equal;
++pub mod modulo;
+ pub mod mul_checked;
+ pub mod mul_wrapped;
+ pub mod neg;
+diff --git a/circuit/types/integers/src/modulo.rs b/circuit/types/integers/src/modulo.rs
+new file mode 100644
+index 000000000..53900d387
+--- /dev/null
++++ b/circuit/types/integers/src/modulo.rs
+@@ -0,0 +1,143 @@
++// Copyright (C) 2019-2022 Aleo Systems Inc.
++// This file is part of the snarkVM library.
 +
-+            if is_v2 {
-+                // Convert returned error into an `anyhow::Error`.
-+                let error: RestError = response
-+                    .json()
-+                    .await
-+                    .with_context(|| format!("Failed to parse JSON error response from {endpoint}"))?;
-+                Err(error.parse().context(format!("Failed to fetch from {endpoint}")))
-+            } else {
-+                let error =
-+                    response.text().await.with_context(|| format!("Failed to read error message {endpoint}"))?;
-+                Err(anyhow!(error).context(format!("Failed to fetch from {endpoint}")))
++// The snarkVM library is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++// The snarkVM library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU General Public License for more details.
++
++// You should have received a copy of the GNU General Public License
++// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
++
++use super::*;
++
++impl<E: Environment, I: IntegerType> Modulo<Self> for Integer<E, I> {
++    type Output = Self;
++
++    #[inline]
++    fn modulo(&self, other: &Integer<E, I>) -> Self::Output {
++        match I::is_signed() {
++            true => E::halt("Attempted to take the modulus of a signed integer."),
++            // For unsigned integers, the modulo operation is equivalent to the remainder operation.
++            false => self.rem_wrapped(other),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use snarkvm_circuit_environment::Circuit;
++
++    use test_utilities::*;
++
++    use core::{ops::RangeInclusive, panic::RefUnwindSafe};
++
++    const ITERATIONS: u64 = 32;
++
++    fn check_modulo<I: IntegerType + RefUnwindSafe>(
++        name: &str,
++        first: console::Integer<<Circuit as Environment>::Network, I>,
++        second: console::Integer<<Circuit as Environment>::Network, I>,
++        mode_a: Mode,
++        mode_b: Mode,
++    ) {
++        let a = Integer::<Circuit, I>::new(mode_a, first);
++        let b = Integer::<Circuit, I>::new(mode_b, second);
++
++        match I::is_signed() {
++            true => check_operation_halts(&a, &b, Integer::modulo),
++            false => {
++                if second == console::Integer::zero() {
++                    match mode_b {
++                        Mode::Constant => check_operation_halts(&a, &b, Integer::modulo),
++                        _ => Circuit::scope(name, || {
++                            let _candidate = a.modulo(&b);
++                            assert!(!Circuit::is_satisfied_in_scope(), "(!is_satisfied_in_scope)");
++                        }),
++                    }
++                } else {
++                    let expected = (*first).modulo(&second);
++                    Circuit::scope(name, || {
++                        let candidate = a.modulo(&b);
++                        assert_eq!(expected, *candidate.eject_value());
++                        assert_eq!(console::Integer::new(expected), candidate.eject_value());
++                        assert!(Circuit::is_satisfied_in_scope(), "(is_satisfied_in_scope)");
++                    })
++                }
 +            }
-         }
++        }
++        Circuit::reset();
++    }
++
++    fn run_test<I: IntegerType + RefUnwindSafe>(mode_a: Mode, mode_b: Mode) {
++        for _ in 0..ITERATIONS {
++            let first = Uniform::rand(&mut test_rng());
++            let second = Uniform::rand(&mut test_rng());
++
++            let name = format!("Mod: {} MOD {}", first, second);
++            check_modulo::<I>(&name, first, second, mode_a, mode_b);
++
++            let name = format!("Mod by One: {} MOD 1", first);
++            check_modulo::<I>(&name, first, console::Integer::one(), mode_a, mode_b);
++
++            let name = format!("Mod by Self: {} MOD {}", first, first);
++            check_modulo::<I>(&name, first, first, mode_a, mode_b);
++
++            let name = format!("Mod by Zero: {} MOD 0", first);
++            check_modulo::<I>(&name, first, console::Integer::zero(), mode_a, mode_b);
++        }
++
++        // Check corner cases.
++        check_modulo::<I>("MAX MOD 1", console::Integer::MAX, console::Integer::one(), mode_a, mode_b);
++        check_modulo::<I>("MIN MOD 1", console::Integer::MIN, console::Integer::one(), mode_a, mode_b);
++        check_modulo::<I>("1 MOD 1", console::Integer::one(), console::Integer::one(), mode_a, mode_b);
++        check_modulo::<I>("0 MOD 1", console::Integer::zero(), console::Integer::one(), mode_a, mode_b);
++        check_modulo::<I>("MAX MOD 0", console::Integer::MAX, console::Integer::zero(), mode_a, mode_b);
++        check_modulo::<I>("MIN MOD 0", console::Integer::MIN, console::Integer::zero(), mode_a, mode_b);
++        check_modulo::<I>("1 MOD 0", console::Integer::one(), console::Integer::zero(), mode_a, mode_b);
++        check_modulo::<I>("0 MOD 0", console::Integer::zero(), console::Integer::zero(), mode_a, mode_b);
++
++        // Check some additional corner cases for signed integers.
++        if I::is_signed() {
++            check_modulo::<I>("MAX MOD -1", console::Integer::MAX, -console::Integer::one(), mode_a, mode_b);
++            check_modulo::<I>("MIN MOD -1", console::Integer::MIN, -console::Integer::one(), mode_a, mode_b);
++            check_modulo::<I>("1 MOD -1", console::Integer::one(), -console::Integer::one(), mode_a, mode_b);
++        }
++    }
++
++    fn run_exhaustive_test<I: IntegerType + RefUnwindSafe>(mode_a: Mode, mode_b: Mode)
++    where
++        RangeInclusive<I>: Iterator<Item = I>,
++    {
++        for first in I::MIN..=I::MAX {
++            for second in I::MIN..=I::MAX {
++                let first = console::Integer::<_, I>::new(first);
++                let second = console::Integer::<_, I>::new(second);
++
++                let name = format!("Mod: ({} MOD {})", first, second);
++                check_modulo::<I>(&name, first, second, mode_a, mode_b);
++            }
++        }
++    }
++
++    test_integer_binary!(run_test, i8, modulo);
++    test_integer_binary!(run_test, i16, modulo);
++    test_integer_binary!(run_test, i32, modulo);
++    test_integer_binary!(run_test, i64, modulo);
++    test_integer_binary!(run_test, i128, modulo);
++
++    test_integer_binary!(run_test, u8, modulo);
++    test_integer_binary!(run_test, u16, modulo);
++    test_integer_binary!(run_test, u32, modulo);
++    test_integer_binary!(run_test, u64, modulo);
++    test_integer_binary!(run_test, u128, modulo);
++
++    test_integer_binary!(#[ignore], run_exhaustive_test, u8, modulo, exhaustive);
++    test_integer_binary!(#[ignore], run_exhaustive_test, i8, modulo, exhaustive);
++}
+diff --git a/console/network/environment/src/traits/arithmetic.rs b/console/network/environment/src/traits/arithmetic.rs
+index b2d51de8e..b889f5a19 100644
+--- a/console/network/environment/src/traits/arithmetic.rs
++++ b/console/network/environment/src/traits/arithmetic.rs
+@@ -58,6 +58,13 @@ pub trait DivWrapped<Rhs: ?Sized = Self> {
+     fn div_wrapped(&self, rhs: &Rhs) -> Self::Output;
+ }
+ 
++/// Binary operator for modding two values.
++pub trait Modulo<Rhs: ?Sized = Self> {
++    type Output;
++
++    fn modulo(&self, rhs: &Rhs) -> Self::Output;
++}
++
+ /// Binary operator for multiplying two values, enforcing an overflow never occurs.
+ pub trait MulChecked<Rhs: ?Sized = Self> {
+     type Output;
+diff --git a/console/network/environment/src/traits/types.rs b/console/network/environment/src/traits/types.rs
+index 711244b78..358ab3e5d 100644
+--- a/console/network/environment/src/traits/types.rs
++++ b/console/network/environment/src/traits/types.rs
+@@ -276,6 +276,7 @@ pub trait IntegerCore<I: integer_type::IntegerType>:
+     + for<'a> DivAssign<&'a Self>
+     + Eq
+     + Equal
++    + Modulo
+     + Mul<Self, Output = Self>
+     + for<'a> Mul<&'a Self, Output = Self>
+     + MulAssign<Self>
+@@ -284,6 +285,10 @@ pub trait IntegerCore<I: integer_type::IntegerType>:
+     + Not<Output = Self>
+     + One
+     + Parser
++    + Rem<Self, Output = Self>
++    + for<'a> Rem<&'a Self, Output = Self>
++    + RemAssign<Self>
++    + for<'a> RemAssign<&'a Self>
+     + Send
+     + SizeInBits
+     + SizeInBytes
+@@ -341,6 +346,7 @@ pub(super) mod integer_type {
+         + FromBytes
+         + FromStr<Err = ParseIntError>
+         + Hash
++        + Modulo
+         + NumZero
+         + NumOne
+         + PartialOrd
+@@ -427,6 +433,26 @@ pub(super) mod integer_type {
+     #[rustfmt::skip]
+     binary_impl!(CheckedShl, i128, checked_shl, self, v, u32, Option<i128>, u128::checked_pow(2u128, *v).and_then(|x| i128::checked_mul(if (x as i128) == i128::MIN { self.wrapping_neg() } else { *self }, x as i128)));
+ 
++    pub trait Modulo: Sized + Rem<Self, Output = Self> {
++        fn modulo(&self, v: &Self) -> Self;
++    }
++
++    binary_impl!(Modulo, u8, modulo, self, v, Self, u8, u8::wrapping_rem(*self, *v));
++    binary_impl!(Modulo, u16, modulo, self, v, Self, u16, u16::wrapping_rem(*self, *v));
++    binary_impl!(Modulo, u32, modulo, self, v, Self, u32, u32::wrapping_rem(*self, *v));
++    binary_impl!(Modulo, u64, modulo, self, v, Self, u64, u64::wrapping_rem(*self, *v));
++    binary_impl!(Modulo, u128, modulo, self, v, Self, u128, u128::wrapping_rem(*self, *v));
++    #[rustfmt::skip]
++    binary_impl!(Modulo, i8, modulo, self, _v, Self, i8, panic!("modulo is not implemented for i8"));
++    #[rustfmt::skip]
++    binary_impl!(Modulo, i16, modulo, self, _v, Self, i16, panic!("modulo is not implemented for i16"));
++    #[rustfmt::skip]
++    binary_impl!(Modulo, i32, modulo, self, _v, Self, i32, panic!("modulo is not implemented for i32"));
++    #[rustfmt::skip]
++    binary_impl!(Modulo, i64, modulo, self, _v, Self, i64, panic!("modulo is not implemented for i64"));
++    #[rustfmt::skip]
++    binary_impl!(Modulo, i128, modulo, self, _v, Self, i128, panic!("modulo is not implemented for i128"));
++
+     pub trait WrappingDiv: Sized + Div<Self, Output = Self> {
+         fn wrapping_div(&self, v: &Self) -> Self;
+     }
+diff --git a/console/types/integers/src/arithmetic.rs b/console/types/integers/src/arithmetic.rs
+index 13408fbca..2eb52b2ba 100644
+--- a/console/types/integers/src/arithmetic.rs
++++ b/console/types/integers/src/arithmetic.rs
+@@ -296,6 +296,22 @@ impl<E: Environment, I: IntegerType> DivAssign<&Integer<E, I>> for Integer<E, I>
      }
  }
-@@ -300,13 +301,13 @@ mod tests {
-         let Query::REST(rest) = query else { panic!() };
-         assert_eq!(rest.base_url.path_and_query().unwrap().to_string(), "/");
-         assert_eq!(rest.base_url.to_string(), withslash);
--        assert_eq!(rest.build_endpoint(route)?, format!("{noslash}/v2/testnet/{route}"));
-+        assert_eq!(rest.build_endpoint(route)?, format!("{noslash}/testnet/{route}"));
  
-         let query = withslash.parse::<CurrentQuery>().unwrap();
-         let Query::REST(rest) = query else { panic!() };
-         assert_eq!(rest.base_url.path_and_query().unwrap().to_string(), "/");
-         assert_eq!(rest.base_url.to_string(), withslash);
--        assert_eq!(rest.build_endpoint(route)?, format!("{noslash}/v2/testnet/{route}"));
-+        assert_eq!(rest.build_endpoint(route)?, format!("{noslash}/testnet/{route}"));
++impl<E: Environment, I: IntegerType> Modulo<Integer<E, I>> for Integer<E, I> {
++    type Output = Integer<E, I>;
++
++    /// Returns the result of taking the modulus of `self` with respect to `other`.
++    #[inline]
++    fn modulo(&self, other: &Integer<E, I>) -> Self {
++        match I::is_signed() {
++            true => E::halt("Taking the modulus of signed integers is not supported"),
++            false => match other.is_zero() {
++                true => E::halt(format!("Integer modulus by zero: {self} % {other}")),
++                false => Integer::new(self.integer.modulo(&other.integer)),
++            },
++        }
++    }
++}
++
+ impl<E: Environment, I: IntegerType> Rem<Integer<E, I>> for Integer<E, I> {
+     type Output = Integer<E, I>;
  
-         Ok(())
-     }
-@@ -323,34 +324,19 @@ mod tests {
+diff --git a/curves/documentation/the_aleo_curves/00_overview.md b/curves/documentation/the_aleo_curves/00_overview.md
+index 5bcd7d326..759472cf6 100644
+--- a/curves/documentation/the_aleo_curves/00_overview.md
++++ b/curves/documentation/the_aleo_curves/00_overview.md
+@@ -1,11 +1,11 @@
+ Aleo uses a tailored set of pairing-friendly elliptic curves to perform efficient proof generation and verification.
  
-     #[test]
-     fn test_rest_url_parse_with_suffix() -> Result<()> {
--        let base = "http://localhost:3030/a/prefix";
-+        let base = "http://localhost:3030/a/prefix/v2";
-         let route = "a/route";
--        let query = base.parse::<CurrentQuery>().unwrap();
--        let Query::REST(rest_query) = &query else { panic!() };
--        assert!(!rest_query.has_api_version);
+-|                     |  Edwards BLS12  |     BLS12-377      |   Edwards BW6   |
+-|:------------------- |:---------------:|:------------------:|:---------------:|
+-| Curve Type          | Twisted Edwards | Barreto-Lynn-Scott | Twisted Edwards |
+-| Scalar Field Size   |    251 bits     |      253 bits      |    374 bits     |
+-| Base Field Size     |    253 bits     |      377 bits      |    377 bits     |
+-| G1 Compressed Size* |    32 bytes     |      48 bytes      |    48 bytes     |
+-| G2 Compressed Size* |       N/A       |      96 bytes      |       N/A       |
++|                     |  Edwards BLS12  |     BLS12-377      |
++|:------------------- |:---------------:|:------------------:|
++| Curve Type          | Twisted Edwards | Barreto-Lynn-Scott |
++| Scalar Field Size   |    251 bits     |      253 bits      |
++| Base Field Size     |    253 bits     |      377 bits      |
++| G1 Compressed Size* |    32 bytes     |      48 bytes      |
++| G2 Compressed Size* |       N/A       |      96 bytes      |
  
-         // Test without trailing slash.
-+        let query = base.parse::<CurrentQuery>().unwrap();
-         let Query::REST(rest) = query else { panic!() };
--        assert_eq!(rest.build_endpoint(route)?, format!("{base}/v2/testnet/{route}"));
-+        assert_eq!(rest.build_endpoint(route)?, format!("{base}/testnet/{route}"));
- 
-         // Set again with trailing slash.
-         let query = format!("{base}/").parse::<CurrentQuery>().unwrap();
-         let Query::REST(rest) = query else { panic!() };
--        assert_eq!(rest.build_endpoint(route)?, format!("{base}/v2/testnet/{route}"));
-+        assert_eq!(rest.build_endpoint(route)?, format!("{base}/testnet/{route}"));
- 
-         Ok(())
-     }
+ \* rounded to multiples of 8 bytes.
+diff --git a/curves/documentation/the_aleo_curves/03_edwards_bw6.md b/curves/documentation/the_aleo_curves/03_edwards_bw6.md
+deleted file mode 100644
+index 42c7c36f6..000000000
+--- a/curves/documentation/the_aleo_curves/03_edwards_bw6.md
++++ /dev/null
+@@ -1,71 +0,0 @@
+-### Scalar Field
 -
--    #[test]
--    fn test_rest_url_parse_with_api_version() {
--        let base = "http://localhost:3030/a/prefix/v1";
--        let query = base.parse::<CurrentQuery>().unwrap();
--        let Query::REST(rest_query) = &query else { panic!() };
--        assert!(rest_query.has_api_version);
+-#### Modulus
 -
--        let base = "http://localhost:3030/a/prefix/v2/";
--        let query = base.parse::<CurrentQuery>().unwrap();
--        let Query::REST(rest_query) = &query else { panic!() };
--        assert!(rest_query.has_api_version);
+-##### Integer Representation
+-```ignore
+-32333053251621136751331591711861691692049189094364332567435817881934511297123972799646723302813083835942624121493
+-```
+-
+-##### Hexadecimal Representation
+-```ignore
+-0035c748c2f8a21d58c760b80d94292763445b3e601ea271e1d75fe7d6eeb84234066d10f5d893814103486497d95295
+-```
+-
+-##### U64 Representation (Little-Endian)
+-```ignore
+-[4684667634276979349, 3748803659444032385, 16273581227874629698, 7152942431629910641, 6397188139321141543, 15137289088311837]
+-```
+-
+-#### Root of Unity
+-
+-##### Integer Representation
+-```ignore
+-4045479506506707059583837976038047929582398534241670004595142696897457385453373366260645700405062319293168935493
+-```
+-
+-##### Hexadecimal Representation
+-```ignore
+-0006ba8c867eaccf5f7e46bcdb07d0f4b2595092eedff5c5603102866827125373710874d7416d75a832273177b0e245
+-```
+-
+-##### U64 Representation (Little-Endian)
+-```ignore
+-[12119792640622387781, 8318439284650634613, 6931324077796168275, 12851391603681523141, 6881015057611215092, 1893962574900431]
+-```
+-
+-### Base Field
+-
+-#### Modulus
+-
+-##### Integer Representation
+-```ignore
+-258664426012969094010652733694893533536393512754914660539884262666720468348340822774968888139573360124440321458177
+-```
+-
+-##### Hexadecimal Representation
+-```ignore
+-01ae3a4617c510eac63b05c06ca1493b1a22d9f300f5138f1ef3622fba094800170b5d44300000008508c00000000001
+-```
+-
+-##### U64 Representation (Little-Endian)
+-```ignore
+-[9586122913090633729, 1660523435060625408, 2230234197602682880, 1883307231910630287, 14284016967150029115, 121098312706494698]
+-```
+-
+-#### Root of Unity
+-
+-##### Integer Representation
+-```ignore
+-146552004846884389553264564610149105174701957497228680529098805315416492923550540437026734404078567406251254115855
+-```
+-
+-##### Hexadecimal Representation
+-```ignore
+-00f3c1414ef58c54f95564f4cbc1b61fee086c1fe367c33776da78169a7f3950f1bd15c3898dd1af1c104955744e6e0f
+-```
+-
+-##### U64 Representation (Little-Endian)
+-```ignore
+-[2022196864061697551, 17419102863309525423, 8564289679875062096, 17152078065055548215, 17966377291017729567, 68610905582439508]
+-```
+diff --git a/curves/src/edwards_bw6/fq.rs b/curves/src/edwards_bw6/fq.rs
+deleted file mode 100644
+index e67237276..000000000
+--- a/curves/src/edwards_bw6/fq.rs
++++ /dev/null
+@@ -1,17 +0,0 @@
+-// Copyright (C) 2019-2022 Aleo Systems Inc.
+-// This file is part of the snarkVM library.
+-
+-// The snarkVM library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The snarkVM library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
+-
+-pub use crate::bls12_377::fq::{Fq, FqParameters};
+diff --git a/curves/src/edwards_bw6/fr.rs b/curves/src/edwards_bw6/fr.rs
+deleted file mode 100644
+index 13ba33d58..000000000
+--- a/curves/src/edwards_bw6/fr.rs
++++ /dev/null
+@@ -1,134 +0,0 @@
+-// Copyright (C) 2019-2022 Aleo Systems Inc.
+-// This file is part of the snarkVM library.
+-
+-// The snarkVM library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The snarkVM library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
+-
+-use snarkvm_fields::{
+-    FftParameters,
+-    FieldParameters,
+-    Fp384,
+-    Fp384Parameters,
+-    PoseidonDefaultParameters,
+-    PoseidonDefaultParametersEntry,
+-};
+-use snarkvm_utilities::biginteger::BigInteger384 as BigInteger;
+-
+-pub type Fr = Fp384<FrParameters>;
+-
+-pub struct FrParameters;
+-
+-impl Fp384Parameters for FrParameters {}
+-
+-impl FftParameters for FrParameters {
+-    type BigInteger = BigInteger;
+-
+-    const TWO_ADICITY: u32 = 2u32;
+-    #[rustfmt::skip]
+-    const TWO_ADIC_ROOT_OF_UNITY: BigInteger = BigInteger([
+-        12119792640622387781u64,
+-        8318439284650634613u64,
+-        6931324077796168275u64,
+-        12851391603681523141u64,
+-        6881015057611215092u64,
+-        1893962574900431u64,
+-    ]);
+-}
+-
+-impl FieldParameters for FrParameters {
+-    #[rustfmt::skip]
+-    const CAPACITY: u32 = Self::MODULUS_BITS - 1;
+-    /// 2
+-    #[rustfmt::skip]
+-    const GENERATOR: BigInteger = BigInteger([
+-        1999556893213776791u64,
+-        13750542494830678672u64,
+-        1782306145063399878u64,
+-        452443773434042853u64,
+-        15997990832658725900u64,
+-        3914639203155617u64,
+-    ]);
+-    #[rustfmt::skip]
+-    const INV: u64 = 16242011933465909059u64;
+-    /// MODULUS = 32333053251621136751331591711861691692049189094364332567435817881934511297123972799646723302813083835942624121493
+-    #[rustfmt::skip]
+-    const MODULUS: BigInteger = BigInteger([
+-        4684667634276979349u64,
+-        3748803659444032385u64,
+-        16273581227874629698u64,
+-        7152942431629910641u64,
+-        6397188139321141543u64,
+-        15137289088311837u64,
+-    ]);
+-    #[rustfmt::skip]
+-    const MODULUS_BITS: u32 = 374;
+-    #[rustfmt::skip]
+-    const MODULUS_MINUS_ONE_DIV_TWO: BigInteger = BigInteger([
+-        11565705853993265482u64,
+-        1874401829722016192u64,
+-        17360162650792090657u64,
+-        12799843252669731128u64,
+-        12421966106515346579u64,
+-        7568644544155918u64,
+-    ]);
+-    #[rustfmt::skip]
+-    const R: BigInteger = BigInteger([
+-        12565484300600153878u64,
+-        8749673077137355528u64,
+-        9027943686469014788u64,
+-        13026065139386752555u64,
+-        11197589485989933721u64,
+-        9525964145733727u64,
+-    ]);
+-    #[rustfmt::skip]
+-    const R2: BigInteger = BigInteger([
+-        17257035094703902127u64,
+-        16096159112880350050u64,
+-        3498553494623421763u64,
+-        333405339929360058u64,
+-        1125865524035793947u64,
+-        1586246138566285u64,
+-    ]);
+-    #[rustfmt::skip]
+-    const REPR_SHAVE_BITS: u32 = 10;
+-    #[rustfmt::skip]
+-    const T: BigInteger = BigInteger([
+-        5782852926996632741,
+-        10160572951715783904,
+-        8680081325396045328,
+-        15623293663189641372,
+-        6210983053257673289,
+-        3784322272077959
+-    ]);
+-    #[rustfmt::skip]
+-    const T_MINUS_ONE_DIV_TWO: BigInteger = BigInteger([
+-        2891426463498316370,
+-        5080286475857891952,
+-        4340040662698022664,
+-        17035018868449596494,
+-        12328863563483612452,
+-        1892161136038979
+-    ]);
+-}
+-
+-impl PoseidonDefaultParameters for FrParameters {
+-    const PARAMS_OPT_FOR_CONSTRAINTS: [PoseidonDefaultParametersEntry; 7] = [
+-        PoseidonDefaultParametersEntry::new(2, 5, 8, 56, 0),
+-        PoseidonDefaultParametersEntry::new(3, 5, 8, 56, 0),
+-        PoseidonDefaultParametersEntry::new(4, 5, 8, 56, 0),
+-        PoseidonDefaultParametersEntry::new(5, 5, 8, 57, 0),
+-        PoseidonDefaultParametersEntry::new(6, 5, 8, 57, 0),
+-        PoseidonDefaultParametersEntry::new(7, 5, 8, 57, 0),
+-        PoseidonDefaultParametersEntry::new(8, 5, 8, 57, 0),
+-    ];
+-}
+diff --git a/curves/src/edwards_bw6/mod.rs b/curves/src/edwards_bw6/mod.rs
+deleted file mode 100644
+index 2013e36ea..000000000
+--- a/curves/src/edwards_bw6/mod.rs
++++ /dev/null
+@@ -1,32 +0,0 @@
+-// Copyright (C) 2019-2022 Aleo Systems Inc.
+-// This file is part of the snarkVM library.
+-
+-// The snarkVM library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The snarkVM library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
+-
+-#![cfg_attr(nightly, doc = include_str!("../../documentation/the_aleo_curves/03_edwards_bw6.md"))]
+-
+-pub mod fq;
+-#[doc(inline)]
+-pub use fq::*;
+-
+-pub mod fr;
+-#[doc(inline)]
+-pub use fr::*;
+-
+-pub mod parameters;
+-#[doc(inline)]
+-pub use parameters::*;
+-
+-#[cfg(test)]
+-mod tests;
+diff --git a/curves/src/edwards_bw6/parameters.rs b/curves/src/edwards_bw6/parameters.rs
+deleted file mode 100644
+index 6a6188f23..000000000
+--- a/curves/src/edwards_bw6/parameters.rs
++++ /dev/null
+@@ -1,176 +0,0 @@
+-// Copyright (C) 2019-2022 Aleo Systems Inc.
+-// This file is part of the snarkVM library.
+-
+-// The snarkVM library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The snarkVM library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
+-
+-use crate::{
+-    edwards_bw6::{Fq, Fr},
+-    errors::GroupError,
+-    templates::twisted_edwards_extended::{Affine, Projective},
+-    traits::{AffineCurve, ModelParameters, MontgomeryParameters, TwistedEdwardsParameters},
+-};
+-use snarkvm_fields::field;
+-use snarkvm_utilities::biginteger::BigInteger384 as BigInteger;
+-
+-use std::str::FromStr;
+-
+-pub type EdwardsAffine = Affine<EdwardsParameters>;
+-pub type EdwardsProjective = Projective<EdwardsParameters>;
+-
+-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+-pub struct EdwardsParameters;
+-
+-impl ModelParameters for EdwardsParameters {
+-    type BaseField = Fq;
+-    type ScalarField = Fr;
+-}
+-
+-impl TwistedEdwardsParameters for EdwardsParameters {
+-    type MontgomeryParameters = EdwardsParameters;
+-
+-    /// AFFINE_GENERATOR_COEFFS = (GENERATOR_X, GENERATOR_Y)
+-    const AFFINE_GENERATOR_COEFFS: (Self::BaseField, Self::BaseField) = (GENERATOR_X, GENERATOR_Y);
+-    /// COEFF_A = -1 =
+-    /// 258664426012969094010652733694893533536393512754914660539884262666720468348340822774968888139573360124440321458176
+-    const COEFF_A: Fq = field!(
+-        Fq,
+-        BigInteger([
+-            9384023879812382873,
+-            14252412606051516495,
+-            9184438906438551565,
+-            11444845376683159689,
+-            8738795276227363922,
+-            81297770384137296,
+-        ])
+-    );
+-    /// COEFF_D = 79743
+-    const COEFF_D: Fq = field!(
+-        Fq,
+-        BigInteger([
+-            0x4669ffffff46a638,
+-            0xa56bbe0a7f9fae05,
+-            0x403b425466a710b4,
+-            0xf6648db6ea4e988b,
+-            0x74d51b5923d35a8d,
+-            0xf8ed90b17fe903,
+-        ])
+-    );
+-    /// COFACTOR = 8
+-    const COFACTOR: &'static [u64] = &[8];
+-    /// COFACTOR^(-1) mod r =
+-    /// 12124894969357926281749346891948134384518445910386624712788431705725441736421489799867521238554906438478484045560
+-    const COFACTOR_INV: Fr = field!(
+-        Fr,
+-        BigInteger([
+-            7353538464571651976,
+-            2030910049503177537,
+-            16726103313845754033,
+-            1110650741117127777,
+-            5304838729792721053,
+-            4975067790294675,
+-        ])
+-    );
+-
+-    /// Multiplication by `a` is just negation.
+-    #[inline(always)]
+-    fn mul_by_a(elem: &Self::BaseField) -> Self::BaseField {
+-        -*elem
 -    }
- }
-diff --git a/synthesizer/Cargo.toml b/synthesizer/Cargo.toml
-index ce156ba46..1f05f241f 100644
---- a/synthesizer/Cargo.toml
-+++ b/synthesizer/Cargo.toml
-@@ -60,7 +60,6 @@ wasm = [
- ]
- dev-print = [ "snarkvm-utilities/dev-print" ]
- dev_skip_checks = [ "snarkvm-synthesizer-process/dev_skip_checks" ]
--test_consensus_heights = [ "snarkvm-synthesizer-process/test_consensus_heights" ]
- 
- [[bench]]
- name = "kary_merkle_tree"
-diff --git a/synthesizer/process/Cargo.toml b/synthesizer/process/Cargo.toml
-index 2ba141357..1530cda61 100644
---- a/synthesizer/process/Cargo.toml
-+++ b/synthesizer/process/Cargo.toml
-@@ -47,7 +47,6 @@ test = [ "snarkvm-console/test" ]
- timer = [ "aleo-std/timer" ]
- dev-print = [ "snarkvm-utilities/dev-print" ]
- dev_skip_checks = [ ]
--test_consensus_heights = [ ]
- 
- [[bench]]
- name = "stack_operations"
-diff --git a/synthesizer/process/src/stack/deploy.rs b/synthesizer/process/src/stack/deploy.rs
-index 160a040e8..5834318ab 100644
---- a/synthesizer/process/src/stack/deploy.rs
-+++ b/synthesizer/process/src/stack/deploy.rs
-@@ -64,18 +64,10 @@ impl<N: Network> Stack<N> {
-     ) -> Result<()> {
-         let timer = timer!("Stack::verify_deployment");
- 
--        // NOTE: As developer, you will likely still want to confirm that your
--        // deployment is within R1CS constraint and variable limits using
--        // targeted and parallelized synthesis.
--        if cfg!(all(feature = "dev_skip_checks", feature = "test_consensus_heights")) {
--            return Ok(());
+-}
+-
+-impl MontgomeryParameters for EdwardsParameters {
+-    type TwistedEdwardsParameters = EdwardsParameters;
+-
+-    /// COEFF_A = 0x95D53EB3F6AC3F7A53C26020144439DC6073BCAE513E03FD06B6B3BAA390F25E51534B26719E33F4CD906D4DA9B535
+-    const COEFF_A: Fq = field!(
+-        Fq,
+-        BigInteger([
+-            7594254284108454966u64,
+-            14287343397973578077u64,
+-            6490358977072726023u64,
+-            8023375322051995268u64,
+-            8242802613686040715u64,
+-            100541941146122331u64,
+-        ])
+-    );
+-    /// COEFF_B = 0x118650763CE64AB4BE743604C8D05013DC2663652A3D58B21ECAB7BFF65B70DB8BA09F9098E61CC903B2F92B2564ACA
+-    const COEFF_B: Fq = field!(
+-        Fq,
+-        BigInteger([
+-            11173793475516310780u64,
+-            14217481814129454913u64,
+-            11878518835804377107u64,
+-            14866315431314324110u64,
+-            9234787938768687129u64,
+-            62053599622152261u64,
+-        ])
+-    );
+-}
+-
+-impl FromStr for EdwardsAffine {
+-    type Err = GroupError;
+-
+-    fn from_str(mut s: &str) -> Result<Self, Self::Err> {
+-        s = s.trim();
+-        if s.is_empty() {
+-            return Err(GroupError::ParsingEmptyString);
 -        }
+-        if s.len() < 3 {
+-            return Err(GroupError::InvalidString);
+-        }
+-        if !(s.starts_with('(') && s.ends_with(')')) {
+-            return Err(GroupError::InvalidString);
+-        }
+-        let mut point = Vec::new();
+-        for substr in s.split(|c| c == '(' || c == ')' || c == ',' || c == ' ') {
+-            if !substr.is_empty() {
+-                point.push(Fq::from_str(substr)?);
+-            }
+-        }
+-        if point.len() != 2 {
+-            return Err(GroupError::InvalidGroupElement);
+-        }
+-        let point = EdwardsAffine::new(point[0], point[1]);
 -
-         // Sanity Checks //
+-        if !point.is_on_curve() { Err(GroupError::InvalidGroupElement) } else { Ok(point) }
+-    }
+-}
+-
+-/// GENERATOR_X =
+-/// 174701772324485506941690903512423551998294352968833659960042362742684869862495746426366187462669992073196420267127
+-const GENERATOR_X: Fq = field!(
+-    Fq,
+-    BigInteger([
+-        3737364149926089590,
+-        13002967008679663837,
+-        9954144214462864555,
+-        3365719140389487049,
+-        8643066672427471196,
+-        120355578793479865,
+-    ])
+-);
+-
+-/// GENERATOR_Y =
+-/// 208487200052258845495340374451540775445408439654930191324011635560142523886549663106522691296420655144190624954833
+-const GENERATOR_Y: Fq = field!(
+-    Fq,
+-    BigInteger([
+-        6027299446526298157,
+-        12854429557810467099,
+-        11207279014226687864,
+-        17040621363687352702,
+-        6112671509202865855,
+-        44040319652922447,
+-    ])
+-);
+diff --git a/curves/src/edwards_bw6/tests.rs b/curves/src/edwards_bw6/tests.rs
+deleted file mode 100644
+index 7b89652c3..000000000
+--- a/curves/src/edwards_bw6/tests.rs
++++ /dev/null
+@@ -1,88 +0,0 @@
+-// Copyright (C) 2019-2022 Aleo Systems Inc.
+-// This file is part of the snarkVM library.
+-
+-// The snarkVM library is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-
+-// The snarkVM library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-// GNU General Public License for more details.
+-
+-// You should have received a copy of the GNU General Public License
+-// along with the snarkVM library. If not, see <https://www.gnu.org/licenses/>.
+-
+-use crate::{
+-    edwards_bw6::*,
+-    templates::twisted_edwards_extended::tests::{edwards_test, montgomery_conversion_test},
+-    traits::{
+-        tests_field::{field_serialization_test, field_test, primefield_test},
+-        tests_group::*,
+-        tests_projective::curve_tests,
+-        AffineCurve,
+-        ProjectiveCurve,
+-    },
+-};
+-
+-#[test]
+-fn test_edwards_bw6_fr() {
+-    let a: Fr = rand::random();
+-    let b: Fr = rand::random();
+-    field_test(a, b);
+-    primefield_test::<Fr>();
+-    field_serialization_test::<Fr>();
+-}
+-
+-#[test]
+-fn test_edwards_bw6_fq() {
+-    let a: Fq = rand::random();
+-    let b: Fq = rand::random();
+-    field_test(a, b);
+-    primefield_test::<Fq>();
+-    field_serialization_test::<Fq>();
+-}
+-
+-#[test]
+-fn test_projective_curve() {
+-    curve_tests::<EdwardsProjective>();
+-    edwards_test::<EdwardsParameters>();
+-}
+-
+-#[test]
+-fn test_projective_group() {
+-    for _i in 0..10 {
+-        let a = rand::random();
+-        let b = rand::random();
+-        projective_test::<EdwardsProjective>(a, b);
+-    }
+-}
+-
+-#[test]
+-fn test_affine_group() {
+-    for _i in 0..10 {
+-        let a: EdwardsAffine = rand::random();
+-        affine_test::<EdwardsAffine>(a);
+-    }
+-}
+-
+-#[test]
+-fn test_generator() {
+-    let generator = EdwardsAffine::prime_subgroup_generator();
+-    assert!(generator.is_on_curve());
+-    assert!(generator.is_in_correct_subgroup_assuming_on_curve());
+-}
+-
+-#[test]
+-fn test_conversion() {
+-    let a: EdwardsAffine = rand::random();
+-    let b: EdwardsAffine = rand::random();
+-    assert_eq!(a.to_projective().to_affine(), a);
+-    assert_eq!(b.to_projective().to_affine(), b);
+-}
+-
+-#[test]
+-fn test_montgomery_conversion() {
+-    montgomery_conversion_test::<EdwardsParameters>();
+-}
+diff --git a/curves/src/lib.rs b/curves/src/lib.rs
+index 4aa3269fc..8c84b5523 100644
+--- a/curves/src/lib.rs
++++ b/curves/src/lib.rs
+@@ -29,8 +29,6 @@ pub mod bls12_377;
  
-         // Ensure the deployment is ordered.
-         deployment.check_is_ordered()?;
+ pub mod edwards_bls12;
+ 
+-pub mod edwards_bw6;
 -
-         // Ensure the program in the stack and deployment matches.
-         ensure!(&self.program == deployment.program(), "The stack program does not match the deployment program");
-         // If the deployment contains a checksum, ensure it matches the one computed by the stack.
-diff --git a/synthesizer/process/src/trace/mod.rs b/synthesizer/process/src/trace/mod.rs
-index 6840684d2..8f0e59924 100644
---- a/synthesizer/process/src/trace/mod.rs
-+++ b/synthesizer/process/src/trace/mod.rs
-@@ -237,7 +237,7 @@ impl<N: Network> Trace<N> {
-         verifier_inputs: Vec<(VerifyingKey<N>, Vec<Vec<N::Field>>)>,
-         execution: &Execution<N>,
-     ) -> Result<()> {
--        if cfg!(all(feature = "dev_skip_checks", feature = "test_consensus_heights")) {
-+        if cfg!(feature = "dev_skip_checks") {
-             return Ok(());
-         }
-         // Retrieve the global state root.
-@@ -271,7 +271,7 @@ impl<N: Network> Trace<N> {
-         verifier_inputs: (VerifyingKey<N>, Vec<Vec<N::Field>>),
-         fee: &Fee<N>,
-     ) -> Result<()> {
--        if cfg!(all(feature = "dev_skip_checks", feature = "test_consensus_heights")) {
-+        if cfg!(feature = "dev_skip_checks") {
-             return Ok(());
-         }
-         // Retrieve the global state root.
+ pub mod errors;
+ pub use errors::*;
+ 
+diff --git a/vm/compiler/src/program/instruction/mod.rs b/vm/compiler/src/program/instruction/mod.rs
+index faafc0c3f..c215d5ae4 100644
+--- a/vm/compiler/src/program/instruction/mod.rs
++++ b/vm/compiler/src/program/instruction/mod.rs
+@@ -123,6 +123,8 @@ pub enum Instruction<N: Network> {
+     LessThan(LessThan<N>),
+     /// Computes whether `first` is less than or equal to `second` as a boolean, storing the outcome in `destination`.
+     LessThanOrEqual(LessThanOrEqual<N>),
++    /// Computes `first` mod `second`, storing the outcome in `destination`.
++    Modulo(Modulo<N>),
+     /// Multiplies `first` with `second`, storing the outcome in `destination`.
+     Mul(Mul<N>),
+     /// Multiplies `first` with `second`, wrapping around at the boundary of the type, and storing the outcome in `destination`.
+@@ -228,6 +230,7 @@ macro_rules! instruction {
+             IsNotEqual,
+             LessThan,
+             LessThanOrEqual,
++            Modulo,
+             Mul,
+             MulWrapped,
+             Nand,
+@@ -395,7 +398,7 @@ mod tests {
+     fn test_opcodes() {
+         // Sanity check the number of instructions is unchanged.
+         assert_eq!(
+-            51,
++            52,
+             Instruction::<CurrentNetwork>::OPCODES.len(),
+             "Update me if the number of instructions changes."
+         );
+diff --git a/vm/compiler/src/program/instruction/operation/mod.rs b/vm/compiler/src/program/instruction/operation/mod.rs
+index c7cf8ad56..78c8a554e 100644
+--- a/vm/compiler/src/program/instruction/operation/mod.rs
++++ b/vm/compiler/src/program/instruction/operation/mod.rs
+@@ -323,6 +323,19 @@ crate::operation!(
+     }
+ );
+ 
++/// Computes the result of `first` mod `second`, storing the outcome in the destination.
++pub type Modulo<N> = BinaryLiteral<N, ModuloOperation<N>>;
++
++crate::operation!(
++    pub struct ModuloOperation<console::prelude::Modulo, circuit::prelude::Modulo, modulo, "mod"> {
++        (U8, U8) => U8("ensure divide by zero halts"),
++        (U16, U16) => U16("ensure divide by zero halts"),
++        (U32, U32) => U32("ensure divide by zero halts"),
++        (U64, U64) => U64("ensure divide by zero halts"),
++        (U128, U128) => U128("ensure divide by zero halts"),
++    }
++);
++
+ /// Multiplies `first` and `second`, storing the outcome in `destination`.
+ pub type Mul<N> = BinaryLiteral<N, MulOperation<N>>;
+ 
+diff --git a/wasm/src/lib.rs b/wasm/src/lib.rs
+index b5989da4c..8ad5926fa 100644
+--- a/wasm/src/lib.rs
++++ b/wasm/src/lib.rs
+@@ -18,7 +18,7 @@
+ pub use snarkvm_console::*;
+ 
+ #[cfg(feature = "curves")]
+-pub use snarkvm_curves::{bls12_377::*, edwards_bls12::*, edwards_bw6::*};
++pub use snarkvm_curves::{bls12_377::*, edwards_bls12::*};
+ 
+ #[cfg(feature = "fields")]
+ pub use snarkvm_fields::*;

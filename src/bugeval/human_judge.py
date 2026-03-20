@@ -291,7 +291,7 @@ def export_cmd(run_dir: str, output_path: str | None, sample_rate: float) -> Non
     # Load normalized results so the CSV includes tool comments for raters.
     normalized: dict[tuple[str, str], NormalizedResult] = {}
     for path in resolved.glob("*.yaml"):
-        if path.name == "checkpoint.yaml":
+        if path.name in ("checkpoint.yaml",):
             continue
         data = yaml.safe_load(path.read_text()) or {}
         try:

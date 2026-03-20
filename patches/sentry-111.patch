@@ -1,0 +1,1391 @@
+diff --git a/src/sentry/dashboards/endpoints/organization_dashboards.py b/src/sentry/dashboards/endpoints/organization_dashboards.py
+index 4c5f03a2c49b99..286f2653713cb0 100644
+--- a/src/sentry/dashboards/endpoints/organization_dashboards.py
++++ b/src/sentry/dashboards/endpoints/organization_dashboards.py
+@@ -96,7 +96,6 @@ class PrebuiltDashboardId(IntEnum):
+ class PrebuiltDashboard(TypedDict, total=False):
+     prebuilt_id: Required[PrebuiltDashboardId]
+     title: Required[str]
+-    pre_favorited: bool
+ 
+ 
+ # Prebuilt dashboards store minimal fields in the database. The actual dashboard and widget settings are
+@@ -132,7 +131,6 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.WEB_VITALS,
+         "title": "Web Vitals",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.WEB_VITALS_SUMMARY,
+@@ -141,7 +139,6 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.MOBILE_VITALS,
+         "title": "Mobile Vitals",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.MOBILE_VITALS_APP_STARTS,
+@@ -158,7 +155,6 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.BACKEND_OVERVIEW,
+         "title": "Backend Overview",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.MOBILE_SESSION_HEALTH,
+@@ -195,12 +191,10 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.AI_AGENTS_OVERVIEW,
+         "title": "AI Agents Overview",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.MCP_OVERVIEW,
+         "title": "MCP Overview",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.LARAVEL_OVERVIEW,
+@@ -297,41 +291,6 @@ def sync_prebuilt_dashboards(organization: Organization) -> None:
+         ).exclude(prebuilt_id__in=prebuilt_ids).delete()
+ 
+ 
+-def sync_prebuilt_dashboards_favorited(organization: Organization, user_id: int) -> None:
+-    """
+-    Checks if pre-favorited prebuilt dashboards have a DashboardFavoriteUser record for the
+-    user, and creates them if they don't. This ensures that certain prebuilt dashboards are
+-    favorited by default for all users.
+-    """
+-    enabled_prebuilt_dashboards = get_enabled_prebuilt_dashboards(organization)
+-    pre_favorited_ids = [
+-        d["prebuilt_id"] for d in enabled_prebuilt_dashboards if d.get("pre_favorited")
+-    ]
+-    if not pre_favorited_ids:
+-        return
+-
+-    with transaction.atomic(router.db_for_write(DashboardFavoriteUser)):
+-        prebuilt_dashboards_without_favorite = (
+-            Dashboard.objects.filter(
+-                organization=organization,
+-                prebuilt_id__in=pre_favorited_ids,
+-            )
+-            .exclude(
+-                id__in=DashboardFavoriteUser.objects.filter(
+-                    organization=organization,
+-                    user_id=user_id,
+-                ).values_list("dashboard_id", flat=True)
+-            )
+-            .order_by("prebuilt_id")
+-        )
+-        for dashboard in prebuilt_dashboards_without_favorite:
+-            DashboardFavoriteUser.objects.insert_favorite_dashboard(
+-                organization=organization,
+-                user_id=user_id,
+-                dashboard=dashboard,
+-            )
+-
+-
+ class OrganizationDashboardsPermission(OrganizationPermission):
+     scope_map = {
+         "GET": ["org:read", "org:write", "org:admin"],
+@@ -421,20 +380,6 @@ def get(self, request: Request, organization: Organization) -> Response:
+             except Exception as err:
+                 sentry_sdk.capture_exception(err)
+ 
+-            # Favorite pre-favorited prebuilt dashboards for the user
+-            try:
+-                favorite_lock = locks.get(
+-                    f"dashboards:sync_prebuilt_dashboards_favorited:{organization.id}:{request.user.id}",
+-                    duration=10,
+-                    name="sync_prebuilt_dashboards_favorited",
+-                )
+-                with favorite_lock.acquire():
+-                    sync_prebuilt_dashboards_favorited(organization, request.user.id)
+-            except UnableToAcquireLock:
+-                pass
+-            except Exception as err:
+-                sentry_sdk.capture_exception(err)
+-
+         filters = request.query_params.getlist("filter")
+ 
+         dashboards = Dashboard.objects.filter(organization_id=organization.id)
+diff --git a/src/sentry/preprod/url_utils.py b/src/sentry/preprod/url_utils.py
+index 995963b39534e6..31a9fce9ddad49 100644
+--- a/src/sentry/preprod/url_utils.py
++++ b/src/sentry/preprod/url_utils.py
+@@ -1,10 +1,16 @@
+ from __future__ import annotations
+ 
++from typing import Literal
++
+ from sentry.models.organization import Organization
+ from sentry.preprod.models import PreprodArtifact
+ 
++ViewType = Literal["size", "snapshots", "install"]
++
+ 
+-def get_preprod_artifact_url(preprod_artifact: PreprodArtifact, view_type: str = "size") -> str:
++def get_preprod_artifact_url(
++    preprod_artifact: PreprodArtifact, view_type: ViewType = "size"
++) -> str:
+     """
+     Build a region/customer-domain aware absolute URL for the preprod artifact UI.
+     """
+@@ -17,7 +23,9 @@ def get_preprod_artifact_url(preprod_artifact: PreprodArtifact, view_type: str =
+ 
+ 
+ def get_preprod_artifact_comparison_url(
+-    preprod_artifact: PreprodArtifact, base_artifact: PreprodArtifact, comparison_type: str = "size"
++    preprod_artifact: PreprodArtifact,
++    base_artifact: PreprodArtifact,
++    comparison_type: ViewType = "size",
+ ) -> str:
+     """
+     Build a region/customer-domain aware absolute URL for the preprod artifact comparison UI.
+@@ -25,5 +33,9 @@ def get_preprod_artifact_comparison_url(
+     organization: Organization = Organization.objects.get_from_cache(
+         id=preprod_artifact.project.organization_id
+     )
+-    path = f"/organizations/{organization.slug}/preprod/{comparison_type}/compare/{preprod_artifact.id}/{base_artifact.id}"
++    if comparison_type == "snapshots":
++        path = f"/organizations/{organization.slug}/preprod/{comparison_type}/{preprod_artifact.id}"
++    else:
++        path = f"/organizations/{organization.slug}/preprod/{comparison_type}/compare/{preprod_artifact.id}/{base_artifact.id}"
++
+     return organization.absolute_url(path)
+diff --git a/src/sentry/sentry_apps/api/bases/sentryapps.py b/src/sentry/sentry_apps/api/bases/sentryapps.py
+index 9ef6881403b2a4..637d0a27d64515 100644
+--- a/src/sentry/sentry_apps/api/bases/sentryapps.py
++++ b/src/sentry/sentry_apps/api/bases/sentryapps.py
+@@ -22,7 +22,7 @@
+ )
+ from sentry.sentry_apps.models.sentry_app import SentryApp
+ from sentry.sentry_apps.services.app import RpcSentryApp, app_service
+-from sentry.sentry_apps.services.region.model import RpcSentryAppError
++from sentry.sentry_apps.services.cell.model import RpcSentryAppError
+ from sentry.sentry_apps.utils.errors import (
+     SentryAppError,
+     SentryAppIntegratorError,
+@@ -96,7 +96,7 @@ class SentryAppsAndStaffPermission(StaffPermissionMixin, SentryAppsPermission):
+ class IntegrationPlatformEndpoint(Endpoint):
+     def respond_rpc_sentry_app_error(self, rpc_error: RpcSentryAppError) -> Response:
+         """
+-        Surfaces errors from the region-side Sentry App RPC to the client.
++        Surfaces errors from the cell-side Sentry App RPC to the client.
+         """
+         response_body = rpc_error.get_public_dict()
+         status_code = rpc_error.status_code or 500
+@@ -286,7 +286,7 @@ def convert_args(
+         return (args, kwargs)
+ 
+ 
+-class RegionSentryAppBaseEndpoint(IntegrationPlatformEndpoint):
++class CellSentryAppBaseEndpoint(IntegrationPlatformEndpoint):
+     def convert_args(
+         self, request: Request, sentry_app_id_or_slug: int | str, *args: Any, **kwargs: Any
+     ):
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py
+index 60fc0118dfefd5..73c95280274c68 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py
+@@ -11,7 +11,7 @@
+ from sentry.sentry_apps.api.serializers.platform_external_issue import (
+     PlatformExternalIssueSerializer,
+ )
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.users.models.user import User
+ from sentry.users.services.user.serial import serialize_rpc_user
+ 
+@@ -61,7 +61,7 @@ def post(self, request: Request, installation) -> Response:
+         if isinstance(user, User):
+             user = serialize_rpc_user(user)
+ 
+-        result = sentry_app_region_service.create_issue_link(
++        result = sentry_app_cell_service.create_issue_link(
+             organization_id=installation.organization_id,
+             installation=installation,
+             group_id=int(group_id),
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py
+index 5b347568ad9a11..b00b450121a5d9 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py
+@@ -6,7 +6,7 @@
+ from sentry.sentry_apps.api.bases.sentryapps import (
+     SentryAppInstallationExternalIssueBaseEndpoint as ExternalIssueBaseEndpoint,
+ )
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.sentry_apps.utils.errors import SentryAppError
+ 
+ 
+@@ -25,7 +25,7 @@ def delete(self, request: Request, installation, external_issue_id) -> Response:
+                 status_code=400,
+             )
+ 
+-        result = sentry_app_region_service.delete_external_issue(
++        result = sentry_app_cell_service.delete_external_issue(
+             organization_id=installation.organization_id,
+             installation=installation,
+             external_issue_id=external_issue_id,
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py b/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py
+index 091d36410dce64..e2ebf39ad904b5 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py
+@@ -13,7 +13,7 @@
+ from sentry.sentry_apps.api.serializers.platform_external_issue import (
+     PlatformExternalIssueSerializer as ResponsePlatformExternalIssueSerializer,
+ )
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ 
+ 
+ class PlatformExternalIssueSerializer(serializers.Serializer):
+@@ -41,7 +41,7 @@ def post(self, request: Request, installation) -> Response:
+         except Exception:
+             return Response({"detail": "issueId is required, and must be an integer"}, status=400)
+ 
+-        result = sentry_app_region_service.create_external_issue(
++        result = sentry_app_cell_service.create_external_issue(
+             organization_id=installation.organization_id,
+             installation=installation,
+             group_id=group_id,
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py b/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py
+index 0b8f966d6774a8..8ac4f0c23999d5 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py
+@@ -9,7 +9,7 @@
+ from sentry.api.base import control_silo_endpoint
+ from sentry.sentry_apps.api.bases.sentryapps import SentryAppInstallationBaseEndpoint
+ from sentry.sentry_apps.services.app.model import RpcSentryAppInstallation
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ 
+ logger = logging.getLogger("sentry.sentry-apps")
+ 
+@@ -26,7 +26,7 @@ def get(self, request: Request, installation: RpcSentryAppInstallation) -> Respo
+         if not uri:
+             return Response({"detail": "uri query parameter is required"}, status=400)
+ 
+-        result = sentry_app_region_service.get_select_options(
++        result = sentry_app_cell_service.get_select_options(
+             organization_id=installation.organization_id,
+             installation=installation,
+             uri=request.GET.get("uri"),
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py b/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py
+index 11d206dca23e3b..35e78fd6e6c883 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py
+@@ -10,7 +10,7 @@
+ from sentry.sentry_apps.api.bases.sentryapps import SentryAppInstallationBaseEndpoint
+ from sentry.sentry_apps.api.serializers.servicehookproject import ServiceHookProjectSerializer
+ from sentry.sentry_apps.services.app.model import RpcSentryAppInstallation
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.users.services.user.serial import serialize_generic_user
+ 
+ 
+@@ -62,7 +62,7 @@ def _get_auth_context(self, request: Request) -> AuthenticationContext:
+         )
+ 
+     def get(self, request: Request, installation: RpcSentryAppInstallation) -> Response:
+-        result = sentry_app_region_service.get_service_hook_projects(
++        result = sentry_app_cell_service.get_service_hook_projects(
+             organization_id=installation.organization_id,
+             installation=installation,
+             auth_context=self._get_auth_context(request),
+@@ -89,7 +89,7 @@ def post(self, request: Request, installation: RpcSentryAppInstallation) -> Resp
+             return Response(serializer.errors, status=400)
+ 
+         projects = serializer.validated_data["projects"]
+-        result = sentry_app_region_service.set_service_hook_projects(
++        result = sentry_app_cell_service.set_service_hook_projects(
+             organization_id=installation.organization_id,
+             installation=installation,
+             project_identifiers=projects,
+@@ -109,7 +109,7 @@ def post(self, request: Request, installation: RpcSentryAppInstallation) -> Resp
+         )
+ 
+     def delete(self, request: Request, installation: RpcSentryAppInstallation) -> Response:
+-        result = sentry_app_region_service.delete_service_hook_projects(
++        result = sentry_app_cell_service.delete_service_hook_projects(
+             organization_id=installation.organization_id,
+             installation=installation,
+             auth_context=self._get_auth_context(request),
+diff --git a/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py b/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py
+index 6e7ff09c458614..a0655dc730cac6 100644
+--- a/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py
++++ b/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py
+@@ -7,17 +7,17 @@
+ from sentry.api.api_publish_status import ApiPublishStatus
+ from sentry.api.base import StatsMixin, control_silo_endpoint
+ from sentry.sentry_apps.api.bases.sentryapps import (
+-    RegionSentryAppBaseEndpoint,
++    CellSentryAppBaseEndpoint,
+     SentryAppStatsPermission,
+ )
+ from sentry.sentry_apps.services.app import app_service
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ @control_silo_endpoint
+-class SentryAppInteractionEndpoint(RegionSentryAppBaseEndpoint, StatsMixin):
++class SentryAppInteractionEndpoint(CellSentryAppBaseEndpoint, StatsMixin):
+     owner = ApiOwner.INTEGRATIONS
+     publish_status = {
+         "GET": ApiPublishStatus.PRIVATE,
+@@ -36,7 +36,7 @@ def get(self, request: Request, sentry_app) -> Response:
+         components = app_service.find_app_components(app_id=sentry_app.id)
+         component_types = [component.type for component in components]
+ 
+-        result = sentry_app_region_service.get_interaction_stats(
++        result = sentry_app_cell_service.get_interaction_stats(
+             sentry_app=sentry_app,
+             component_types=component_types,
+             since=args["start"].timestamp(),
+@@ -66,7 +66,7 @@ def post(self, request: Request, sentry_app) -> Response:
+         tsdb_field = request.data.get("tsdbField", "")
+         component_type = request.data.get("componentType")
+ 
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=sentry_app,
+             tsdb_field=tsdb_field,
+             component_type=component_type,
+diff --git a/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py b/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py
+index 112a7a9a72712f..c736fd9abd9b13 100644
+--- a/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py
++++ b/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py
+@@ -17,8 +17,8 @@
+ from sentry.sentry_apps.api.utils.webhook_requests import (
+     BufferedRequest,
+     DatetimeOrganizationFilterArgs,
++    get_buffer_requests_from_cells,
+     get_buffer_requests_from_control,
+-    get_buffer_requests_from_regions,
+ )
+ from sentry.sentry_apps.models.sentry_app import SentryApp
+ from sentry.sentry_apps.services.app_request import SentryAppRequestFilterArgs
+@@ -90,8 +90,8 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+ 
+         requests: list[BufferedRequest] = []
+         control_filter: SentryAppRequestFilterArgs = {}
+-        region_filter: SentryAppRequestFilterArgs = {}
+-        control_filter["errors_only"] = region_filter["errors_only"] = errors_only
++        cell_filter: SentryAppRequestFilterArgs = {}
++        control_filter["errors_only"] = cell_filter["errors_only"] = errors_only
+         datetime_org_filter: DatetimeOrganizationFilterArgs = {
+             "start_time": start_time,
+             "end_time": end_time,
+@@ -106,9 +106,9 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+             )
+         # If event type has been specified, we only need to fetch requests from region buffers
+         elif event_type:
+-            region_filter["event"] = event_type
++            cell_filter["event"] = event_type
+             requests.extend(
+-                get_buffer_requests_from_regions(sentry_app.id, region_filter, datetime_org_filter)
++                get_buffer_requests_from_cells(sentry_app.id, cell_filter, datetime_org_filter)
+             )
+         else:
+             control_filter["event"] = [
+@@ -118,7 +118,7 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+             requests.extend(
+                 get_buffer_requests_from_control(sentry_app, control_filter, datetime_org_filter)
+             )
+-            region_filter["event"] = list(
++            cell_filter["event"] = list(
+                 set(EXTENDED_VALID_EVENTS)
+                 - {
+                     "installation.created",
+@@ -126,7 +126,7 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+                 }
+             )
+             requests.extend(
+-                get_buffer_requests_from_regions(sentry_app.id, region_filter, datetime_org_filter)
++                get_buffer_requests_from_cells(sentry_app.id, cell_filter, datetime_org_filter)
+             )
+ 
+         requests.sort(key=lambda x: parse_date(x.data.date), reverse=True)
+diff --git a/src/sentry/sentry_apps/api/serializers/platform_external_issue.py b/src/sentry/sentry_apps/api/serializers/platform_external_issue.py
+index 27b91fffc3b30c..2f47224e82b86a 100644
+--- a/src/sentry/sentry_apps/api/serializers/platform_external_issue.py
++++ b/src/sentry/sentry_apps/api/serializers/platform_external_issue.py
+@@ -5,7 +5,7 @@
+ 
+ from sentry.api.serializers import Serializer, register
+ from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+-from sentry.sentry_apps.services.region.model import RpcPlatformExternalIssue
++from sentry.sentry_apps.services.cell.model import RpcPlatformExternalIssue
+ from sentry.users.models.user import User
+ from sentry.users.services.user.model import RpcUser
+ 
+diff --git a/src/sentry/sentry_apps/api/serializers/servicehookproject.py b/src/sentry/sentry_apps/api/serializers/servicehookproject.py
+index 1e4e5012f2144f..c8cff88f8e4a8f 100644
+--- a/src/sentry/sentry_apps/api/serializers/servicehookproject.py
++++ b/src/sentry/sentry_apps/api/serializers/servicehookproject.py
+@@ -1,6 +1,6 @@
+ from sentry.api.serializers import Serializer, register
+ from sentry.sentry_apps.models.servicehook import ServiceHookProject
+-from sentry.sentry_apps.services.region.model import RpcServiceHookProject
++from sentry.sentry_apps.services.cell.model import RpcServiceHookProject
+ 
+ 
+ @register(ServiceHookProject)
+diff --git a/src/sentry/sentry_apps/api/utils/webhook_requests.py b/src/sentry/sentry_apps/api/utils/webhook_requests.py
+index 26a6b9c99c5ceb..266eaaf7e25850 100644
+--- a/src/sentry/sentry_apps/api/utils/webhook_requests.py
++++ b/src/sentry/sentry_apps/api/utils/webhook_requests.py
+@@ -82,16 +82,16 @@ def get_buffer_requests_from_control(
+     )
+ 
+ 
+-def get_buffer_requests_from_regions(
++def get_buffer_requests_from_cells(
+     sentry_app_id: int,
+     filter: SentryAppRequestFilterArgs,
+     datetime_org_filter: DatetimeOrganizationFilterArgs,
+ ) -> list[BufferedRequest]:
+     requests: list[RpcSentryAppRequest] = []
+-    for region_name in find_all_cell_names():
++    for cell_name in find_all_cell_names():
+         buffer_requests = app_request_service.get_buffer_requests_for_region(
+             sentry_app_id=sentry_app_id,
+-            region_name=region_name,
++            region_name=cell_name,
+             filter=filter,
+         )
+         if buffer_requests:
+diff --git a/src/sentry/sentry_apps/logic.py b/src/sentry/sentry_apps/logic.py
+index a11c23414ceee4..16436e90d546a0 100644
+--- a/src/sentry/sentry_apps/logic.py
++++ b/src/sentry/sentry_apps/logic.py
+@@ -214,12 +214,12 @@ def _update_service_hooks(self) -> None:
+ 
+     def _update_service_hooks_via_outbox(self) -> None:
+         if installations := SentryAppInstallation.objects.filter(sentry_app_id=self.sentry_app.id):
+-            org_ids_and_region_names = OrganizationMapping.objects.filter(
++            org_ids_and_cell_names = OrganizationMapping.objects.filter(
+                 organization_id__in=installations.values_list("organization_id", flat=True)
+             ).values_list("organization_id", "cell_name")
+ 
+-            installation_org_id_to_region_name = {
+-                org_id: region_name for org_id, region_name in org_ids_and_region_names
++            installation_org_id_to_cell_name = {
++                org_id: cell_name for org_id, cell_name in org_ids_and_cell_names
+             }
+ 
+             with outbox_context(
+@@ -227,7 +227,7 @@ def _update_service_hooks_via_outbox(self) -> None:
+             ):
+                 for installation in installations:
+                     assert (
+-                        installation_org_id_to_region_name.get(installation.organization_id)
++                        installation_org_id_to_cell_name.get(installation.organization_id)
+                         is not None
+                     ), (
+                         f"OrganizationMapping must exist for installation {installation.id} and organization {installation.organization_id}"
+@@ -238,7 +238,7 @@ def _update_service_hooks_via_outbox(self) -> None:
+                         shard_identifier=self.sentry_app.id,
+                         object_identifier=installation.id,
+                         category=OutboxCategory.SERVICE_HOOK_UPDATE,
+-                        cell_name=installation_org_id_to_region_name[installation.organization_id],
++                        cell_name=installation_org_id_to_cell_name[installation.organization_id],
+                     ).save()
+                     logger.info(
+                         "_update_service_hooks_via_outbox.created_outbox_entry",
+@@ -247,7 +247,7 @@ def _update_service_hooks_via_outbox(self) -> None:
+                             "sentry_app_id": self.sentry_app.id,
+                             "events": self.sentry_app.events,
+                             "application_id": self.sentry_app.application_id,
+-                            "region_name": installation_org_id_to_region_name[
++                            "cell_name": installation_org_id_to_cell_name[
+                                 installation.organization_id
+                             ],
+                         },
+diff --git a/src/sentry/sentry_apps/models/sentry_app.py b/src/sentry/sentry_apps/models/sentry_app.py
+index 48e6e8631f0a85..49a67aa509c220 100644
+--- a/src/sentry/sentry_apps/models/sentry_app.py
++++ b/src/sentry/sentry_apps/models/sentry_app.py
+@@ -32,7 +32,7 @@
+ from sentry.hybridcloud.outbox.category import OutboxCategory, OutboxScope
+ from sentry.models.apiscopes import HasApiScopes
+ from sentry.sentry_apps.utils.webhooks import EVENT_EXPANSION
+-from sentry.types.region import find_all_cell_names, find_regions_for_sentry_app
++from sentry.types.region import find_all_cell_names, find_cells_for_sentry_app
+ from sentry.utils import metrics
+ 
+ REQUIRED_EVENT_PERMISSIONS = {
+@@ -235,8 +235,8 @@ def outboxes_for_delete(self) -> list[ControlOutbox]:
+             for cell_name in find_all_cell_names()
+         ]
+ 
+-    def regions_with_installations(self) -> set[str]:
+-        return find_regions_for_sentry_app(self)
++    def cells_with_installations(self) -> set[str]:
++        return find_cells_for_sentry_app(self)
+ 
+     def delete(self, *args, **kwargs):
+         from sentry.sentry_apps.models.sentry_app_avatar import SentryAppAvatar
+diff --git a/src/sentry/sentry_apps/models/sentry_app_installation.py b/src/sentry/sentry_apps/models/sentry_app_installation.py
+index 31f80e02cf30c0..93dd7b57a4b64f 100644
+--- a/src/sentry/sentry_apps/models/sentry_app_installation.py
++++ b/src/sentry/sentry_apps/models/sentry_app_installation.py
+@@ -163,13 +163,13 @@ def outboxes_for_delete(self) -> list[ControlOutbox]:
+                 shard_identifier=self.api_application_id or 0,
+                 object_identifier=self.id,
+                 category=OutboxCategory.SENTRY_APP_INSTALLATION_DELETE,
+-                cell_name=region_name,
++                cell_name=cell_name,
+                 payload={
+                     "sentry_app_id": self.sentry_app_id,
+                     "organization_id": self.organization_id,
+                 },
+             )
+-            for region_name in find_all_cell_names()
++            for cell_name in find_all_cell_names()
+         ]
+ 
+     def prepare_ui_component(
+diff --git a/src/sentry/sentry_apps/services/region/__init__.py b/src/sentry/sentry_apps/services/cell/__init__.py
+similarity index 100%
+rename from src/sentry/sentry_apps/services/region/__init__.py
+rename to src/sentry/sentry_apps/services/cell/__init__.py
+diff --git a/src/sentry/sentry_apps/services/region/impl.py b/src/sentry/sentry_apps/services/cell/impl.py
+similarity index 98%
+rename from src/sentry/sentry_apps/services/region/impl.py
+rename to src/sentry/sentry_apps/services/cell/impl.py
+index ced38c3b7a7ee9..e9a5e444a9f002 100644
+--- a/src/sentry/sentry_apps/services/region/impl.py
++++ b/src/sentry/sentry_apps/services/cell/impl.py
+@@ -16,7 +16,7 @@
+ from sentry.sentry_apps.models.servicehook import ServiceHook, ServiceHookProject
+ from sentry.sentry_apps.services.app import RpcSentryAppInstallation
+ from sentry.sentry_apps.services.app.model import RpcSentryApp
+-from sentry.sentry_apps.services.region.model import (
++from sentry.sentry_apps.services.cell.model import (
+     RpcEmptyResult,
+     RpcInteractionStatsResult,
+     RpcPlatformExternalIssueResult,
+@@ -25,11 +25,11 @@
+     RpcServiceHookProjectsResult,
+     RpcTimeSeriesPoint,
+ )
+-from sentry.sentry_apps.services.region.serial import (
++from sentry.sentry_apps.services.cell.serial import (
+     serialize_platform_external_issue,
+     serialize_service_hook_project,
+ )
+-from sentry.sentry_apps.services.region.service import SentryAppRegionService
++from sentry.sentry_apps.services.cell.service import SentryAppCellService
+ from sentry.sentry_apps.utils.errors import SentryAppIntegratorError, SentryAppSentryError
+ from sentry.tsdb.base import TSDBModel
+ from sentry.users.services.user import RpcUser
+@@ -37,7 +37,7 @@
+ COMPONENT_TYPES = ["stacktrace-link", "issue-link"]
+ 
+ 
+-class DatabaseBackedSentryAppRegionService(SentryAppRegionService):
++class DatabaseBackedSentryAppCellService(SentryAppCellService):
+     def get_select_options(
+         self,
+         *,
+diff --git a/src/sentry/sentry_apps/services/region/model.py b/src/sentry/sentry_apps/services/cell/model.py
+similarity index 100%
+rename from src/sentry/sentry_apps/services/region/model.py
+rename to src/sentry/sentry_apps/services/cell/model.py
+diff --git a/src/sentry/sentry_apps/services/region/serial.py b/src/sentry/sentry_apps/services/cell/serial.py
+similarity index 86%
+rename from src/sentry/sentry_apps/services/region/serial.py
+rename to src/sentry/sentry_apps/services/cell/serial.py
+index 585a63c6866a5f..1d0c6630fbfb05 100644
+--- a/src/sentry/sentry_apps/services/region/serial.py
++++ b/src/sentry/sentry_apps/services/cell/serial.py
+@@ -1,6 +1,6 @@
+ from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+ from sentry.sentry_apps.models.servicehook import ServiceHookProject
+-from sentry.sentry_apps.services.region.model import RpcPlatformExternalIssue, RpcServiceHookProject
++from sentry.sentry_apps.services.cell.model import RpcPlatformExternalIssue, RpcServiceHookProject
+ 
+ 
+ def serialize_service_hook_project(project: ServiceHookProject) -> RpcServiceHookProject:
+diff --git a/src/sentry/sentry_apps/services/region/service.py b/src/sentry/sentry_apps/services/cell/service.py
+similarity index 94%
+rename from src/sentry/sentry_apps/services/region/service.py
+rename to src/sentry/sentry_apps/services/cell/service.py
+index 07f2be7825b9bd..7a3fedcdf09e31 100644
+--- a/src/sentry/sentry_apps/services/region/service.py
++++ b/src/sentry/sentry_apps/services/cell/service.py
+@@ -10,7 +10,7 @@
+ from sentry.hybridcloud.rpc.resolvers import ByOrganizationId, ByOrganizationIdAttribute
+ from sentry.hybridcloud.rpc.service import RpcService, regional_rpc_method
+ from sentry.sentry_apps.services.app import RpcSentryApp, RpcSentryAppInstallation
+-from sentry.sentry_apps.services.region.model import (
++from sentry.sentry_apps.services.cell.model import (
+     RpcEmptyResult,
+     RpcInteractionStatsResult,
+     RpcPlatformExternalIssueResult,
+@@ -21,7 +21,7 @@
+ from sentry.users.services.user import RpcUser
+ 
+ 
+-class SentryAppRegionService(RpcService):
++class SentryAppCellService(RpcService):
+     """
+     Region silo service for Sentry App operations that require access to region-specific data
+     (like projects, issues, etc.).
+@@ -35,9 +35,9 @@ class SentryAppRegionService(RpcService):
+ 
+     @classmethod
+     def get_local_implementation(cls) -> RpcService:
+-        from sentry.sentry_apps.services.region.impl import DatabaseBackedSentryAppRegionService
++        from sentry.sentry_apps.services.cell.impl import DatabaseBackedSentryAppCellService
+ 
+-        return DatabaseBackedSentryAppRegionService()
++        return DatabaseBackedSentryAppCellService()
+ 
+     def get_component_interaction_key(self, sentry_app_slug: str, component_type: str) -> str:
+         """Combines SentryApp.slug and SentryAppComponent.type to create a unique key for TSDB metrics."""
+@@ -179,4 +179,4 @@ def record_interaction(
+         pass
+ 
+ 
+-sentry_app_region_service = SentryAppRegionService.create_delegation()
++sentry_app_cell_service = SentryAppCellService.create_delegation()
+diff --git a/src/sentry/types/region.py b/src/sentry/types/region.py
+index 03defe5dfb4ef7..8ac70ffe6d1191 100644
+--- a/src/sentry/types/region.py
++++ b/src/sentry/types/region.py
+@@ -475,7 +475,7 @@ def find_regions_for_user(user_id: int) -> set[str]:
+ 
+ 
+ @control_silo_function
+-def find_regions_for_sentry_app(sentry_app: SentryApp) -> set[str]:
++def find_cells_for_sentry_app(sentry_app: SentryApp) -> set[str]:
+     from sentry.models.organizationmapping import OrganizationMapping
+     from sentry.sentry_apps.models.sentry_app_installation import SentryAppInstallation
+ 
+diff --git a/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts b/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
+index ce2702b3339093..474e12d1f7aab2 100644
+--- a/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
++++ b/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
+@@ -6,8 +6,8 @@ import {
+ } from 'sentry/components/events/autofix/preferences/hooks/useProjectSeerPreferences';
+ import type {ProjectSeerPreferences} from 'sentry/components/events/autofix/types';
+ import type {Project} from 'sentry/types/project';
+-import apiFetch from 'sentry/utils/api/apiFetch';
+ import {
++  fetchDataQuery,
+   fetchMutation,
+   getApiQueryData,
+   setApiQueryData,
+@@ -32,12 +32,12 @@ export function useFetchProjectSeerPreferences({project}: {project: Project}) {
+   const queryKey = makeProjectSeerPreferencesQueryKey(organization.slug, project.slug);
+ 
+   return useCallback(async () => {
+-    const response = await queryClient.fetchQuery({
++    const [data] = await queryClient.fetchQuery({
+       queryKey,
+-      queryFn: apiFetch<SeerPreferencesResponse>,
++      queryFn: fetchDataQuery<SeerPreferencesResponse>,
+       staleTime: 0,
+     });
+-    return response.json.preference;
++    return data?.preference;
+   }, [queryClient, queryKey]);
+ }
+ 
+diff --git a/static/app/stores/projectsStore.tsx b/static/app/stores/projectsStore.tsx
+index bac6ca04e86ce8..34950e406cec7c 100644
+--- a/static/app/stores/projectsStore.tsx
++++ b/static/app/stores/projectsStore.tsx
+@@ -13,8 +13,6 @@ type State = {
+   projects: Project[];
+ };
+ 
+-type StatsData = Record<string, Project['stats']>;
+-
+ /**
+  * Attributes that need typing but aren't part of the external interface,
+  */
+@@ -35,7 +33,6 @@ interface ProjectsStoreDefinition
+   onDeleteProject(projectSlug: string): void;
+   onDeleteTeam(slug: string): void;
+   onRemoveTeam(teamSlug: string, projectSlug: string): void;
+-  onStatsLoadSuccess(data: StatsData): void;
+   onUpdateSuccess(data: Partial<Project>): void;
+   reset(): void;
+ }
+@@ -117,18 +114,6 @@ const storeConfig: ProjectsStoreDefinition = {
+     clearQueryCache();
+   },
+ 
+-  onStatsLoadSuccess(data) {
+-    const statsData = data || {};
+-
+-    // Assign stats into projects
+-    const newProjects = this.state.projects.map(project =>
+-      statsData[project.id] ? {...project, stats: data[project.id]} : project
+-    );
+-    this.state = {...this.state, projects: newProjects};
+-
+-    this.trigger(new Set(Object.keys(data)));
+-  },
+-
+   onDeleteProject(projectSlug: string) {
+     const project = this.getBySlug(projectSlug);
+     if (!project) {
+diff --git a/static/app/utils/discover/fieldRenderers.tsx b/static/app/utils/discover/fieldRenderers.tsx
+index 83dcee57ba980d..80999ea3412af0 100644
+--- a/static/app/utils/discover/fieldRenderers.tsx
++++ b/static/app/utils/discover/fieldRenderers.tsx
+@@ -822,9 +822,10 @@ const SPECIAL_FIELDS: Record<string, SpecialField> = {
+     sortField: null,
+     renderFunc: data => (
+       <StarredSegmentCell
+-        projectSlug={data.project}
+-        segmentName={data.transaction}
+-        isStarred={data.is_starred_transaction}
++        projectSlug={data[SpanFields.PROJECT]}
++        projectId={data[SpanFields.PROJECT_ID]?.toString()}
++        segmentName={data[SpanFields.TRANSACTION]}
++        isStarred={data[SpanFields.IS_STARRED_TRANSACTION]}
+       />
+     ),
+   },
+diff --git a/static/app/views/alerts/rules/metric/eapMetricsField.tsx b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+index 7c2a5c4396c7c6..ac23bf880f8692 100644
+--- a/static/app/views/alerts/rules/metric/eapMetricsField.tsx
++++ b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+@@ -125,11 +125,13 @@ export default function EAPMetricsField({
+         trailingItems: (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+index 59324a865d1bbe..32ec8af6080ff4 100644
+--- a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
++++ b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+@@ -129,11 +129,13 @@ export function MetricsVisualize() {
+         trailingItems: (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/explore/constants.tsx b/static/app/views/explore/constants.tsx
+index 2116ebe2911e96..db009892b8758c 100644
+--- a/static/app/views/explore/constants.tsx
++++ b/static/app/views/explore/constants.tsx
+@@ -72,6 +72,14 @@ export const SENTRY_SPAN_NUMBER_TAGS: string[] = [...SENTRY_SEARCHABLE_SPAN_NUMB
+ export const SENTRY_SPAN_BOOLEAN_TAGS: string[] = [
+   // duplicating until we've fully rolled out boolean attributes
+   SpanFields.IS_TRANSACTION,
++  SpanFields.IS_STARRED_TRANSACTION,
++];
++
++// Span attributes that should only appear in dashboards, not in Explore.
++// is_starred_transaction relies on the dashboard widget query cache for
++// starring mutations and is not supported in Explore.
++export const DASHBOARD_ONLY_SPAN_ATTRIBUTES: string[] = [
++  SpanFields.IS_STARRED_TRANSACTION,
+ ];
+ 
+ export const SENTRY_LOG_STRING_TAGS: string[] = [
+diff --git a/static/app/views/explore/contexts/traceItemAttributeContext.tsx b/static/app/views/explore/contexts/traceItemAttributeContext.tsx
+index b6341d4f4f842e..3fe5405c53e7b6 100644
+--- a/static/app/views/explore/contexts/traceItemAttributeContext.tsx
++++ b/static/app/views/explore/contexts/traceItemAttributeContext.tsx
+@@ -5,6 +5,7 @@ import type {Project} from 'sentry/types/project';
+ import {FieldKind} from 'sentry/utils/fields';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {
++  DASHBOARD_ONLY_SPAN_ATTRIBUTES,
+   SENTRY_LOG_BOOLEAN_TAGS,
+   SENTRY_LOG_NUMBER_TAGS,
+   SENTRY_LOG_STRING_TAGS,
+@@ -264,7 +265,19 @@ export function useSpanItemAttributes(
+   type?: TraceItemAttributeType,
+   hiddenKeys?: string[]
+ ): TraceItemAttributeResult {
+-  return useTraceItemDatasetAttributes(TraceItemDataset.SPANS, options, type, hiddenKeys);
++  const mergedHiddenKeys = useMemo(() => {
++    if (!hiddenKeys?.length) {
++      return DASHBOARD_ONLY_SPAN_ATTRIBUTES;
++    }
++    return [...hiddenKeys, ...DASHBOARD_ONLY_SPAN_ATTRIBUTES];
++  }, [hiddenKeys]);
++
++  return useTraceItemDatasetAttributes(
++    TraceItemDataset.SPANS,
++    options,
++    type,
++    mergedHiddenKeys
++  );
+ }
+ 
+ export function useLogItemAttributes(
+diff --git a/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx b/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
+index 6fb1579070b4df..510e13cfaaee0c 100644
+--- a/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
++++ b/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
+@@ -107,7 +107,11 @@ function useMetricsQueryKey({
+             traceMetric.unit
+           );
+         } else if (traceMetric.unit === NONE_UNIT) {
++          newSearch.addOp('(');
+           newSearch.addFilterValue('!has', TraceMetricKnownFieldKey.METRIC_UNIT);
++          newSearch.addOp('OR');
++          newSearch.addFilterValue(TraceMetricKnownFieldKey.METRIC_UNIT, NONE_UNIT);
++          newSearch.addOp(')');
+         }
+       }
+     }
+diff --git a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+index c5d25c5c55b965..57a8ec6b8d6c85 100644
+--- a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
++++ b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+@@ -99,11 +99,13 @@ export function MetricSelector({
+         trailingItems: () => (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx b/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
+index 43b00e8f080fa5..b4c923c68098c8 100644
+--- a/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
++++ b/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
+@@ -13,8 +13,9 @@ import type {SpanResponse} from 'sentry/views/insights/types';
+ 
+ interface Props {
+   isStarred: boolean;
+-  projectSlug: string;
+   segmentName: string;
++  projectId?: string;
++  projectSlug?: string;
+ }
+ 
+ type TableRow = Simplify<
+@@ -26,18 +27,23 @@ type TableResponse = [{confidence: any; meta: EventsMetaType; data?: TableRow[]}
+ // The query key used for the starred segments table request, this key is used to reference that query and update the starred segment state
+ export const STARRED_SEGMENT_TABLE_QUERY_KEY = ['starred-segment-table'];
+ 
+-export function StarredSegmentCell({segmentName, isStarred, projectSlug}: Props) {
++export function StarredSegmentCell({
++  segmentName,
++  isStarred,
++  projectSlug,
++  projectId,
++}: Props) {
+   const queryClient = useQueryClient();
+   const {projects} = useProjects();
+   const project = projects.find(p => p.slug === projectSlug);
+ 
+   const {setStarredSegment, isPending} = useStarredSegment({
+-    projectId: project?.id,
++    projectId: project?.id || projectId,
+     segmentName,
+     onError: () => updateTableData(!isStarred),
+   });
+ 
+-  const disabled = !project || !segmentName || isPending;
++  const disabled = (!project && !projectId) || !segmentName || isPending;
+ 
+   const updateTableData = (newIsStarred: boolean) => {
+     queryClient.setQueriesData(
+diff --git a/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
+index d08c24e959bb47..98457d25cfc329 100644
+--- a/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
+@@ -1,4 +1,4 @@
+-import {Fragment, useMemo} from 'react';
++import {Fragment} from 'react';
+ import * as Sentry from '@sentry/react';
+ 
+ import ErrorBoundary from 'sentry/components/errorBoundary';
+@@ -23,14 +23,6 @@ export function DashboardsSecondaryNavigation() {
+ 
+   const {data: starredDashboards = []} = useGetStarredDashboards();
+ 
+-  const {prebuiltDashboards, customDashboards} = useMemo(
+-    () => ({
+-      prebuiltDashboards: starredDashboards.filter(d => defined(d.prebuiltId)),
+-      customDashboards: starredDashboards.filter(d => !defined(d.prebuiltId)),
+-    }),
+-    [starredDashboards]
+-  );
+-
+   return (
+     <Fragment>
+       <SecondaryNavigation.Header>
+@@ -46,17 +38,17 @@ export function DashboardsSecondaryNavigation() {
+             {t('All Dashboards')}
+           </SecondaryNavigation.Item>
+         </SecondaryNavigation.Section>
+-        {customDashboards.length > 0 ? (
++        {starredDashboards.length > 0 ? (
+           <SecondaryNavigation.Section
+             id="dashboards-starred"
+             title={t('Starred Dashboards')}
+           >
+             <ErrorBoundary mini>
+               {organization.features.includes('dashboards-starred-reordering') ? (
+-                <DashboardsNavigationItems initialDashboards={customDashboards} />
++                <DashboardsNavigationItems initialDashboards={starredDashboards} />
+               ) : (
+                 <StarredDashboardItems
+-                  dashboards={customDashboards}
++                  dashboards={starredDashboards}
+                   projects={projects}
+                   organizationSlug={organization.slug}
+                   organizationId={organization.id}
+@@ -66,22 +58,6 @@ export function DashboardsSecondaryNavigation() {
+             </ErrorBoundary>
+           </SecondaryNavigation.Section>
+         ) : null}
+-        {prebuiltDashboards.length > 0 ? (
+-          <SecondaryNavigation.Section
+-            id="dashboards-starred-sentry"
+-            title={t('Starred Sentry Built')}
+-          >
+-            <ErrorBoundary mini>
+-              <StarredDashboardItems
+-                dashboards={prebuiltDashboards}
+-                projects={projects}
+-                organizationSlug={organization.slug}
+-                organizationId={organization.id}
+-                userId={user.id}
+-              />
+-            </ErrorBoundary>
+-          </SecondaryNavigation.Section>
+-        ) : null}
+       </SecondaryNavigation.Body>
+     </Fragment>
+   );
+diff --git a/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx b/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
+index fbbb131f9a06b1..e74baa04f4b568 100644
+--- a/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
++++ b/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
+@@ -77,7 +77,7 @@ export default function AutofixAgent({canWrite, preference, project}: Props) {
+ 
+   return (
+     <PanelNoMargin>
+-      <PanelHeader>{t('Autofix Agent')}</PanelHeader>
++      <PanelHeader>{t('Autofix Handoff')}</PanelHeader>
+       <PanelBody>
+         {isPending ? (
+           <Flex justify="center" align="center" padding="xl">
+@@ -92,9 +92,9 @@ export default function AutofixAgent({canWrite, preference, project}: Props) {
+               disabled={Boolean(disabledReason)}
+               disabledReason={disabledReason}
+               name="autofixAgent"
+-              label={t('Autofix Agent')}
++              label={t('Autofix Handoff')}
+               help={tct(
+-                'Seer will orchestrate the autofix process, and automatically hand off issue data coding agent for processing. You can choose to automatically process Issues, and which agent to use here. You can also manually trigger autofix with different agents from the Issue Details page. [docsLink:Read the docs] to learn more.',
++                'Seer will orchestrate the autofix process, and automatically hand off issue data to the coding agent for processing. You can choose to automatically process Issues, and which agent to use here. You can also manually trigger autofix with different agents from the Issue Details page. [docsLink:Read the docs] to learn more.',
+                 {
+                   docsLink: (
+                     <ExternalLink href="https://docs.sentry.io/product/ai-in-sentry/" />
+diff --git a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+index 09806c531d2d47..4bdb9c5b494658 100644
+--- a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
++++ b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+@@ -30,14 +30,14 @@ interface Props {
+ 
+ const COLUMNS = [
+   {title: t('Project'), key: 'project', sortKey: 'project'},
+-  {title: t('Autofix Agent'), key: 'fixes'},
++  {title: t('Autofix Handoff'), key: 'fixes'},
+   {
+     title: (
+       <Flex gap="sm" align="center">
+         {t('PR Creation')}
+         <InfoTip
+           title={t(
+-            'This setting only applies when an Autofix Agent is configured to run automatically.'
++            'This setting only applies when an Autofix Handoff is configured to run automatically.'
+           )}
+         />
+       </Flex>
+diff --git a/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx b/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
+index b1b3c1e727b364..80aea1f2069603 100644
+--- a/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
++++ b/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
+@@ -51,7 +51,7 @@ describe('seerAgentHooks', () => {
+       expect(options[0]).toEqual({value: 'seer', label: expect.any(String)});
+       expect(options[1]).toMatchObject({
+         value: {id: '42', name: 'Cursor', provider: 'cursor'},
+-        label: 'Cursor (42)',
++        label: 'Cursor',
+       });
+       expect(options[2]).toEqual({value: 'none', label: expect.any(String)});
+     });
+diff --git a/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx b/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
+index a6c21914805cfb..02d20203a46df3 100644
+--- a/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
++++ b/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
+@@ -30,7 +30,7 @@ export function useAgentOptions({
+         .filter(integration => integration.id)
+         .map(integration => ({
+           value: integration,
+-          label: `${integration.name} (${integration.id})`,
++          label: integration.name,
+         })),
+       {value: 'none' as const, label: t('Manual Agent Selection')},
+     ];
+diff --git a/tests/sentry/dashboards/endpoints/test_organization_dashboards.py b/tests/sentry/dashboards/endpoints/test_organization_dashboards.py
+index 810b7f05a0131f..644220367890c1 100644
+--- a/tests/sentry/dashboards/endpoints/test_organization_dashboards.py
++++ b/tests/sentry/dashboards/endpoints/test_organization_dashboards.py
+@@ -2269,37 +2269,6 @@ def test_get_with_exclude_prebuilt(self) -> None:
+                 assert response.status_code == 200
+                 assert len(response.data) == total_count - prebuilt_dashboards_count
+ 
+-    def test_endpoint_creates_favorites_for_pre_favorited_prebuilt_dashboards(self) -> None:
+-        assert (
+-            DashboardFavoriteUser.objects.filter(
+-                organization=self.organization, user_id=self.user.id
+-            ).count()
+-            == 0
+-        )
+-
+-        pre_favorited_prebuilt_ids = {
+-            d["prebuilt_id"] for d in PREBUILT_DASHBOARDS if d.get("pre_favorited")
+-        }
+-
+-        with self.feature(
+-            [
+-                "organizations:dashboards-prebuilt-insights-dashboards",
+-                "organizations:dashboards-sync-all-registered-prebuilt-dashboards",
+-            ]
+-        ):
+-            response = self.do_request("get", self.url)
+-        assert response.status_code == 200
+-
+-        favorites = DashboardFavoriteUser.objects.filter(
+-            organization=self.organization, user_id=self.user.id
+-        )
+-        favorited_prebuilt_ids = set(
+-            Dashboard.objects.filter(
+-                id__in=favorites.values_list("dashboard_id", flat=True)
+-            ).values_list("prebuilt_id", flat=True)
+-        )
+-        assert favorited_prebuilt_ids == pre_favorited_prebuilt_ids
+-
+     def test_post_with_text_widget(self) -> None:
+         with self.feature("organizations:dashboards-text-widgets"):
+             data = {
+diff --git a/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py b/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
+index 92af7e4c4cd5e1..bc2850428d2d57 100644
+--- a/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
++++ b/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
+@@ -560,7 +560,7 @@ def test_summary_uses_comparison_url_when_base_artifact_exists(self):
+             base_artifact_map,
+         )
+ 
+-        expected_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/compare/{head_artifact.id}/{base_artifact.id}"
++        expected_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/{head_artifact.id}"
+         assert expected_url in summary
+ 
+     def test_summary_uses_artifact_url_when_no_base(self):
+diff --git a/tests/sentry/sentry_apps/models/test_sentryapp.py b/tests/sentry/sentry_apps/models/test_sentryapp.py
+index edc1ed12a6d114..ce56074d654254 100644
+--- a/tests/sentry/sentry_apps/models/test_sentryapp.py
++++ b/tests/sentry/sentry_apps/models/test_sentryapp.py
+@@ -93,15 +93,15 @@ def test_save_outbox_update(self) -> None:
+         assert outboxes[0].shard_identifier == self.sentry_app.id
+         assert outboxes[0].cell_name
+ 
+-    def test_regions_with_installations(self) -> None:
++    def test_cells_with_installations(self) -> None:
+         self.us_org = self.create_organization(name="us test name", region="us")
+         self.create_sentry_app_installation(
+             organization=self.us_org, slug=self.sentry_app.slug, prevent_token_exchange=True
+         )
+-        assert self.sentry_app.regions_with_installations() == {"us"}
++        assert self.sentry_app.cells_with_installations() == {"us"}
+ 
+         self.eu_org = self.create_organization(name="eu test name", region="eu")
+         self.create_sentry_app_installation(
+             organization=self.eu_org, slug=self.sentry_app.slug, prevent_token_exchange=True
+         )
+-        assert self.sentry_app.regions_with_installations() == {"us", "eu"}
++        assert self.sentry_app.cells_with_installations() == {"us", "eu"}
+diff --git a/tests/sentry/sentry_apps/services/test_region_service.py b/tests/sentry/sentry_apps/services/test_cell_service.py
+similarity index 92%
+rename from tests/sentry/sentry_apps/services/test_region_service.py
+rename to tests/sentry/sentry_apps/services/test_cell_service.py
+index 9316766623bc68..32d8afdd01b379 100644
+--- a/tests/sentry/sentry_apps/services/test_region_service.py
++++ b/tests/sentry/sentry_apps/services/test_cell_service.py
+@@ -10,7 +10,7 @@
+ from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+ from sentry.sentry_apps.models.servicehook import ServiceHook, ServiceHookProject
+ from sentry.sentry_apps.services.app.serial import serialize_sentry_app_installation
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.helpers.datetime import before_now
+ from sentry.testutils.silo import all_silo_test, assume_test_silo_mode_of
+@@ -18,7 +18,7 @@
+ 
+ 
+ @all_silo_test
+-class TestSentryAppRegionService(TestCase):
++class TestSentryAppCellService(TestCase):
+     def setUp(self) -> None:
+         self.user = self.create_user(email="boop@example.com")
+         self.org = self.create_organization(owner=self.user)
+@@ -56,7 +56,7 @@ def test_get_select_options(self) -> None:
+             content_type="application/json",
+         )
+ 
+-        result = sentry_app_region_service.get_select_options(
++        result = sentry_app_cell_service.get_select_options(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             uri="/get-projects",
+@@ -77,7 +77,7 @@ def test_get_select_options_error(self) -> None:
+             content_type="application/json",
+         )
+ 
+-        result = sentry_app_region_service.get_select_options(
++        result = sentry_app_cell_service.get_select_options(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             uri="/get-projects",
+@@ -105,7 +105,7 @@ def test_create_issue_link(self) -> None:
+ 
+         with assume_test_silo_mode_of(PlatformExternalIssue):
+             assert PlatformExternalIssue.objects.filter(group_id=self.group.id).exists() is False
+-        result = sentry_app_region_service.create_issue_link(
++        result = sentry_app_cell_service.create_issue_link(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=self.group.id,
+@@ -133,7 +133,7 @@ def test_create_issue_link_error(self) -> None:
+             content_type="application/json",
+         )
+ 
+-        result = sentry_app_region_service.create_issue_link(
++        result = sentry_app_cell_service.create_issue_link(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=self.group.id,
+@@ -152,7 +152,7 @@ def test_create_external_issue(self) -> None:
+         with assume_test_silo_mode_of(PlatformExternalIssue):
+             assert PlatformExternalIssue.objects.filter(group_id=self.group.id).exists() is False
+ 
+-        result = sentry_app_region_service.create_external_issue(
++        result = sentry_app_cell_service.create_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=self.group.id,
+@@ -171,7 +171,7 @@ def test_create_external_issue(self) -> None:
+         assert result.external_issue.display_name == "ProjectName#issue-1"
+ 
+     def test_create_external_issue_group_not_found(self) -> None:
+-        result = sentry_app_region_service.create_external_issue(
++        result = sentry_app_cell_service.create_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=99999999,
+@@ -194,7 +194,7 @@ def test_delete_external_issue(self) -> None:
+                 web_url="https://example.com/issue/123",
+             )
+ 
+-        result = sentry_app_region_service.delete_external_issue(
++        result = sentry_app_cell_service.delete_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             external_issue_id=external_issue.id,
+@@ -206,7 +206,7 @@ def test_delete_external_issue(self) -> None:
+             assert not PlatformExternalIssue.objects.filter(id=external_issue.id).exists()
+ 
+     def test_delete_external_issue_not_found(self) -> None:
+-        result = sentry_app_region_service.delete_external_issue(
++        result = sentry_app_cell_service.delete_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             external_issue_id=99999999,
+@@ -226,7 +226,7 @@ def test_get_service_hook_projects(self) -> None:
+             installation_id=self.install.id, project_id=project2.id
+         )
+ 
+-        result = sentry_app_region_service.get_service_hook_projects(
++        result = sentry_app_cell_service.get_service_hook_projects(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             auth_context=self.auth_context,
+@@ -257,7 +257,7 @@ def test_set_service_hook_projects(self) -> None:
+             installation_id=self.install.id, project_id=project2.id
+         )
+ 
+-        result = sentry_app_region_service.set_service_hook_projects(
++        result = sentry_app_cell_service.set_service_hook_projects(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             project_identifiers=[project2.id, project3.slug],
+@@ -301,7 +301,7 @@ def test_set_service_hook_projects_access(self) -> None:
+ 
+         # Member user should not have access to set service hook projects
+         rpc_installation = serialize_sentry_app_installation(install)
+-        result = sentry_app_region_service.set_service_hook_projects(
++        result = sentry_app_cell_service.set_service_hook_projects(
+             organization_id=organization.id,
+             installation=rpc_installation,
+             project_identifiers=[project2.id],
+@@ -328,7 +328,7 @@ def test_delete_service_hook_projects(self) -> None:
+             installation_id=self.install.id, project_id=project2.id
+         )
+ 
+-        result = sentry_app_region_service.delete_service_hook_projects(
++        result = sentry_app_cell_service.delete_service_hook_projects(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             auth_context=self.auth_context,
+@@ -343,7 +343,7 @@ def test_delete_service_hook_projects(self) -> None:
+     def test_get_interaction_stats(self) -> None:
+         now = before_now(days=1)
+         since = (now - timedelta(minutes=5)).timestamp()
+-        result = sentry_app_region_service.get_interaction_stats(
++        result = sentry_app_cell_service.get_interaction_stats(
+             sentry_app=self.rpc_installation.sentry_app,
+             component_types=["issue-link", "stacktrace-link"],
+             since=since,
+@@ -355,7 +355,7 @@ def test_get_interaction_stats(self) -> None:
+         assert set(result.component_interactions.keys()) == {"issue-link", "stacktrace-link"}
+ 
+     def test_record_interaction(self) -> None:
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="sentry_app_viewed",
+         )
+@@ -363,7 +363,7 @@ def test_record_interaction(self) -> None:
+         assert result.success is True
+         assert result.error is None
+ 
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="sentry_app_component_interacted",
+             component_type="issue-link",
+@@ -373,7 +373,7 @@ def test_record_interaction(self) -> None:
+         assert result.error is None
+ 
+     def test_record_interaction_error(self) -> None:
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="invalid_field",
+         )
+@@ -383,7 +383,7 @@ def test_record_interaction_error(self) -> None:
+         assert result.error.status_code == 400
+         assert "tsdbField must be one of" in result.error.message
+ 
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="sentry_app_component_interacted",
+         )
+diff --git a/tests/sentry/types/test_region.py b/tests/sentry/types/test_region.py
+index 8997ae999f8c8c..5acf6aa4aee3a6 100644
+--- a/tests/sentry/types/test_region.py
++++ b/tests/sentry/types/test_region.py
+@@ -22,7 +22,7 @@
+     RegionResolutionError,
+     find_all_cell_names,
+     find_all_multitenant_region_names,
+-    find_regions_for_sentry_app,
++    find_cells_for_sentry_app,
+     find_regions_for_user,
+     get_cell_by_name,
+     get_cell_for_organization,
+@@ -185,7 +185,7 @@ def test_find_regions_for_user(self) -> None:
+             find_regions_for_user(user_id=user.id)
+ 
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+-    def test_find_regions_for_sentry_app(self) -> None:
++    def test_find_cells_for_sentry_app(self) -> None:
+         with override_settings(SENTRY_MONOLITH_REGION="us"):
+             directory = load_from_config(self._INPUTS, [])
+         with self._in_global_state(directory):
+@@ -196,26 +196,26 @@ def test_find_regions_for_sentry_app(self) -> None:
+                 organization=self.organization,
+                 scopes=["project:write"],
+             )
+-            actual_regions = find_regions_for_sentry_app(sentry_app=sentry_app)
+-            assert actual_regions == set()
++            actual_cells = find_cells_for_sentry_app(sentry_app=sentry_app)
++            assert actual_cells == set()
+ 
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=us_org_1)
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=us_org_2)
+-            actual_regions = find_regions_for_sentry_app(sentry_app=sentry_app)
+-            assert actual_regions == {"us"}
++            actual_cells = find_cells_for_sentry_app(sentry_app=sentry_app)
++            assert actual_cells == {"us"}
+ 
+             eu_org_1 = self.create_organization(name="eu test name", region="eu")
+             eu_org_2 = self.create_organization(name="eu test name", region="eu")
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=eu_org_1)
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=eu_org_2)
+-            actual_regions = find_regions_for_sentry_app(sentry_app=sentry_app)
+-            assert actual_regions == {"us", "eu"}
++            actual_cells = find_cells_for_sentry_app(sentry_app=sentry_app)
++            assert actual_cells == {"us", "eu"}
+ 
+         with (
+             override_settings(SILO_MODE=SiloMode.REGION),
+             pytest.raises(SiloLimit.AvailabilityError),
+         ):
+-            find_regions_for_sentry_app(sentry_app=sentry_app)
++            find_cells_for_sentry_app(sentry_app=sentry_app)
+ 
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+     def test_find_all_cell_names(self) -> None:

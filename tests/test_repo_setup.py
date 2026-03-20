@@ -7,7 +7,12 @@ import pytest
 
 from bugeval.git_utils import GitError
 from bugeval.models import Category, Difficulty, PRSize, Severity, TestCase
-from bugeval.repo_setup import cleanup_repo, get_or_create_cached_repo, setup_repo_for_case
+from bugeval.repo_setup import (
+    cleanup_repo,
+    get_or_create_cached_repo,
+    materialize_workspace,
+    setup_repo_for_case,
+)
 
 
 def _make_case() -> TestCase:
@@ -224,3 +229,166 @@ def test_cleanup_repo_removes_directory(tmp_path: Path) -> None:
     with patch("bugeval.repo_setup.shutil.rmtree") as mock_rmtree:
         cleanup_repo(repo_dir)
     mock_rmtree.assert_called_once_with(repo_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# materialize_workspace tests
+# ---------------------------------------------------------------------------
+
+
+def _make_case_with_pr(**overrides: object) -> TestCase:
+    defaults: dict[str, object] = {
+        "id": "aleo-lang-001",
+        "repo": "provable-org/aleo-lang",
+        "base_commit": "abc123",
+        "head_commit": "def456",
+        "fix_commit": "def456",
+        "category": Category.logic,
+        "difficulty": Difficulty.medium,
+        "severity": Severity.high,
+        "language": "rust",
+        "pr_size": PRSize.small,
+        "description": "Off-by-one in loop bound",
+        "expected_findings": [],
+        "pr_title": "Fix loop bound error",
+        "pr_body": "This PR fixes the off-by-one error in the loop.",
+        "pr_commit_messages": ["fix: correct loop bound", "test: add boundary test"],
+        "stats": {"lines_added": 5, "lines_deleted": 2, "files_changed": 1, "hunks": 1},
+    }
+    defaults.update(overrides)
+    return TestCase(**defaults)  # type: ignore[arg-type]
+
+
+class TestMaterializeWorkspace:
+    def test_creates_pr_directory(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws)
+        assert (ws / ".pr").is_dir()
+
+    def test_writes_description_md_with_title_and_body(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws)
+        desc = (ws / ".pr" / "description.md").read_text()
+        assert "# Fix loop bound error" in desc
+        assert "This PR fixes the off-by-one error in the loop." in desc
+
+    def test_writes_commits_txt(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws)
+        commits = (ws / ".pr" / "commits.txt").read_text()
+        assert "fix: correct loop bound\n" in commits
+        assert "test: add boundary test\n" in commits
+
+    def test_writes_diff_patch(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "--- a/foo\n+++ b/foo\n", "diff-only", ws)
+        assert (ws / "diff.patch").exists()
+        content = (ws / "diff.patch").read_text()
+        assert "--- a/foo" in content
+
+    def test_diff_patch_is_sanitized(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        raw = "diff --git a/f b/f\nindex abc123..def456 100644\n--- a/f\n+++ b/f\n"
+        materialize_workspace(case, raw, "diff-only", ws)
+        content = (ws / "diff.patch").read_text()
+        assert "index abc123..def456" not in content
+
+    def test_writes_domain_md_for_diff_repo_domain(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff+repo+domain", ws)
+        domain = (ws / ".pr" / "domain.md").read_text()
+        assert "Category: logic" in domain
+        assert "Severity: high" in domain
+        assert "Language: rust" in domain
+        assert "Description: Off-by-one in loop bound" in domain
+
+    def test_no_domain_md_for_diff_only(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws)
+        assert not (ws / ".pr" / "domain.md").exists()
+
+    def test_description_md_includes_stats(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws)
+        desc = (ws / ".pr" / "description.md").read_text()
+        assert "5" in desc  # lines_added
+        assert "2" in desc  # lines_deleted
+        assert "1" in desc  # files_changed
+
+    def test_empty_pr_context_still_creates_files(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr(
+            pr_title="",
+            pr_body="",
+            pr_commit_messages=[],
+            stats=None,
+        )
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "", "diff-only", ws)
+        assert (ws / ".pr" / "description.md").exists()
+        assert (ws / ".pr" / "commits.txt").exists()
+        assert (ws / "diff.patch").exists()
+
+    def test_pr_body_truncated_when_too_long(self, tmp_path: Path) -> None:
+        long_body = "x" * 5000
+        case = _make_case_with_pr(pr_body=long_body)
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws)
+        desc = (ws / ".pr" / "description.md").read_text()
+        # Body should be truncated to 3000 chars
+        assert len(long_body) == 5000
+        assert "x" * 3000 in desc
+        assert "x" * 3001 not in desc
+
+    def test_blind_mode_redacts_description(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws, blind=True)
+        desc = (ws / ".pr" / "description.md").read_text()
+        assert "Fix loop bound error" not in desc
+        assert "off-by-one" not in desc
+        assert "Pull Request" in desc
+        assert "redacted" in desc.lower()
+
+    def test_blind_mode_empties_commits(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws, blind=True)
+        commits = (ws / ".pr" / "commits.txt").read_text()
+        assert commits == ""
+
+    def test_blind_mode_preserves_diff(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "--- a/foo\n+++ b/foo\n", "diff-only", ws, blind=True)
+        assert (ws / "diff.patch").exists()
+        content = (ws / "diff.patch").read_text()
+        assert "--- a/foo" in content
+
+    def test_blind_mode_preserves_stats(self, tmp_path: Path) -> None:
+        case = _make_case_with_pr()
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        materialize_workspace(case, "diff content", "diff-only", ws, blind=True)
+        desc = (ws / ".pr" / "description.md").read_text()
+        assert "Files changed:" in desc

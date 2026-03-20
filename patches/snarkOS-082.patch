@@ -1,37 +1,852 @@
-diff --git a/src/environment/mod.rs b/src/environment/mod.rs
-index a7c4f9e85..da12691d4 100644
---- a/src/environment/mod.rs
-+++ b/src/environment/mod.rs
-@@ -138,6 +138,6 @@ impl<N: Network> Environment for MinerTrial<N> {
-     type Network = N;
-     const NODE_TYPE: NodeType = NodeType::Miner;
-     const SYNC_NODES: [&'static str; 3] = ["144.126.219.193:4132", "165.232.145.194:4132", "143.198.164.241:4132"];
--    const MINIMUM_NUMBER_OF_PEERS: usize = 3;
-+    const MINIMUM_NUMBER_OF_PEERS: usize = 5;
-     const COINBASE_IS_PUBLIC: bool = true;
- }
-diff --git a/src/network/server.rs b/src/network/server.rs
-index 7c4a5f18e..99e1e2dca 100644
---- a/src/network/server.rs
-+++ b/src/network/server.rs
-@@ -189,16 +189,13 @@ impl<N: Network, E: Environment> Server<N, E> {
+diff --git a/.ci/bench_bft_sync.sh b/.ci/bench_bft_sync.sh
+index 4c94372ed..062f41a78 100755
+--- a/.ci/bench_bft_sync.sh
++++ b/.ci/bench_bft_sync.sh
+@@ -95,7 +95,11 @@ echo "ℹ️ Nodes are fully connected (took $connect_time secs). Starting block
+ # Check heights periodically with a timeout
+ SECONDS=0
+ while (( SECONDS < max_wait )); do
+-  if check_heights 1 $((num_nodes+1)) $min_height "$network_name" "$SECONDS"; then
++  # The last block cannot be fully applied to the ledger yet as there is no next block to confirm it.
++  # However, we know that the sync height of a node is always at least one more than the ledger height.
++  expected_height=$((min_height-1))
++  
++  if check_heights 1 $((num_nodes+1)) $expected_height "$network_name" "$SECONDS"; then
+     total_wait=$SECONDS
+     throughput=$(compute_throughput "$min_height" "$total_wait")
  
-         // Initialize the ledger router process.
-         let peers_router = peers_router.clone();
--        let tasks_clone = tasks.clone();
-         tasks.append(task::spawn(async move {
-             // Asynchronously wait for a ledger request.
-             while let Some(request) = ledger_handler.recv().await {
--                let ledger = ledger.clone();
--                let peers_router = peers_router.clone();
--                tasks_clone.append(task::spawn(async move {
--                    // Hold the ledger write lock briefly, to update the state of the ledger.
--                    ledger.write().await.update(request, &peers_router).await;
--                }));
-+                // Hold the ledger write lock briefly, to update the state of the ledger.
-+                // Note: Do not wrap this call in a `task::spawn` as `BlockResponse` messages
-+                // will end up being processed out of order.
-+                ledger.write().await.update(request, &peers_router).await;
+diff --git a/.ci/bench_rest_api.sh b/.ci/bench_rest_api.sh
+index b6c90512c..97358e79d 100755
+--- a/.ci/bench_rest_api.sh
++++ b/.ci/bench_rest_api.sh
+@@ -36,7 +36,7 @@ trap child_exit_handler CHLD
+ # Define a trap handler that prints a message when an error occurs.
+ trap 'echo "⛔️ Error in $BASH_SOURCE at line $LINENO: \"$BASH_COMMAND\" failed (exit $?)"' ERR
+ 
+-# Shared flags betwen all nodes
++# Shared flags between all nodes
+ common_flags=(
+   --nodisplay --nobanner --noupdater # reduce clutter in the output
+   "--log-filter=$log_filter" # only show the logs we care about
+diff --git a/.ci/rest_api_helper.py b/.ci/rest_api_helper.py
+index d0f69d6c7..8fa9ca0ec 100755
+--- a/.ci/rest_api_helper.py
++++ b/.ci/rest_api_helper.py
+@@ -42,7 +42,7 @@ async def make_request(session, worker_id, mode):
+     """Make a single async request to the block endpoint"""
+ 
+     if mode == "get-block":
+-        block_id = random.randint(MIN_BLOCK, MAX_BLOCK+1)
++        block_id = random.randint(MIN_BLOCK, MAX_BLOCK)
+         url = f"{GET_BLOCK_BASE_URL}/{block_id}"
+     elif mode == "block-height":
+         url = BLOCK_HEIGHT_URL
+diff --git a/.ci/utils.sh b/.ci/utils.sh
+index bf9b7fc73..8f723d468 100644
+--- a/.ci/utils.sh
++++ b/.ci/utils.sh
+@@ -15,7 +15,7 @@ node_stopped=false
+ # NOTE: when you update this, update TASKSET1/2 as well.
+ CORES_PER_NODE=8
+ 
+-# Tasksets to pin processes to specfic CPUs.
++# Tasksets to pin processes to specific CPUs.
+ # This is a no-op on MacOS.
+ if [[ "$(uname)" == "Darwin" ]]; then
+   TASKSET1=""
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index d924f44de..f728ef6aa 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -34,17 +34,22 @@ commands:
+       - restore_cache:
+           key: cargo-cache-{{ arch }}-{{ checksum "Cargo.lock" }}
+       - run:
+-          name: "Install Rust and run cargo check"
++          name: "Install Rust"
++          timeout: 10m
+           command: |
+             $ProgressPreference = "SilentlyContinue"
+-            # Remove the circleci installed rustc.
+-            choco uninstall rust
++            # Remove the version of rustc that (might be) installed already..
++            # Use non-interactive mode and force uninstall to prevent the job from getting stuck.
++            choco uninstall rust -y --force
+             # Install llvm (libclang for rocksdb).
+-            choco install llvm -y 
++            choco install llvm -y
+             refreshenv
++
+             # Install rust with rustup.
+             Invoke-WebRequest -Uri "https://win.rustup.rs/" -OutFile "C:\rustup-init.exe"
+-            & C:\rustup-init.exe -y --default-toolchain "1.83.0-x86_64-pc-windows-msvc" --no-modify-path --profile minimal # Attention - Change the MSRV in Cargo.toml and rust-toolchain as well
++            & C:\rustup-init.exe -y --default-toolchain "1.88.0-x86_64-pc-windows-msvc" --no-modify-path --profile minimal # Attention - Change the MSRV in Cargo.toml and rust-toolchain as well
++
++            # Add cargo to PATH
+             $Env:Path += ";$Env:USERPROFILE\.cargo\bin"
+             # Verify the installation.
+             cargo --version --verbose
+@@ -52,6 +57,12 @@ commands:
+             if (!(Test-Path "Cargo.lock" -PathType Leaf)) {
+                 cargo generate-lockfile
              }
-         }));
++      - run:
++          name: "Run cargo check"
++          command: |
++            # Add cargo to PATH
++            $Env:Path += ";$Env:USERPROFILE\.cargo\bin"
++            # Check that the given package compiles
+             cd << parameters.workspace_member >>
+             cargo check --examples --benches --tests
+       - save_cache:
+diff --git a/.github/workflows/benchmarks.yml b/.github/workflows/benchmarks.yml
+index 3e3eebd12..5d4711879 100644
+--- a/.github/workflows/benchmarks.yml
++++ b/.github/workflows/benchmarks.yml
+@@ -51,7 +51,8 @@ jobs:
+         run: |
+           gcloud config set project protocol-development-sandbox
+           # Created with `.ci/generate_ledger.sh 40 250 1`
+-          gcloud storage cp gs://ci_testdata/sync-ledger-val40-250.zip ledger.zip
++          # NOTE: This needs to be updated when the consensus version changes.
++          gcloud storage cp gs://ci_testdata/sync-ledger-val40-250-9ec2291c57.zip ledger.zip
+           unzip ledger.zip
+  
+       - name: Install snarkOS (test_network)
+@@ -116,7 +117,9 @@ jobs:
+           fail-on-alert: false
+           github-token: ${{ secrets.GITHUB_TOKEN }}
+           # Use generic JSON format
+-          tool: 'customSmallerIsBetter'
++          # Note: there is no way to set smallerIsBetter for individual benchmarks right now,
++          # but for all, except the sync variance, bigger is indeed better.
++          tool: 'customBiggerIsBetter'
+           output-file-path: results.json
+           alert-comment-cc-users: '@kaimast'
+           # Only push the results on staging (see below)
+diff --git a/Cargo.lock b/Cargo.lock
+index 276f9f34b..6d509cb17 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4095,6 +4095,7 @@ dependencies = [
+  "snarkos-node-router",
+  "snarkos-node-router-messages",
+  "snarkos-node-sync",
++ "snarkos-node-sync-communication-service",
+  "snarkos-node-sync-locators",
+  "snarkos-node-tcp",
+  "snarkvm",
+@@ -4138,6 +4139,7 @@ dependencies = [
+  "snarkos-node-router",
+  "snarkos-node-sync-communication-service",
+  "snarkos-node-sync-locators",
++ "snarkos-node-tcp",
+  "snarkvm",
+  "tokio",
+  "tracing",
+@@ -4149,7 +4151,6 @@ name = "snarkos-node-sync-communication-service"
+ version = "4.2.1"
+ dependencies = [
+  "async-trait",
+- "parking_lot",
+  "tokio",
+ ]
+ 
+diff --git a/node/bft/src/gateway.rs b/node/bft/src/gateway.rs
+index e0a9b4116..0eab488a5 100644
+--- a/node/bft/src/gateway.rs
++++ b/node/bft/src/gateway.rs
+@@ -311,17 +311,6 @@ impl<N: Network> CommunicationService for Gateway<N> {
+     async fn send(&self, peer_ip: SocketAddr, message: Self::Message) -> Option<oneshot::Receiver<io::Result<()>>> {
+         Transport::send(self, peer_ip, message).await
+     }
+-
+-    fn ban_peer(&self, peer_ip: SocketAddr) {
+-        trace!("Banning peer {peer_ip} for timing out on block requests");
+-
+-        let tcp = self.tcp().clone();
+-        tcp.banned_peers().update_ip_ban(peer_ip.ip());
+-
+-        tokio::spawn(async move {
+-            tcp.disconnect(peer_ip).await;
+-        });
+-    }
+ }
+ 
+ impl<N: Network> Gateway<N> {
+@@ -385,12 +374,8 @@ impl<N: Network> Gateway<N> {
+ 
+     /// Returns `true` if the node is connected to the given Aleo address.
+     pub fn is_connected_address(&self, address: Address<N>) -> bool {
+-        // Retrieve the peer IP of the given address.
+-        match self.resolver.read().get_peer_ip_for_address(address) {
+-            // Determine if the peer IP is connected.
+-            Some(peer_ip) => self.is_connected(peer_ip),
+-            None => false,
+-        }
++        // The resolver only contains data on connected peers.
++        self.resolver.read().get_peer_ip_for_address(address).is_some()
+     }
+ 
+     /// Returns `true` if the given peer IP is an authorized validator.
+@@ -400,7 +385,7 @@ impl<N: Network> Gateway<N> {
+             return true;
+         }
+         // Retrieve the Aleo address of the peer IP.
+-        match self.resolver.read().get_address(ip) {
++        match self.resolve_to_aleo_addr(ip) {
+             // Determine if the peer IP is an authorized validator.
+             Some(address) => self.is_authorized_validator_address(address),
+             None => false,
+@@ -557,8 +542,8 @@ impl<N: Network> Gateway<N> {
+             });
+         }
+         if let Some(peer) = self.peer_pool.write().get_mut(&peer_ip) {
+-            if matches!(peer, Peer::Connected(_)) {
+-                self.resolver.write().remove_peer(peer_ip);
++            if let Peer::Connected(connected_peer) = peer {
++                self.resolver.write().remove_peer(peer_ip, connected_peer.aleo_addr);
+             }
+             peer.downgrade_to_candidate(peer_ip);
+         }
+@@ -573,7 +558,7 @@ impl<N: Network> Gateway<N> {
+     /// which can be used to determine when and whether the event has been delivered.
+     fn send_inner(&self, peer_ip: SocketAddr, event: Event<N>) -> Option<oneshot::Receiver<io::Result<()>>> {
+         // Resolve the listener IP to the (ambiguous) peer address.
+-        let Some(peer_addr) = self.resolver.read().get_ambiguous(peer_ip) else {
++        let Some(peer_addr) = self.resolve_to_ambiguous(peer_ip) else {
+             warn!("Unable to resolve the listener IP address '{peer_ip}'");
+             return None;
+         };
+@@ -823,7 +808,7 @@ impl<N: Network> Gateway<N> {
+                     // Iterate over the validators.
+                     for validator_ip in connected_peers.into_iter().take(MAX_VALIDATORS_TO_SEND) {
+                         // Retrieve the validator address.
+-                        if let Some(validator_address) = self_.resolver.read().get_address(validator_ip) {
++                        if let Some(validator_address) = self_.resolve_to_aleo_addr(validator_ip) {
+                             // Add the validator to the list of validators.
+                             validators.insert(validator_ip, validator_address);
+                         }
+@@ -912,20 +897,6 @@ impl<N: Network> Gateway<N> {
+         }
+     }
+ 
+-    /// Disconnects from the given peer IP, if the peer is connected. The returned boolean
+-    /// indicates whether the peer was actually disconnected from, or if this was a noop.
+-    pub fn disconnect(&self, peer_ip: SocketAddr) -> JoinHandle<bool> {
+-        let gateway = self.clone();
+-        tokio::spawn(async move {
+-            if let Some(peer) = gateway.get_connected_peer(peer_ip) {
+-                let connected_addr = peer.connected_addr;
+-                gateway.tcp.disconnect(connected_addr).await
+-            } else {
+-                false
+-            }
+-        })
+-    }
+-
+     /// Initialize a new instance of the heartbeat.
+     fn initialize_heartbeat(&self) {
+         let self_clone = self.clone();
+@@ -999,7 +970,7 @@ impl<N: Network> Gateway<N> {
+         // Log the connected validators.
+         info!("{connections_msg}");
+         for peer_ip in &connected_validators {
+-            let address = self.resolver.read().get_address(*peer_ip).map_or("Unknown".to_string(), |a| {
++            let address = self.resolve_to_aleo_addr(*peer_ip).map_or("Unknown".to_string(), |a| {
+                 connected_validator_addresses.insert(a);
+                 a.to_string()
+             });
+diff --git a/node/bft/src/helpers/resolver.rs b/node/bft/src/helpers/resolver.rs
+index 7d1723fd6..c9ed3ee8d 100644
+--- a/node/bft/src/helpers/resolver.rs
++++ b/node/bft/src/helpers/resolver.rs
+@@ -17,14 +17,13 @@ use snarkvm::prelude::{Address, Network};
+ 
+ use std::{collections::HashMap, net::SocketAddr};
+ 
++/// The resolver contains some reverse maps for peers which are not available
++/// by default to the implementors of PeerPoolHandling (who already contain
++/// maps from the peer's listening address to their various components).
+ #[derive(Debug)]
+ pub struct Resolver<N: Network> {
+-    /// The map of the listener address to (ambiguous) peer address.
+-    from_listener: HashMap<SocketAddr, SocketAddr>,
+     /// The map of the (ambiguous) peer address to listener address.
+     to_listener: HashMap<SocketAddr, SocketAddr>,
+-    /// A map of `peer IP` to `address`.
+-    peer_addresses: HashMap<SocketAddr, Address<N>>,
+     /// A map of `address` to `peer IP`.
+     address_peers: HashMap<Address<N>, SocketAddr>,
+ }
+@@ -39,12 +38,7 @@ impl<N: Network> Default for Resolver<N> {
+ impl<N: Network> Resolver<N> {
+     /// Initializes a new instance of the resolver.
+     pub fn new() -> Self {
+-        Self {
+-            from_listener: Default::default(),
+-            to_listener: Default::default(),
+-            peer_addresses: Default::default(),
+-            address_peers: Default::default(),
+-        }
++        Self { to_listener: Default::default(), address_peers: Default::default() }
+     }
+ }
+ 
+@@ -54,39 +48,23 @@ impl<N: Network> Resolver<N> {
+         self.to_listener.get(&peer_addr).copied()
+     }
+ 
+-    /// Returns the (ambiguous) peer address for the given listener address, if it exists.
+-    pub fn get_ambiguous(&self, peer_ip: SocketAddr) -> Option<SocketAddr> {
+-        self.from_listener.get(&peer_ip).copied()
+-    }
+-
+-    /// Returns the address for the given peer IP.
+-    pub fn get_address(&self, peer_ip: SocketAddr) -> Option<Address<N>> {
+-        self.peer_addresses.get(&peer_ip).copied()
+-    }
+-
+     /// Returns the peer IP for the given address.
+     pub fn get_peer_ip_for_address(&self, address: Address<N>) -> Option<SocketAddr> {
+         self.address_peers.get(&address).copied()
+     }
+ 
+-    /// Inserts a bidirectional mapping of the listener address and the (ambiguous) peer address,
+-    /// alongside a bidirectional mapping of the listener address and the Aleo address.
++    /// Inserts a mapping of a peer's connected address to its listener address,
++    /// alongside a mapping of the Aleo address to the listener address.
+     pub fn insert_peer(&mut self, listener_ip: SocketAddr, peer_addr: SocketAddr, address: Address<N>) {
+-        self.from_listener.insert(listener_ip, peer_addr);
+         self.to_listener.insert(peer_addr, listener_ip);
+-        self.peer_addresses.insert(listener_ip, address);
+         self.address_peers.insert(address, listener_ip);
+     }
+ 
+-    /// Removes the bidirectional mapping of the listener address and the (ambiguous) peer address,
+-    /// alongside the bidirectional mapping of the listener address and the Aleo address.
+-    pub fn remove_peer(&mut self, listener_ip: SocketAddr) {
+-        if let Some(peer_addr) = self.from_listener.remove(&listener_ip) {
+-            self.to_listener.remove(&peer_addr);
+-        }
+-        if let Some(address) = self.peer_addresses.remove(&listener_ip) {
+-            self.address_peers.remove(&address);
+-        }
++    /// Removes the mapping of a peer's connected address to its listener address,
++    /// alongside the mapping of the Aleo address to the listener address.
++    pub fn remove_peer(&mut self, connected_addr: SocketAddr, aleo_addr: Address<N>) {
++        self.to_listener.remove(&connected_addr);
++        self.address_peers.remove(&aleo_addr);
+     }
+ }
+ 
+@@ -106,22 +84,16 @@ mod tests {
+         let address = Address::<CurrentNetwork>::new(rng.r#gen());
+ 
+         assert!(resolver.get_listener(peer_addr).is_none());
+-        assert!(resolver.get_address(listener_ip).is_none());
+-        assert!(resolver.get_ambiguous(listener_ip).is_none());
+         assert!(resolver.get_peer_ip_for_address(address).is_none());
+ 
+         resolver.insert_peer(listener_ip, peer_addr, address);
+ 
+         assert_eq!(resolver.get_listener(peer_addr).unwrap(), listener_ip);
+-        assert_eq!(resolver.get_address(listener_ip).unwrap(), address);
+-        assert_eq!(resolver.get_ambiguous(listener_ip).unwrap(), peer_addr);
+         assert_eq!(resolver.get_peer_ip_for_address(address).unwrap(), listener_ip);
+ 
+-        resolver.remove_peer(listener_ip);
++        resolver.remove_peer(peer_addr, address);
+ 
+         assert!(resolver.get_listener(peer_addr).is_none());
+-        assert!(resolver.get_address(listener_ip).is_none());
+-        assert!(resolver.get_ambiguous(listener_ip).is_none());
+         assert!(resolver.get_peer_ip_for_address(address).is_none());
+     }
+ }
+diff --git a/node/bft/src/primary.rs b/node/bft/src/primary.rs
+index bcd6eb2af..07bfee158 100644
+--- a/node/bft/src/primary.rs
++++ b/node/bft/src/primary.rs
+@@ -44,6 +44,7 @@ use crate::{
+ use snarkos_account::Account;
+ use snarkos_node_bft_events::PrimaryPing;
+ use snarkos_node_bft_ledger_service::LedgerService;
++use snarkos_node_router::PeerPoolHandling;
+ use snarkos_node_sync::{BlockSync, DUMMY_SELF_IP, Ping};
+ use snarkvm::{
+     console::{
+@@ -731,7 +732,7 @@ impl<N: Network> Primary<N> {
+         let batch_author = batch_header.author();
+ 
+         // Ensure the batch proposal is from the validator.
+-        match self.gateway.resolver().read().get_address(peer_ip) {
++        match self.gateway.resolve_to_aleo_addr(peer_ip) {
+             // If the peer is a validator, then ensure the batch proposal is from the validator.
+             Some(address) => {
+                 if address != batch_author {
+@@ -1005,7 +1006,7 @@ impl<N: Network> Primary<N> {
+         let signer = signature.to_address();
+ 
+         // Ensure the batch signature is signed by the validator.
+-        if self.gateway.resolver().read().get_address(peer_ip) != Some(signer) {
++        if self.gateway.resolve_to_aleo_addr(peer_ip) != Some(signer) {
+             // Proceed to disconnect the validator.
+             self.gateway.disconnect(peer_ip);
+             bail!("Malicious peer - batch signature is from a different validator ({signer})");
+@@ -1044,7 +1045,7 @@ impl<N: Network> Primary<N> {
+                     // Retrieve the committee lookback for the round.
+                     let committee_lookback = self_.ledger.get_committee_lookback_for_round(proposal.round())?;
+                     // Retrieve the address of the validator.
+-                    let Some(signer) = self_.gateway.resolver().read().get_address(peer_ip) else {
++                    let Some(signer) = self_.gateway.resolve_to_aleo_addr(peer_ip) else {
+                         bail!("Signature is from a disconnected validator");
+                     };
+                     // Add the signature to the batch.
+diff --git a/node/router/Cargo.toml b/node/router/Cargo.toml
+index 0a13d9711..86d337479 100644
+--- a/node/router/Cargo.toml
++++ b/node/router/Cargo.toml
+@@ -67,6 +67,9 @@ workspace = true
+ workspace = true
+ features = [ "ledger", "prover" ]
+ 
++[dependencies.snarkos-node-sync-communication-service]
++workspace = true
++
+ [dependencies.snarkos-node-sync-locators]
+ workspace = true
+ 
+diff --git a/node/router/src/lib.rs b/node/router/src/lib.rs
+index 9d5fc895d..92c4008a1 100644
+--- a/node/router/src/lib.rs
++++ b/node/router/src/lib.rs
+@@ -45,10 +45,11 @@ pub use routing::*;
+ mod writing;
+ 
+ pub use crate::messages::NodeType;
+-use crate::messages::{Message, MessageCodec};
++use crate::messages::{BlockRequest, Message, MessageCodec};
+ 
+ use snarkos_account::Account;
+ use snarkos_node_bft_ledger_service::LedgerService;
++use snarkos_node_sync_communication_service::CommunicationService;
+ use snarkos_node_tcp::{Config, ConnectionSide, P2P, Tcp, is_bogon_ip, is_unspecified_or_broadcast_ip};
+ 
+ use snarkvm::prelude::{Address, Network, PrivateKey, ViewKey, error};
+@@ -93,6 +94,15 @@ pub trait PeerPoolHandling<N: Network>: P2P {
+         }
+     }
+ 
++    /// Returns the connected peer aleo address from the listener IP address.
++    fn resolve_to_aleo_addr(&self, listener_addr: SocketAddr) -> Option<Address<N>> {
++        if let Some(Peer::Connected(peer)) = self.peer_pool().read().get(&listener_addr) {
++            Some(peer.aleo_addr)
++        } else {
++            None
++        }
++    }
++
+     /// Returns `true` if the node is connecting to the given peer's listener address.
+     fn is_connecting(&self, listener_addr: SocketAddr) -> bool {
+         self.peer_pool().read().get(&listener_addr).is_some_and(|peer| peer.is_connecting())
+@@ -312,6 +322,28 @@ pub trait PeerPoolHandling<N: Network>: P2P {
+         }
+         Ok(())
+     }
++
++    /// Disconnects from the given peer IP, if the peer is connected. The returned boolean
++    /// indicates whether the peer was actually disconnected from, or if this was a noop.
++    fn disconnect(&self, listener_addr: SocketAddr) -> JoinHandle<bool> {
++        let connected_addr = self.resolve_to_ambiguous(listener_addr);
++        let tcp = self.tcp().clone();
++        tokio::spawn(async move {
++            if let Some(connected_addr) = connected_addr { tcp.disconnect(connected_addr).await } else { false }
++        })
++    }
++
++    /// Temporarily IP-ban and disconnect from the peer with the given listener address and an
++    /// optional reason for the ban.
++    fn ip_ban_peer(&self, listener_addr: SocketAddr, reason: Option<&str>) {
++        let ip = listener_addr.ip();
++        debug!("IP-banning {ip}{}", reason.map(|r| format!(" reason: {r}")).unwrap_or_default());
++
++        let tcp = self.tcp().clone();
++        tcp.banned_peers().update_ip_ban(ip);
++
++        self.disconnect(listener_addr);
++    }
+ }
+ 
+ /// The router keeps track of connected and connecting peers.
+@@ -484,20 +516,6 @@ impl<N: Network> Router<N> {
+         Ok(false)
+     }
+ 
+-    /// Disconnects from the given peer IP, if the peer is connected. The returned boolean
+-    /// indicates whether the peer was actually disconnected from, or if this was a noop.
+-    pub fn disconnect(&self, peer_ip: SocketAddr) -> JoinHandle<bool> {
+-        let router = self.clone();
+-        tokio::spawn(async move {
+-            if let Some(peer) = router.get_connected_peer(peer_ip) {
+-                let connected_addr = peer.connected_addr;
+-                router.tcp.disconnect(connected_addr).await
+-            } else {
+-                false
+-            }
+-        })
+-    }
+-
+     /// Returns the IP address of this node.
+     pub fn local_ip(&self) -> SocketAddr {
+         self.tcp.listening_addr().expect("The TCP listener is not enabled")
+@@ -666,6 +684,31 @@ impl<N: Network> Router<N> {
+     }
+ }
+ 
++#[async_trait]
++impl<N: Network> CommunicationService for Router<N> {
++    /// The message type.
++    type Message = Message<N>;
++
++    /// Prepares a block request to be sent.
++    fn prepare_block_request(start_height: u32, end_height: u32) -> Self::Message {
++        debug_assert!(start_height < end_height, "Invalid block request format");
++        Message::BlockRequest(BlockRequest { start_height, end_height })
++    }
++
++    /// Sends the given message to specified peer.
++    ///
++    /// This function returns as soon as the message is queued to be sent,
++    /// without waiting for the actual delivery; instead, the caller is provided with a [`oneshot::Receiver`]
++    /// which can be used to determine when and whether the message has been delivered.
++    async fn send(
++        &self,
++        peer_ip: SocketAddr,
++        message: Self::Message,
++    ) -> Option<tokio::sync::oneshot::Receiver<io::Result<()>>> {
++        self.send(peer_ip, message)
++    }
++}
++
+ /// Returns the list of bootstrap peers.
+ #[allow(clippy::if_same_then_else)]
+ pub fn bootstrap_peers<N: Network>(is_dev: bool) -> Vec<SocketAddr> {
+diff --git a/node/router/tests/common/router.rs b/node/router/tests/common/router.rs
+index b3d17e1d1..358b25628 100644
+--- a/node/router/tests/common/router.rs
++++ b/node/router/tests/common/router.rs
+@@ -18,6 +18,7 @@ use snarkos_node_router::{
+     Heartbeat,
+     Inbound,
+     Outbound,
++    PeerPoolHandling,
+     Router,
+     Routing,
+     messages::{
+diff --git a/node/src/client/mod.rs b/node/src/client/mod.rs
+index 4eb03f5e9..439bb7ee6 100644
+--- a/node/src/client/mod.rs
++++ b/node/src/client/mod.rs
+@@ -294,7 +294,7 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
+         // (if the ledger height is lower or equal to the current sync height, this is a noop)
+         self.sync.set_sync_height(self.ledger.latest_height());
+ 
+-        let new_requests = self.sync.handle_block_request_timeouts(self);
++        let new_requests = self.sync.handle_block_request_timeouts(self.router());
+         if let Some((block_requests, sync_peers)) = new_requests {
+             self.send_block_requests(block_requests, sync_peers).await;
+         }
+@@ -354,7 +354,7 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
+     ) {
+         // Issues the block requests in batches.
+         for requests in block_requests.chunks(DataBlocks::<N>::MAXIMUM_NUMBER_OF_BLOCKS as usize) {
+-            if !self.sync.send_block_requests(self, &sync_peers, requests).await {
++            if !self.sync.send_block_requests(self.router(), &sync_peers, requests).await {
+                 // Stop if we fail to process a batch of requests.
+                 break;
+             }
+diff --git a/node/src/client/router.rs b/node/src/client/router.rs
+index 5ca2ae91e..577f3f128 100644
+--- a/node/src/client/router.rs
++++ b/node/src/client/router.rs
+@@ -31,7 +31,6 @@ use snarkos_node_router::{
+         UnconfirmedTransaction,
+     },
+ };
+-use snarkos_node_sync::communication_service::CommunicationService;
+ use snarkos_node_tcp::{Connection, ConnectionSide, Tcp};
+ use snarkvm::{
+     ledger::narwhal::Data,
+@@ -134,42 +133,6 @@ impl<N: Network, C: ConsensusStorage<N>> Client<N, C> {
+     }
+ }
+ 
+-#[async_trait]
+-impl<N: Network, C: ConsensusStorage<N>> CommunicationService for Client<N, C> {
+-    /// The message type.
+-    type Message = Message<N>;
+-
+-    /// Prepares a block request to be sent.
+-    fn prepare_block_request(start_height: u32, end_height: u32) -> Self::Message {
+-        debug_assert!(start_height < end_height, "Invalid block request format");
+-        Message::BlockRequest(BlockRequest { start_height, end_height })
+-    }
+-
+-    /// Sends the given message to specified peer.
+-    ///
+-    /// This function returns as soon as the message is queued to be sent,
+-    /// without waiting for the actual delivery; instead, the caller is provided with a [`oneshot::Receiver`]
+-    /// which can be used to determine when and whether the message has been delivered.
+-    async fn send(
+-        &self,
+-        peer_ip: SocketAddr,
+-        message: Self::Message,
+-    ) -> Option<tokio::sync::oneshot::Receiver<io::Result<()>>> {
+-        self.router().send(peer_ip, message)
+-    }
+-
+-    fn ban_peer(&self, peer_ip: SocketAddr) {
+-        debug!("Banning peer {peer_ip} for timing out on block requests");
+-
+-        let tcp = self.router.tcp().clone();
+-        tcp.banned_peers().update_ip_ban(peer_ip.ip());
+-
+-        tokio::spawn(async move {
+-            tcp.disconnect(peer_ip).await;
+-        });
+-    }
+-}
+-
+ #[async_trait]
+ impl<N: Network, C: ConsensusStorage<N>> Routing<N> for Client<N, C> {}
+ 
+diff --git a/node/src/validator/router.rs b/node/src/validator/router.rs
+index b35c675e9..622b9aad4 100644
+--- a/node/src/validator/router.rs
++++ b/node/src/validator/router.rs
+@@ -14,16 +14,19 @@
+ // limitations under the License.
+ 
+ use super::*;
+-use snarkos_node_router::messages::{
+-    BlockRequest,
+-    BlockResponse,
+-    DataBlocks,
+-    DisconnectReason,
+-    Message,
+-    MessageCodec,
+-    Ping,
+-    Pong,
+-    UnconfirmedTransaction,
++use snarkos_node_router::{
++    PeerPoolHandling,
++    messages::{
++        BlockRequest,
++        BlockResponse,
++        DataBlocks,
++        DisconnectReason,
++        Message,
++        MessageCodec,
++        Ping,
++        Pong,
++        UnconfirmedTransaction,
++    },
+ };
+ use snarkos_node_tcp::{Connection, ConnectionSide, Tcp};
+ use snarkvm::{
+diff --git a/node/sync/Cargo.toml b/node/sync/Cargo.toml
+index a759cc33d..9cae8c5d4 100644
+--- a/node/sync/Cargo.toml
++++ b/node/sync/Cargo.toml
+@@ -90,6 +90,9 @@ features = [ "test" ]
+ workspace = true
+ features = [ "test" ]
+ 
++[dev-dependencies.snarkos-node-tcp]
++workspace = true
++
+ [dev-dependencies.snarkos-node-sync-communication-service]
+ workspace = true
+ features = [ "test-helpers" ]
+diff --git a/node/sync/communication-service/Cargo.toml b/node/sync/communication-service/Cargo.toml
+index ac0777cf2..46835b662 100644
+--- a/node/sync/communication-service/Cargo.toml
++++ b/node/sync/communication-service/Cargo.toml
+@@ -23,13 +23,6 @@ version = "0.1"
+ workspace = true
+ features = [ "sync" ]
+ 
+-[dependencies.parking_lot]
+-workspace = true
+-optional = true
+-
+-[dev-dependencies.parking_lot]
+-workspace = true
+-
+ [features]
+ default = [ ]
+-test-helpers = [ "dep:parking_lot" ]
++test-helpers = [ ]
+diff --git a/node/sync/communication-service/src/lib.rs b/node/sync/communication-service/src/lib.rs
+index 57ab993d0..7793ab8a5 100644
+--- a/node/sync/communication-service/src/lib.rs
++++ b/node/sync/communication-service/src/lib.rs
+@@ -39,26 +39,18 @@ pub trait CommunicationService: Send + Sync {
+     /// which can be used to determine when and whether the message has been delivered.
+     /// If no peer with the given IP exists, this function returns None.
+     async fn send(&self, peer_ip: SocketAddr, message: Self::Message) -> Option<oneshot::Receiver<io::Result<()>>>;
+-
+-    /// Mark a peer to be removed and (temporarily) banned.
+-    fn ban_peer(&self, peer_ip: SocketAddr);
+ }
+ 
+ #[cfg(any(test, feature = "test-helpers"))]
+ pub mod test_helpers {
+     use super::*;
+ 
+-    use parking_lot::Mutex;
+-
+     #[derive(Clone)]
+     pub struct DummyMessage {}
+ 
+     /// A communication service that does not do anything (for testing).
+     #[derive(Default)]
+-    pub struct DummyCommunicationService {
+-        // Any ban requests will be stored here.
+-        pub peers_to_ban: Mutex<Vec<SocketAddr>>,
+-    }
++    pub struct DummyCommunicationService;
+ 
+     #[async_trait]
+     impl CommunicationService for DummyCommunicationService {
+@@ -75,9 +67,5 @@ pub mod test_helpers {
+         ) -> Option<oneshot::Receiver<io::Result<()>>> {
+             None
+         }
+-
+-        fn ban_peer(&self, peer_ip: SocketAddr) {
+-            self.peers_to_ban.lock().push(peer_ip);
+-        }
+     }
+ }
+diff --git a/node/sync/src/block_sync.rs b/node/sync/src/block_sync.rs
+index c372a758d..7fa97919b 100644
+--- a/node/sync/src/block_sync.rs
++++ b/node/sync/src/block_sync.rs
+@@ -18,7 +18,7 @@ use crate::{
+     locators::BlockLocators,
+ };
+ use snarkos_node_bft_ledger_service::LedgerService;
+-use snarkos_node_router::messages::DataBlocks;
++use snarkos_node_router::{PeerPoolHandling, messages::DataBlocks};
+ use snarkos_node_sync_communication_service::CommunicationService;
+ use snarkos_node_sync_locators::{CHECKPOINT_INTERVAL, NUM_RECENT_BLOCKS};
+ use snarkvm::prelude::{Network, block::Block};
+@@ -936,12 +936,12 @@ impl<N: Network> BlockSync<N> {
+     /// Removes block requests that have timed out, i.e, requests we sent that did not receive a response in time.
+     ///
+     /// This removes the corresponding block responses and returns the set of peers/addresses that timed out.
+-    /// It will ask the communication service to ban any timed-out peers.
++    /// It will ask the peer pool handling service to ban any timed-out peers.
+     ///
+     /// Finally, it will return a set of new of block requests that replaced the timed-out requests (if needed).
+-    pub fn handle_block_request_timeouts<C: CommunicationService>(
++    pub fn handle_block_request_timeouts<P: PeerPoolHandling<N>>(
+         &self,
+-        communication: &C,
++        peer_pool_handler: &P,
+     ) -> Option<BlockRequestBatch<N>> {
+         // Acquire the write lock on the requests map.
+         let mut requests = self.requests.write();
+@@ -1003,7 +1003,7 @@ impl<N: Network> BlockSync<N> {
+         // Now remove and ban any unresponsive peers
+         for peer_ip in peers_to_ban {
+             self.remove_peer(&peer_ip);
+-            communication.ban_peer(peer_ip);
++            peer_pool_handler.ip_ban_peer(peer_ip, Some("timed out on block requests"));
+         }
+ 
+         // Re-issue any timed-out requests.
+@@ -1290,18 +1290,44 @@ mod tests {
+     };
+ 
+     use snarkos_node_bft_ledger_service::MockLedgerService;
+-    use snarkos_node_sync_communication_service::test_helpers::DummyCommunicationService;
++    use snarkos_node_router::Peer;
++    use snarkos_node_tcp::{P2P, Tcp};
+     use snarkvm::{
+         ledger::committee::Committee,
+         prelude::{Field, TestRng},
+     };
+ 
+     use indexmap::{IndexSet, indexset};
++    #[cfg(feature = "locktick")]
++    use locktick::parking_lot::RwLock;
++    #[cfg(not(feature = "locktick"))]
++    use parking_lot::RwLock;
+     use rand::Rng;
+     use std::net::{IpAddr, Ipv4Addr};
+ 
+     type CurrentNetwork = snarkvm::prelude::MainnetV0;
+ 
++    #[derive(Default)]
++    struct DummyPeerPoolHandler {
++        peers_to_ban: RwLock<Vec<SocketAddr>>,
++    }
++
++    impl P2P for DummyPeerPoolHandler {
++        fn tcp(&self) -> &Tcp {
++            unreachable!();
++        }
++    }
++
++    impl<N: Network> PeerPoolHandling<N> for DummyPeerPoolHandler {
++        fn peer_pool(&self) -> &RwLock<HashMap<SocketAddr, Peer<N>>> {
++            unreachable!();
++        }
++
++        fn ip_ban_peer(&self, listener_addr: SocketAddr, _reason: Option<&str>) {
++            self.peers_to_ban.write().push(listener_addr);
++        }
++    }
++
+     /// Returns the peer IP for the sync pool.
+     fn sample_peer_ip(id: u16) -> SocketAddr {
+         assert_ne!(id, 0, "The peer ID must not be 0 (reserved for local IP in testing)");
+@@ -1818,7 +1844,7 @@ mod tests {
+         assert_eq!(new_sync.requests.read().len(), requests.len());
+ 
+         // Remove timed out block requests.
+-        let c = DummyCommunicationService::default();
++        let c = DummyPeerPoolHandler::default();
+         new_sync.handle_block_request_timeouts(&c);
+ 
+         // Check that the number of requests is reduced based on the ledger height.
+@@ -1847,10 +1873,10 @@ mod tests {
+         assert_eq!(sync.locators.read().len(), 1);
+ 
+         // Remove timed out block requests.
+-        let c = DummyCommunicationService::default();
++        let c = DummyPeerPoolHandler::default();
+         sync.handle_block_request_timeouts(&c);
+ 
+-        let ban_list = c.peers_to_ban.lock();
++        let ban_list = c.peers_to_ban.write();
+         assert_eq!(ban_list.len(), 1);
+         assert_eq!(ban_list.iter().next(), Some(&peer_ip));
+ 
+@@ -1894,10 +1920,11 @@ mod tests {
+         assert_eq!(sync.requests.read().len(), 2);
+ 
+         // Remove timed out block requests.
+-        let c = DummyCommunicationService::default();
++        let c = DummyPeerPoolHandler::default();
++
+         let re_requests = sync.handle_block_request_timeouts(&c);
+ 
+-        let ban_list = c.peers_to_ban.lock();
++        let ban_list = c.peers_to_ban.write();
+         assert_eq!(ban_list.len(), 1);
+         assert_eq!(ban_list.iter().next(), Some(&peer_ip1));
  

@@ -1,47 +1,945 @@
-diff --git a/ledger/block/src/lib.rs b/ledger/block/src/lib.rs
-index 8b35d163a..bdb507d46 100644
---- a/ledger/block/src/lib.rs
-+++ b/ledger/block/src/lib.rs
-@@ -707,7 +707,7 @@ pub mod test_helpers {
-         (block, transaction, private_key)
-     }
+diff --git a/Cargo.lock b/Cargo.lock
+index 24f17f9b0..38e1ebd74 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3049,6 +3049,7 @@ dependencies = [
+  "snarkvm-ledger-authority",
+  "snarkvm-ledger-coinbase",
+  "snarkvm-ledger-committee",
++ "snarkvm-ledger-narwhal-batch-header",
+  "snarkvm-ledger-narwhal-subdag",
+  "snarkvm-ledger-narwhal-transmission-id",
+  "snarkvm-ledger-query",
+@@ -3095,6 +3096,7 @@ dependencies = [
+  "serde_json",
+  "snarkvm-console",
+  "snarkvm-ledger-committee",
++ "snarkvm-ledger-narwhal-batch-header",
+  "test-strategy",
+ ]
  
--    pub(crate) fn sample_metadata(rng: &mut TestRng) -> Metadata<CurrentNetwork> {
-+    pub(crate) fn sample_metadata() -> Metadata<CurrentNetwork> {
-         let network = CurrentNetwork::ID;
-         let round = u64::MAX;
-         let height = u32::MAX;
-@@ -719,7 +719,7 @@ pub mod test_helpers {
-         let timestamp = i64::MAX - 1;
-         let last_coinbase_timestamp = timestamp - 1;
-         Metadata::new(
--            CurrentNetwork::ID,
-+            network,
-             round,
-             height,
-             cumulative_weight,
-@@ -881,9 +881,9 @@ mod tests {
+@@ -3157,6 +3159,7 @@ dependencies = [
+  "serde_json",
+  "snarkvm-console",
+  "snarkvm-ledger-narwhal-batch-certificate",
++ "snarkvm-ledger-narwhal-batch-header",
+  "snarkvm-ledger-narwhal-subdag",
+  "snarkvm-ledger-narwhal-transmission-id",
+ ]
+diff --git a/algorithms/src/snark/varuna/data_structures/proof.rs b/algorithms/src/snark/varuna/data_structures/proof.rs
+index 196059b70..0d7767f77 100644
+--- a/algorithms/src/snark/varuna/data_structures/proof.rs
++++ b/algorithms/src/snark/varuna/data_structures/proof.rs
+@@ -170,7 +170,7 @@ impl<F: PrimeField> Evaluations<F> {
  
-     #[test]
-     fn test_serde_metadata() {
--        let rng = &mut TestRng::default();
--        let metadata = crate::test_helpers::sample_metadata(rng);
-+        let metadata = crate::test_helpers::sample_metadata();
-         let json_metadata = serde_json::to_string(&metadata).unwrap();
-         let deserialized_metadata: Metadata<CurrentNetwork> = serde_json::from_str(&json_metadata).unwrap();
-+        assert_eq!(metadata, deserialized_metadata);
+         for (label, value) in map {
+             if label == "g_1" {
+-                break;
++                continue;
+             }
+ 
+             if label.contains("g_a") {
+diff --git a/console/network/src/lib.rs b/console/network/src/lib.rs
+index 9179b3c36..717946cba 100644
+--- a/console/network/src/lib.rs
++++ b/console/network/src/lib.rs
+@@ -109,8 +109,8 @@ pub trait Network:
+     const BLOCK_TIME: u16 = 10;
+     /// The coinbase puzzle degree.
+     const COINBASE_PUZZLE_DEGREE: u32 = (1 << 13) - 1; // 8,191
+-    /// The maximum number of prover solutions that can be included per block.
+-    const MAX_PROVER_SOLUTIONS: usize = 1 << 8; // 256 prover solutions
++    /// The maximum number of solutions that can be included per block.
++    const MAX_SOLUTIONS: usize = 1 << 8; // 256 solutions
+     /// The number of blocks per epoch.
+     const NUM_BLOCKS_PER_EPOCH: u32 = 3600 / Self::BLOCK_TIME as u32; // 360 blocks == ~1 hour
+ 
+diff --git a/console/program/src/request/serialize.rs b/console/program/src/request/serialize.rs
+index 650279e49..905b67d99 100644
+--- a/console/program/src/request/serialize.rs
++++ b/console/program/src/request/serialize.rs
+@@ -21,7 +21,7 @@ impl<N: Network> Serialize for Request<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut transition = serializer.serialize_struct("Request", 9)?;
++                let mut transition = serializer.serialize_struct("Request", 10)?;
+                 transition.serialize_field("signer", &self.signer)?;
+                 transition.serialize_field("network", &self.network_id)?;
+                 transition.serialize_field("program", &self.program_id)?;
+diff --git a/ledger/block/Cargo.toml b/ledger/block/Cargo.toml
+index 41c9017a0..6ce4e1497 100644
+--- a/ledger/block/Cargo.toml
++++ b/ledger/block/Cargo.toml
+@@ -100,6 +100,10 @@ package = "snarkvm-ledger-committee"
+ path = "../../ledger/committee"
+ features = [ "test-helpers" ]
+ 
++[dev-dependencies.ledger-narwhal-batch-header]
++package = "snarkvm-ledger-narwhal-batch-header"
++path = "../narwhal/batch-header"
++
+ [dev-dependencies.ledger-query]
+ package = "snarkvm-ledger-query"
+ path = "../query"
+diff --git a/ledger/block/src/helpers/target.rs b/ledger/block/src/helpers/target.rs
+index b39623425..ffb6265bd 100644
+--- a/ledger/block/src/helpers/target.rs
++++ b/ledger/block/src/helpers/target.rs
+@@ -27,7 +27,7 @@ pub const fn block_reward(total_supply: u64, block_time: u16, coinbase_reward: u
+     // Compute the expected block height at year 1.
+     let block_height_at_year_1 = block_height_at_year(block_time, 1);
+     // Compute the annual reward: (0.05 * S).
+-    let annual_reward = (total_supply / 1000) * 50;
++    let annual_reward = total_supply / 20;
+     // Compute the block reward: (0.05 * S) / H_Y1.
+     let block_reward = annual_reward / block_height_at_year_1 as u64;
+     // Return the sum of the block reward, coinbase reward, and transaction fees.
+diff --git a/ledger/block/src/serialize.rs b/ledger/block/src/serialize.rs
+index b50a82c80..24edfa868 100644
+--- a/ledger/block/src/serialize.rs
++++ b/ledger/block/src/serialize.rs
+@@ -19,7 +19,7 @@ impl<N: Network> Serialize for Block<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut block = serializer.serialize_struct("Block", 6)?;
++                let mut block = serializer.serialize_struct("Block", 7 + self.solutions.is_some() as usize)?;
+                 block.serialize_field("block_hash", &self.block_hash)?;
+                 block.serialize_field("previous_hash", &self.previous_hash)?;
+                 block.serialize_field("header", &self.header)?;
+diff --git a/ledger/block/src/transaction/execution/serialize.rs b/ledger/block/src/transaction/execution/serialize.rs
+index 08724acbb..b432dd8e7 100644
+--- a/ledger/block/src/transaction/execution/serialize.rs
++++ b/ledger/block/src/transaction/execution/serialize.rs
+@@ -19,7 +19,7 @@ impl<N: Network> Serialize for Execution<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut execution = serializer.serialize_struct("Execution", 3)?;
++                let mut execution = serializer.serialize_struct("Execution", 2 + self.proof.is_some() as usize)?;
+                 execution
+                     .serialize_field("transitions", &self.transitions.values().collect::<Vec<&Transition<N>>>())?;
+                 execution.serialize_field("global_state_root", &self.global_state_root)?;
+diff --git a/ledger/block/src/transaction/fee/serialize.rs b/ledger/block/src/transaction/fee/serialize.rs
+index 97c1f08f6..b73ec5e03 100644
+--- a/ledger/block/src/transaction/fee/serialize.rs
++++ b/ledger/block/src/transaction/fee/serialize.rs
+@@ -19,7 +19,7 @@ impl<N: Network> Serialize for Fee<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut fee = serializer.serialize_struct("Fee", 3)?;
++                let mut fee = serializer.serialize_struct("Fee", 2 + self.proof.is_some() as usize)?;
+                 fee.serialize_field("transition", &self.transition)?;
+                 fee.serialize_field("global_state_root", &self.global_state_root)?;
+                 if let Some(proof) = &self.proof {
+diff --git a/ledger/block/src/transaction/serialize.rs b/ledger/block/src/transaction/serialize.rs
+index 9e9b7f941..ec6aae144 100644
+--- a/ledger/block/src/transaction/serialize.rs
++++ b/ledger/block/src/transaction/serialize.rs
+@@ -29,7 +29,7 @@ impl<N: Network> Serialize for Transaction<N> {
+                     transaction.end()
+                 }
+                 Self::Execute(id, execution, fee) => {
+-                    let mut transaction = serializer.serialize_struct("Transaction", 4)?;
++                    let mut transaction = serializer.serialize_struct("Transaction", 3 + fee.is_some() as usize)?;
+                     transaction.serialize_field("type", "execute")?;
+                     transaction.serialize_field("id", &id)?;
+                     transaction.serialize_field("execution", &execution)?;
+diff --git a/ledger/block/src/transactions/mod.rs b/ledger/block/src/transactions/mod.rs
+index be1a1f6b7..2eb3a3137 100644
+--- a/ledger/block/src/transactions/mod.rs
++++ b/ledger/block/src/transactions/mod.rs
+@@ -339,3 +339,18 @@ pub mod test_helpers {
+         crate::test_helpers::sample_genesis_block(rng).transactions().clone()
      }
  }
-diff --git a/synthesizer/process/src/cost.rs b/synthesizer/process/src/cost.rs
-index fbb072c58..532637255 100644
---- a/synthesizer/process/src/cost.rs
-+++ b/synthesizer/process/src/cost.rs
-@@ -87,7 +87,7 @@ pub fn execution_cost_v1<N: Network>(process: &Process<N>, execution: &Execution
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    type CurrentNetwork = console::network::Testnet3;
++
++    #[test]
++    fn test_max_transactions() {
++        assert_eq!(
++            Transactions::<CurrentNetwork>::MAX_TRANSACTIONS,
++            ledger_narwhal_batch_header::BatchHeader::<CurrentNetwork>::MAX_TRANSACTIONS
++        );
++    }
++}
+diff --git a/ledger/block/src/transition/input/serialize.rs b/ledger/block/src/transition/input/serialize.rs
+index 281d47cff..3a959b7c4 100644
+--- a/ledger/block/src/transition/input/serialize.rs
++++ b/ledger/block/src/transition/input/serialize.rs
+@@ -20,7 +20,7 @@ impl<N: Network> Serialize for Input<N> {
+         match serializer.is_human_readable() {
+             true => match self {
+                 Self::Constant(id, value) => {
+-                    let mut input = serializer.serialize_struct("Input", 3)?;
++                    let mut input = serializer.serialize_struct("Input", 2 + value.is_some() as usize)?;
+                     input.serialize_field("type", "constant")?;
+                     input.serialize_field("id", &id)?;
+                     if let Some(value) = value {
+@@ -29,7 +29,7 @@ impl<N: Network> Serialize for Input<N> {
+                     input.end()
+                 }
+                 Self::Public(id, value) => {
+-                    let mut input = serializer.serialize_struct("Input", 3)?;
++                    let mut input = serializer.serialize_struct("Input", 2 + value.is_some() as usize)?;
+                     input.serialize_field("type", "public")?;
+                     input.serialize_field("id", &id)?;
+                     if let Some(value) = value {
+@@ -38,7 +38,7 @@ impl<N: Network> Serialize for Input<N> {
+                     input.end()
+                 }
+                 Self::Private(id, value) => {
+-                    let mut input = serializer.serialize_struct("Input", 3)?;
++                    let mut input = serializer.serialize_struct("Input", 2 + value.is_some() as usize)?;
+                     input.serialize_field("type", "private")?;
+                     input.serialize_field("id", &id)?;
+                     if let Some(value) = value {
+diff --git a/ledger/block/src/transition/output/serialize.rs b/ledger/block/src/transition/output/serialize.rs
+index bdf49c4ba..47041735a 100644
+--- a/ledger/block/src/transition/output/serialize.rs
++++ b/ledger/block/src/transition/output/serialize.rs
+@@ -20,7 +20,7 @@ impl<N: Network> Serialize for Output<N> {
+         match serializer.is_human_readable() {
+             true => match self {
+                 Self::Constant(id, value) => {
+-                    let mut output = serializer.serialize_struct("Output", 3)?;
++                    let mut output = serializer.serialize_struct("Output", 2 + value.is_some() as usize)?;
+                     output.serialize_field("type", "constant")?;
+                     output.serialize_field("id", &id)?;
+                     if let Some(value) = value {
+@@ -29,7 +29,7 @@ impl<N: Network> Serialize for Output<N> {
+                     output.end()
+                 }
+                 Self::Public(id, value) => {
+-                    let mut output = serializer.serialize_struct("Output", 3)?;
++                    let mut output = serializer.serialize_struct("Output", 2 + value.is_some() as usize)?;
+                     output.serialize_field("type", "public")?;
+                     output.serialize_field("id", &id)?;
+                     if let Some(value) = value {
+@@ -38,7 +38,7 @@ impl<N: Network> Serialize for Output<N> {
+                     output.end()
+                 }
+                 Self::Private(id, value) => {
+-                    let mut output = serializer.serialize_struct("Output", 3)?;
++                    let mut output = serializer.serialize_struct("Output", 2 + value.is_some() as usize)?;
+                     output.serialize_field("type", "private")?;
+                     output.serialize_field("id", &id)?;
+                     if let Some(value) = value {
+@@ -47,7 +47,7 @@ impl<N: Network> Serialize for Output<N> {
+                     output.end()
+                 }
+                 Self::Record(id, checksum, value) => {
+-                    let mut output = serializer.serialize_struct("Output", 5)?;
++                    let mut output = serializer.serialize_struct("Output", 3 + value.is_some() as usize)?;
+                     output.serialize_field("type", "record")?;
+                     output.serialize_field("id", &id)?;
+                     output.serialize_field("checksum", &checksum)?;
+@@ -63,7 +63,7 @@ impl<N: Network> Serialize for Output<N> {
+                     output.end()
+                 }
+                 Self::Future(id, value) => {
+-                    let mut output = serializer.serialize_struct("Output", 3)?;
++                    let mut output = serializer.serialize_struct("Output", 2 + value.is_some() as usize)?;
+                     output.serialize_field("type", "future")?;
+                     output.serialize_field("id", &id)?;
+                     if let Some(value) = value {
+diff --git a/ledger/block/src/verify.rs b/ledger/block/src/verify.rs
+index 057ff2b56..9fa609322 100644
+--- a/ledger/block/src/verify.rs
++++ b/ledger/block/src/verify.rs
+@@ -137,16 +137,11 @@ impl<N: Network> Block<N> {
+         previous_height: u32,
+         current_committee: &Committee<N>,
+     ) -> Result<(u64, u32, i64)> {
++        #[cfg(not(any(test, feature = "test")))]
++        ensure!(self.authority.is_quorum(), "The next block must be a quorum block");
++
+         // Determine the expected height.
+         let expected_height = previous_height.saturating_add(1);
+-        // Ensure the block type is correct.
+-        match expected_height == 0 {
+-            true => ensure!(self.authority.is_beacon(), "The genesis block must be a beacon block"),
+-            false => {
+-                #[cfg(not(any(test, feature = "test")))]
+-                ensure!(self.authority.is_quorum(), "The next block must be a quorum block");
+-            }
+-        }
  
-     // Get the finalize cost for the root transition.
-     let stack = process.get_stack(transition.program_id())?;
--    let finalize_cost = cost_in_microcredits_v1(stack, transition.function_name())?;
-+    let finalize_cost = cost_in_microcredits_v1(&stack, transition.function_name())?;
+         // Determine the expected round.
+         let expected_round = match &self.authority {
+@@ -271,10 +266,10 @@ impl<N: Network> Block<N> {
+             Some(coinbase) => {
+                 // Ensure the number of solutions is within the allowed range.
+                 ensure!(
+-                    coinbase.len() <= N::MAX_PROVER_SOLUTIONS,
++                    coinbase.len() <= N::MAX_SOLUTIONS,
+                     "Block {height} contains too many prover solutions (found '{}', expected '{}')",
+                     coinbase.len(),
+-                    N::MAX_PROVER_SOLUTIONS
++                    N::MAX_SOLUTIONS
+                 );
+                 // Ensure the solutions are not accepted after the block height at year 10.
+                 if height > block_height_at_year(N::BLOCK_TIME, 10) {
+diff --git a/ledger/coinbase/benches/coinbase_puzzle.rs b/ledger/coinbase/benches/coinbase_puzzle.rs
+index 418466b67..fe8c86c4c 100644
+--- a/ledger/coinbase/benches/coinbase_puzzle.rs
++++ b/ledger/coinbase/benches/coinbase_puzzle.rs
+@@ -95,7 +95,7 @@ fn coinbase_puzzle_verify(c: &mut Criterion) {
+         let puzzle = CoinbasePuzzleInst::trim(&universal_srs, config).unwrap();
+         let epoch_challenge = sample_epoch_challenge(degree, rng);
  
-     // Compute the total cost in microcredits.
-     let total_cost = storage_cost
+-        for batch_size in [10, 100, <Testnet3 as Network>::MAX_PROVER_SOLUTIONS] {
++        for batch_size in [10, 100, <Testnet3 as Network>::MAX_SOLUTIONS] {
+             let solutions = (0..batch_size)
+                 .map(|_| {
+                     let (address, nonce) = sample_address_and_nonce(rng);
+diff --git a/ledger/coinbase/src/helpers/coinbase_solution/mod.rs b/ledger/coinbase/src/helpers/coinbase_solution/mod.rs
+index bfdacbace..a735607a5 100644
+--- a/ledger/coinbase/src/helpers/coinbase_solution/mod.rs
++++ b/ledger/coinbase/src/helpers/coinbase_solution/mod.rs
+@@ -33,11 +33,11 @@ impl<N: Network> CoinbaseSolution<N> {
+         // Ensure the solutions are not empty.
+         ensure!(!solutions.is_empty(), "There are no solutions to verify for the coinbase puzzle");
+         // Ensure the number of partial solutions does not exceed `MAX_PROVER_SOLUTIONS`.
+-        if solutions.len() > N::MAX_PROVER_SOLUTIONS {
++        if solutions.len() > N::MAX_SOLUTIONS {
+             bail!(
+                 "The solutions exceed the allowed number of partial solutions. ({} > {})",
+                 solutions.len(),
+-                N::MAX_PROVER_SOLUTIONS
++                N::MAX_SOLUTIONS
+             );
+         }
+         // Ensure the puzzle commitments are unique.
+diff --git a/ledger/coinbase/src/helpers/prover_solution/serialize.rs b/ledger/coinbase/src/helpers/prover_solution/serialize.rs
+index 32ce1b22d..564cba8be 100644
+--- a/ledger/coinbase/src/helpers/prover_solution/serialize.rs
++++ b/ledger/coinbase/src/helpers/prover_solution/serialize.rs
+@@ -21,7 +21,8 @@ impl<N: Network> Serialize for ProverSolution<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut prover_solution = serializer.serialize_struct("ProverSolution", 3)?;
++                let mut prover_solution =
++                    serializer.serialize_struct("ProverSolution", 2 + self.proof.random_v.is_some() as usize)?;
+                 prover_solution.serialize_field("partial_solution", &self.partial_solution)?;
+                 prover_solution.serialize_field("proof.w", &self.proof.w)?;
+                 if let Some(random_v) = &self.proof.random_v {
+diff --git a/ledger/coinbase/src/lib.rs b/ledger/coinbase/src/lib.rs
+index d07e0109e..eacb8c779 100644
+--- a/ledger/coinbase/src/lib.rs
++++ b/ledger/coinbase/src/lib.rs
+@@ -171,11 +171,11 @@ impl<N: Network> CoinbasePuzzle<N> {
+         ensure!(!solutions.is_empty(), "There are no solutions to verify for the coinbase puzzle");
+ 
+         // Ensure the number of partial solutions does not exceed `MAX_PROVER_SOLUTIONS`.
+-        if solutions.len() > N::MAX_PROVER_SOLUTIONS {
++        if solutions.len() > N::MAX_SOLUTIONS {
+             bail!(
+                 "The solutions exceed the allowed number of partial solutions. ({} > {})",
+                 solutions.len(),
+-                N::MAX_PROVER_SOLUTIONS
++                N::MAX_SOLUTIONS
+             );
+         }
+ 
+diff --git a/ledger/coinbase/src/tests.rs b/ledger/coinbase/src/tests.rs
+index 5c5546ce2..15a39fc6a 100644
+--- a/ledger/coinbase/src/tests.rs
++++ b/ledger/coinbase/src/tests.rs
+@@ -133,7 +133,7 @@ fn test_profiler() -> Result<()> {
+     // Generate proof inputs
+     let epoch_challenge = EpochChallenge::new(rng.next_u32(), Default::default(), degree).unwrap();
+ 
+-    for batch_size in [10, 100, <Testnet3 as Network>::MAX_PROVER_SOLUTIONS] {
++    for batch_size in [10, 100, <Testnet3 as Network>::MAX_SOLUTIONS] {
+         // Generate the solutions.
+         let solutions = (0..batch_size)
+             .map(|_| {
+diff --git a/ledger/committee/Cargo.toml b/ledger/committee/Cargo.toml
+index 6e01316f0..a7ae50f51 100644
+--- a/ledger/committee/Cargo.toml
++++ b/ledger/committee/Cargo.toml
+@@ -82,3 +82,7 @@ version = "1"
+ [dev-dependencies.snarkvm-ledger-committee]
+ path = "."
+ features = [ "prop-tests" ]
++
++[dev-dependencies.ledger-narwhal-batch-header]
++package = "snarkvm-ledger-narwhal-batch-header"
++path = "../narwhal/batch-header"
+diff --git a/ledger/committee/src/bytes.rs b/ledger/committee/src/bytes.rs
+index d55a80ab4..2c3eba977 100644
+--- a/ledger/committee/src/bytes.rs
++++ b/ledger/committee/src/bytes.rs
+@@ -28,6 +28,13 @@ impl<N: Network> FromBytes for Committee<N> {
+         let starting_round = u64::read_le(&mut reader)?;
+         // Read the number of members.
+         let num_members = u16::read_le(&mut reader)?;
++        // Ensure the number of members is within the allowed limit.
++        if num_members > Self::MAX_COMMITTEE_SIZE {
++            return Err(error(format!(
++                "Committee cannot exceed {} members, found {num_members}",
++                Self::MAX_COMMITTEE_SIZE,
++            )));
++        }
+         // Read the members.
+         let mut members = IndexMap::with_capacity(num_members as usize);
+         for _ in 0..num_members {
+diff --git a/ledger/committee/src/lib.rs b/ledger/committee/src/lib.rs
+index 6a08e72b5..5d81de441 100644
+--- a/ledger/committee/src/lib.rs
++++ b/ledger/committee/src/lib.rs
+@@ -405,4 +405,12 @@ mod tests {
+             }
+         }
+     }
++
++    #[test]
++    fn test_maximum_committee_size() {
++        assert_eq!(
++            Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize,
++            ledger_narwhal_batch_header::BatchHeader::<CurrentNetwork>::MAX_CERTIFICATES
++        );
++    }
+ }
+diff --git a/ledger/narwhal/batch-header/src/bytes.rs b/ledger/narwhal/batch-header/src/bytes.rs
+index f564e58c1..386ee958d 100644
+--- a/ledger/narwhal/batch-header/src/bytes.rs
++++ b/ledger/narwhal/batch-header/src/bytes.rs
+@@ -34,18 +34,32 @@ impl<N: Network> FromBytes for BatchHeader<N> {
+         let timestamp = i64::read_le(&mut reader)?;
+ 
+         // Read the number of transmission IDs.
+-        let num_transmissions = u32::read_le(&mut reader)?;
++        let num_transmission_ids = u32::read_le(&mut reader)?;
++        // Ensure the number of transmission IDs is within bounds.
++        if num_transmission_ids as usize > Self::MAX_TRANSMISSIONS {
++            return Err(error(format!(
++                "Number of transmission IDs ({num_transmission_ids}) exceeds the maximum ({})",
++                Self::MAX_TRANSMISSIONS,
++            )));
++        }
+         // Read the transmission IDs.
+         let mut transmission_ids = IndexSet::new();
+-        for _ in 0..num_transmissions {
++        for _ in 0..num_transmission_ids {
+             // Insert the transmission ID.
+             transmission_ids.insert(TransmissionID::read_le(&mut reader)?);
+         }
+ 
+         // Read the number of previous certificate IDs.
+         let num_previous_certificate_ids = u32::read_le(&mut reader)?;
++        // Ensure the number of previous certificate IDs is within bounds.
++        if num_previous_certificate_ids as usize > Self::MAX_CERTIFICATES {
++            return Err(error(format!(
++                "Number of previous certificate IDs ({num_previous_certificate_ids}) exceeds the maximum ({})",
++                Self::MAX_CERTIFICATES
++            )));
++        }
+         // Read the previous certificate IDs.
+-        let mut previous_certificate_ids = IndexSet::with_capacity(num_previous_certificate_ids as usize);
++        let mut previous_certificate_ids = IndexSet::new();
+         for _ in 0..num_previous_certificate_ids {
+             // Read the certificate ID.
+             previous_certificate_ids.insert(Field::read_le(&mut reader)?);
+diff --git a/ledger/narwhal/batch-header/src/lib.rs b/ledger/narwhal/batch-header/src/lib.rs
+index abe394872..3801498a3 100644
+--- a/ledger/narwhal/batch-header/src/lib.rs
++++ b/ledger/narwhal/batch-header/src/lib.rs
+@@ -46,6 +46,17 @@ pub struct BatchHeader<N: Network> {
+     signature: Signature<N>,
+ }
+ 
++impl<N: Network> BatchHeader<N> {
++    /// The maximum number of certificates in a batch.
++    pub const MAX_CERTIFICATES: usize = 200;
++    /// The maximum number of solutions in a batch.
++    pub const MAX_SOLUTIONS: usize = N::MAX_SOLUTIONS;
++    /// The maximum number of transactions in a batch.
++    pub const MAX_TRANSACTIONS: usize = usize::pow(2, console::program::TRANSACTIONS_DEPTH as u32);
++    /// The maximum number of transmissions in a batch.
++    pub const MAX_TRANSMISSIONS: usize = Self::MAX_SOLUTIONS + Self::MAX_TRANSACTIONS;
++}
++
+ impl<N: Network> BatchHeader<N> {
+     /// Initializes a new batch header.
+     pub fn new<R: Rng + CryptoRng>(
+diff --git a/ledger/narwhal/subdag/Cargo.toml b/ledger/narwhal/subdag/Cargo.toml
+index 9c7a41904..7c0a5b676 100644
+--- a/ledger/narwhal/subdag/Cargo.toml
++++ b/ledger/narwhal/subdag/Cargo.toml
+@@ -39,6 +39,11 @@ package = "snarkvm-ledger-narwhal-batch-certificate"
+ path = "../batch-certificate"
+ version = "=0.16.8"
+ 
++[dependencies.narwhal-batch-header]
++package = "snarkvm-ledger-narwhal-batch-header"
++path = "../batch-header"
++version = "=0.16.8"
++
+ [dependencies.narwhal-transmission-id]
+ package = "snarkvm-ledger-narwhal-transmission-id"
+ path = "../transmission-id"
+diff --git a/ledger/narwhal/subdag/src/bytes.rs b/ledger/narwhal/subdag/src/bytes.rs
+index c5435663e..d4ed42913 100644
+--- a/ledger/narwhal/subdag/src/bytes.rs
++++ b/ledger/narwhal/subdag/src/bytes.rs
+@@ -21,11 +21,15 @@ impl<N: Network> FromBytes for Subdag<N> {
+         let version = u8::read_le(&mut reader)?;
+         // Ensure the version is valid.
+         if version != 1 {
+-            return Err(error("Invalid batch version"));
++            return Err(error(format!("Invalid subdag version ({version})")));
+         }
+ 
+         // Read the number of rounds.
+         let num_rounds = u32::read_le(&mut reader)?;
++        // Ensure the number of rounds is within bounds.
++        if num_rounds as usize > Self::MAX_ROUNDS {
++            return Err(error(format!("Number of rounds ({num_rounds}) exceeds the maximum ({})", Self::MAX_ROUNDS)));
++        }
+         // Read the round certificates.
+         let mut subdag = BTreeMap::new();
+         for _ in 0..num_rounds {
+@@ -33,8 +37,15 @@ impl<N: Network> FromBytes for Subdag<N> {
+             let round = u64::read_le(&mut reader)?;
+             // Read the number of certificates.
+             let num_certificates = u32::read_le(&mut reader)?;
++            // Ensure the number of certificates is within bounds.
++            if num_certificates as usize > BatchHeader::<N>::MAX_CERTIFICATES {
++                return Err(error(format!(
++                    "Number of certificates ({num_certificates}) exceeds the maximum ({})",
++                    BatchHeader::<N>::MAX_CERTIFICATES
++                )));
++            }
+             // Read the certificates.
+-            let mut certificates = IndexSet::with_capacity(num_certificates as usize);
++            let mut certificates = IndexSet::new();
+             for _ in 0..num_certificates {
+                 // Read the certificate.
+                 certificates.insert(BatchCertificate::read_le(&mut reader)?);
+@@ -43,7 +54,7 @@ impl<N: Network> FromBytes for Subdag<N> {
+             subdag.insert(round, certificates);
+         }
+         // Return the subdag.
+-        Self::from(subdag).map_err(|e| error(e.to_string()))
++        Self::from(subdag).map_err(error)
+     }
+ }
+ 
+@@ -53,13 +64,13 @@ impl<N: Network> ToBytes for Subdag<N> {
+         // Write the version.
+         1u8.write_le(&mut writer)?;
+         // Write the number of rounds.
+-        u32::try_from(self.subdag.len()).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?;
++        u32::try_from(self.subdag.len()).map_err(error)?.write_le(&mut writer)?;
+         // Write the round certificates.
+         for (round, certificates) in &self.subdag {
+             // Write the round.
+             round.write_le(&mut writer)?;
+             // Write the number of certificates.
+-            u32::try_from(certificates.len()).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?;
++            u32::try_from(certificates.len()).map_err(error)?.write_le(&mut writer)?;
+             // Write the certificates.
+             for certificate in certificates {
+                 // Write the certificate.
+diff --git a/ledger/narwhal/subdag/src/lib.rs b/ledger/narwhal/subdag/src/lib.rs
+index beafc1963..8fb93cfe9 100644
+--- a/ledger/narwhal/subdag/src/lib.rs
++++ b/ledger/narwhal/subdag/src/lib.rs
+@@ -21,6 +21,7 @@ mod string;
+ 
+ use console::{account::Address, prelude::*, program::SUBDAG_CERTIFICATES_DEPTH, types::Field};
+ use narwhal_batch_certificate::BatchCertificate;
++use narwhal_batch_header::BatchHeader;
+ use narwhal_transmission_id::TransmissionID;
+ 
+ use indexmap::IndexSet;
+@@ -101,6 +102,11 @@ impl<N: Network> Subdag<N> {
+     }
+ }
+ 
++impl<N: Network> Subdag<N> {
++    /// The maximum number of rounds in a subdag (bounded up to GC depth).
++    pub const MAX_ROUNDS: usize = 50;
++}
++
+ impl<N: Network> Subdag<N> {
+     /// Returns the anchor round.
+     pub fn anchor_round(&self) -> u64 {
+diff --git a/ledger/narwhal/transmission/src/serialize.rs b/ledger/narwhal/transmission/src/serialize.rs
+index 2acd03750..4657a7ff7 100644
+--- a/ledger/narwhal/transmission/src/serialize.rs
++++ b/ledger/narwhal/transmission/src/serialize.rs
+@@ -18,23 +18,25 @@ impl<N: Network> Serialize for Transmission<N> {
+     #[inline]
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+-            true => {
+-                let mut transmission = serializer.serialize_struct("Transmission", 2)?;
+-                match self {
+-                    Self::Ratification => {
+-                        transmission.serialize_field("type", "ratification")?;
+-                    }
+-                    Self::Solution(solution) => {
+-                        transmission.serialize_field("type", "solution")?;
+-                        transmission.serialize_field("transmission", solution)?;
+-                    }
+-                    Self::Transaction(transaction) => {
+-                        transmission.serialize_field("type", "transaction")?;
+-                        transmission.serialize_field("transmission", transaction)?;
+-                    }
++            true => match self {
++                Self::Ratification => {
++                    let mut transmission = serializer.serialize_struct("Transmission", 1)?;
++                    transmission.serialize_field("type", "ratification")?;
++                    transmission.end()
+                 }
+-                transmission.end()
+-            }
++                Self::Solution(solution) => {
++                    let mut transmission = serializer.serialize_struct("Transmission", 2)?;
++                    transmission.serialize_field("type", "solution")?;
++                    transmission.serialize_field("transmission", solution)?;
++                    transmission.end()
++                }
++                Self::Transaction(transaction) => {
++                    let mut transmission = serializer.serialize_struct("Transmission", 2)?;
++                    transmission.serialize_field("type", "transaction")?;
++                    transmission.serialize_field("transmission", transaction)?;
++                    transmission.end()
++                }
++            },
+             false => ToBytesSerializer::serialize_with_size_encoding(self, serializer),
+         }
+     }
+diff --git a/ledger/src/lib.rs b/ledger/src/lib.rs
+index 0e5511b79..0259e567b 100644
+--- a/ledger/src/lib.rs
++++ b/ledger/src/lib.rs
+@@ -145,8 +145,9 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
+         let timer = timer!("Ledger::load_unchecked");
+ 
+         // Initialize the consensus store.
+-        let Ok(store) = ConsensusStore::<N, C>::open(dev) else {
+-            bail!("Failed to load ledger (run 'snarkos clean' and try again)");
++        let store = match ConsensusStore::<N, C>::open(dev) {
++            Ok(store) => store,
++            Err(e) => bail!("Failed to load ledger (run 'snarkos clean' and try again)\n\n{e}\n"),
+         };
+         lap!(timer, "Load consensus store");
+ 
+diff --git a/ledger/src/tests.rs b/ledger/src/tests.rs
+index af9510219..ea5ab8b8d 100644
+--- a/ledger/src/tests.rs
++++ b/ledger/src/tests.rs
+@@ -567,3 +567,72 @@ fn test_bond_and_unbond_validator() {
+     let committee = ledger.latest_committee().unwrap();
+     assert!(!committee.is_committee_member(new_member_address));
+ }
++
++#[test]
++fn test_aborted_transaction_indexing() {
++    let rng = &mut TestRng::default();
++
++    // Initialize the test environment.
++    let crate::test_helpers::TestEnv { ledger, private_key, .. } = crate::test_helpers::sample_test_env(rng);
++
++    // Sample a recipient account.
++    let recipient_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++    let recipient_address = Address::try_from(&recipient_private_key).unwrap();
++
++    // Sample another recipient account.
++    let recipient_private_key_2 = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++    let recipient_address_2 = Address::try_from(&recipient_private_key_2).unwrap();
++
++    // Fund a new address.
++    let inputs = [Value::from_str(&format!("{recipient_address}")).unwrap(), Value::from_str("185000u64").unwrap()];
++    let transfer_transaction = ledger
++        .vm
++        .execute(&private_key, ("credits.aleo", "transfer_public"), inputs.iter(), None, 0, None, rng)
++        .unwrap();
++
++    // Construct the next block.
++    let transfer_block = ledger
++        .prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![transfer_transaction], rng)
++        .unwrap();
++
++    // Check that the next block is valid.
++    ledger.check_next_block(&transfer_block).unwrap();
++
++    // Add the deployment block to the ledger.
++    ledger.advance_to_next_block(&transfer_block).unwrap();
++
++    // Send a transaction that will be aborted due to insufficient fee.
++    let inputs = [Value::from_str(&format!("{recipient_address_2}")).unwrap(), Value::from_str("1u64").unwrap()];
++    let transfer_transaction = ledger
++        .vm
++        .execute(&recipient_private_key_2, ("credits.aleo", "transfer_public"), inputs.iter(), None, 0, None, rng)
++        .unwrap();
++    let aborted_transaction_id = transfer_transaction.id();
++
++    // Create another arbitrary transaction.
++    let inputs = [Value::from_str(&format!("{recipient_address_2}")).unwrap(), Value::from_str("1u64").unwrap()];
++    let transfer_transaction_2 = ledger
++        .vm
++        .execute(&private_key, ("credits.aleo", "transfer_public"), inputs.iter(), None, 0, None, rng)
++        .unwrap();
++
++    // Create a block.
++    let block = ledger
++        .prepare_advance_to_next_beacon_block(
++            &private_key,
++            vec![],
++            vec![],
++            vec![transfer_transaction, transfer_transaction_2],
++            rng,
++        )
++        .unwrap();
++
++    // Check that the block contains the aborted transaction.
++    assert_eq!(block.aborted_transaction_ids(), &[aborted_transaction_id]);
++
++    // Check that the next block is valid.
++    ledger.check_next_block(&block).unwrap();
++
++    // Add the deployment block to the ledger.
++    ledger.advance_to_next_block(&block).unwrap();
++}
+diff --git a/synthesizer/process/src/stack/helpers/matches.rs b/synthesizer/process/src/stack/helpers/matches.rs
+index 796608f5a..975045943 100644
+--- a/synthesizer/process/src/stack/helpers/matches.rs
++++ b/synthesizer/process/src/stack/helpers/matches.rs
+@@ -223,8 +223,14 @@ impl<N: Network> Stack<N> {
+                     Plaintext::Array(..) => bail!("'{struct_name}' is invalid: expected struct, found array"),
+                 };
+ 
+-                // Ensure the number of struct members does not exceed the maximum.
+                 let num_members = members.len();
++                // Ensure the number of struct members does not go below the minimum.
++                ensure!(
++                    num_members >= N::MIN_STRUCT_ENTRIES,
++                    "'{struct_name}' cannot be less than {} entries",
++                    N::MIN_STRUCT_ENTRIES
++                );
++                // Ensure the number of struct members does not exceed the maximum.
+                 ensure!(
+                     num_members <= N::MAX_STRUCT_ENTRIES,
+                     "'{struct_name}' cannot exceed {} entries",
+diff --git a/synthesizer/process/src/stack/register_types/initialize.rs b/synthesizer/process/src/stack/register_types/initialize.rs
+index 173e71d31..ee76d5f31 100644
+--- a/synthesizer/process/src/stack/register_types/initialize.rs
++++ b/synthesizer/process/src/stack/register_types/initialize.rs
+@@ -305,6 +305,7 @@ impl<N: Network> RegisterTypes<N> {
+         operand: &Operand<N>,
+         register_type: &RegisterType<N>,
+     ) -> Result<()> {
++        #[cfg(feature = "aleo-cli")]
+         match operand {
+             // Inform the user the output operand is an input register, to ensure this is intended behavior.
+             Operand::Register(register) if self.is_input(register) => {
+diff --git a/synthesizer/process/src/stack/register_types/matches.rs b/synthesizer/process/src/stack/register_types/matches.rs
+index 2082fa995..395772684 100644
+--- a/synthesizer/process/src/stack/register_types/matches.rs
++++ b/synthesizer/process/src/stack/register_types/matches.rs
+@@ -168,8 +168,6 @@ impl<N: Network> RegisterTypes<N> {
+     }
+ 
+     /// Checks that the given record matches the layout of the record type.
+-    /// Note: Ordering for `owner` **does** matter, however ordering
+-    /// for record data does **not** matter, as long as all defined members are present.
+     pub fn matches_record(
+         &self,
+         stack: &(impl StackMatches<N> + StackProgram<N>),
+diff --git a/synthesizer/program/src/lib.rs b/synthesizer/program/src/lib.rs
+index a6597740b..26f9b7c2b 100644
+--- a/synthesizer/program/src/lib.rs
++++ b/synthesizer/program/src/lib.rs
+@@ -589,6 +589,7 @@ impl<N: Network, Instruction: InstructionTrait<N>, Command: CommandTrait<N>> Pro
+         "owner",
+         // Program
+         "transition",
++        "import",
+         "function",
+         "struct",
+         "closure",
+diff --git a/synthesizer/program/src/logic/finalize_operation/serialize.rs b/synthesizer/program/src/logic/finalize_operation/serialize.rs
+index f9f666e5d..1a128d3e9 100644
+--- a/synthesizer/program/src/logic/finalize_operation/serialize.rs
++++ b/synthesizer/program/src/logic/finalize_operation/serialize.rs
+@@ -19,41 +19,51 @@ impl<N: Network> Serialize for FinalizeOperation<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut operation = serializer.serialize_struct("FinalizeOperation", 5)?;
+                 // Serialize the components.
+                 match self {
+                     Self::InitializeMapping(mapping_id) => {
++                        let mut operation = serializer.serialize_struct("FinalizeOperation", 2)?;
+                         operation.serialize_field("type", "initialize_mapping")?;
+                         operation.serialize_field("mapping_id", mapping_id)?;
++                        operation.end()
+                     }
+                     Self::InsertKeyValue(mapping_id, key_id, value_id) => {
++                        let mut operation = serializer.serialize_struct("FinalizeOperation", 4)?;
+                         operation.serialize_field("type", "insert_key_value")?;
+                         operation.serialize_field("mapping_id", mapping_id)?;
+                         operation.serialize_field("key_id", key_id)?;
+                         operation.serialize_field("value_id", value_id)?;
++                        operation.end()
+                     }
+                     Self::UpdateKeyValue(mapping_id, index, key_id, value_id) => {
++                        let mut operation = serializer.serialize_struct("FinalizeOperation", 5)?;
+                         operation.serialize_field("type", "update_key_value")?;
+                         operation.serialize_field("mapping_id", mapping_id)?;
+                         operation.serialize_field("index", index)?;
+                         operation.serialize_field("key_id", key_id)?;
+                         operation.serialize_field("value_id", value_id)?;
++                        operation.end()
+                     }
+                     Self::RemoveKeyValue(mapping_id, index) => {
++                        let mut operation = serializer.serialize_struct("FinalizeOperation", 3)?;
+                         operation.serialize_field("type", "remove_key_value")?;
+                         operation.serialize_field("mapping_id", mapping_id)?;
+                         operation.serialize_field("index", index)?;
++                        operation.end()
+                     }
+                     Self::ReplaceMapping(mapping_id) => {
++                        let mut operation = serializer.serialize_struct("FinalizeOperation", 2)?;
+                         operation.serialize_field("type", "replace_mapping")?;
+                         operation.serialize_field("mapping_id", mapping_id)?;
++                        operation.end()
+                     }
+                     Self::RemoveMapping(mapping_id) => {
++                        let mut operation = serializer.serialize_struct("FinalizeOperation", 2)?;
+                         operation.serialize_field("type", "remove_mapping")?;
+                         operation.serialize_field("mapping_id", mapping_id)?;
++                        operation.end()
+                     }
+                 }
+-                operation.end()
+             }
+             false => ToBytesSerializer::serialize_with_size_encoding(self, serializer),
+         }
+diff --git a/synthesizer/src/vm/finalize.rs b/synthesizer/src/vm/finalize.rs
+index c30166343..fe367d94d 100644
+--- a/synthesizer/src/vm/finalize.rs
++++ b/synthesizer/src/vm/finalize.rs
+@@ -204,13 +204,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+             let mut confirmed = Vec::with_capacity(num_transactions);
+             // Initialize a list of the aborted transactions.
+             let mut aborted = Vec::new();
++            // Initialize a counter for the confirmed transaction index.
++            let mut counter = 0u32;
+ 
+             // Finalize the transactions.
+-            'outer: for (index, transaction) in transactions.enumerate() {
+-                // Convert the transaction index to a u32.
+-                // Note: On failure, this will abort the entire atomic batch.
+-                let index = u32::try_from(index).map_err(|_| "Failed to convert transaction index".to_string())?;
+-
++            'outer: for transaction in transactions {
+                 // Process the transaction in an isolated atomic batch.
+                 // - If the transaction succeeds, the finalize operations are stored.
+                 // - If the transaction fails, the atomic batch is aborted and no finalize operations are stored.
+@@ -221,7 +219,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                         match process.finalize_deployment(state, store, deployment, fee) {
+                             // Construct the accepted deploy transaction.
+                             Ok((_, finalize)) => {
+-                                ConfirmedTransaction::accepted_deploy(index, transaction.clone(), finalize)
++                                ConfirmedTransaction::accepted_deploy(counter, transaction.clone(), finalize)
+                                     .map_err(|e| e.to_string())
+                             }
+                             // Construct the rejected deploy transaction.
+@@ -234,7 +232,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                                         // Construct the rejected deployment.
+                                         let rejected = Rejected::new_deployment(*program_owner, *deployment.clone());
+                                         // Construct the rejected deploy transaction.
+-                                        ConfirmedTransaction::rejected_deploy(index, fee_tx, rejected, finalize)
++                                        ConfirmedTransaction::rejected_deploy(counter, fee_tx, rejected, finalize)
+                                             .map_err(|e| e.to_string())
+                                     }
+                                     Err(error) => {
+@@ -256,7 +254,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                         match process.finalize_execution(state, store, execution, fee.as_ref()) {
+                             // Construct the accepted execute transaction.
+                             Ok(finalize) => {
+-                                ConfirmedTransaction::accepted_execute(index, transaction.clone(), finalize)
++                                ConfirmedTransaction::accepted_execute(counter, transaction.clone(), finalize)
+                                     .map_err(|e| e.to_string())
+                             }
+                             // Construct the rejected execute transaction.
+@@ -270,7 +268,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                                             // Construct the rejected execution.
+                                             let rejected = Rejected::new_execution(execution.clone());
+                                             // Construct the rejected execute transaction.
+-                                            ConfirmedTransaction::rejected_execute(index, fee_tx, rejected, finalize)
++                                            ConfirmedTransaction::rejected_execute(counter, fee_tx, rejected, finalize)
+                                                 .map_err(|e| e.to_string())
+                                         }
+                                         Err(error) => {
+@@ -298,7 +296,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+ 
+                 match outcome {
+                     // If the transaction succeeded, store it and continue to the next transaction.
+-                    Ok(confirmed_transaction) => confirmed.push(confirmed_transaction),
++                    Ok(confirmed_transaction) => {
++                        confirmed.push(confirmed_transaction);
++                        // Increment the transaction index counter.
++                        counter = counter.saturating_add(1);
++                    }
+                     // If the transaction failed, abort the entire batch.
+                     Err(error) => {
+                         eprintln!("Critical bug in speculate: {error}\n\n{transaction}");
+diff --git a/synthesizer/src/vm/helpers/cost.rs b/synthesizer/src/vm/helpers/cost.rs
+index a9e55368d..6f349baa8 100644
+--- a/synthesizer/src/vm/helpers/cost.rs
++++ b/synthesizer/src/vm/helpers/cost.rs
+@@ -199,5 +199,9 @@ pub fn cost_in_microcredits<N: Network>(finalize: &Finalize<N>) -> Result<u64> {
+         Command::BranchEq(_) | Command::BranchNeq(_) => Ok(5_000),
+         Command::Position(_) => Ok(1_000),
+     };
+-    finalize.commands().iter().map(|command| cost(command)).sum()
++    finalize
++        .commands()
++        .iter()
++        .map(cost)
++        .try_fold(0u64, |acc, res| res.and_then(|x| acc.checked_add(x).ok_or(anyhow!("Finalize cost overflowed"))))
+ }
+diff --git a/synthesizer/src/vm/verify.rs b/synthesizer/src/vm/verify.rs
+index 99c921dec..f6aeaceaa 100644
+--- a/synthesizer/src/vm/verify.rs
++++ b/synthesizer/src/vm/verify.rs
+@@ -255,7 +255,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+ 
+         // Ensure the fee does not exceed the limit.
+         let fee_amount = fee.amount()?;
+-        ensure!(*fee_amount < N::MAX_FEE, "Fee verification failed: fee exceeds the maximum limit");
++        ensure!(*fee_amount <= N::MAX_FEE, "Fee verification failed: fee exceeds the maximum limit");
+ 
+         // Verify the fee.
+         let verification = self.process.read().verify_fee(fee, deployment_or_execution_id);
+diff --git a/utilities/src/bytes.rs b/utilities/src/bytes.rs
+index 2a9938dcc..9a7ba1d82 100644
+--- a/utilities/src/bytes.rs
++++ b/utilities/src/bytes.rs
+@@ -145,6 +145,11 @@ impl<'de, T: FromBytes> FromBytesDeserializer<T> {
+             false => (size_b, size_a),
+         };
+ 
++        // Ensure 'size_b' is within bounds.
++        if size_b > i32::MAX as usize {
++            return Err(D::Error::custom(format!("size_b ({size_b}) exceeds maximum")));
++        }
++
+         // Reserve a new `Vec` with the larger size capacity.
+         let mut buffer = Vec::with_capacity(size_b);
+ 

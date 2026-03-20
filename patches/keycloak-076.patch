@@ -1,0 +1,775 @@
+diff --git a/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/condition/ClientIdUriSchemeConditionFactory.java b/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/condition/ClientIdUriSchemeConditionFactory.java
+index 80867e573ec4..1d7e7f437ec3 100644
+--- a/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/condition/ClientIdUriSchemeConditionFactory.java
++++ b/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/condition/ClientIdUriSchemeConditionFactory.java
+@@ -44,10 +44,9 @@ public class ClientIdUriSchemeConditionFactory extends AbstractClientPolicyCondi
+                 "If some domains are filled, The condition evaluates to true " +
+                         "if the host part of client_id parameter in an authorization request matches one of the filled domains. " +
+                         "Otherwise, the condition evaluates to false " +
+-                        "The domains are checked by using regex. " +
++                        "The domains are checked by using wildcard pattern matching (e.g. '*.example.org'). " +
+                         "If the domains not filled, the condition evaluate to false regardless of the client_id parameter value. " +
+-                        "For example, use pattern like this '(.*)\\.example\\.org' if you want to accept the parameter / property whose domain is 'example.org'." +
+-                        "Don't forget to use escaping of special characters like dots as otherwise dot is interpreted as any character in regex!",
++                        "For example, use pattern like '*.example.org' if you want to accept the parameter / property whose domain is 'example.org' or its subdomains.",
+                 ProviderConfigProperty.MULTIVALUED_STRING_TYPE,
+                 null);
+         configProperties.add(property);
+diff --git a/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutor.java b/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutor.java
+index 812fefdab65c..71ffa7a24d08 100644
+--- a/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutor.java
++++ b/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutor.java
+@@ -180,9 +180,9 @@ public static class OIDCClientRepresentationWithCacheControl {
+         private final ClientMetadataCacheControl clientMetadataCacheControl;
+ 
+         public OIDCClientRepresentationWithCacheControl(OIDCClientRepresentation oidcClientRepresentation,
+-                                                        String rawCacheControlHeaderValue, int minCacheTime, int maxCacheTime) {
++                                                        ClientMetadataCacheControl clientMetadataCacheControl) {
+             this.oidcClientRepresentation = oidcClientRepresentation;
+-            this.clientMetadataCacheControl = new ClientMetadataCacheControl(rawCacheControlHeaderValue, minCacheTime, maxCacheTime);
++            this.clientMetadataCacheControl = clientMetadataCacheControl;
+         }
+ 
+         public OIDCClientRepresentation getOidcClientRepresentation() {
+@@ -222,18 +222,29 @@ public ClientMetadataCacheControl(String rawCacheControlHeaderValue, int minCach
+                 normalizedCacheControlHeaderValue = null;
+             } else {
+                 normalizedCacheControlHeaderValue = rawCacheControlHeaderValue.toLowerCase().replaceAll("\\s", "");
+-                List<String> sList  = Arrays.asList(normalizedCacheControlHeaderValue.split(",", 0));
+-                if (sList.contains("no-cache")) {
+-                    noCache = true;
+-                }
+-                if (sList.contains("no-store")) {
+-                    noStore = true;
++                String[] directives = normalizedCacheControlHeaderValue.split(",", 0);
++                boolean isMaxAgeExist = false;
++                boolean isSMaxAgeExist = false;
++                String maxAgeRaw = null;
++                String sMaxAgeRaw = null;
++                for (String directive : directives) {
++                    if ("no-cache".equals(directive)) {
++                        noCache = true;
++                    } else if ("no-store".equals(directive)) {
++                        noStore = true;
++                    } else if (directive.startsWith("max-age=")) {
++                        isMaxAgeExist = true;
++                        maxAgeRaw = directive;
++                    } else if (directive.startsWith("s-maxage=")) {
++                        isSMaxAgeExist = true;
++                        sMaxAgeRaw = directive;
++                    }
+                 }
+-                if (sList.stream().filter(i->i.startsWith("max-age=")).count() == 1) {
+-                    maxAgeValue = deriveExpiryValue("max-age", sList);
++                if (isMaxAgeExist && maxAgeRaw != null) {
++                    maxAgeValue = parseExpiryValue(maxAgeRaw);
+                 }
+-                if (sList.stream().filter(i->i.startsWith("s-maxage=")).count() == 1) {
+-                    sMaxAgeValue = deriveExpiryValue("s-maxage", sList);
++                if (isSMaxAgeExist && sMaxAgeRaw != null) {
++                    sMaxAgeValue = parseExpiryValue(sMaxAgeRaw);
+                 }
+             }
+         }
+@@ -279,11 +290,11 @@ public int getCacheExpiryTimeInSec() {
+             return minCacheTime > 0 ? Time.currentTime() + minCacheTime : Time.currentTime();
+         }
+ 
+-        private int deriveExpiryValue(final String key, List<String> sList) {
+-            String[] sAry = sList.stream().filter(i->i.startsWith(key + "=")).findFirst().get().split("=");
++        private int parseExpiryValue(String directive) {
++            String[] parts = directive.split("=", 2);
+             try {
+-                if (sAry.length == 2) {
+-                    int returnValue = Integer.parseInt(sAry[1]);
++                if (parts.length == 2) {
++                    int returnValue = Integer.parseInt(parts[1]);
+                     if (returnValue < minCacheTime) {
+                         returnValue = minCacheTime;
+                     } else if (returnValue > maxCacheTime) {
+@@ -511,7 +522,8 @@ protected URI verifyClientId(final String clientId) throws ClientPolicyException
+         //  It checks if a host part is under one of trusted domains.
+         //  It checks if an address resolved from a property whose value is URI is loopback address.
+         //  It checks if an address resolved from a property whose value is URI is private address.
+-        verifyUri(clientId, (error, logMessageTemplate) -> {
++        List<String> trustedDomains = convertContentFilledList(getConfiguration().getTrustedDomains());
++        verifyUri(clientId, trustedDomains, (error, logMessageTemplate) -> {
+             getLogger().warnv(logMessageTemplate, "client_id", clientId);
+             throw invalidClientIdMetadata(error);
+         });
+@@ -528,7 +540,6 @@ protected URI verifyClientId(final String clientId) throws ClientPolicyException
+      */
+     protected void validateClientId(final URI clientIdURI) throws ClientPolicyException {
+         // The authorization server MAY choose to have its own heuristics and policies around the trust of domain names used as client IDs.
+-        return;
+     }
+ 
+     // apply the same logic in TrustedHostClientRegistrationPolicy.
+@@ -589,7 +600,7 @@ protected OIDCClientRepresentationWithCacheControl fetchClientMetadata(final URI
+             // to successfully convert it to Client Representation, intentionally augment it.
+             augmentClientOIDC(clientOIDC);
+ 
+-            return new OIDCClientRepresentationWithCacheControl(clientOIDC, cacheControlHeaderValue, providerConfig.getMinCacheTime(), providerConfig.getMaxCacheTime());
++            return new OIDCClientRepresentationWithCacheControl(clientOIDC, clientMetadataCacheControl);
+         } catch (IOException e) {
+             getLogger().warnv("HTTP connection failure: {0}", e);
+             throw new ClientPolicyException(OAuthErrorException.INVALID_REQUEST, ERR_METADATA_FETCH_FAILED);
+@@ -655,46 +666,19 @@ protected URI verifyClientMetadata(final URI clientIdURI, final URI redirectUriU
+         // CIMD (mandatory): client_id
+         // RFC 7591 (mandagory): redirect_uris
+         // RFC 7591 (optional): logo_uri, client_uri, tos_uri, policy_uri, jwks_uri
+-        verifyUri(clientOIDC.getClientId(), (error, logMessageTemplate) -> {
+-            getLogger().warnv(logMessageTemplate, "client_id", clientOIDC.getClientId());
+-            throw invalidClientIdMetadata(error);
+-        });
++
++        List<String> trustedDomains = convertContentFilledList(getConfiguration().getTrustedDomains());
++        verifyUriProperty(clientOIDC.getClientId(), "client_id", trustedDomains);
++
+         for (String redirect_uri : clientOIDC.getRedirectUris()) {
+-            verifyUri(redirect_uri, (error, logMessageTemplate) -> {
+-                getLogger().warnv(logMessageTemplate, "redirect_uris", redirect_uri);
+-                throw invalidClientIdMetadata(error);
+-            });
+-        }
+-        if (clientOIDC.getLogoUri() != null) {
+-            verifyUri(clientOIDC.getLogoUri(), (error, logMessageTemplate) -> {
+-                getLogger().warnv(logMessageTemplate, "logo_uri", clientOIDC.getLogoUri());
+-                throw invalidClientIdMetadata(error);
+-            });
+-        }
+-        if (clientOIDC.getClientUri() != null) {
+-            verifyUri(clientOIDC.getClientUri(), (error, logMessageTemplate) -> {
+-                getLogger().warnv(logMessageTemplate, "client_uri", clientOIDC.getClientUri());
+-                throw invalidClientIdMetadata(error);
+-            });
+-        }
+-        if (clientOIDC.getTosUri() != null) {
+-            verifyUri(clientOIDC.getTosUri(), (error, logMessageTemplate) -> {
+-                getLogger().warnv(logMessageTemplate, "tos_uri", clientOIDC.getTosUri());
+-                throw invalidClientIdMetadata(error);
+-            });
+-        }
+-        if (clientOIDC.getPolicyUri() != null) {
+-            verifyUri(clientOIDC.getPolicyUri(), (error, logMessageTemplate) -> {
+-                getLogger().warnv(logMessageTemplate, "policy_uri", clientOIDC.getPolicyUri());
+-                throw invalidClientIdMetadata(error);
+-            });
+-        }
+-        if (clientOIDC.getJwksUri() != null) {
+-            verifyUri(clientOIDC.getJwksUri(), (error, logMessageTemplate) -> {
+-                getLogger().warnv(logMessageTemplate, "jwks_uri", clientOIDC.getJwksUri());
+-                throw invalidClientIdMetadata(error);
+-            });
++            verifyUriProperty(redirect_uri, "redirect_uris", trustedDomains);
+         }
++ 
++        verifyUriPropertyIfPresent(clientOIDC.getLogoUri(), "logo_uri", trustedDomains);
++        verifyUriPropertyIfPresent(clientOIDC.getClientUri(), "client_uri", trustedDomains);
++        verifyUriPropertyIfPresent(clientOIDC.getTosUri(), "tos_uri", trustedDomains);
++        verifyUriPropertyIfPresent(clientOIDC.getPolicyUri(), "policy_uri", trustedDomains);
++        verifyUriPropertyIfPresent(clientOIDC.getJwksUri(), "jwks_uri", trustedDomains);
+ 
+         URI clientIdURIfromMetadata;
+         try {
+@@ -708,6 +692,19 @@ protected URI verifyClientMetadata(final URI clientIdURI, final URI redirectUriU
+         return clientIdURIfromMetadata;
+     }
+ 
++    private void verifyUriProperty(String uriString, String propertyName, List<String> trustedDomains) throws ClientPolicyException {
++        verifyUri(uriString, trustedDomains, (error, logMessageTemplate) -> {
++            getLogger().warnv(logMessageTemplate, propertyName, uriString);
++            throw invalidClientIdMetadata(error);
++        });
++    }
++
++    private void verifyUriPropertyIfPresent(String uriString, String propertyName, List<String> trustedDomains) throws ClientPolicyException {
++        if (uriString != null) {
++            verifyUriProperty(uriString, propertyName, trustedDomains);
++        }
++    }
++
+     // any access to parent folder /../ or current /./ is unsafe with or without encoding
+     private final static Pattern UNSAFE_PATH_PATTERN = Pattern.compile(
+             "(/|%2[fF]|%5[cC]|\\\\)(%2[eE]|\\.){1,2}(/|%2[fF]|%5[cC]|\\\\)|(/|%2[fF]|%5[cC]|\\\\)(%2[eE]|\\.){1,2}$");
+@@ -716,10 +713,8 @@ private boolean isUnsafeUriPath(URI redirectUri) {
+         return UNSAFE_PATH_PATTERN.matcher(redirectUri.getRawPath()).find();
+     }
+ 
+-    private void verifyUri(String uriString, ErrorHandler errorHandler) throws ClientPolicyException {
+-        // allow trusted domain
+-        List<String> trustedDomains = convertContentFilledList(getConfiguration().getTrustedDomains());
+-        if (trustedDomains == null || trustedDomains.isEmpty()) {
++    private void verifyUri(String uriString, List<String> trustedDomains, ErrorHandler errorHandler) throws ClientPolicyException {
++        if (trustedDomains.isEmpty()) {        // allow trusted domain
+             getLogger().debug("trusted domain list is vacant.");
+             throw invalidClientIdMetadata(ERR_NOTALLOWED_DOMAIN);
+         }
+diff --git a/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutorFactory.java b/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutorFactory.java
+index 3950a118fd79..727b19073309 100644
+--- a/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutorFactory.java
++++ b/services/src/main/java/org/keycloak/protocol/oauth2/cimd/clientpolicy/executor/AbstractClientIdMetadataDocumentExecutorFactory.java
+@@ -89,10 +89,9 @@ static protected void addCommonConfigProperties(List<ProviderConfigProperty> con
+                 "If some domains are filled, the executor only accepts the following URL-formatted parameters whose host part matches one of the filled domains: " +
+                         "Authorization request parameters: client_id, redirect_uri, " +
+                         "Client metadata properties: client_id, redirect_uris, jwks_uri, logo_uri, policy_uri, tos_uri, client_uri. " +
+-                        "The domains are checked by using regex. " +
++                        "The domains are checked by using wildcard pattern matching (e.g. '*.example.org'). " +
+                         "If the domains not filled, the executor denies all such the parameters and properties. " +
+-                        "For example, use pattern like this '(.*)\\.example\\.org' if you want to accept the parameter / property whose domain is 'example.org'." +
+-                        "Don't forget to use escaping of special characters like dots as otherwise dot is interpreted as any character in regex!",
++                        "For example, use pattern like '*.example.org' if you want to accept the parameter / property whose domain is 'example.org' or its subdomains.",
+                 ProviderConfigProperty.MULTIVALUED_STRING_TYPE,
+                 null);
+         configProperties.add(property);
+diff --git a/tests/base/src/test/java/org/keycloak/tests/broker/IdentityProviderStoreTokenTest.java b/tests/base/src/test/java/org/keycloak/tests/broker/IdentityProviderStoreTokenTest.java
+new file mode 100644
+index 000000000000..71b1b09d281f
+--- /dev/null
++++ b/tests/base/src/test/java/org/keycloak/tests/broker/IdentityProviderStoreTokenTest.java
+@@ -0,0 +1,285 @@
++/*
++ * Copyright 2016 Red Hat, Inc. and/or its affiliates
++ * and other contributors as indicated by the @author tags.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.keycloak.tests.broker;
++
++import org.keycloak.admin.client.resource.IdentityProviderResource;
++import org.keycloak.broker.oidc.OAuth2IdentityProviderConfig;
++import org.keycloak.broker.oidc.OIDCIdentityProviderConfig;
++import org.keycloak.broker.oidc.OIDCIdentityProviderFactory;
++import org.keycloak.models.ClientModel;
++import org.keycloak.models.Constants;
++import org.keycloak.models.IdentityProviderModel;
++import org.keycloak.models.RealmModel;
++import org.keycloak.models.RoleModel;
++import org.keycloak.models.UserModel;
++import org.keycloak.models.UserProvider;
++import org.keycloak.models.jpa.JpaRealmProviderFactory;
++import org.keycloak.representations.idm.IdentityProviderRepresentation;
++import org.keycloak.representations.idm.UserRepresentation;
++import org.keycloak.testframework.annotations.InjectRealm;
++import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
++import org.keycloak.testframework.oauth.OAuthClient;
++import org.keycloak.testframework.oauth.annotations.InjectOAuthClient;
++import org.keycloak.testframework.realm.ClientConfig;
++import org.keycloak.testframework.realm.ClientConfigBuilder;
++import org.keycloak.testframework.realm.ManagedRealm;
++import org.keycloak.testframework.realm.RealmConfig;
++import org.keycloak.testframework.realm.RealmConfigBuilder;
++import org.keycloak.testframework.remote.runonserver.InjectRunOnServer;
++import org.keycloak.testframework.remote.runonserver.RunOnServerClient;
++import org.keycloak.testframework.remote.timeoffset.InjectTimeOffSet;
++import org.keycloak.testframework.remote.timeoffset.TimeOffSet;
++import org.keycloak.testframework.ui.annotations.InjectPage;
++import org.keycloak.testframework.ui.page.LoginPage;
++import org.keycloak.testsuite.util.IdentityProviderBuilder;
++import org.keycloak.testsuite.util.oauth.AccessTokenResponse;
++
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.Test;
++
++@KeycloakIntegrationTest
++public class IdentityProviderStoreTokenTest {
++
++    public static String IDP_ALIAS = "oidc-idp-alias";
++
++    public static String EXTERNAL_REALM_NAME = "external-realm";
++
++    @InjectOAuthClient
++    OAuthClient oauth;
++
++    @InjectOAuthClient(ref = "external-realm", realmRef = "external-realm", config = TestClientConfig.class)
++    OAuthClient oauthExternal;
++
++    @InjectPage
++    LoginPage loginPage;
++
++    @InjectRealm(config = IdpRealmConfig.class)
++    protected ManagedRealm realm;
++
++    @InjectRealm(ref = "external-realm", config = ExternalRealmConfig.class)
++    ManagedRealm externalRealm;
++
++    @InjectRunOnServer
++    RunOnServerClient runOnServer;
++
++    @InjectTimeOffSet
++    TimeOffSet timeOffSet;
++
++    @Test
++    public void testOIDCIdentityProviderStoreTokenManualRoleGrant() {
++        realm.updateIdentityProvider(IDP_ALIAS, idp-> {
++            idp.setAddReadTokenRoleOnCreate(false);
++        });
++
++        oauth.openLoginForm();
++        loginPage.clickSocial(IDP_ALIAS);
++        loginPage.fillLogin("testuser", "password");
++        loginPage.submit();
++
++        AccessTokenResponse internalTokens = oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
++        Assertions.assertTrue(internalTokens.isSuccess());
++
++        //user without the role tries to read the stored token
++        AccessTokenResponse externalTokens = oauth.doFetchExternalIdpToken(IDP_ALIAS, internalTokens.getAccessToken());
++        Assertions.assertEquals(403, externalTokens.getStatusCode());
++
++        oauth.logoutRequest().idTokenHint(internalTokens.getIdToken()).send();
++
++        //grant the role to the user and repeat the login
++        runOnServer.run(session -> {
++            RealmModel realm = session.getContext().getRealm();
++            ClientModel brokerClient = realm.getClientByClientId(Constants.BROKER_SERVICE_CLIENT_ID);
++            RoleModel readTokenRole = brokerClient.getRole(Constants.READ_TOKEN_ROLE);
++            UserModel user = session.users().getUserByUsername(realm, "testuser");
++            user.grantRole(readTokenRole);
++        });
++
++        oauth.openLoginForm();
++        loginPage.clickSocial(IDP_ALIAS);
++
++        internalTokens = oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
++        Assertions.assertTrue(internalTokens.isSuccess());
++
++        externalTokens = oauth.doFetchExternalIdpToken(IDP_ALIAS, internalTokens.getAccessToken());
++        Assertions.assertEquals(200, externalTokens.getStatusCode());
++
++        //refresh with the external token
++        externalTokens = oauthExternal.doRefreshTokenRequest(externalTokens.getRefreshToken());
++        Assertions.assertEquals(200, externalTokens.getStatusCode());
++
++        oauth.logoutRequest().idTokenHint(internalTokens.getIdToken()).send();
++        oauthExternal.logoutRequest().idTokenHint(externalTokens.getIdToken()).send();
++        UserRepresentation testUser = realm.admin().users().search("testuser").get(0);
++        realm.admin().users().delete(testUser.getId()).close();
++    }
++
++    @Test
++    public void testOIDCIdentityProviderStoreTokenRoleGrantOnUserCreation() {
++        oauth.openLoginForm();
++        loginPage.clickSocial(IDP_ALIAS);
++        loginPage.fillLogin("testuser", "password");
++        loginPage.submit();
++
++        AccessTokenResponse tokenResponse = oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
++        Assertions.assertTrue(tokenResponse.isSuccess());
++
++        AccessTokenResponse externalTokens = oauth.doFetchExternalIdpToken(IDP_ALIAS, tokenResponse.getAccessToken());
++        Assertions.assertEquals(200, externalTokens.getStatusCode());
++
++        //use the stored token to refresh for a refresh token request
++        AccessTokenResponse refreshTokenResponse = oauthExternal.refreshRequest(externalTokens.getRefreshToken()).send();
++        Assertions.assertEquals(200, refreshTokenResponse.getStatusCode());
++
++        //logout and remove user
++        oauth.logoutRequest().idTokenHint(refreshTokenResponse.getIdToken()).send();
++        oauthExternal.logoutRequest().idTokenHint(refreshTokenResponse.getIdToken()).send();
++        UserRepresentation testUser = realm.admin().users().search("testuser").get(0);
++        realm.admin().users().delete(testUser.getId()).close();
++    }
++
++    @Test
++    public void testRefreshTokenFetchExternalIdpTokenSuccess() {
++        oauth.openLoginForm();
++        loginPage.clickSocial(IDP_ALIAS);
++        loginPage.fillLogin("testuser", "password");
++        loginPage.submit();
++
++        AccessTokenResponse internalTokens = oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
++        Assertions.assertTrue(internalTokens.isSuccess());
++
++        AccessTokenResponse externalTokens = oauth.doFetchExternalIdpToken(IDP_ALIAS, internalTokens.getAccessToken());
++        Assertions.assertEquals(200, externalTokens.getStatusCode());
++
++        String realmName = realm.getName();
++        String oldTokenFromDatabase = runOnServer.fetch(session -> {
++            RealmModel realm = session.realms().getRealmByName(realmName);
++            UserModel user = session.users().getUserByUsername(realm, "testuser");
++            return session.getProvider(UserProvider.class, JpaRealmProviderFactory.PROVIDER_ID).getFederatedIdentity(realm, user, IDP_ALIAS).getToken();
++        }, String.class);
++
++        timeOffSet.set(externalTokens.getExpiresIn() - IdentityProviderModel.DEFAULT_MIN_VALIDITY_TOKEN + 1);
++
++        internalTokens = oauth
++                .doRefreshTokenRequest(internalTokens.getRefreshToken());
++        Assertions.assertEquals(200, internalTokens.getStatusCode());
++        org.keycloak.testsuite.util.oauth.AccessTokenResponse externalTokens2 = oauth.doFetchExternalIdpToken(IDP_ALIAS, internalTokens.getAccessToken());
++        Assertions.assertEquals(200, externalTokens2.getStatusCode());
++
++        // Check that we now have a different access and refresh token
++        Assertions.assertNotEquals(externalTokens.getAccessToken(), externalTokens2.getAccessToken());
++        Assertions.assertNotEquals(externalTokens.getRefreshToken(), externalTokens2.getRefreshToken());
++
++        String newTokenFromDatabase = runOnServer.fetch(session -> {
++            RealmModel realm = session.realms().getRealmByName(realmName);
++            UserModel user = session.users().getUserByUsername(realm, "testuser");
++            return session.getProvider(UserProvider.class, JpaRealmProviderFactory.PROVIDER_ID).getFederatedIdentity(realm, user, IDP_ALIAS).getToken();
++        }, String.class);
++
++        // Ensure that the new token has been persisted
++        Assertions.assertNotEquals(newTokenFromDatabase, oldTokenFromDatabase);
++
++        //logout and remove created user
++        oauth.logoutRequest().idTokenHint(internalTokens.getIdToken()).send();
++        oauthExternal.logoutRequest().idTokenHint(externalTokens.getIdToken()).send();
++        UserRepresentation testUser = realm.admin().users().search("testuser").get(0);
++        realm.admin().users().delete(testUser.getId()).close();
++    }
++
++    @Test
++    public void testRefreshTokenFetchExternalIdpTokenFailure() {
++        oauth.openLoginForm();
++        loginPage.clickSocial(IDP_ALIAS);
++        loginPage.fillLogin("testuser", "password");
++        loginPage.submit();
++
++        AccessTokenResponse internalTokens = oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
++        Assertions.assertTrue(internalTokens.isSuccess());
++
++        AccessTokenResponse externalTokens = oauth.doFetchExternalIdpToken(IDP_ALIAS, internalTokens.getAccessToken());
++        Assertions.assertEquals(200, externalTokens.getStatusCode());
++
++        timeOffSet.set(externalTokens.getExpiresIn() + 10);
++
++        IdentityProviderResource resource = realm.admin().identityProviders().get(IDP_ALIAS);
++        IdentityProviderRepresentation idp = resource.toRepresentation();
++        idp.getConfig().put("clientSecret", "wrongpassword");
++        resource.update(idp);
++
++        internalTokens = oauth.doRefreshTokenRequest(internalTokens.getRefreshToken());
++        Assertions.assertEquals(200, internalTokens.getStatusCode());
++        AccessTokenResponse error = oauth.doFetchExternalIdpToken(IDP_ALIAS, internalTokens.getAccessToken());
++        Assertions.assertEquals(502, error.getStatusCode());
++        Assertions.assertEquals("Unable to refresh token", error.getError());
++
++        oauth.logoutRequest().idTokenHint(internalTokens.getIdToken()).send();
++        oauthExternal.logoutRequest().idTokenHint(externalTokens.getIdToken()).send();
++
++        UserRepresentation testUser = realm.admin().users().search("testuser").get(0);
++        realm.admin().users().delete(testUser.getId()).close();
++
++        //restore secret manually, clientSecret cannot be cleaned up automatically
++        idp.getConfig().put("clientSecret", "test-secret");
++        resource.update(idp);
++    }
++
++    public static class ExternalRealmConfig implements RealmConfig {
++
++        @Override
++        public RealmConfigBuilder configure(RealmConfigBuilder realm) {
++
++            realm.addUser("testuser")
++                    .name("Test", "User")
++                    .email("test@localhost")
++                    .emailVerified(Boolean.TRUE)
++                    .password("password");
++            return realm;
++        }
++    }
++
++    public static class IdpRealmConfig implements RealmConfig {
++
++        @Override
++        public RealmConfigBuilder configure(RealmConfigBuilder realm) {
++            realm.identityProvider(IdentityProviderBuilder.create()
++                    .providerId(OIDCIdentityProviderFactory.PROVIDER_ID)
++                    .alias(IDP_ALIAS)
++                    .setAttribute("clientId", "test-app")
++                    .setAttribute("clientSecret", "test-secret")
++                    .setAttribute(IdentityProviderModel.SYNC_MODE, "IMPORT")
++                    .setAttribute(OAuth2IdentityProviderConfig.TOKEN_ENDPOINT_URL, "http://localhost:8080/realms/" + EXTERNAL_REALM_NAME + "/protocol/openid-connect/token")
++                    .setAttribute("authorizationUrl", "http://localhost:8080/realms/" + EXTERNAL_REALM_NAME + "/protocol/openid-connect/auth")
++                    .setAttribute(OIDCIdentityProviderConfig.JWKS_URL, "http://localhost:8080/realms/" + EXTERNAL_REALM_NAME + "/protocol/openid-connect/cert")
++                    .storeToken(true)
++                    .addReadTokenRoleOnCreate(true)
++                    .build());
++            return realm;
++        }
++    }
++
++    public static class TestClientConfig implements ClientConfig {
++
++        @Override
++        public ClientConfigBuilder configure(ClientConfigBuilder client) {
++            return client.clientId("test-app")
++                    .serviceAccountsEnabled(true)
++                    .directAccessGrantsEnabled(true)
++                    .redirectUris("http://localhost:8080/*")
++                    .secret("test-secret");
++        }
++    }
++}
+diff --git a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/IdentityProviderBuilder.java b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/IdentityProviderBuilder.java
+index ba809f2988e2..1b661e8acaeb 100644
+--- a/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/IdentityProviderBuilder.java
++++ b/tests/utils-shared/src/main/java/org/keycloak/testsuite/util/IdentityProviderBuilder.java
+@@ -57,6 +57,16 @@ public IdentityProviderBuilder hideOnLoginPage() {
+         return this;
+     }
+ 
++    public IdentityProviderBuilder storeToken(boolean storeToken) {
++        rep.setStoreToken(storeToken);
++        return this;
++    }
++
++    public IdentityProviderBuilder addReadTokenRoleOnCreate(boolean addReadTokenRoleOnCreate) {
++        rep.setAddReadTokenRoleOnCreate(addReadTokenRoleOnCreate);
++        return this;
++    }
++
+     public IdentityProviderBuilder setAttribute(String name, String value) {
+         config().put(name, value);
+         return this;
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java
+index d2d130f1aca7..4b812e38f565 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java
+@@ -1,17 +1,11 @@
+ package org.keycloak.testsuite.broker;
+ 
+-import java.net.URI;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicReference;
+ import java.util.stream.Collectors;
+ 
+-import jakarta.ws.rs.client.Client;
+-import jakarta.ws.rs.client.ClientRequestFilter;
+-import jakarta.ws.rs.client.WebTarget;
+-import jakarta.ws.rs.core.HttpHeaders;
+ import jakarta.ws.rs.core.Response;
+ 
+ import org.keycloak.admin.client.resource.IdentityProviderResource;
+@@ -28,17 +22,14 @@
+ import org.keycloak.representations.idm.RealmRepresentation;
+ import org.keycloak.representations.idm.RoleRepresentation;
+ import org.keycloak.representations.idm.UserRepresentation;
+-import org.keycloak.services.Urls;
+ import org.keycloak.storage.UserStorageProvider;
+ import org.keycloak.testsuite.Assert;
+ import org.keycloak.testsuite.AssertEvents;
+-import org.keycloak.testsuite.client.KeycloakTestingClient;
+ import org.keycloak.testsuite.federation.DummyUserFederationProviderFactory;
+ import org.keycloak.testsuite.util.AccountHelper;
+ import org.keycloak.testsuite.util.ClientBuilder;
+ import org.keycloak.testsuite.util.RealmBuilder;
+ import org.keycloak.testsuite.util.TestAppHelper;
+-import org.keycloak.testsuite.util.oauth.AccessTokenResponse;
+ 
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -47,9 +38,6 @@
+ import static org.keycloak.testsuite.admin.ApiUtil.removeUserByUsername;
+ import static org.keycloak.testsuite.broker.BrokerRunOnServerUtil.configurePostBrokerLoginWithOTP;
+ import static org.keycloak.testsuite.broker.BrokerRunOnServerUtil.disablePostBrokerLoginFlow;
+-import static org.keycloak.testsuite.broker.BrokerRunOnServerUtil.grantReadTokenRole;
+-import static org.keycloak.testsuite.broker.BrokerRunOnServerUtil.revokeReadTokenRole;
+-import static org.keycloak.testsuite.broker.BrokerTestTools.getConsumerRoot;
+ import static org.keycloak.testsuite.broker.BrokerTestTools.getProviderRoot;
+ import static org.keycloak.testsuite.broker.BrokerTestTools.waitForElementEnabled;
+ import static org.keycloak.testsuite.broker.BrokerTestTools.waitForPage;
+@@ -175,59 +163,6 @@ public void testAccountManagementLinkedIdentityAlreadyExists() {
+         Assert.assertTrue(testAppHelper.login(bc.getUserLogin(), bc.getUserPassword(), bc.consumerRealmName(), "broker-app", bc.getIDPAlias()));
+     }
+ 
+-    /**
+-     * Refers to in old test suite: org.keycloak.testsuite.broker.AbstractKeycloakIdentityProviderTest#testTokenStorageAndRetrievalByApplication
+-     */
+-    @Test
+-    public void testRetrieveToken() throws Exception {
+-        assumeFalse("There is no user to update once the user has logged in using transient sessions", isUsingTransientSessions());
+-
+-        updateExecutions(AbstractBrokerTest::enableRequirePassword);
+-        updateExecutions(AbstractBrokerTest::disableUpdateProfileOnFirstLogin);
+-        IdentityProviderRepresentation idpRep = identityProviderResource.toRepresentation();
+-
+-        idpRep.setStoreToken(true);
+-
+-        identityProviderResource.update(idpRep);
+-
+-        oauth.clientId("broker-app");
+-        loginPage.open(bc.consumerRealmName());
+-
+-        logInWithBroker(bc);
+-        updatePasswordPage.updatePasswords("password", "password");
+-        Assert.assertTrue(appPage.isCurrent());
+-
+-        String username = bc.getUserLogin();
+-
+-        testingClient.server(bc.consumerRealmName()).run(grantReadTokenRole(username));
+-
+-        AccessTokenResponse accessTokenResponse = oauth.realm(bc.consumerRealmName()).client("broker-app", "broker-app-secret").doPasswordGrantRequest(bc.getUserLogin(), bc.getUserPassword());
+-        AtomicReference<String> accessToken = (AtomicReference<String>) new AtomicReference<>(accessTokenResponse.getAccessToken());
+-        Client client = KeycloakTestingClient.getRestEasyClientBuilder().register((ClientRequestFilter) request -> request.getHeaders().add(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken.get())).build();
+-
+-        try {
+-            WebTarget target = client.target(Urls.identityProviderRetrieveToken(URI.create(getConsumerRoot() + "/auth"), bc.getIDPAlias(), bc.consumerRealmName()));
+-
+-            try (Response response = target.request().get()) {
+-                assertEquals(Response.Status.OK.getStatusCode(), response.getStatus());
+-                assertNotNull(response.readEntity(String.class));
+-            }
+-
+-            testingClient.server(bc.consumerRealmName()).run(revokeReadTokenRole(username));
+-
+-            accessTokenResponse = oauth.realm(bc.consumerRealmName()).client("broker-app", "broker-app-secret").doPasswordGrantRequest(bc.getUserLogin(), bc.getUserPassword());
+-            accessToken.set(accessTokenResponse.getAccessToken());
+-
+-            try (Response response = target.request().get()) {
+-                assertEquals(Response.Status.FORBIDDEN.getStatusCode(), response.getStatus());
+-            }
+-        } finally {
+-            client.close();
+-        }
+-    }
+-
+-
+-
+     // KEYCLOAK-3267
+     @Test
+     public void loginWithExistingUserWithBruteForceEnabled() {
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcOidcFirstBrokerLoginTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcOidcFirstBrokerLoginTest.java
+index e3ab27bd07a3..0e289017f2f5 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcOidcFirstBrokerLoginTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcOidcFirstBrokerLoginTest.java
+@@ -9,8 +9,6 @@
+ import org.keycloak.models.IdentityProviderSyncMode;
+ import org.keycloak.models.RealmModel;
+ import org.keycloak.models.UserModel;
+-import org.keycloak.models.UserProvider;
+-import org.keycloak.models.jpa.JpaRealmProviderFactory;
+ import org.keycloak.representations.AccessTokenResponse;
+ import org.keycloak.representations.idm.ClientRepresentation;
+ import org.keycloak.representations.idm.FederatedIdentityRepresentation;
+@@ -38,7 +36,6 @@
+ import org.openqa.selenium.WebElement;
+ 
+ import static org.keycloak.testsuite.admin.ApiUtil.removeUserByUsername;
+-import static org.keycloak.testsuite.broker.BrokerRunOnServerUtil.grantReadTokenRole;
+ import static org.keycloak.testsuite.broker.BrokerTestConstants.IDP_OIDC_ALIAS;
+ import static org.keycloak.testsuite.broker.BrokerTestConstants.USER_EMAIL;
+ import static org.keycloak.testsuite.broker.BrokerTestTools.createIdentityProvider;
+@@ -55,7 +52,6 @@
+ import static org.hamcrest.Matchers.nullValue;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+-import static org.junit.Assert.assertNotEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
+@@ -150,99 +146,6 @@ public void testRefreshTokenSentOnlyOnFirstLogin() throws Exception {
+         assertThat(firstLoginRefreshToken, is(equalTo(secondLoginRefreshToken)));
+     }
+ 
+-    @Test
+-    public void testRefreshTokenFetchExternalIdpTokenSuccess() {
+-        // Step 1: Set up the identity provider and user in the provider realm
+-        IdentityProviderResource idp = realmsResouce().realm(bc.consumerRealmName()).identityProviders().get(bc.getIDPAlias());
+-        IdentityProviderRepresentation representation = idp.toRepresentation();
+-        representation.setStoreToken(true);
+-        idp.update(representation);
+-
+-        // Create a test user in the provider realm
+-        createUser(bc.providerRealmName(), "brucewayne", BrokerTestConstants.USER_PASSWORD, "Bruce", "Wayne", "brucewayne@gotham.com");
+-
+-        oauth.client("broker-app", "broker-app-secret");
+-        oauth.realm(bc.consumerRealmName());
+-        oauth.openLoginForm();
+-        logInWithIdp(bc.getIDPAlias(), "brucewayne", BrokerTestConstants.USER_PASSWORD);
+-        testingClient.server(bc.consumerRealmName()).run(grantReadTokenRole("brucewayne"));
+-
+-        String code = oauth.parseLoginResponse().getCode();
+-        org.keycloak.testsuite.util.oauth.AccessTokenResponse internalTokens = oauth.doAccessTokenRequest(code);
+-        assertEquals(200, internalTokens.getStatusCode());
+-
+-        org.keycloak.testsuite.util.oauth.AccessTokenResponse externalTokens = oauth.doFetchExternalIdpToken(bc.getIDPAlias(), internalTokens.getAccessToken());
+-        assertEquals(200, externalTokens.getStatusCode());
+-
+-        String realmName = bc.consumerRealmName();
+-        String userName = "brucewayne";
+-        String idpAlias = bc.getIDPAlias();
+-        String oldTokenFromDatabase = testingClient.server().fetch(session -> {
+-            RealmModel realm = session.realms().getRealmByName(realmName);
+-            UserModel user = session.users().getUserByUsername(realm, userName);
+-            return session.getProvider(UserProvider.class, JpaRealmProviderFactory.PROVIDER_ID).getFederatedIdentity(realm, user, idpAlias).getToken();
+-        }, String.class);
+-
+-        setTimeOffset(externalTokens.getExpiresIn() - IdentityProviderModel.DEFAULT_MIN_VALIDITY_TOKEN + 1);
+-
+-        internalTokens = oauth
+-                .doRefreshTokenRequest(internalTokens.getRefreshToken());
+-        assertEquals(200, internalTokens.getStatusCode());
+-        org.keycloak.testsuite.util.oauth.AccessTokenResponse externalTokens2 = oauth.doFetchExternalIdpToken(bc.getIDPAlias(), internalTokens.getAccessToken());
+-        assertEquals(200, externalTokens2.getStatusCode());
+-
+-        // Check that we now have a different access and refresh token
+-        assertNotEquals(externalTokens.getAccessToken(), externalTokens2.getAccessToken());
+-        assertNotEquals(externalTokens.getRefreshToken(), externalTokens2.getRefreshToken());
+-
+-        String newTokenFromDatabase = testingClient.server().fetch(session -> {
+-            RealmModel realm = session.realms().getRealmByName(realmName);
+-            UserModel user = session.users().getUserByUsername(realm, userName);
+-            return session.getProvider(UserProvider.class, JpaRealmProviderFactory.PROVIDER_ID).getFederatedIdentity(realm, user, idpAlias).getToken();
+-        }, String.class);
+-
+-        // Ensure that the new token has been persisted
+-        assertNotEquals(newTokenFromDatabase, oldTokenFromDatabase);
+-
+-    }
+-
+-    @Test
+-    public void testRefreshTokenFetchExternalIdpTokenFailure() {
+-        // Step 1: Set up the identity provider and user in the provider realm
+-        IdentityProviderResource idp = realmsResouce().realm(bc.consumerRealmName()).identityProviders().get(bc.getIDPAlias());
+-        IdentityProviderRepresentation representation = idp.toRepresentation();
+-        representation.setStoreToken(true);
+-        idp.update(representation);
+-
+-        // Create a test user in the provider realm
+-        createUser(bc.providerRealmName(), "brucewayne", BrokerTestConstants.USER_PASSWORD, "Bruce", "Wayne", "brucewayne@gotham.com");
+-
+-        oauth.client("broker-app", "broker-app-secret");
+-        oauth.realm(bc.consumerRealmName());
+-        oauth.openLoginForm();
+-        logInWithIdp(bc.getIDPAlias(), "brucewayne", BrokerTestConstants.USER_PASSWORD);
+-        testingClient.server(bc.consumerRealmName()).run(grantReadTokenRole("brucewayne"));
+-
+-        String code = oauth.parseLoginResponse().getCode();
+-        org.keycloak.testsuite.util.oauth.AccessTokenResponse internalTokens = oauth.doAccessTokenRequest(code);
+-        assertEquals(200, internalTokens.getStatusCode());
+-
+-        org.keycloak.testsuite.util.oauth.AccessTokenResponse externalTokens = oauth.doFetchExternalIdpToken(bc.getIDPAlias(), internalTokens.getAccessToken());
+-        assertEquals(200, externalTokens.getStatusCode());
+-
+-        setTimeOffset(externalTokens.getExpiresIn() + 10);
+-
+-        representation.getConfig().put("clientSecret", "wrongpassword");
+-        idp.update(representation);
+-
+-        internalTokens = oauth.doRefreshTokenRequest(internalTokens.getRefreshToken());
+-        assertEquals(200, internalTokens.getStatusCode());
+-        org.keycloak.testsuite.util.oauth.AccessTokenResponse error = oauth.doFetchExternalIdpToken(bc.getIDPAlias(), internalTokens.getAccessToken());
+-        assertEquals(502, error.getStatusCode());
+-        assertEquals("Unable to refresh token", error.getError());
+-
+-    }
+-
+     /**
+      * KEYCLOAK-10932
+      */

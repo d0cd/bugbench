@@ -1,0 +1,1871 @@
+diff --git a/src/sentry/api/endpoints/organization_trace.py b/src/sentry/api/endpoints/organization_trace.py
+index 3788cf850c1d18..13d508b3ab6638 100644
+--- a/src/sentry/api/endpoints/organization_trace.py
++++ b/src/sentry/api/endpoints/organization_trace.py
+@@ -56,9 +56,16 @@ def query_trace_data(
+         error_id: str | None = None,
+         additional_attributes: list[str] | None = None,
+         include_uptime: bool = False,
++        *,
++        organization: Organization,
+     ) -> list[SerializedEvent]:
+         return query_trace_data(
+-            snuba_params, trace_id, error_id, additional_attributes, include_uptime
++            snuba_params,
++            trace_id,
++            error_id,
++            additional_attributes,
++            include_uptime,
++            organization=organization,
+         )
+ 
+     def has_feature(self, organization: Organization, request: Request) -> bool:
+@@ -88,7 +95,12 @@ def data_fn(offset: int, limit: int) -> list[SerializedEvent]:
+                 update_snuba_params_with_timestamp(request, snuba_params)
+ 
+                 spans = self.query_trace_data(
+-                    snuba_params, trace_id, error_id, additional_attributes, include_uptime
++                    snuba_params,
++                    trace_id,
++                    error_id,
++                    additional_attributes,
++                    include_uptime,
++                    organization=organization,
+                 )
+             return spans
+ 
+diff --git a/src/sentry/grouping/context.py b/src/sentry/grouping/context.py
+index eedd9a53a3f8f5..ba927bfa3e2329 100644
+--- a/src/sentry/grouping/context.py
++++ b/src/sentry/grouping/context.py
+@@ -7,12 +7,6 @@
+     from sentry.services.eventstore.models import Event
+ 
+ 
+-# XXX: Want to make ContextDict typeddict but also want to type/overload dict
+-# API on GroupingContext
+-ContextValue = Any
+-ContextDict = dict[str, ContextValue]
+-
+-
+ class GroupingContext:
+     """
+     A key-value store used for passing state between strategy functions and other helpers used
+@@ -45,18 +39,18 @@ def __init__(self, strategy_config: StrategyConfiguration, event: Event):
+         self.event = event
+         self._push_context_layer()
+ 
+-    def __setitem__(self, key: str, value: ContextValue) -> None:
++    def __setitem__(self, key: str, value: Any) -> None:
+         # Add the key-value pair to the context layer at the top of the stack
+         self._stack[-1][key] = value
+ 
+-    def __getitem__(self, key: str) -> ContextValue:
++    def __getitem__(self, key: str) -> Any:
+         # Walk down the stack from the top and return the first instance of `key` found
+         for d in reversed(self._stack):
+             if key in d:
+                 return d[key]
+         raise KeyError(key)
+ 
+-    def get(self, key: str, default: ContextValue | None = None) -> ContextValue | None:
++    def get(self, key: str, default: Any = None) -> Any | None:
+         try:
+             return self[key]
+         except KeyError:
+diff --git a/src/sentry/grouping/strategies/base.py b/src/sentry/grouping/strategies/base.py
+index ee0bcf42464553..dc6b06f6d9f9dc 100644
+--- a/src/sentry/grouping/strategies/base.py
++++ b/src/sentry/grouping/strategies/base.py
+@@ -28,12 +28,6 @@
+ STRATEGIES: dict[str, Strategy[Any]] = {}
+ 
+ 
+-# XXX: Want to make ContextDict typeddict but also want to type/overload dict
+-# API on GroupingContext
+-ContextValue = Any
+-ContextDict = dict[str, ContextValue]
+-
+-
+ # TODO: Hack to make `ComponentsByVariant` covariant. At some point we should probably turn
+ # `ComponentsByVariant` into a Mapping (immutable), since in practice it's read-only.
+ GroupingComponent = TypeVar("GroupingComponent", bound=BaseGroupingComponent[Any])
+@@ -198,7 +192,7 @@ class StrategyConfiguration:
+     base: type[StrategyConfiguration] | None = None
+     strategies: dict[str, Strategy[Any]] = {}
+     delegates: dict[str, Strategy[Any]] = {}
+-    initial_context: ContextDict = {}
++    initial_context: dict[str, Any] = {}
+     enhancements_base: str | None = DEFAULT_ENHANCEMENTS_BASE
+     fingerprinting_bases: Sequence[str] | None = DEFAULT_GROUPING_FINGERPRINTING_BASES
+ 
+@@ -242,7 +236,7 @@ def create_strategy_configuration_class(
+     strategies: Sequence[str] | None = None,
+     delegates: Sequence[str] | None = None,
+     base: type[StrategyConfiguration] | None = None,
+-    initial_context: ContextDict | None = None,
++    initial_context: dict[str, Any] | None = None,
+     enhancements_base: str | None = None,
+     fingerprinting_bases: Sequence[str] | None = None,
+ ) -> type[StrategyConfiguration]:
+diff --git a/src/sentry/issues/grouptype.py b/src/sentry/issues/grouptype.py
+index 57dce8053d872b..0770b3815cd404 100644
+--- a/src/sentry/issues/grouptype.py
++++ b/src/sentry/issues/grouptype.py
+@@ -246,7 +246,8 @@ class GroupType:
+     noise_config: NoiseConfig | None = None
+     default_priority: int = PriorityLevel.MEDIUM
+     # If True this group type should be released everywhere. If False, fall back to features to
+-    # decide if this is released.
++    # decide if this is released. Add to HIDDEN_ISSUE_TYPES as well to prevent Events from this Group
++    # being displayed on frontend.
+     released: bool = False
+     # If False this group is excluded from default searches, when there are no filters on issue.category or issue.type.
+     in_default_search: bool = True
+diff --git a/src/sentry/seer/autofix/autofix.py b/src/sentry/seer/autofix/autofix.py
+index 259c1a2a49e2bd..550cb450a9cd22 100644
+--- a/src/sentry/seer/autofix/autofix.py
++++ b/src/sentry/seer/autofix/autofix.py
+@@ -205,7 +205,9 @@ def _fetch_trace():
+         )
+ 
+         trace_endpoint = OrganizationTraceEndpoint()
+-        trace = trace_endpoint.query_trace_data(snuba_params, trace_id)
++        trace = trace_endpoint.query_trace_data(
++            snuba_params, trace_id, organization=project.organization
++        )
+ 
+         if not trace:
+             logger.info(
+diff --git a/src/sentry/seer/endpoints/organization_trace_summary.py b/src/sentry/seer/endpoints/organization_trace_summary.py
+index 7e60a16abfc5f5..ce0b96c9fb93fd 100644
+--- a/src/sentry/seer/endpoints/organization_trace_summary.py
++++ b/src/sentry/seer/endpoints/organization_trace_summary.py
+@@ -64,7 +64,9 @@ def post(self, request: Request, organization: Organization) -> Response:
+         try:
+             trace_endpoint = OrganizationTraceEndpoint()
+             snuba_params = trace_endpoint.get_snuba_params(request, organization)
+-            trace_tree = trace_endpoint.query_trace_data(snuba_params, trace_id)
++            trace_tree = trace_endpoint.query_trace_data(
++                snuba_params, trace_id, organization=organization
++            )
+         except Exception:
+             return Response({"detail": "Error fetching trace"}, status=400)
+ 
+diff --git a/src/sentry/seer/explorer/tools.py b/src/sentry/seer/explorer/tools.py
+index 8cb723641fdfb1..7d7d7cc1fcf86e 100644
+--- a/src/sentry/seer/explorer/tools.py
++++ b/src/sentry/seer/explorer/tools.py
+@@ -417,6 +417,7 @@ def get_trace_waterfall(trace_id: str, organization_id: int) -> EAPTrace | None:
+         full_trace_id,
+         additional_attributes=["span.status_code"],
+         referrer=Referrer.SEER_EXPLORER_TOOLS,
++        organization=organization,
+     )
+ 
+     return EAPTrace(
+diff --git a/src/sentry/snuba/trace.py b/src/sentry/snuba/trace.py
+index 58de0f0be034a8..7f01c5174b30aa 100644
+--- a/src/sentry/snuba/trace.py
++++ b/src/sentry/snuba/trace.py
+@@ -25,8 +25,10 @@
+ from snuba_sdk import Column as SnubaColumn
+ from snuba_sdk import Function
+ 
++from sentry.issues.grouptype import registry as grouptype_registry
+ from sentry.issues.issue_occurrence import IssueOccurrence
+ from sentry.models.group import Group
++from sentry.models.organization import Organization
+ from sentry.models.project import Project
+ from sentry.search.eap.common_columns import COMMON_COLUMNS
+ from sentry.search.eap.types import SearchResolverConfig
+@@ -323,12 +325,23 @@ def _run_errors_query(errors_query: DiscoverQueryBuilder):
+     return error_data
+ 
+ 
+-def _perf_issues_query(snuba_params: SnubaParams, trace_id: str) -> DiscoverQueryBuilder:
++def _perf_issues_query(
++    snuba_params: SnubaParams,
++    trace_id: str,
++    organization: Organization | None = None,
++) -> DiscoverQueryBuilder:
++    query = f"trace:{trace_id}"
++
++    if organization:
++        visible_type_ids = [gt.type_id for gt in grouptype_registry.get_visible(organization)]
++        if visible_type_ids:
++            query = f"trace:{trace_id} occurrence_type_id:[{','.join(map(str, visible_type_ids))}]"
++
+     occurrence_query = DiscoverQueryBuilder(
+         Dataset.IssuePlatform,
+         params={},
+         snuba_params=snuba_params,
+-        query=f"trace:{trace_id}",
++        query=query,
+         selected_columns=["event_id", "occurrence_id", "project_id"],
+         config=QueryBuilderConfig(
+             functions_acl=["groupArray"],
+@@ -524,6 +537,7 @@ def query_trace_data(
+     additional_attributes: list[str] | None = None,
+     include_uptime: bool = False,
+     referrer: Referrer = Referrer.API_TRACE_VIEW_GET_EVENTS,
++    organization: Organization | None = None,
+ ) -> list[SerializedEvent]:
+     """Queries span/error data for a given trace"""
+     # This is a hack, long term EAP will store both errors and performance_issues eventually but is not ready
+@@ -535,7 +549,7 @@ def query_trace_data(
+     # up. Because of that, tests can fail during tear down as there are active connections
+     # to the database preventing a DROP.
+     errors_query = _errors_query(snuba_params, trace_id, error_id)
+-    occurrence_query = _perf_issues_query(snuba_params, trace_id)
++    occurrence_query = _perf_issues_query(snuba_params, trace_id, organization)
+     uptime_query = _uptime_results_query(snuba_params, trace_id) if include_uptime else None
+ 
+     # 1 worker each for spans, errors, performance issues, and optionally uptime
+diff --git a/static/app/components/commandPalette/useGlobalCommandPaletteActions.tsx b/static/app/components/commandPalette/useGlobalCommandPaletteActions.tsx
+index 17a9c6cd5a0f30..b7a21ee3b4478f 100644
+--- a/static/app/components/commandPalette/useGlobalCommandPaletteActions.tsx
++++ b/static/app/components/commandPalette/useGlobalCommandPaletteActions.tsx
+@@ -36,7 +36,7 @@ import {FRONTEND_LANDING_SUB_PATH} from 'sentry/views/insights/pages/frontend/se
+ import {MCP_LANDING_SUB_PATH} from 'sentry/views/insights/pages/mcp/settings';
+ import {MOBILE_LANDING_SUB_PATH} from 'sentry/views/insights/pages/mobile/settings';
+ import {ISSUE_TAXONOMY_CONFIG} from 'sentry/views/issueList/taxonomies';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {useStarredIssueViews} from 'sentry/views/navigation/secondary/sections/issues/issueViews/useStarredIssueViews';
+ import {getUserOrgNavigationConfiguration} from 'sentry/views/settings/organization/userOrgNavigationConfiguration';
+ 
+diff --git a/static/app/components/events/autofix/v3/content.tsx b/static/app/components/events/autofix/v3/content.tsx
+index 9f9d5438952cd2..21a74cdfef5303 100644
+--- a/static/app/components/events/autofix/v3/content.tsx
++++ b/static/app/components/events/autofix/v3/content.tsx
+@@ -1,4 +1,4 @@
+-import {useMemo} from 'react';
++import {Fragment, useMemo} from 'react';
+ 
+ import {Flex} from '@sentry/scraps/layout';
+ 
+@@ -15,6 +15,7 @@ import {
+   RootCauseCard,
+   SolutionCard,
+ } from 'sentry/components/events/autofix/v3/autofixCards';
++import {SeerDrawerNextStep} from 'sentry/components/events/autofix/v3/nextStep';
+ import Placeholder from 'sentry/components/placeholder';
+ import {isArrayOf} from 'sentry/types/utils';
+ import type {useAiConfig} from 'sentry/views/issueDetails/streamline/hooks/useAiConfig';
+@@ -31,14 +32,27 @@ export function SeerDrawerContent({aiConfig, autofix}: SeerDrawerContentProps) {
+     [autofix.runState]
+   );
+ 
+-  return autofix.isLoading ? (
+-    <Flex direction="column" gap="xl">
+-      <Placeholder height="10rem" />
+-      <Placeholder height="15rem" />
++  if (autofix.isLoading) {
++    return (
++      <Flex direction="column" gap="xl">
++        <Placeholder height="10rem" />
++        <Placeholder height="15rem" />
++      </Flex>
++    );
++  }
++
++  if (!autofix.runState && aiConfig.hasAutofix) {
++    return null; // TODO: should this have an empty state?
++  }
++
++  return (
++    <Flex direction="column" gap="lg">
++      <SeerDrawerArtifacts artifacts={artifacts} />
++      {autofix.runState?.status === 'completed' && (
++        <SeerDrawerNextStep autofix={autofix} artifacts={artifacts} />
++      )}
+     </Flex>
+-  ) : !autofix.runState && aiConfig.hasAutofix ? null : artifacts.length ? (
+-    <SeerDrawerArtifacts artifacts={artifacts} />
+-  ) : null;
++  );
+ }
+ 
+ interface SeerDrawerArtifactsProps {
+@@ -47,7 +61,7 @@ interface SeerDrawerArtifactsProps {
+ 
+ function SeerDrawerArtifacts({artifacts}: SeerDrawerArtifactsProps) {
+   return (
+-    <Flex direction="column" gap="lg">
++    <Fragment>
+       {artifacts.map(artifact => {
+         // there should only be 1 artifact of each type
+         if (isRootCauseArtifact(artifact)) {
+@@ -69,6 +83,6 @@ function SeerDrawerArtifacts({artifacts}: SeerDrawerArtifactsProps) {
+         // TODO: maybe send a log?
+         return null;
+       })}
+-    </Flex>
++    </Fragment>
+   );
+ }
+diff --git a/static/app/components/events/autofix/v3/nextStep.spec.tsx b/static/app/components/events/autofix/v3/nextStep.spec.tsx
+new file mode 100644
+index 00000000000000..3f8e0989c33578
+--- /dev/null
++++ b/static/app/components/events/autofix/v3/nextStep.spec.tsx
+@@ -0,0 +1,180 @@
++import {render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
++
++import type {
++  RootCauseArtifact,
++  SolutionArtifact,
++  useExplorerAutofix,
++} from 'sentry/components/events/autofix/useExplorerAutofix';
++import type {Artifact, ExplorerFilePatch} from 'sentry/views/seerExplorer/types';
++
++import {SeerDrawerNextStep} from './nextStep';
++
++function makeAutofix(
++  overrides: Partial<ReturnType<typeof useExplorerAutofix>> = {}
++): ReturnType<typeof useExplorerAutofix> {
++  return {
++    runState: {run_id: 1} as any,
++    startStep: jest.fn(),
++    createPR: jest.fn(),
++    sendMessage: jest.fn(),
++    reset: jest.fn(),
++    isLoading: false,
++    isReady: true,
++    isStreaming: false,
++    ...overrides,
++  } as ReturnType<typeof useExplorerAutofix>;
++}
++
++function makeRootCauseArtifact(): Artifact<RootCauseArtifact> {
++  return {
++    key: 'root-cause',
++    reason: 'Found root cause',
++    data: {
++      one_line_description: 'Null pointer dereference',
++      five_whys: ['Why 1', 'Why 2'],
++    },
++  };
++}
++
++function makeSolutionArtifact(): Artifact<SolutionArtifact> {
++  return {
++    key: 'solution',
++    reason: 'Found solution',
++    data: {
++      one_line_summary: 'Add null check',
++      steps: [{title: 'Step 1', description: 'Add guard clause'}],
++    },
++  };
++}
++
++function makePatch(): ExplorerFilePatch {
++  return {
++    repo_name: 'org/repo',
++    diff: 'diff content',
++    patch: {
++      path: 'src/file.py',
++      added: 1,
++      removed: 0,
++      hunks: [],
++      source_file: 'src/file.py',
++      target_file: 'src/file.py',
++      type: 'M',
++    },
++  } as ExplorerFilePatch;
++}
++
++describe('SeerDrawerNextStep', () => {
++  it('returns null when no runId', () => {
++    const autofix = makeAutofix({runState: null});
++    const {container} = render(<SeerDrawerNextStep artifacts={[]} autofix={autofix} />);
++    expect(container).toBeEmptyDOMElement();
++  });
++
++  it('returns null when artifact type does not match any case', () => {
++    const autofix = makeAutofix();
++    const {container} = render(<SeerDrawerNextStep artifacts={[]} autofix={autofix} />);
++    expect(container).toBeEmptyDOMElement();
++  });
++
++  describe('RootCauseNextStep', () => {
++    it('renders prompt and yes button', () => {
++      const autofix = makeAutofix();
++      render(
++        <SeerDrawerNextStep artifacts={[makeRootCauseArtifact()]} autofix={autofix} />
++      );
++      expect(screen.getByText('Are you happy with this root cause?')).toBeInTheDocument();
++      expect(screen.getByRole('button', {name: 'No'})).toBeInTheDocument();
++      expect(
++        screen.getByRole('button', {name: 'Yes, make an implementation plan'})
++      ).toBeInTheDocument();
++    });
++
++    it('calls startStep with solution on yes click', async () => {
++      const autofix = makeAutofix();
++      render(
++        <SeerDrawerNextStep artifacts={[makeRootCauseArtifact()]} autofix={autofix} />
++      );
++      await userEvent.click(
++        screen.getByRole('button', {name: 'Yes, make an implementation plan'})
++      );
++      expect(autofix.startStep).toHaveBeenCalledWith('solution', 1);
++    });
++
++    it('calls startStep with root_cause on no click', async () => {
++      const autofix = makeAutofix();
++      render(
++        <SeerDrawerNextStep artifacts={[makeRootCauseArtifact()]} autofix={autofix} />
++      );
++      await userEvent.click(screen.getByRole('button', {name: 'No'}));
++      expect(autofix.startStep).toHaveBeenCalledWith('root_cause', 1);
++    });
++  });
++
++  describe('SolutionNextStep', () => {
++    it('renders prompt and yes button', () => {
++      const autofix = makeAutofix();
++      render(
++        <SeerDrawerNextStep artifacts={[makeSolutionArtifact()]} autofix={autofix} />
++      );
++      expect(
++        screen.getByText('Are you happy with this implementation plan?')
++      ).toBeInTheDocument();
++      expect(screen.getByRole('button', {name: 'No'})).toBeInTheDocument();
++      expect(
++        screen.getByRole('button', {name: 'Yes, write a code fix'})
++      ).toBeInTheDocument();
++    });
++
++    it('calls startStep with code_changes on yes click', async () => {
++      const autofix = makeAutofix();
++      render(
++        <SeerDrawerNextStep artifacts={[makeSolutionArtifact()]} autofix={autofix} />
++      );
++      await userEvent.click(screen.getByRole('button', {name: 'Yes, write a code fix'}));
++      expect(autofix.startStep).toHaveBeenCalledWith('code_changes', 1);
++    });
++
++    it('calls startStep with solution on no click', async () => {
++      const autofix = makeAutofix();
++      render(
++        <SeerDrawerNextStep artifacts={[makeSolutionArtifact()]} autofix={autofix} />
++      );
++      await userEvent.click(screen.getByRole('button', {name: 'No'}));
++      expect(autofix.startStep).toHaveBeenCalledWith('solution', 1);
++    });
++  });
++
++  describe('CodeChangesNextStep', () => {
++    it('renders prompt and yes button', () => {
++      const autofix = makeAutofix();
++      render(<SeerDrawerNextStep artifacts={[[makePatch()]]} autofix={autofix} />);
++      expect(
++        screen.getByText('Are you happy with these code changes?')
++      ).toBeInTheDocument();
++      expect(screen.getByRole('button', {name: 'No'})).toBeInTheDocument();
++      expect(screen.getByRole('button', {name: 'Yes, draft a PR'})).toBeInTheDocument();
++    });
++
++    it('calls createPR on yes click', async () => {
++      const autofix = makeAutofix();
++      render(<SeerDrawerNextStep artifacts={[[makePatch()]]} autofix={autofix} />);
++      await userEvent.click(screen.getByRole('button', {name: 'Yes, draft a PR'}));
++      expect(autofix.createPR).toHaveBeenCalledWith(1);
++    });
++
++    it('calls startStep with code_changes on no click', async () => {
++      const autofix = makeAutofix();
++      render(<SeerDrawerNextStep artifacts={[[makePatch()]]} autofix={autofix} />);
++      await userEvent.click(screen.getByRole('button', {name: 'No'}));
++      expect(autofix.startStep).toHaveBeenCalledWith('code_changes', 1);
++    });
++
++    it('returns null for empty file patches array', () => {
++      const autofix = makeAutofix();
++      const {container} = render(
++        <SeerDrawerNextStep artifacts={[[]]} autofix={autofix} />
++      );
++      expect(container).toBeEmptyDOMElement();
++    });
++  });
++});
+diff --git a/static/app/components/events/autofix/v3/nextStep.tsx b/static/app/components/events/autofix/v3/nextStep.tsx
+new file mode 100644
+index 00000000000000..ae36ecac204d47
+--- /dev/null
++++ b/static/app/components/events/autofix/v3/nextStep.tsx
+@@ -0,0 +1,144 @@
++import {useCallback, type ReactNode} from 'react';
++
++import {Button} from '@sentry/scraps/button';
++import {Flex} from '@sentry/scraps/layout';
++import {Text} from '@sentry/scraps/text';
++
++import {
++  isRootCauseArtifact,
++  isSolutionArtifact,
++  type AutofixArtifact,
++  type useExplorerAutofix,
++} from 'sentry/components/events/autofix/useExplorerAutofix';
++import {t} from 'sentry/locale';
++import {isArrayOf} from 'sentry/types/utils';
++import {isExplorerFilePatch} from 'sentry/views/seerExplorer/types';
++
++interface SeerDrawerNextStepProps {
++  artifacts: AutofixArtifact[];
++  autofix: ReturnType<typeof useExplorerAutofix>;
++}
++
++export function SeerDrawerNextStep({artifacts, autofix}: SeerDrawerNextStepProps) {
++  const runId = autofix.runState?.run_id;
++  if (!runId) {
++    return null;
++  }
++
++  const lastArtifact = artifacts[artifacts.length - 1];
++
++  if (isRootCauseArtifact(lastArtifact)) {
++    return <RootCauseNextStep autofix={autofix} runId={runId} />;
++  }
++
++  if (isSolutionArtifact(lastArtifact)) {
++    return <SolutionNextStep autofix={autofix} runId={runId} />;
++  }
++
++  if (isArrayOf(lastArtifact, isExplorerFilePatch) && lastArtifact.length) {
++    return <CodeChangesNextStep autofix={autofix} runId={runId} />;
++  }
++
++  return null;
++}
++
++interface NextStepProps {
++  autofix: ReturnType<typeof useExplorerAutofix>;
++  runId: number;
++}
++
++function RootCauseNextStep({autofix, runId}: NextStepProps) {
++  const {startStep} = autofix;
++
++  const handleYesClick = useCallback(() => {
++    startStep('solution', runId);
++  }, [startStep, runId]);
++
++  const handleNoClick = useCallback(() => {
++    // for now, just re run the current step
++    startStep('root_cause', runId);
++  }, [startStep, runId]);
++
++  return (
++    <NextStep
++      prompt={t('Are you happy with this root cause?')}
++      labelYes={t('Yes, make an implementation plan')}
++      onClickYes={handleYesClick}
++      labelNo={t('No')}
++      onClickNo={handleNoClick}
++    />
++  );
++}
++
++function SolutionNextStep({autofix, runId}: NextStepProps) {
++  const {startStep} = autofix;
++
++  const handleYesClick = useCallback(() => {
++    startStep('code_changes', runId);
++  }, [startStep, runId]);
++
++  const handleNoClick = useCallback(() => {
++    // for now, just re run the current step
++    startStep('solution', runId);
++  }, [startStep, runId]);
++
++  return (
++    <NextStep
++      prompt={t('Are you happy with this implementation plan?')}
++      labelYes={t('Yes, write a code fix')}
++      onClickYes={handleYesClick}
++      labelNo={t('No')}
++      onClickNo={handleNoClick}
++    />
++  );
++}
++
++function CodeChangesNextStep({autofix, runId}: NextStepProps) {
++  const {createPR, startStep} = autofix;
++
++  const handleYesClick = useCallback(() => {
++    createPR(runId);
++  }, [createPR, runId]);
++
++  const handleNoClick = useCallback(() => {
++    startStep('code_changes', runId);
++  }, [startStep, runId]);
++
++  return (
++    <NextStep
++      prompt={t('Are you happy with these code changes?')}
++      labelYes={t('Yes, draft a PR')}
++      onClickYes={handleYesClick}
++      labelNo={t('No')}
++      onClickNo={handleNoClick}
++    />
++  );
++}
++
++interface NextStepTemplateProps {
++  labelNo: ReactNode;
++  labelYes: ReactNode;
++  onClickNo: () => void;
++  onClickYes: () => void;
++  prompt: ReactNode;
++}
++
++function NextStep({
++  prompt,
++  labelYes,
++  onClickYes,
++  labelNo,
++  onClickNo,
++}: NextStepTemplateProps) {
++  return (
++    <Flex direction="column" gap="lg">
++      <Text>{prompt}</Text>
++      <Flex gap="md">
++        <Button onClick={onClickNo}>{labelNo}</Button>
++        <Button priority="primary" onClick={onClickYes}>
++          {labelYes}
++        </Button>
++      </Flex>
++    </Flex>
++  );
++}
+diff --git a/static/app/components/onboardingWizard/content.spec.tsx b/static/app/components/onboardingWizard/content.spec.tsx
+index aa0ab5ac5c87cc..b9184fd26ecc2b 100644
+--- a/static/app/components/onboardingWizard/content.spec.tsx
++++ b/static/app/components/onboardingWizard/content.spec.tsx
+@@ -10,7 +10,7 @@ import {
+ 
+ import {OnboardingSidebarContent} from 'sentry/components/onboardingWizard/content';
+ import {OnboardingTaskKey} from 'sentry/types/onboarding';
+-import {NavigationContextProvider} from 'sentry/views/navigation/context';
++import {NavigationContextProvider} from 'sentry/views/navigation/navigationContext';
+ import {NavigationTourProvider} from 'sentry/views/navigation/navigationTour';
+ 
+ const DEFAULT_GETTING_STARTED_TASKS = [
+diff --git a/static/app/utils/replays/hooks/useReplayLayout.tsx b/static/app/utils/replays/hooks/useReplayLayout.tsx
+index a13d6d09435276..ccf3f463059050 100644
+--- a/static/app/utils/replays/hooks/useReplayLayout.tsx
++++ b/static/app/utils/replays/hooks/useReplayLayout.tsx
+@@ -11,7 +11,7 @@ import {
+   PRIMARY_SIDEBAR_WIDTH,
+   SECONDARY_SIDEBAR_WIDTH,
+ } from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ 
+ export enum LayoutKey {
+   /**
+diff --git a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+index feedcb2b0f0c43..7783168d8239d4 100644
+--- a/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
++++ b/static/app/views/dashboards/widgetBuilder/components/newWidgetBuilder.tsx
+@@ -44,7 +44,7 @@ import {
+ } from 'sentry/views/dashboards/widgetBuilder/contexts/widgetBuilderContext';
+ import type {OnDataFetchedParams} from 'sentry/views/dashboards/widgetCard';
+ import {DashboardsMEPProvider} from 'sentry/views/dashboards/widgetCard/dashboardsMEPContext';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {MetricsDataSwitcher} from 'sentry/views/performance/landing/metricsDataSwitcher';
+ 
+ export interface ThresholdMetaState {
+diff --git a/static/app/views/navigation/collapsible.tsx b/static/app/views/navigation/collapsible.tsx
+deleted file mode 100644
+index 9cd4f9a2202dfa..00000000000000
+--- a/static/app/views/navigation/collapsible.tsx
++++ /dev/null
+@@ -1,65 +0,0 @@
+-import styled from '@emotion/styled';
+-import {AnimatePresence, motion} from 'framer-motion';
+-
+-import testableTransition from 'sentry/utils/testableTransition';
+-
+-export function Collapsible({
+-  children,
+-  collapsed,
+-  disabled = false,
+-}: {
+-  children: React.ReactNode;
+-  collapsed: boolean;
+-  disabled?: boolean;
+-}) {
+-  if (disabled) {
+-    return children;
+-  }
+-  const visualDuration = 0.4;
+-
+-  return (
+-    <AnimatePresence mode="wait" initial={false}>
+-      {!collapsed && (
+-        <CollapsableWrapper
+-          key="collapsible-content"
+-          variants={{
+-            collapsed: {
+-              height: 0,
+-              overflow: 'hidden',
+-            },
+-            expanded: {
+-              // overflow: 'visible',
+-              height: 'auto',
+-            },
+-          }}
+-          initial="collapsed"
+-          animate="expanded"
+-          exit="collapsed"
+-          transition={testableTransition({
+-            type: 'spring',
+-            damping: 50,
+-            stiffness: 600,
+-            bounce: 0,
+-            visualDuration,
+-          })}
+-        >
+-          {/*
+-            We need to wrap the children in a div to prevent the parent's flex-direction: column-reverse
+-            from applying to the children, which may cause the children's order to be reversed
+-          */}
+-          <div>{children}</div>
+-        </CollapsableWrapper>
+-      )}
+-    </AnimatePresence>
+-  );
+-}
+-
+-const CollapsableWrapper = styled(motion.div)`
+-  display: flex;
+-  /*
+-    This column-reverse is what creates the "folder" animation effect, where children "fall out" of the header
+-    when un-collapsed, and are "sucked in" to the header when collapsed, rather than a standard accordion effect.
+-  */
+-  flex-direction: column-reverse;
+-  margin: 0;
+-`;
+diff --git a/static/app/views/navigation/index.spec.tsx b/static/app/views/navigation/index.spec.tsx
+index 71c8f9f0c49039..bb215233f964a6 100644
+--- a/static/app/views/navigation/index.spec.tsx
++++ b/static/app/views/navigation/index.spec.tsx
+@@ -18,7 +18,7 @@ import ConfigStore from 'sentry/stores/configStore';
+ import {trackAnalytics} from 'sentry/utils/analytics';
+ import {Navigation} from 'sentry/views/navigation';
+ import {NAVIGATION_SIDEBAR_COLLAPSED_LOCAL_STORAGE_KEY} from 'sentry/views/navigation/constants';
+-import {NavigationContextProvider} from 'sentry/views/navigation/context';
++import {NavigationContextProvider} from 'sentry/views/navigation/navigationContext';
+ 
+ jest.mock('sentry/utils/analytics', () => ({
+   ...jest.requireActual('sentry/utils/analytics'),
+diff --git a/static/app/views/navigation/index.tsx b/static/app/views/navigation/index.tsx
+index 1ae365f9c6aa5b..fe8fac2b66d65e 100644
+--- a/static/app/views/navigation/index.tsx
++++ b/static/app/views/navigation/index.tsx
+@@ -1,6 +1,5 @@
+ import {useEffect} from 'react';
+-import {css} from '@emotion/react';
+-import styled from '@emotion/styled';
++import {useTheme} from '@emotion/react';
+ 
+ import {Flex} from '@sentry/scraps/layout';
+ 
+@@ -13,18 +12,19 @@ import {useGlobalModal} from 'sentry/components/globalModal/useGlobalModal';
+ import {useHotkeys} from 'sentry/utils/useHotkeys';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {PRIMARY_SIDEBAR_WIDTH} from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
+-import {MobileTopbar} from 'sentry/views/navigation/mobileTopbar';
++import {MobileNavigation} from 'sentry/views/navigation/mobileNavigation';
++import {Navigation as DesktopNavigation} from 'sentry/views/navigation/navigation';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   NavigationTourProvider,
+   useNavigationTour,
+ } from 'sentry/views/navigation/navigationTour';
+ import {UserDropdown} from 'sentry/views/navigation/primary/userDropdown';
+-import {Sidebar} from 'sentry/views/navigation/sidebar';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ import {useResetActiveNavigationGroup} from 'sentry/views/navigation/useResetActiveNavigationGroup';
+ 
+ function UserAndOrganizationNavigation() {
++  const theme = useTheme();
+   const {layout, navigationParentRef} = useNavigationContext();
+   const {currentStepId, endTour} = useNavigationTour();
+   const tourIsActive = currentStepId !== null;
+@@ -60,24 +60,41 @@ function UserAndOrganizationNavigation() {
+   }, [endTour, layout, tourIsActive]);
+ 
+   return (
+-    <NavigationContainer
++    <Flex
+       ref={navigationParentRef}
+-      tourIsActive={tourIsActive}
+-      isMobile={layout === NavigationLayout.MOBILE}
++      top={0}
++      position={tourIsActive ? undefined : 'sticky'}
++      bottom={layout === NavigationLayout.MOBILE ? undefined : 0}
++      height={layout === NavigationLayout.MOBILE ? undefined : '100dvh'}
++      style={{
++        zIndex: tourIsActive ? undefined : theme.zIndex.sidebarPanel,
++        userSelect: 'none',
++      }}
+       {...hoverProps}
+     >
+-      {layout === NavigationLayout.SIDEBAR ? <Sidebar /> : <MobileTopbar />}
+-    </NavigationContainer>
++      {layout === NavigationLayout.SIDEBAR ? <DesktopNavigation /> : <MobileNavigation />}
++    </Flex>
+   );
+ }
+ 
+ function UserOnlyNavigation() {
++  const theme = useTheme();
+   return (
+-    <NoOrganizationSidebar data-test-id="no-organization-sidebar">
++    <Flex
++      data-test-id="no-organization-sidebar"
++      width={`${PRIMARY_SIDEBAR_WIDTH}px`}
++      padding="lg 0 md 0"
++      borderRight="primary"
++      background="primary"
++      direction="column"
++      align="center"
++      justify="between"
++      style={{zIndex: theme.zIndex.sidebarPanel}}
++    >
+       <Flex direction="column" gap="md" justify="between">
+         <UserDropdown />
+       </Flex>
+-    </NoOrganizationSidebar>
++    </Flex>
+   );
+ }
+ 
+@@ -94,35 +111,3 @@ export function Navigation() {
+     </NavigationTourProvider>
+   );
+ }
+-
+-const NavigationContainer = styled('div')<{isMobile: boolean; tourIsActive: boolean}>`
+-  display: flex;
+-  user-select: none;
+-
+-  ${p =>
+-    !p.tourIsActive &&
+-    css`
+-      position: sticky;
+-      top: 0;
+-      z-index: ${p.theme.zIndex.sidebarPanel};
+-    `}
+-
+-  ${p =>
+-    !p.isMobile &&
+-    css`
+-      bottom: 0;
+-      height: 100vh;
+-      height: 100dvh;
+-    `}
+-`;
+-
+-const NoOrganizationSidebar = styled('div')`
+-  z-index: ${p => p.theme.zIndex.sidebarPanel};
+-  width: ${PRIMARY_SIDEBAR_WIDTH}px;
+-  padding: ${p => p.theme.space.lg} 0 ${p => p.theme.space.md} 0;
+-  border-right: 1px solid ${p => p.theme.tokens.border.primary};
+-  background: ${p => p.theme.tokens.background.primary};
+-  display: flex;
+-  align-items: center;
+-  flex-direction: column;
+-`;
+diff --git a/static/app/views/navigation/mobileTopbar.tsx b/static/app/views/navigation/mobileNavigation.tsx
+similarity index 67%
+rename from static/app/views/navigation/mobileTopbar.tsx
+rename to static/app/views/navigation/mobileNavigation.tsx
+index 2e55ac075d8c3e..7ae96ee401e55e 100644
+--- a/static/app/views/navigation/mobileTopbar.tsx
++++ b/static/app/views/navigation/mobileNavigation.tsx
+@@ -1,6 +1,6 @@
+ import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
+ import {createPortal} from 'react-dom';
+-import styled from '@emotion/styled';
++import {useTheme} from '@emotion/react';
+ 
+ import {Button} from '@sentry/scraps/button';
+ import {Flex} from '@sentry/scraps/layout';
+@@ -22,33 +22,49 @@ import {useActiveNavigationGroup} from 'sentry/views/navigation/useActiveNavigat
+ 
+ type ActiveView = 'primary' | 'secondary' | 'closed';
+ 
+-export function MobileTopbar() {
++export function MobileNavigation() {
++  const theme = useTheme();
+   const location = useLocation();
+   const organization = useOrganization();
+   const activeGroup = useActiveNavigationGroup();
+   const closeButtonRef = useRef<HTMLButtonElement>(null);
+   const [view, setView] = useState<ActiveView>('closed');
++
+   /** Sync menu state with `body` attributes */
+   useLayoutEffect(() => {
+     updateNavigationStyleAttributes(view);
+   }, [view]);
+-  /** Automatically close the menu after any navigation */
+-  useEffect(() => {
+-    setView('closed');
+-  }, [location.pathname]);
+-  const handleClick = useCallback(() => {
+-    setView(v => (v === 'closed' ? (activeGroup ? 'secondary' : 'primary') : 'closed'));
+-  }, [activeGroup]);
+ 
+-  // Avoid showing superuser UI on certain organizations
+-  const isExcludedOrg = HookStore.get('component:superuser-warning-excluded')[0]?.(
+-    organization
++  /** Close menu after any location pathname change */
++  useEffect(() => setView('closed'), [location.pathname]);
++
++  const handleClick = useCallback(
++    () =>
++      setView(v => (v === 'closed' ? (activeGroup ? 'secondary' : 'primary') : 'closed')),
++    [activeGroup]
+   );
++
+   const showSuperuserWarning =
+-    isActiveSuperuser() && !ConfigStore.get('isSelfHosted') && !isExcludedOrg;
++    isActiveSuperuser() &&
++    !ConfigStore.get('isSelfHosted') &&
++    !HookStore.get('component:superuser-warning-excluded')[0]?.(organization);
+ 
+   return (
+-    <Topbar showSuperuserWarning={showSuperuserWarning}>
++    <Flex
++      as="header"
++      direction="row"
++      align="center"
++      height={`${NAVIGATION_MOBILE_TOPBAR_HEIGHT}px`}
++      paddingLeft="lg"
++      paddingRight="lg"
++      width="100vw"
++      borderBottom="primary"
++      background="secondary"
++      justify="between"
++      position="sticky"
++      top={0}
++      style={{zIndex: theme.zIndex.sidebar}}
++    >
+       <Flex align="center" gap="md">
+         {/* If the view is not closed, it will render under the full screen mobile menu */}
+         <OrganizationDropdown onClick={() => setView('closed')} />
+@@ -76,7 +92,46 @@ export function MobileTopbar() {
+           ) : null}
+         </NavigationOverlayPortal>
+       )}
+-    </Topbar>
++    </Flex>
++  );
++}
++
++interface NavigationOverlayPortalProps {
++  children: React.ReactNode;
++  closeButtonRef: React.RefObject<HTMLButtonElement | null>;
++  label: string;
++  setView: (view: ActiveView) => void;
++}
++
++function NavigationOverlayPortal(props: NavigationOverlayPortalProps) {
++  const theme = useTheme();
++  const ref = useRef<HTMLDivElement | null>(null);
++
++  useOnClickOutside(ref, e => {
++    // Without this check the menu will reopen when the click event triggers
++    if (props.closeButtonRef.current?.contains(e.target as Node)) {
++      return;
++    }
++    props.setView('closed');
++  });
++
++  return createPortal(
++    <Flex
++      ref={ref}
++      as="nav"
++      aria-label={props.label}
++      direction="column"
++      background="tertiary"
++      position="fixed"
++      top={`${NAVIGATION_MOBILE_TOPBAR_HEIGHT}px`}
++      right={0}
++      bottom={0}
++      left={0}
++      style={{zIndex: theme.zIndex.modal}}
++    >
++      {props.children}
++    </Flex>,
++    document.body
+   );
+ }
+ 
+@@ -97,60 +152,3 @@ function updateNavigationStyleAttributes(view: ActiveView) {
+     document.body.style.setProperty('overflow', 'hidden');
+   }
+ }
+-
+-function NavigationOverlayPortal({
+-  children,
+-  label,
+-  setView,
+-  closeButtonRef,
+-}: {
+-  children: React.ReactNode;
+-  closeButtonRef: React.RefObject<HTMLButtonElement | null>;
+-  label: string;
+-  setView: (view: ActiveView) => void;
+-}) {
+-  const ref = useRef<HTMLDivElement | null>(null);
+-  useOnClickOutside(ref, e => {
+-    // Without this check the menu will reopen when the click event triggers
+-    if (closeButtonRef.current?.contains(e.target as Node)) {
+-      return;
+-    }
+-    setView('closed');
+-  });
+-  return createPortal(
+-    <NavigationOverlay ref={ref} aria-label={label}>
+-      {children}
+-    </NavigationOverlay>,
+-    document.body
+-  );
+-}
+-
+-const Topbar = styled('header')<{showSuperuserWarning: boolean}>`
+-  height: ${NAVIGATION_MOBILE_TOPBAR_HEIGHT}px;
+-  width: 100vw;
+-  padding-left: ${p => p.theme.space.lg};
+-  padding-right: ${p => p.theme.space.lg};
+-  border-bottom: 1px solid ${p => p.theme.colors.gray200};
+-  background: ${p => p.theme.tokens.background.secondary};
+-  display: flex;
+-  flex-direction: row;
+-  align-items: center;
+-  justify-content: space-between;
+-  position: sticky;
+-  top: 0;
+-  z-index: ${p => p.theme.zIndex.sidebar};
+-`;
+-
+-const NavigationOverlay = styled('nav')`
+-  position: fixed;
+-  top: 40px;
+-  right: 0;
+-  bottom: 0;
+-  left: 0;
+-  display: flex;
+-  flex-direction: column;
+-  background: ${p => p.theme.tokens.background.tertiary};
+-  z-index: ${p => p.theme.zIndex.modal};
+-  --color: ${p => p.theme.tokens.content.primary};
+-  --color-hover: ${p => p.theme.tokens.interactive.link.accent.rest};
+-`;
+diff --git a/static/app/views/navigation/navigation.tsx b/static/app/views/navigation/navigation.tsx
+new file mode 100644
+index 00000000000000..ab1d616e34b74c
+--- /dev/null
++++ b/static/app/views/navigation/navigation.tsx
+@@ -0,0 +1,135 @@
++import {Fragment, useMemo} from 'react';
++import {useTheme} from '@emotion/react';
++import {motion, type MotionProps} from 'framer-motion';
++
++import {Container, Flex} from '@sentry/scraps/layout';
++
++import Hook from 'sentry/components/hook';
++import ConfigStore from 'sentry/stores/configStore';
++import HookStore from 'sentry/stores/hookStore';
++import {isActiveSuperuser} from 'sentry/utils/isActiveSuperuser';
++import useOrganization from 'sentry/utils/useOrganization';
++import {useSyncedLocalStorageState} from 'sentry/utils/useSyncedLocalStorageState';
++import {
++  NAVIGATION_SIDEBAR_SECONDARY_WIDTH_LOCAL_STORAGE_KEY,
++  PRIMARY_SIDEBAR_WIDTH,
++  SECONDARY_SIDEBAR_WIDTH,
++} from 'sentry/views/navigation/constants';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
++import {
++  useNavigationTour,
++  useNavigationTourModal,
++} from 'sentry/views/navigation/navigationTour';
++import {PrimaryNavigationItems} from 'sentry/views/navigation/primary/index';
++import {OrganizationDropdown} from 'sentry/views/navigation/primary/organizationDropdown';
++import {SecondarySidebar} from 'sentry/views/navigation/secondary/secondarySidebar';
++import {useCollapsedNavigation} from 'sentry/views/navigation/useCollapsedNavigation';
++
++export function Navigation() {
++  const theme = useTheme();
++  const organization = useOrganization();
++
++  const collapsedNavigation = useCollapsedNavigation();
++  const navigationContext = useNavigationContext();
++
++  useNavigationTourModal();
++
++  const showSuperuserWarning =
++    isActiveSuperuser() &&
++    !ConfigStore.get('isSelfHosted') &&
++    !HookStore.get('component:superuser-warning-excluded')[0]?.(organization);
++
++  const {currentStepId} = useNavigationTour();
++  const isCollapsed = currentStepId === null ? navigationContext.isCollapsed : false;
++
++  const [secondarySidebarWidth] = useSyncedLocalStorageState(
++    NAVIGATION_SIDEBAR_SECONDARY_WIDTH_LOCAL_STORAGE_KEY,
++    SECONDARY_SIDEBAR_WIDTH
++  );
++
++  const sidebarAnimationProps = useMemo(
++    () =>
++      makeCollapsedSecondaryWrapperAnimationProps(
++        collapsedNavigation.isOpen,
++        secondarySidebarWidth
++      ),
++    [collapsedNavigation.isOpen, secondarySidebarWidth]
++  );
++
++  return (
++    <Fragment>
++      <Flex
++        as="nav"
++        aria-label="Primary Navigation"
++        width={`${PRIMARY_SIDEBAR_WIDTH}px`}
++        padding="lg 0 md 0"
++        borderRight="primary"
++        background="primary"
++        direction="column"
++        style={{zIndex: currentStepId === null ? theme.zIndex.sidebar : undefined}}
++      >
++        <Flex
++          as="header"
++          direction="column"
++          align="center"
++          justify="center"
++          position="relative"
++        >
++          <OrganizationDropdown />
++          {showSuperuserWarning && (
++            <Container
++              position="absolute"
++              top={`-${theme.space.lg}`}
++              left={0}
++              width={`${PRIMARY_SIDEBAR_WIDTH}px`}
++              style={{
++                zIndex: theme.zIndex.initial,
++                background: theme.tokens.background.danger.vibrant,
++              }}
++            >
++              <Hook name="component:superuser-warning" organization={organization} />
++            </Container>
++          )}
++        </Flex>
++        <PrimaryNavigationItems />
++      </Flex>
++      {isCollapsed ? null : <SecondarySidebar />}
++      {isCollapsed ? (
++        <CollapsedSecondaryWrapper
++          data-visible={collapsedNavigation.isOpen}
++          data-test-id="collapsed-secondary-sidebar"
++          height="100%"
++          left={`${PRIMARY_SIDEBAR_WIDTH}px`}
++          top={0}
++          position="absolute"
++          background="primary"
++          {...sidebarAnimationProps}
++        >
++          <SecondarySidebar />
++        </CollapsedSecondaryWrapper>
++      ) : null}
++    </Fragment>
++  );
++}
++
++const CollapsedSecondaryWrapper = motion.create(Flex);
++const makeCollapsedSecondaryWrapperAnimationProps = (
++  open: boolean,
++  left: number
++): MotionProps => {
++  return {
++    initial: 'hidden',
++    animate: open ? 'visible' : 'hidden',
++    variants: {
++      visible: {x: 0},
++      hidden: {x: -left - 10},
++    },
++    transition: {
++      type: 'spring',
++      damping: 50,
++      stiffness: 700,
++      bounce: 0,
++      visualDuration: 0.1,
++    },
++  };
++};
+diff --git a/static/app/views/navigation/context.tsx b/static/app/views/navigation/navigationContext.tsx
+similarity index 99%
+rename from static/app/views/navigation/context.tsx
+rename to static/app/views/navigation/navigationContext.tsx
+index 2b99b8ad736519..44a49d957a8ca5 100644
+--- a/static/app/views/navigation/context.tsx
++++ b/static/app/views/navigation/navigationContext.tsx
+@@ -44,6 +44,7 @@ export function useNavigationContext(): NavigationContext {
+ 
+ export function NavigationContextProvider({children}: {children: React.ReactNode}) {
+   const navigationParentRef = useRef<HTMLDivElement>(null);
++
+   const isInteractingRef = useRef(false);
+   const [isCollapsed, setIsCollapsed] = useLocalStorageState(
+     NAVIGATION_SIDEBAR_COLLAPSED_LOCAL_STORAGE_KEY,
+diff --git a/static/app/views/navigation/primary/components.tsx b/static/app/views/navigation/primary/components.tsx
+index cc73843c6e5a33..98051b25cfcfd5 100644
+--- a/static/app/views/navigation/primary/components.tsx
++++ b/static/app/views/navigation/primary/components.tsx
+@@ -20,7 +20,7 @@ import {
+   NAVIGATION_PRIMARY_LINK_DATA_ATTRIBUTE,
+   SIDEBAR_NAVIGATION_SOURCE,
+ } from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import type {PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+diff --git a/static/app/views/navigation/primary/index.tsx b/static/app/views/navigation/primary/index.tsx
+index c24dba5d2de34c..22532dbd950c31 100644
+--- a/static/app/views/navigation/primary/index.tsx
++++ b/static/app/views/navigation/primary/index.tsx
+@@ -20,7 +20,7 @@ import {
+ } from 'sentry/icons';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {getDefaultExploreRoute} from 'sentry/views/explore/utils';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   NavigationTour,
+   NavigationTourElement,
+diff --git a/static/app/views/navigation/primary/onboarding.spec.tsx b/static/app/views/navigation/primary/onboarding.spec.tsx
+index 9fa48019c7b2dd..4ddb44998f5925 100644
+--- a/static/app/views/navigation/primary/onboarding.spec.tsx
++++ b/static/app/views/navigation/primary/onboarding.spec.tsx
+@@ -5,7 +5,7 @@ import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrar
+ 
+ import {OnboardingTaskKey} from 'sentry/types/onboarding';
+ import type {Organization} from 'sentry/types/organization';
+-import {NavigationContextProvider} from 'sentry/views/navigation/context';
++import {NavigationContextProvider} from 'sentry/views/navigation/navigationContext';
+ import {NavigationTourProvider} from 'sentry/views/navigation/navigationTour';
+ import {PrimaryNavigationOnboarding} from 'sentry/views/navigation/primary/onboarding';
+ 
+diff --git a/static/app/views/navigation/primary/onboarding.tsx b/static/app/views/navigation/primary/onboarding.tsx
+index 4ad014a660a404..fc235bf963ddc9 100644
+--- a/static/app/views/navigation/primary/onboarding.tsx
++++ b/static/app/views/navigation/primary/onboarding.tsx
+@@ -17,7 +17,7 @@ import {trackAnalytics} from 'sentry/utils/analytics';
+ import {isDemoModeActive} from 'sentry/utils/demoMode';
+ import {useLocalStorageState} from 'sentry/utils/useLocalStorageState';
+ import useOrganization from 'sentry/utils/useOrganization';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   SidebarButton,
+   SidebarItemUnreadIndicator,
+diff --git a/static/app/views/navigation/primary/organizationDropdown.tsx b/static/app/views/navigation/primary/organizationDropdown.tsx
+index 9876d881c3d95d..7d56901b69fa44 100644
+--- a/static/app/views/navigation/primary/organizationDropdown.tsx
++++ b/static/app/views/navigation/primary/organizationDropdown.tsx
+@@ -20,7 +20,7 @@ import {useNavigate} from 'sentry/utils/useNavigate';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import useProjects from 'sentry/utils/useProjects';
+ import {useSessionStorage} from 'sentry/utils/useSessionStorage';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ import {makeProjectsPathname} from 'sentry/views/projects/pathname';
+ 
+diff --git a/static/app/views/navigation/primary/primaryButtonOverlay.tsx b/static/app/views/navigation/primary/primaryButtonOverlay.tsx
+index b225052257b850..1e3d6c19582676 100644
+--- a/static/app/views/navigation/primary/primaryButtonOverlay.tsx
++++ b/static/app/views/navigation/primary/primaryButtonOverlay.tsx
+@@ -5,7 +5,7 @@ import {FocusScope} from '@react-aria/focus';
+ 
+ import {Overlay, PositionWrapper} from 'sentry/components/overlay';
+ import useOverlay, {type UseOverlayProps} from 'sentry/utils/useOverlay';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ 
+ type PrimaryButtonOverlayProps = {
+diff --git a/static/app/views/navigation/primary/serviceIncidents.tsx b/static/app/views/navigation/primary/serviceIncidents.tsx
+index bb2ef3a2435060..152e1e67bce5f9 100644
+--- a/static/app/views/navigation/primary/serviceIncidents.tsx
++++ b/static/app/views/navigation/primary/serviceIncidents.tsx
+@@ -6,7 +6,7 @@ import {IconFire} from 'sentry/icons';
+ import {t} from 'sentry/locale';
+ import type {StatuspageIncident} from 'sentry/types/system';
+ import {useServiceIncidents} from 'sentry/utils/useServiceIncidents';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   SidebarButton,
+   SidebarItemUnreadIndicator,
+diff --git a/static/app/views/navigation/primary/useActivateNavigationGroupOnHover.tsx b/static/app/views/navigation/primary/useActivateNavigationGroupOnHover.tsx
+index 04807a8f35222a..690679582a888c 100644
+--- a/static/app/views/navigation/primary/useActivateNavigationGroupOnHover.tsx
++++ b/static/app/views/navigation/primary/useActivateNavigationGroupOnHover.tsx
+@@ -1,7 +1,7 @@
+ import {useRef} from 'react';
+ 
+ import {PRIMARY_SIDEBAR_WIDTH} from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {useMouseMovement} from 'sentry/views/navigation/primary/useMouseMovement';
+ import {useWindowHeight} from 'sentry/views/navigation/primary/useWindowHeight';
+ import {NavigationLayout, PrimaryNavigationGroup} from 'sentry/views/navigation/types';
+diff --git a/static/app/views/navigation/primary/userDropdown.tsx b/static/app/views/navigation/primary/userDropdown.tsx
+index 52173e2d2b3ff3..9815af16591c4d 100644
+--- a/static/app/views/navigation/primary/userDropdown.tsx
++++ b/static/app/views/navigation/primary/userDropdown.tsx
+@@ -15,7 +15,7 @@ import {isActiveSuperuser} from 'sentry/utils/isActiveSuperuser';
+ import useApi from 'sentry/utils/useApi';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {useUser} from 'sentry/utils/useUser';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ 
+ // Stable module-level component to avoid remounts when used as `renderWrapAs`
+diff --git a/static/app/views/navigation/primary/whatsNew/whatsNew.tsx b/static/app/views/navigation/primary/whatsNew/whatsNew.tsx
+index 470bfd79b2f46d..262611dc0742ba 100644
+--- a/static/app/views/navigation/primary/whatsNew/whatsNew.tsx
++++ b/static/app/views/navigation/primary/whatsNew/whatsNew.tsx
+@@ -16,7 +16,7 @@ import {
+ } from 'sentry/utils/queryClient';
+ import useApi from 'sentry/utils/useApi';
+ import useOrganization from 'sentry/utils/useOrganization';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   SidebarButton,
+   SidebarItemUnreadIndicator,
+diff --git a/static/app/views/navigation/secondary/secondary.stories.tsx b/static/app/views/navigation/secondary/secondary.stories.tsx
+index 7306bc7ce5a7ee..a7d2eef1187f97 100644
+--- a/static/app/views/navigation/secondary/secondary.stories.tsx
++++ b/static/app/views/navigation/secondary/secondary.stories.tsx
+@@ -3,7 +3,7 @@ import styled from '@emotion/styled';
+ 
+ import {NegativeSpaceContainer} from 'sentry/components/container/negativeSpaceContainer';
+ import * as Storybook from 'sentry/stories';
+-import {NavigationContextProvider} from 'sentry/views/navigation/context';
++import {NavigationContextProvider} from 'sentry/views/navigation/navigationContext';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+ 
+ export default Storybook.story('SecondaryNavigation', story => {
+diff --git a/static/app/views/navigation/secondary/secondary.tsx b/static/app/views/navigation/secondary/secondary.tsx
+index d3931893c58e8e..3897b4a86ff61e 100644
+--- a/static/app/views/navigation/secondary/secondary.tsx
++++ b/static/app/views/navigation/secondary/secondary.tsx
+@@ -3,6 +3,7 @@ import type {To} from 'react-router-dom';
+ import type {Theme} from '@emotion/react';
+ import {css} from '@emotion/react';
+ import styled from '@emotion/styled';
++import {AnimatePresence, motion} from 'framer-motion';
+ import PlatformIcon from 'platformicons/build/platformIcon';
+ 
+ import {Button} from '@sentry/scraps/button';
+@@ -15,15 +16,76 @@ import {useHovercardContext} from 'sentry/components/hovercard';
+ import {IconAllProjects, IconChevron, IconMyProjects} from 'sentry/icons';
+ import {t} from 'sentry/locale';
+ import {trackAnalytics} from 'sentry/utils/analytics';
++import testableTransition from 'sentry/utils/testableTransition';
+ import {useLocalStorageState} from 'sentry/utils/useLocalStorageState';
+ import {useLocation} from 'sentry/utils/useLocation';
+ import useOrganization from 'sentry/utils/useOrganization';
+-import {Collapsible} from 'sentry/views/navigation/collapsible';
+ import {SIDEBAR_NAVIGATION_SOURCE} from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {isSidebarLinkActive} from 'sentry/views/navigation/primary/components';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ 
++function Collapsible({
++  children,
++  collapsed,
++  disabled = false,
++}: {
++  children: React.ReactNode;
++  collapsed: boolean;
++  disabled?: boolean;
++}) {
++  if (disabled) {
++    return children;
++  }
++  const visualDuration = 0.4;
++
++  return (
++    <AnimatePresence mode="wait" initial={false}>
++      {!collapsed && (
++        <CollapsableWrapper
++          key="collapsible-content"
++          variants={{
++            collapsed: {
++              height: 0,
++              overflow: 'hidden',
++            },
++            expanded: {
++              // overflow: 'visible',
++              height: 'auto',
++            },
++          }}
++          initial="collapsed"
++          animate="expanded"
++          exit="collapsed"
++          transition={testableTransition({
++            type: 'spring',
++            damping: 50,
++            stiffness: 600,
++            bounce: 0,
++            visualDuration,
++          })}
++        >
++          {/*
++            We need to wrap the children in a div to prevent the parent's flex-direction: column-reverse
++            from applying to the children, which may cause the children's order to be reversed
++          */}
++          <div>{children}</div>
++        </CollapsableWrapper>
++      )}
++    </AnimatePresence>
++  );
++}
++
++const CollapsableWrapper = styled(motion.div)`
++  display: flex;
++  /*
++    This column-reverse is what creates the "folder" animation effect, where children "fall out" of the header
++    when un-collapsed, and are "sucked in" to the header when collapsed, rather than a standard accordion effect.
++  */
++  flex-direction: column-reverse;
++  margin: 0;
++`;
++
+ type SecondaryNavigationProps = {
+   children: ReactNode;
+   className?: string;
+diff --git a/static/app/views/navigation/secondary/secondarySidebar.tsx b/static/app/views/navigation/secondary/secondarySidebar.tsx
+index 832c3f5b766c62..6252a712a59160 100644
+--- a/static/app/views/navigation/secondary/secondarySidebar.tsx
++++ b/static/app/views/navigation/secondary/secondarySidebar.tsx
+@@ -11,7 +11,7 @@ import {
+   SECONDARY_SIDEBAR_MIN_WIDTH,
+   SECONDARY_SIDEBAR_WIDTH,
+ } from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   NAVIGATION_TOUR_CONTENT,
+   NavigationTour,
+diff --git a/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.spec.tsx b/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.spec.tsx
+index c5fdb6f01ba174..6b258016ad04c3 100644
+--- a/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.spec.tsx
++++ b/static/app/views/navigation/secondary/sections/explore/exploreSecondaryNavigation.spec.tsx
+@@ -2,7 +2,7 @@ import {initializeOrg} from 'sentry-test/initializeOrg';
+ import {render, screen} from 'sentry-test/reactTestingLibrary';
+ 
+ import {Navigation} from 'sentry/views/navigation';
+-import {NavigationContextProvider} from 'sentry/views/navigation/context';
++import {NavigationContextProvider} from 'sentry/views/navigation/navigationContext';
+ 
+ describe('ExploreSecondaryNavigation', () => {
+   const {organization} = initializeOrg({
+diff --git a/static/app/views/navigation/secondary/sections/issues/issueViews/issueViewItem.tsx b/static/app/views/navigation/secondary/sections/issues/issueViews/issueViewItem.tsx
+index 4bc33972038378..5d558e6b86f04d 100644
+--- a/static/app/views/navigation/secondary/sections/issues/issueViews/issueViewItem.tsx
++++ b/static/app/views/navigation/secondary/sections/issues/issueViews/issueViewItem.tsx
+@@ -14,7 +14,7 @@ import oxfordizeArray from 'sentry/utils/oxfordizeArray';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import useProjects from 'sentry/utils/useProjects';
+ import {useIssueViewUnsavedChanges} from 'sentry/views/issueList/issueViews/useIssueViewUnsavedChanges';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+ import {IssueViewQueryCount} from 'sentry/views/navigation/secondary/sections/issues/issueViews/issueViewQueryCount';
+ import {
+diff --git a/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx
+index db97d76edec547..86780a662a5bfe 100644
+--- a/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/issues/issuesSecondaryNavigation.tsx
+@@ -6,7 +6,7 @@ import {t} from 'sentry/locale';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {makeMonitorBasePathname} from 'sentry/views/detectors/pathnames';
+ import {ISSUE_TAXONOMY_CONFIG} from 'sentry/views/issueList/taxonomies';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {PRIMARY_NAVIGATION_GROUP_CONFIG} from 'sentry/views/navigation/primary/config';
+ import {SecondaryNavigation} from 'sentry/views/navigation/secondary/secondary';
+ import {IssueViews} from 'sentry/views/navigation/secondary/sections/issues/issueViews/issueViews';
+diff --git a/static/app/views/navigation/sidebar.tsx b/static/app/views/navigation/sidebar.tsx
+deleted file mode 100644
+index 440400750fd866..00000000000000
+--- a/static/app/views/navigation/sidebar.tsx
++++ /dev/null
+@@ -1,135 +0,0 @@
+-import {Fragment} from 'react';
+-import {css} from '@emotion/react';
+-import styled from '@emotion/styled';
+-import {motion} from 'framer-motion';
+-
+-import Hook from 'sentry/components/hook';
+-import ConfigStore from 'sentry/stores/configStore';
+-import HookStore from 'sentry/stores/hookStore';
+-import {isActiveSuperuser} from 'sentry/utils/isActiveSuperuser';
+-import useOrganization from 'sentry/utils/useOrganization';
+-import {useSyncedLocalStorageState} from 'sentry/utils/useSyncedLocalStorageState';
+-import {
+-  NAVIGATION_SIDEBAR_SECONDARY_WIDTH_LOCAL_STORAGE_KEY,
+-  PRIMARY_SIDEBAR_WIDTH,
+-  SECONDARY_SIDEBAR_WIDTH,
+-} from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
+-import {
+-  useNavigationTour,
+-  useNavigationTourModal,
+-} from 'sentry/views/navigation/navigationTour';
+-import {PrimaryNavigationItems} from 'sentry/views/navigation/primary/index';
+-import {OrganizationDropdown} from 'sentry/views/navigation/primary/organizationDropdown';
+-import {SecondarySidebar} from 'sentry/views/navigation/secondary/secondarySidebar';
+-import {useCollapsedNavigation} from 'sentry/views/navigation/useCollapsedNavigation';
+-
+-export function Sidebar() {
+-  const organization = useOrganization();
+-  const {isCollapsed: isCollapsedState} = useNavigationContext();
+-
+-  // Avoid showing superuser UI on certain organizations
+-  const isExcludedOrg = HookStore.get('component:superuser-warning-excluded')[0]?.(
+-    organization
+-  );
+-  const showSuperuserWarning =
+-    isActiveSuperuser() && !ConfigStore.get('isSelfHosted') && !isExcludedOrg;
+-
+-  const {currentStepId: currentStepId} = useNavigationTour();
+-
+-  const tourIsActive = currentStepId !== null;
+-  const forceExpanded = tourIsActive;
+-  const isCollapsed = forceExpanded ? false : isCollapsedState;
+-  const {isOpen} = useCollapsedNavigation();
+-
+-  const [secondarySidebarWidth] = useSyncedLocalStorageState(
+-    NAVIGATION_SIDEBAR_SECONDARY_WIDTH_LOCAL_STORAGE_KEY,
+-    SECONDARY_SIDEBAR_WIDTH
+-  );
+-
+-  useNavigationTourModal();
+-
+-  return (
+-    <Fragment>
+-      <SidebarWrapper
+-        role="navigation"
+-        aria-label="Primary Navigation"
+-        tourIsActive={currentStepId !== null}
+-      >
+-        <SidebarHeader isSuperuser={showSuperuserWarning}>
+-          <OrganizationDropdown />
+-          {showSuperuserWarning && (
+-            <SuperuserBadge>
+-              <Hook name="component:superuser-warning" organization={organization} />
+-            </SuperuserBadge>
+-          )}
+-        </SidebarHeader>
+-        <PrimaryNavigationItems />
+-      </SidebarWrapper>
+-      {isCollapsed ? null : <SecondarySidebar />}
+-      {isCollapsed ? (
+-        <CollapsedSecondaryWrapper
+-          initial="hidden"
+-          animate={isOpen ? 'visible' : 'hidden'}
+-          variants={{
+-            visible: {x: 0},
+-            hidden: {x: -secondarySidebarWidth - 10},
+-          }}
+-          transition={{
+-            type: 'spring',
+-            damping: 50,
+-            stiffness: 700,
+-            bounce: 0,
+-            visualDuration: 0.1,
+-          }}
+-          data-test-id="collapsed-secondary-sidebar"
+-          data-visible={isOpen}
+-        >
+-          <SecondarySidebar />
+-        </CollapsedSecondaryWrapper>
+-      ) : null}
+-    </Fragment>
+-  );
+-}
+-
+-const SidebarWrapper = styled('div')<{tourIsActive: boolean}>`
+-  width: ${PRIMARY_SIDEBAR_WIDTH}px;
+-  padding: ${p => p.theme.space.lg} 0 ${p => p.theme.space.md} 0;
+-  border-right: 1px solid ${p => p.theme.tokens.border.primary};
+-  background: ${p => p.theme.tokens.background.primary};
+-  display: flex;
+-  flex-direction: column;
+-
+-  ${p =>
+-    !p.tourIsActive &&
+-    css`
+-      z-index: ${p.theme.zIndex.sidebar};
+-    `}
+-`;
+-
+-const CollapsedSecondaryWrapper = styled(motion.div)`
+-  position: absolute;
+-  top: 0;
+-  left: ${PRIMARY_SIDEBAR_WIDTH}px;
+-  height: 100%;
+-  box-shadow: none;
+-  background: ${p => p.theme.tokens.background.primary};
+-`;
+-
+-const SidebarHeader = styled('header')<{isSuperuser: boolean}>`
+-  position: relative;
+-  display: flex;
+-  flex-direction: column;
+-  align-items: center;
+-  justify-content: center;
+-  margin-bottom: ${p => p.theme.space.xs};
+-`;
+-
+-const SuperuserBadge = styled('div')`
+-  position: absolute;
+-  top: -${p => p.theme.space.lg};
+-  z-index: ${p => p.theme.zIndex.initial};
+-  left: 0;
+-  width: ${PRIMARY_SIDEBAR_WIDTH}px;
+-  background: ${p => p.theme.tokens.background.danger.vibrant};
+-`;
+diff --git a/static/app/views/navigation/useCollapsedNavigation.tsx b/static/app/views/navigation/useCollapsedNavigation.tsx
+index fbcf9d48e6efe3..266e5c0323e5e0 100644
+--- a/static/app/views/navigation/useCollapsedNavigation.tsx
++++ b/static/app/views/navigation/useCollapsedNavigation.tsx
+@@ -5,7 +5,7 @@ import {
+   NAVIGATION_SIDEBAR_COLLAPSE_DELAY_MS,
+   NAVIGATION_SIDEBAR_OPEN_DELAY_MS,
+ } from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ 
+ const IGNORE_ELEMENTS = [
+   // Tooltips are rendered in document.body so will cause the nav to close
+diff --git a/static/app/views/navigation/useResetActiveNavigationGroup.tsx b/static/app/views/navigation/useResetActiveNavigationGroup.tsx
+index 6e817e4eaa38bd..747adffd4d925a 100644
+--- a/static/app/views/navigation/useResetActiveNavigationGroup.tsx
++++ b/static/app/views/navigation/useResetActiveNavigationGroup.tsx
+@@ -7,7 +7,7 @@ import {
+   NAVIGATION_SECONDARY_SIDEBAR_DATA_ATTRIBUTE,
+   NAVIGATION_SIDEBAR_RESET_DELAY_MS,
+ } from 'sentry/views/navigation/constants';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ 
+ /**
+diff --git a/static/app/views/organizationLayout/index.tsx b/static/app/views/organizationLayout/index.tsx
+index 353c05a70a8d72..514ed76fef9714 100644
+--- a/static/app/views/organizationLayout/index.tsx
++++ b/static/app/views/organizationLayout/index.tsx
+@@ -19,7 +19,7 @@ import useOrganization from 'sentry/utils/useOrganization';
+ import {AppBodyContent} from 'sentry/views/app/appBodyContent';
+ import {useRegisterDomainViewUsage} from 'sentry/views/insights/common/utils/domainRedirect';
+ import {Navigation} from 'sentry/views/navigation';
+-import {NavigationContextProvider} from 'sentry/views/navigation/context';
++import {NavigationContextProvider} from 'sentry/views/navigation/navigationContext';
+ import {OrganizationContainer} from 'sentry/views/organizationContainer';
+ import {useReleasesDrawer} from 'sentry/views/releases/drawer/useReleasesDrawer';
+ 
+diff --git a/static/app/views/releases/list/mobileBuilds.tsx b/static/app/views/releases/list/mobileBuilds.tsx
+index 0a5e7f9ebda15a..fc1a0b01a432a1 100644
+--- a/static/app/views/releases/list/mobileBuilds.tsx
++++ b/static/app/views/releases/list/mobileBuilds.tsx
+@@ -46,6 +46,7 @@ export function MobileBuilds({organization, selectedProjectIds}: Props) {
+     const query: Record<string, any> = {
+       per_page: 25,
+       ...normalizeDateTimeParams(location.query),
++      display: activeDisplay,
+     };
+ 
+     if (cursor) {
+diff --git a/static/app/views/replays/list/replayOnboardingPanel.tsx b/static/app/views/replays/list/replayOnboardingPanel.tsx
+index be05db53f8d5cf..38209b10b19ce5 100644
+--- a/static/app/views/replays/list/replayOnboardingPanel.tsx
++++ b/static/app/views/replays/list/replayOnboardingPanel.tsx
+@@ -19,7 +19,7 @@ import {useReplayOnboardingSidebarPanel} from 'sentry/utils/replays/hooks/useRep
+ import {useCanCreateProject} from 'sentry/utils/useCanCreateProject';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import useProjects from 'sentry/utils/useProjects';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {HeaderContainer, WidgetContainer} from 'sentry/views/profiling/landing/styles';
+ import {makeProjectsPathname} from 'sentry/views/projects/pathname';
+ import useAllMobileProj from 'sentry/views/replays/detail/useAllMobileProj';
+diff --git a/static/gsApp/components/navBillingStatus.tsx b/static/gsApp/components/navBillingStatus.tsx
+index a2f1e093017d0d..4149b453d09179 100644
+--- a/static/gsApp/components/navBillingStatus.tsx
++++ b/static/gsApp/components/navBillingStatus.tsx
+@@ -14,7 +14,7 @@ import {t, tct} from 'sentry/locale';
+ import {DataCategory} from 'sentry/types/core';
+ import type {Organization} from 'sentry/types/organization';
+ import getDaysSinceDate from 'sentry/utils/getDaysSinceDate';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   SidebarButton,
+   SidebarItemUnreadIndicator,
+diff --git a/static/gsApp/components/primaryNavSeerConfigReminder.tsx b/static/gsApp/components/primaryNavSeerConfigReminder.tsx
+index b3a8b244168ce6..9f54e44e980f1b 100644
+--- a/static/gsApp/components/primaryNavSeerConfigReminder.tsx
++++ b/static/gsApp/components/primaryNavSeerConfigReminder.tsx
+@@ -13,7 +13,7 @@ import getApiUrl from 'sentry/utils/api/getApiUrl';
+ import {isActiveSuperuser} from 'sentry/utils/isActiveSuperuser';
+ import {useApiQuery} from 'sentry/utils/queryClient';
+ import useOrganization from 'sentry/utils/useOrganization';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   SidebarButton,
+   SidebarItemUnreadIndicator,
+diff --git a/static/gsApp/components/tryBusinessSidebarItem.tsx b/static/gsApp/components/tryBusinessSidebarItem.tsx
+index ac9e9736e43b46..fc99d2884c7ce6 100644
+--- a/static/gsApp/components/tryBusinessSidebarItem.tsx
++++ b/static/gsApp/components/tryBusinessSidebarItem.tsx
+@@ -5,7 +5,7 @@ import {t} from 'sentry/locale';
+ import type {Hooks} from 'sentry/types/hooks';
+ import type {Organization} from 'sentry/types/organization';
+ import {useLocalStorageState} from 'sentry/utils/useLocalStorageState';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {
+   SidebarButton,
+   SidebarItemUnreadIndicator,
+diff --git a/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx b/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx
+index 5b56c71d084348..74eafc75805647 100644
+--- a/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx
++++ b/static/gsApp/views/subscriptionPage/headerCards/billingInfoCard.tsx
+@@ -6,7 +6,7 @@ import Placeholder from 'sentry/components/placeholder';
+ import {t, tct} from 'sentry/locale';
+ import type {Organization} from 'sentry/types/organization';
+ import {toTitleCase} from 'sentry/utils/string/toTitleCase';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ 
+ import {useBillingDetails} from 'getsentry/hooks/useBillingDetails';
+diff --git a/static/gsApp/views/subscriptionPage/headerCards/headerCards.tsx b/static/gsApp/views/subscriptionPage/headerCards/headerCards.tsx
+index de9c92e71cbdb9..c765d952f2cf17 100644
+--- a/static/gsApp/views/subscriptionPage/headerCards/headerCards.tsx
++++ b/static/gsApp/views/subscriptionPage/headerCards/headerCards.tsx
+@@ -2,7 +2,7 @@ import {Grid} from '@sentry/scraps/layout';
+ 
+ import ErrorBoundary from 'sentry/components/errorBoundary';
+ import type {Organization} from 'sentry/types/organization';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ 
+ import type {Subscription} from 'getsentry/types';
+ import {
+diff --git a/static/gsApp/views/subscriptionPage/usageOverview/components/actions.tsx b/static/gsApp/views/subscriptionPage/usageOverview/components/actions.tsx
+index 4c4e73c01076b4..dea7245e19c76e 100644
+--- a/static/gsApp/views/subscriptionPage/usageOverview/components/actions.tsx
++++ b/static/gsApp/views/subscriptionPage/usageOverview/components/actions.tsx
+@@ -8,7 +8,7 @@ import {IconDownload, IconEllipsis, IconTable} from 'sentry/icons';
+ import {t} from 'sentry/locale';
+ import type {Organization} from 'sentry/types/organization';
+ import useMedia from 'sentry/utils/useMedia';
+-import {useNavigationContext} from 'sentry/views/navigation/context';
++import {useNavigationContext} from 'sentry/views/navigation/navigationContext';
+ import {NavigationLayout} from 'sentry/views/navigation/types';
+ 
+ import {useCurrentBillingHistory} from 'getsentry/hooks/useCurrentBillingHistory';
+diff --git a/tests/snuba/api/endpoints/test_organization_events_trace_metrics.py b/tests/snuba/api/endpoints/test_organization_events_trace_metrics.py
+index 1573bd1bcd19b2..8a639bcc8ccbc0 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_trace_metrics.py
++++ b/tests/snuba/api/endpoints/test_organization_events_trace_metrics.py
+@@ -734,7 +734,7 @@ def test_aggregation_with_none_includes_items_with_none_explicitly_set(self):
+             ),
+             self.create_trace_metric("request_duration", 200.0, "distribution", metric_unit="none"),
+         ]
+-        self.store_trace_metrics(trace_metrics)
++        self.store_eap_items(trace_metrics)
+ 
+         response = self.do_request(
+             {
+diff --git a/tests/snuba/api/endpoints/test_organization_trace.py b/tests/snuba/api/endpoints/test_organization_trace.py
+index 8795b8d023e7e0..a0430756586ed1 100644
+--- a/tests/snuba/api/endpoints/test_organization_trace.py
++++ b/tests/snuba/api/endpoints/test_organization_trace.py
+@@ -9,6 +9,10 @@
+ from sentry_protos.snuba.v1.trace_item_pb2 import TraceItem
+ 
+ from sentry.conf.types.uptime import UptimeRegionConfig
++from sentry.issues.grouptype import (
++    PerformanceFileIOMainThreadGroupType,
++    PerformanceSlowDBQueryGroupType,
++)
+ from sentry.issues.ingest import save_issue_occurrence
+ from sentry.issues.issue_occurrence import IssueOccurrence
+ from sentry.models.group import Group
+@@ -852,3 +856,44 @@ def test_uptime_occurrences(self):
+         occurrence = occurrences[0]
+         assert occurrence["transaction"] == "uptime.check"
+         assert occurrence["level"] == "error"
++
++    def _count_occurrences_by_type(self, data: list[dict]) -> tuple[int, dict[int, int]]:
++        """Count occurrences from trace children, grouped by issue type."""
++        counts: dict[int, int] = {}
++        for child in data[0].get("children", []):
++            for o in child.get("occurrences", []):
++                issue_type = o.get("issue_type")
++                counts[issue_type] = counts.get(issue_type, 0) + 1
++        return sum(counts.values()), counts
++
++    def test_trace_filters_unreleased_issue_types(self) -> None:
++        """Test that unreleased issue types are filtered from trace results"""
++        self.load_trace()  # load_trace() creates both FileIO and SlowDB issues
++
++        file_io_visible_flag = PerformanceFileIOMainThreadGroupType.build_visible_feature_name()[0]
++        file_io_type = PerformanceFileIOMainThreadGroupType.type_id
++        slow_db_type = PerformanceSlowDBQueryGroupType.type_id
++
++        # Mock FileIO as unreleased
++        with mock.patch.object(PerformanceFileIOMainThreadGroupType, "released", False):
++            # Without feature flag - FileIO should be filtered out
++            with self.feature({**{f: True for f in self.FEATURES}, file_io_visible_flag: False}):
++                response = self.client_get(data={"timestamp": self.day_ago})
++
++            assert response.status_code == 200, response.content
++            assert len(response.data) == 1
++            total, counts = self._count_occurrences_by_type(response.data)
++            assert total == 1
++            assert counts.get(file_io_type, 0) == 0
++            assert counts.get(slow_db_type, 0) == 1
++
++            # With feature flag - FileIO should appear
++            with self.feature({**{f: True for f in self.FEATURES}, file_io_visible_flag: True}):
++                response = self.client_get(data={"timestamp": self.day_ago})
++
++            assert response.status_code == 200, response.content
++            assert len(response.data) == 1
++            total, counts = self._count_occurrences_by_type(response.data)
++            assert total == 2
++            assert counts.get(file_io_type, 0) == 1
++            assert counts.get(slow_db_type, 0) == 1

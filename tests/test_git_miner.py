@@ -10,9 +10,11 @@ from bugeval.git_miner import (
     _has_code_files,
     detect_fix_keywords,
     find_introducing_commit,
+    find_introducing_commit_via_blame,
     parse_fix_commits,
     score_git_candidate,
 )
+from bugeval.models import ExpectedFinding
 
 # --- parse_fix_commits ---
 
@@ -315,4 +317,71 @@ def test_find_introducing_commit_malformed_sha_skipped(tmp_path: Path) -> None:
     malformed_log = "not-a-sha\n../../../etc/passwd\n\x00injected"
     with patch("bugeval.git_miner.run_git", return_value=malformed_log):
         result = find_introducing_commit("abc" * 13 + "d", ["main.rs"], tmp_path)
+    assert result is None
+
+
+# --- find_introducing_commit_via_blame ---
+
+
+def test_find_introducing_commit_via_blame_basic(tmp_path: Path) -> None:
+    """Blame output pointing to a valid SHA is returned."""
+    findings = [ExpectedFinding(file="src/main.rs", line=42, summary="bug")]
+    blame_sha = "a" * 40
+    blame_output = f"{blame_sha} 42 42 1\nauthor Test\n"
+
+    with patch("bugeval.git_miner.run_git", return_value=blame_output):
+        result = find_introducing_commit_via_blame("fix" + "0" * 37, findings, tmp_path)
+
+    assert result == blame_sha
+
+
+def test_find_introducing_commit_via_blame_majority_vote(tmp_path: Path) -> None:
+    """Multiple findings: most common blame SHA wins."""
+    sha_a = "a" * 40
+    sha_b = "b" * 40
+    findings = [
+        ExpectedFinding(file="a.rs", line=10, summary="bug1"),
+        ExpectedFinding(file="b.rs", line=20, summary="bug2"),
+        ExpectedFinding(file="c.rs", line=30, summary="bug3"),
+    ]
+
+    call_count = 0
+
+    def mock_run_git(*args: object, **kwargs: object) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return f"{sha_a} 10 10 1\nauthor T\n"
+        return f"{sha_b} 30 30 1\nauthor T\n"
+
+    with patch("bugeval.git_miner.run_git", side_effect=mock_run_git):
+        result = find_introducing_commit_via_blame("fix" + "0" * 37, findings, tmp_path)
+
+    assert result == sha_a  # 2 votes vs 1
+
+
+def test_find_introducing_commit_via_blame_empty_findings(tmp_path: Path) -> None:
+    result = find_introducing_commit_via_blame("fix" + "0" * 37, [], tmp_path)
+    assert result is None
+
+
+def test_find_introducing_commit_via_blame_git_error(tmp_path: Path) -> None:
+    """GitError from blame is handled gracefully."""
+    from bugeval.git_utils import GitError
+
+    findings = [ExpectedFinding(file="a.rs", line=10, summary="bug")]
+    with patch("bugeval.git_miner.run_git", side_effect=GitError(["git"], "fail")):
+        result = find_introducing_commit_via_blame("fix" + "0" * 37, findings, tmp_path)
+    assert result is None
+
+
+def test_find_introducing_commit_via_blame_skips_null_sha(tmp_path: Path) -> None:
+    """The null SHA (all zeros) from initial commit blame is ignored."""
+    findings = [ExpectedFinding(file="a.rs", line=10, summary="bug")]
+    null_sha = "0" * 40
+    blame_output = f"{null_sha} 10 10 1\nauthor T\n"
+
+    with patch("bugeval.git_miner.run_git", return_value=blame_output):
+        result = find_introducing_commit_via_blame("fix" + "0" * 37, findings, tmp_path)
+
     assert result is None

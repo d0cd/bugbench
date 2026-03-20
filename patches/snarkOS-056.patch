@@ -1,55 +1,174 @@
-diff --git a/node/bft/events/src/helpers/codec.rs b/node/bft/events/src/helpers/codec.rs
-index e2b575def..453476318 100644
---- a/node/bft/events/src/helpers/codec.rs
-+++ b/node/bft/events/src/helpers/codec.rs
-@@ -108,6 +108,21 @@ pub enum EventOrBytes<N: Network> {
-     Event(Event<N>),
- }
- 
-+impl<N: Network> ToBytes for EventOrBytes<N> {
-+    fn write_le<W: io::Write>(&self, mut writer: W) -> io::Result<()> {
-+        match self {
-+            Self::Bytes(bytes) => {
-+                0u8.write_le(&mut writer)?;
-+                writer.write_all(bytes)
-+            }
-+            Self::Event(event) => {
-+                1u8.write_le(&mut writer)?;
-+                event.write_le(writer)
-+            }
-+        }
-+    }
-+}
-+
- #[derive(Clone)]
- pub struct PostHandshakeState {
-     state: Arc<StatelessTransportState>,
-@@ -346,7 +361,8 @@ mod tests {
-         let mut ciphertext = BytesMut::new();
- 
-         assert!(initiator_codec.encode(msg.clone(), &mut ciphertext).is_ok());
--        assert_eq!(responder_codec.decode(&mut ciphertext).unwrap().unwrap(), msg);
-+        let decoded = responder_codec.decode(&mut ciphertext).unwrap().unwrap();
-+        assert_eq!(decoded.to_bytes_le().unwrap(), msg.to_bytes_le().unwrap());
+diff --git a/consensus/src/consensus/inner/mod.rs b/consensus/src/consensus/inner/mod.rs
+index a0412499e..8b5f5efb8 100644
+--- a/consensus/src/consensus/inner/mod.rs
++++ b/consensus/src/consensus/inner/mod.rs
+@@ -68,7 +68,7 @@ impl ConsensusInner {
+         let canon_hashes = self
+             .storage
+             .get_block_hashes(
+-                Some(crate::OLDEST_FORK_THRESHOLD as u32 + 1),
++                Some(crate::OLDEST_FORK_THRESHOLD as u32),
+                 BlockFilter::CanonOnly(BlockOrder::Descending),
+             )
+             .await?;
+diff --git a/storage/src/storage/key_value/store.rs b/storage/src/storage/key_value/store.rs
+index 8d16eef5d..1a4bcc6df 100644
+--- a/storage/src/storage/key_value/store.rs
++++ b/storage/src/storage/key_value/store.rs
+@@ -194,14 +194,6 @@ impl<S: KeyValueStorage + Validator + 'static> SyncStorage for KeyValueStore<S>
+         Ok(())
      }
  
-     #[proptest]
-diff --git a/node/bft/events/src/primary_ping.rs b/node/bft/events/src/primary_ping.rs
-index 4f6bd2fbf..0aa23760c 100644
---- a/node/bft/events/src/primary_ping.rs
-+++ b/node/bft/events/src/primary_ping.rs
-@@ -124,6 +124,13 @@ pub mod prop_tests {
-             primary_ping.primary_certificate.deserialize_blocking().unwrap(),
-             decoded.primary_certificate.deserialize_blocking().unwrap(),
-         );
--        assert_eq!(primary_ping.batch_certificates, decoded.batch_certificates);
-+        assert!(
-+            primary_ping
-+                .batch_certificates
-+                .into_iter()
-+                .map(|bc| bc.deserialize_blocking().unwrap())
-+                .zip(decoded.batch_certificates.into_iter().map(|bc| bc.deserialize_blocking().unwrap()))
-+                .all(|(a, b)| a == b)
-+        )
+-    fn cache_block_children(&mut self, _block_hash: Digest, _block_children: Vec<Digest>) {
+-        unimplemented!();
+-    }
+-
+-    fn get_cached_block_children(&mut self, _block_hash: &Digest) -> Option<Vec<Digest>> {
+-        unimplemented!();
+-    }
+-
+     fn get_block_children(&mut self, hash: &Digest) -> Result<Vec<Digest>> {
+         Ok(self
+             .inner()
+diff --git a/storage/src/storage/sqlite/mod.rs b/storage/src/storage/sqlite/mod.rs
+index 2da941431..d1eed88ae 100644
+--- a/storage/src/storage/sqlite/mod.rs
++++ b/storage/src/storage/sqlite/mod.rs
+@@ -15,7 +15,6 @@
+ // along with the snarkOS library. If not, see <https://www.gnu.org/licenses/>.
+ 
+ use anyhow::*;
+-use hash_hasher::{HashBuildHasher, HashedMap, HashedSet};
+ use rusqlite::{
+     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+     Connection,
+@@ -30,14 +29,12 @@ mod sync;
+ 
+ pub struct SqliteStorage {
+     conn: Connection,
+-    block_children_cache: HashedMap<Digest, HashedSet<Digest>>,
+ }
+ 
+ impl SqliteStorage {
+     pub fn new_ephemeral() -> Result<Self> {
+         Ok(Self {
+             conn: Connection::open_in_memory()?,
+-            block_children_cache: HashedMap::with_hasher(HashBuildHasher::default()),
+         })
+     }
+ 
+@@ -47,7 +44,6 @@ impl SqliteStorage {
+                 path,
+                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+             )?,
+-            block_children_cache: HashedMap::with_hasher(HashBuildHasher::default()),
+         })
      }
  }
+diff --git a/storage/src/storage/sqlite/sync.rs b/storage/src/storage/sqlite/sync.rs
+index d5d6688d5..4b2b7db38 100644
+--- a/storage/src/storage/sqlite/sync.rs
++++ b/storage/src/storage/sqlite/sync.rs
+@@ -16,7 +16,6 @@
+ 
+ use std::convert::TryInto;
+ 
+-use hash_hasher::{HashBuildHasher, HashedSet};
+ use rusqlite::{params, OptionalExtension, Row, ToSql};
+ use snarkvm_dpc::{AleoAmount, MerkleRootHash, Network, PedersenMerkleRootHash, ProofOfSuccinctWork};
+ use tracing::*;
+@@ -159,11 +158,6 @@ impl SyncStorage for SqliteStorage {
+     fn insert_block(&mut self, block: &SerialBlock) -> Result<()> {
+         let hash = block.header.hash();
+ 
+-        self.block_children_cache
+-            .entry(block.header.previous_block_hash.clone())
+-            .or_insert_with(|| HashedSet::with_hasher(HashBuildHasher::default()))
+-            .insert(hash.clone());
+-
+         let mut block_query = self.conn.prepare_cached(
+             r"
+         INSERT INTO blocks (
+@@ -490,17 +484,39 @@ impl SyncStorage for SqliteStorage {
+         })
+     }
+ 
+-    fn cache_block_children(&mut self, block_hash: Digest, block_children: Vec<Digest>) {
+-        self.block_children_cache
+-            .entry(block_hash)
+-            .or_insert_with(|| HashedSet::with_hasher(HashBuildHasher::default()))
+-            .extend(block_children);
+-    }
+-
+-    fn get_cached_block_children(&mut self, block_hash: &Digest) -> Option<Vec<Digest>> {
+-        self.block_children_cache
+-            .get(block_hash)
+-            .map(|set| set.iter().cloned().collect())
++    fn longest_child_path(&mut self, block_hash: &Digest) -> Result<Vec<Digest>> {
++        let mut stmt = self.conn.prepare_cached(
++            r"
++            WITH RECURSIVE
++                children(parent, sub, length) AS (
++                    SELECT ?, NULL, 0 as length
++                    UNION ALL
++                    SELECT blocks.hash, blocks.previous_block_hash, children.length + 1 FROM blocks
++                    INNER JOIN children
++                    WHERE blocks.previous_block_hash = children.parent
++                ),
++                preferred_tip AS (
++                    SELECT parent, sub, length FROM children
++                    WHERE length = (SELECT max(length) FROM children)
++                    ORDER BY parent
++                    LIMIT 1
++                ),
++                total_tip(parent, remaining) AS (
++                    SELECT preferred_tip.parent, preferred_tip.length FROM preferred_tip
++                    UNION ALL
++                    SELECT blocks.previous_block_hash, total_tip.remaining - 1
++                    FROM total_tip
++                    INNER JOIN blocks ON blocks.hash = total_tip.parent
++                    WHERE total_tip.remaining > 0
++                )
++                SELECT total_tip.parent, total_tip.remaining FROM total_tip
++                order by remaining;
++        ",
++        )?;
++        let out = stmt
++            .query_map([block_hash], |row| row.get(0))?
++            .collect::<rusqlite::Result<Vec<Digest>>>()?;
++        Ok(out)
+     }
+ 
+     fn get_block_children(&mut self, hash: &Digest) -> Result<Vec<Digest>> {
+diff --git a/storage/src/storage/sync.rs b/storage/src/storage/sync.rs
+index ab9d4e8e3..33e4bc84a 100644
+--- a/storage/src/storage/sync.rs
++++ b/storage/src/storage/sync.rs
+@@ -131,13 +131,7 @@ pub trait SyncStorage {
+         loop {
+             for path in &round {
+                 let last_hash = path.last().unwrap();
+-                let children = if let Some(children) = self.get_cached_block_children(last_hash) {
+-                    children.to_vec()
+-                } else {
+-                    let children = self.get_block_children(last_hash)?;
+-                    self.cache_block_children(last_hash.clone(), children.clone());
+-                    children
+-                };
++                let children = self.get_block_children(last_hash)?;
+                 next_round.extend(children.into_iter().map(|x| {
+                     let mut path = path.clone();
+                     path.push(x);
+@@ -202,12 +196,6 @@ pub trait SyncStorage {
+         Ok(trees.remove(block_hash).expect("missing block hash tree"))
+     }
+ 
+-    /// Stores the immediate children of `block_hash` in a cache.
+-    fn cache_block_children(&mut self, block_hash: Digest, block_children: Vec<Digest>);
+-
+-    /// Attempts to get the immediate children of `block_hash` from a cache.
+-    fn get_cached_block_children(&mut self, block_hash: &Digest) -> Option<Vec<Digest>>;
+-
+     /// Gets the immediate children of `block_hash`.
+     fn get_block_children(&mut self, block_hash: &Digest) -> Result<Vec<Digest>>;
+ 

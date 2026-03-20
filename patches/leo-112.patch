@@ -1,74 +1,1209 @@
-diff --git a/compiler/passes/src/code_generation/visit_expressions.rs b/compiler/passes/src/code_generation/visit_expressions.rs
-index 052d6b0235..b0cf048ab7 100644
---- a/compiler/passes/src/code_generation/visit_expressions.rs
-+++ b/compiler/passes/src/code_generation/visit_expressions.rs
-@@ -280,14 +280,14 @@ impl<'a> CodeGenerator<'a> {
-     // TODO: Cleanup
-     fn visit_call(&mut self, input: &'a CallExpression) -> (String, String) {
-         let mut call_instruction = match &input.external {
--            Some(external) => format!("    call {external}.aleo/{} ", input.function),
--            None => format!("    call {} ", input.function),
-+            Some(external) => format!("    call {external}.aleo/{}", input.function),
-+            None => format!("    call {}", input.function),
-         };
-         let mut instructions = String::new();
+diff --git a/compiler/parser/src/parser/statement.rs b/compiler/parser/src/parser/statement.rs
+index 5b3a79bb15..ecd10e0e39 100644
+--- a/compiler/parser/src/parser/statement.rs
++++ b/compiler/parser/src/parser/statement.rs
+@@ -41,7 +41,9 @@ impl ParserContext<'_> {
+     pub(crate) fn parse_statement(&mut self) -> Result<Statement> {
+         match &self.token.token {
+             Token::Return => Ok(Statement::Return(self.parse_return_statement()?)),
+-            Token::Finalize => Ok(Statement::Finalize(self.parse_finalize_statement()?)),
++            Token::Async => Ok(Statement::Finalize(self.parse_finalize_statement()?)),
++            // If a finalize token is found without a preceding async token, return an error.
++            Token::Finalize => Err(ParserError::finalize_without_async(self.token.span).into()),
+             Token::Increment => Ok(Statement::Increment(self.parse_increment_statement()?)),
+             Token::Decrement => Ok(Statement::Decrement(self.parse_decrement_statement()?)),
+             Token::If => Ok(Statement::Conditional(self.parse_conditional_statement()?)),
+@@ -122,6 +124,7 @@ impl ParserContext<'_> {
  
-         for argument in input.arguments.iter() {
-             let (argument, argument_instructions) = self.visit_expression(argument);
--            write!(call_instruction, "{argument} ").expect("failed to write to string");
-+            write!(call_instruction, " {argument}").expect("failed to write to string");
-             instructions.push_str(&argument_instructions);
-         }
+     /// Returns a [`FinalizeStatement`] AST node if the next tokens represent a finalize statement.
+     fn parse_finalize_statement(&mut self) -> Result<FinalizeStatement> {
++        self.expect(&Token::Async)?;
+         let start = self.expect(&Token::Finalize)?;
+         let (arguments, _, span) = self.parse_paren_comma_list(|p| p.parse_expression().map(Some))?;
+         self.expect(&Token::Semicolon)?;
+diff --git a/compiler/parser/src/tokenizer/lexer.rs b/compiler/parser/src/tokenizer/lexer.rs
+index 2c788d5fe2..4473406afc 100644
+--- a/compiler/parser/src/tokenizer/lexer.rs
++++ b/compiler/parser/src/tokenizer/lexer.rs
+@@ -394,6 +394,7 @@ impl Token {
+                 match &*identifier {
+                     x if x.starts_with("aleo1") => Token::AddressLit(identifier),
+                     "address" => Token::Address,
++                    "async" => Token::Async,
+                     "bool" => Token::Bool,
+                     "circuit" => Token::Circuit,
+                     "console" => Token::Console,
+diff --git a/compiler/parser/src/tokenizer/mod.rs b/compiler/parser/src/tokenizer/mod.rs
+index c07c51a534..ebfb97d1ba 100644
+--- a/compiler/parser/src/tokenizer/mod.rs
++++ b/compiler/parser/src/tokenizer/mod.rs
+@@ -83,6 +83,7 @@ mod tests {
+     test_ident
+     12345
+     address
++    async
+     bool
+     const
+     else
+@@ -157,7 +158,7 @@ mod tests {
  
-@@ -304,7 +304,11 @@ impl<'a> CodeGenerator<'a> {
-             .unwrap()
-             .output_type;
-         match return_type {
--            Type::Unit => (String::new(), instructions), // Do nothing
-+            Type::Unit => {
-+                call_instruction.push(';');
-+                instructions.push_str(&call_instruction);
-+                (String::new(), instructions)
-+            } // Do nothing
-             Type::Tuple(tuple) => match tuple.len() {
-                 0 | 1 => unreachable!("Parsing guarantees that a tuple type has at least two elements"),
-                 len => {
-@@ -315,17 +319,17 @@ impl<'a> CodeGenerator<'a> {
-                         self.next_register += 1;
-                     }
-                     let destinations = destinations.join(" ");
--                    writeln!(call_instruction, "into {destinations};", destinations = destinations)
-+                    writeln!(call_instruction, " into {destinations};", destinations = destinations)
-                         .expect("failed to write to string");
-                     instructions.push_str(&call_instruction);
+             assert_eq!(
+                 output,
+-                r#""test" "test{}test" "test{}" "{}test" "test{" "test}" "test{test" "test}test" "te{{}}" test_ident 12345 address bool const else false field finalize for function group i128 i64 i32 i16 i8 if in input let mut return scalar self string test true u128 u64 u32 u16 u8 console ! != && ( ) * ** + , - -> => _ . .. / : ; < <= = == > >= [ ] { { } } || ? @ // test
++                r#""test" "test{}test" "test{}" "{}test" "test{" "test}" "test{test" "test}test" "te{{}}" test_ident 12345 address async bool const else false field finalize for function group i128 i64 i32 i16 i8 if in input let mut return scalar self string test true u128 u64 u32 u16 u8 console ! != && ( ) * ** + , - -> => _ . .. / : ; < <= = == > >= [ ] { { } } || ? @ // test
+  /* test */ // "#
+             );
+         });
+diff --git a/compiler/parser/src/tokenizer/token.rs b/compiler/parser/src/tokenizer/token.rs
+index c60d266907..f929a0464b 100644
+--- a/compiler/parser/src/tokenizer/token.rs
++++ b/compiler/parser/src/tokenizer/token.rs
+@@ -108,6 +108,7 @@ pub enum Token {
+     Record,
  
--                    (destinations, call_instruction)
-+                    (destinations, instructions)
-                 }
-             },
-             _ => {
-                 // Push destination register to call instruction.
-                 let destination_register = format!("r{}", self.next_register);
--                writeln!(call_instruction, "into {destination_register};").expect("failed to write to string");
-+                writeln!(call_instruction, " into {destination_register};").expect("failed to write to string");
-                 instructions.push_str(&call_instruction);
+     // Regular Keywords
++    Async,
+     Circuit,
+     Console,
+     // Const variable and a const function.
+@@ -143,6 +144,7 @@ pub enum Token {
+ /// because true and false are also boolean literals, which are different tokens from keywords
+ pub const KEYWORD_TOKENS: &[Token] = &[
+     Token::Address,
++    Token::Async,
+     Token::Bool,
+     Token::Circuit,
+     Token::Console,
+@@ -192,6 +194,7 @@ impl Token {
+     pub fn keyword_to_symbol(&self) -> Option<Symbol> {
+         Some(match self {
+             Token::Address => sym::address,
++            Token::Async => sym::Async,
+             Token::Bool => sym::bool,
+             Token::Circuit => sym::circuit,
+             Token::Console => sym::console,
+@@ -319,6 +322,7 @@ impl fmt::Display for Token {
+             U128 => write!(f, "u128"),
+             Record => write!(f, "record"),
  
-                 // Increment the register counter.
-diff --git a/compiler/passes/src/code_generation/visit_statements.rs b/compiler/passes/src/code_generation/visit_statements.rs
-index ae227d7e10..434bafb556 100644
---- a/compiler/passes/src/code_generation/visit_statements.rs
-+++ b/compiler/passes/src/code_generation/visit_statements.rs
-@@ -128,9 +128,11 @@ impl<'a> CodeGenerator<'a> {
++            Async => write!(f, "async"),
+             Circuit => write!(f, "circuit"),
+             Console => write!(f, "console"),
+             Const => write!(f, "const"),
+diff --git a/compiler/span/src/symbol.rs b/compiler/span/src/symbol.rs
+index 442f842f87..e47c4f58ca 100644
+--- a/compiler/span/src/symbol.rs
++++ b/compiler/span/src/symbol.rs
+@@ -181,6 +181,7 @@ symbols! {
+     // general keywords
+     AlwaysConst,
+     assert,
++    Async: "async",
+     caller,
+     circuit,
+     Class: "class",
+diff --git a/errors/src/errors/parser/parser_errors.rs b/errors/src/errors/parser/parser_errors.rs
+index dc13a42d7b..e92baf79ea 100644
+--- a/errors/src/errors/parser/parser_errors.rs
++++ b/errors/src/errors/parser/parser_errors.rs
+@@ -260,4 +260,11 @@ create_messages!(
+         msg: "Illegal spacing in the annotation declaration.",
+         help: Some("Remove whitespace between the `@` symbol and the identifier.".to_string()),
+     }
++
++    @formatted
++    finalize_without_async {
++        args: (),
++        msg: "A finalize statement must be preceded by the `async` keyword.",
++        help: Some("Add the `async` keyword before the `finalize` keyword.".to_string()),
++    }
+ );
+diff --git a/examples/auction/README.md b/examples/auction/README.md
+index 590d13656c..ecbe6d9005 100644
+--- a/examples/auction/README.md
++++ b/examples/auction/README.md
+@@ -1,13 +1,73 @@
+-# Auction Record Example
++# Blind Auction
+ 
+-## Build Guide
++An auction application written in Leo.
+ 
+-To compile this program:
++## Summary
++
++A first-price sealed-bid auction (or blind auction) is a type of auction in which each participant submits a bid without knowing the bids of the other participants. 
++The bidder with the highest bid wins the auction.
++
++In this model, there are two parties: the auctioneer and the bidders.
++- **Bidder**: A participant in the auction.
++- **Auctioneer**: The party responsible for conducting the auction.
++
++We make following assumptions about the auction:
++- The auctioneer is honest. That is, the auctioneer will resolve **all** bids in the order they are received. The auctioneer will not tamper with the bids. The auctioneer will not reveal the bids to any other party.
++- There is no limit to the number of bids.
++- The auctioneer knows the identity of all bidders, but bidders do not necessarily know the identity of other bidders.
++
++Under this model, we require that:
++- Bidders do not learn any information about the value of other bids.
++
++### Auction Flow
++The auction is conducted in a series of stages.
++- **Bidding**: In the bidding stage, bidders submit bids to the auctioneer. They do so by invoking the `place_bid` function.
++- **Resolution**:  In the resolution stage, the auctioneer resolves the bids in the order they were received. The auctioneer does so by invoking the `resolve` function. The resolution process produces a single winning bid.
++- **Finishing**: In this stage, the auctioneer finishes the auction by invoking the `finish` function. This function returns the winning bid to the bidder, which the bidder can then use to claim the item.
++
++
++## Language Features and Concepts
++- `record` declarations
++- `console.assert_eq`
++- record ownership
++
++## Running the Program
++
++Leo provides users with a command line interface for compiling and running Leo programs.
++Users may either specify input values via the command line or provide an input file in `inputs/`.
++
++### Configuring Accounts
++The `program.json` file contains a private key and address. 
++This is the account that will be used to sign transactions and is checked for record ownership.
++When executing programs as different parties, be sure to set the `private_key` and `address` fields in `program.json` to the appropriate values.
++
++See `./run.sh` for an example of how to run the program as different parties.
++
++
++The [Aleo SDK](https://github.com/AleoHQ/leo/tree/testnet3) provides a command line interface for generating new accounts.
++To generate a new account, run 
++```
++aleo account new
++```
++
++
++### Providing inputs via the command line.
++1. Run
+ ```bash
+-leo build
++leo run <function_name> <input_1> <input_2> ...
+ ```
++See `./run.sh` for an example.
++
+ 
+-To run this program:
++### Using an input file.
++1. Modify `inputs/auction.in` with the desired inputs.
++2. Run
++```bash
++leo run <function_name>
++```
++For example, 
+ ```bash
+-leo run
++leo run place_bid
++leo run resolve
++leo run finish
+ ```
+diff --git a/examples/auction/src/main.leo b/examples/auction/src/main.leo
+index ba9fa332c9..cbac3bbb67 100644
+--- a/examples/auction/src/main.leo
++++ b/examples/auction/src/main.leo
+@@ -1,4 +1,10 @@
+-// This record defines a bid in the auction.
++// A bid in an auction.
++// - `owner`     : The address of the account that owns the record associated with this bid.
++//                 This is separate from the address of the account that placed the bid.
++// - `gates`     : The value associated with the record (always zero).
++// - `bidder`    : The address of the account that placed the bid.
++// - `amount`    : The amount of the bid.
++// - `is_winner` : Whether the bid is the winning bid.
+ record Bid {
+     owner: address,
+     gates: u64,
+@@ -7,11 +13,12 @@ record Bid {
+     is_winner: bool,
+ }
+ 
+-// This function creates a new bid.
+-// This function checks that `bidder` invoked the function.
+-// Note that the owner of the record is set to the entity responsible for running the auction.
+-//   The entity's address is aleo1fxs9s0w97lmkwlcmgn0z3nuxufdee5yck9wqrs0umevp7qs0sg9q5xxxzh.
+-//   This is necessary to allow the entity running the auction to process bids.
++// Returns a new bid.
++// - `bidder` : The address of the account that placed the bid.
++// - `amount` : The amount of the bid.
++// Requires that `bidder` matches the function caller.
++// The owner of the record is set to the entity responsible for running the auction (auction runner).
++// The address of the auction runner is aleo1fxs9s0w97lmkwlcmgn0z3nuxufdee5yck9wqrs0umevp7qs0sg9q5xxxzh.
+ @program
+ function place_bid(bidder: address, amount: u64) -> Bid {
+     console.assert_eq(self.caller, bidder);
+@@ -24,9 +31,12 @@ function place_bid(bidder: address, amount: u64) -> Bid {
+     };
+ }
+ 
+-// This function consumes two bids, selecting the winning one. In the event of a tie, the first bid is selected.
+-// This function should be invoked once the bidding period has ended.
+-// This function can only be called by the entity running the auction.
++// Returns the winning bid.
++// - `first`  : The first bid.
++// - `second` : The second bid.
++// Requires that the function caller is the auction runner.
++// Assumes that the function is invoked only after the bidding period has ended.
++// In the event of a tie, the first bid is selected.
+ @program
+ function resolve(first: Bid, second: Bid) -> Bid {
+     console.assert_eq(self.caller, aleo1fxs9s0w97lmkwlcmgn0z3nuxufdee5yck9wqrs0umevp7qs0sg9q5xxxzh);
+@@ -37,9 +47,10 @@ function resolve(first: Bid, second: Bid) -> Bid {
+     }
+ }
+ 
+-// This function returns ownership of the `Bid` record to the original bidder.
+-// This function should be called after all bids have been resolved.
+-// This function can only be called by the entity running the auction.
++// Returns ownership of the bid to bidder.
++// - `bid` : The winning bid.
++// Requires that the function caller is the auction runner.
++// Assumes that the function is invoked only after all bids have been resolved.
+ @program
+ function finish(bid: Bid) -> Bid {
+     console.assert_eq(self.caller, aleo1fxs9s0w97lmkwlcmgn0z3nuxufdee5yck9wqrs0umevp7qs0sg9q5xxxzh);
+diff --git a/examples/broken_bank/README.md b/examples/broken_bank/README.md
+index 3e1b373cae..39ad943ebc 100644
+--- a/examples/broken_bank/README.md
++++ b/examples/broken_bank/README.md
+@@ -1,8 +1,76 @@
+-# bank.aleo
++# Broken Bank
+ 
+-## Build Guide
++A "broken" bank written in Leo.
+ 
+-To compile this Aleo program, run:
++## Summary
++
++This application implements a bank that issues tokens to users and allows users to deposit tokens and accrue interest on their deposits.
++
++
++### User Flow
++1. The bank issues users tokens via the `issue` function.
++2. A user deposits tokens via the `deposit` function.
++3. Upon a user's request to withdraw, the bank calculates the appropriate amount of compound interest and pays the user the principal and interest via the `withdraw` function.
++
++Note that the program can be easily extended to include addition features such as a `transfer` function, which would allow users to transfer tokens to other users.
++
++## Bugs
++
++You may have already guessed that this program has a few bugs. We list some of them below: 
++- `withdraw` can only be invoked by the bank. A malicious bank could lock users' tokens by not invoking `withdraw`.
++- `withdraw` fails if the sum of the interest and principal is greater than the user's balance. 
++- User's can increase their principal by depositing tokens multiple times, including immediately before withdrawl.
++- Integer division rounds down; if the calculated interest is too small, then it will be rounded down to zero.
++
++Can you find any others?
++
++## Language Features and Concepts
++- `record` declarations
++- `console.assert_eq`
++- core functions, e.g. `BHP256::hash`
++- record ownership
++- loops and bounded iteration
++- mappings
++- finalize
++
++## Running the Program
++
++Leo provides users with a command line interface for compiling and running Leo programs.
++Users may either specify input values via the command line or provide an input file in `inputs/`.
++
++### Configuring Accounts
++The `program.json` file contains a private key and address.
++This is the account that will be used to sign transactions and is checked for record ownership.
++When executing programs as different parties, be sure to set the `private_key` and `address` fields in `program.json` to the appropriate values.
++
++
++See `./run.sh` for an example of how to run the program as different parties.
++
++
++The [Aleo SDK](https://github.com/AleoHQ/leo/tree/testnet3) provides a command line interface for generating new accounts.
++To generate a new account, run
++```
++leo account new
++```
++
++
++### Providing inputs via the command line.
++1. Run
++```bash
++leo run <function_name> <input_1> <input_2> ...
++```
++See `./run.sh` for an example.
++
++
++### Using an input file.
++1. Modify `inputs/auction.in` with the desired inputs.
++2. Run
++```bash
++leo run <function_name>
++```
++For example,
+ ```bash
+-aleo build
++leo run issue
++leo run deposit
++leo run withdraw
+ ```
+diff --git a/examples/broken_bank/inputs/bank.in b/examples/broken_bank/inputs/broken_bank.in
+similarity index 80%
+rename from examples/broken_bank/inputs/bank.in
+rename to examples/broken_bank/inputs/broken_bank.in
+index 70d1ec3c13..cbac6c3fe4 100644
+--- a/examples/broken_bank/inputs/bank.in
++++ b/examples/broken_bank/inputs/broken_bank.in
+@@ -1,8 +1,9 @@
+-// The program input for broken_bank/src/main.leo
++// Inputs for the `issue` function.
+ [issue]
+ owner: address = aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a;
+ amount: u64 = 1234u64;
+ 
++// Inputs for the `deposit` function.
+ [deposit]
+ token: Token = Token {
+     owner: aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a,
+@@ -12,6 +13,7 @@ token: Token = Token {
+ };
+ amount: u64 = 321u64;
+ 
++// Inputs for the `withdraw` function.
+ [withdraw]
+ recipient: address = aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a;
+ amount: u64 = 321u64;
+diff --git a/examples/broken_bank/program.json b/examples/broken_bank/program.json
+index aa28543c68..a2250a5a3d 100644
+--- a/examples/broken_bank/program.json
++++ b/examples/broken_bank/program.json
+@@ -1,5 +1,5 @@
+ {
+-  "program": "bank.aleo",
++  "program": "broken_bank.aleo",
+   "version": "0.0.0",
+   "description": "",
+   "development": {
+diff --git a/examples/broken_bank/run.sh b/examples/broken_bank/run.sh
+index dc5d137999..765bde20a6 100755
+--- a/examples/broken_bank/run.sh
++++ b/examples/broken_bank/run.sh
+@@ -7,18 +7,18 @@ then
+ fi
+ 
+ # The private key and address of the bank.
+-# Swap these into program.json, when running transactions as the first bidder.
++# Swap these into program.json, when running transactions as the bank.
+ # "private_key": "APrivateKey1zkpHtqVWT6fSHgUMNxsuVf7eaR6id2cj7TieKY1Z8CP5rCD",
+ # "address": "aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a"
+ 
+ # The private key and address of the user.
+-# Swap these into program.json, when running transactions as the second bidder.
++# Swap these into program.json, when running transactions as the user.
+ # "private_key": "APrivateKey1zkp75cpr5NNQpVWc5mfsD9Uf2wg6XvHknf82iwB636q3rtc"
+ # "address": "aleo1zeklp6dd8e764spe74xez6f8w27dlua3w7hl4z2uln03re52egpsv46ngg"
+ 
+ # Swap in the private key and address of the bank to program.json.
+ echo "{
+-  \"program\": \"bank.aleo\",
++  \"program\": \"broken_bank.aleo\",
+   \"version\": \"0.0.0\",
+   \"description\": \"\",
+   \"development\": {
+@@ -37,7 +37,7 @@ leo run issue aleo1zeklp6dd8e764spe74xez6f8w27dlua3w7hl4z2uln03re52egpsv46ngg 10
+ 
+ # Swap in the private key and address of the user to program.json.
+ echo "{
+-  \"program\": \"bank.aleo\",
++  \"program\": \"broken_bank.aleo\",
+   \"version\": \"0.0.0\",
+   \"description\": \"\",
+   \"development\": {
+@@ -61,7 +61,7 @@ leo run deposit "{
+ 
+ # Swap in the private key and address of the bank to program.json.
+ echo "{
+-  \"program\": \"bank.aleo\",
++  \"program\": \"broken_bank.aleo\",
+   \"version\": \"0.0.0\",
+   \"description\": \"\",
+   \"development\": {
+@@ -75,5 +75,5 @@ echo "{
+ echo "
+ 
+ 
+-The bank is withdrawing the user's tokens after 75 periods."
++The bank is withdrawing the user's tokens after 15 periods at 12.34%."
+ leo run withdraw aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a 50u64 1234u64 15u64;
+diff --git a/examples/broken_bank/src/main.leo b/examples/broken_bank/src/main.leo
+index dc8e244abd..98a4cce736 100644
+--- a/examples/broken_bank/src/main.leo
++++ b/examples/broken_bank/src/main.leo
+@@ -1,11 +1,22 @@
++// A token, issued by a bank.
++// - 'owner'  : The address of the account that owns the record associated with this token.
++// - 'gates'  : The value associated with the record (always zero).
++// - 'amount' : The amount of tokens owned by the account.
+ record Token {
+     owner: address,
+     gates: u64,
+     amount: u64,
+ }
+ 
++// An on-chain mapping, storing the amount of tokens owned by each account
++// The account is stored as a to preserve user privacy.
+ mapping balances: field => u64;
+ 
++// Returns a new Token.
++// - `owner` : The address of the account to issue the token to.
++// - `amount`: The amount of tokens to issue.
++// Requires that the function caller is the bank.
++// The bank's address is aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a.
+ @program
+ function issue(owner: address, amount: u64) -> Token {
+     console.assert_eq(self.caller, aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a);
+@@ -16,6 +27,10 @@ function issue(owner: address, amount: u64) -> Token {
+     };
+ }
+ 
++// Deposits some amount of money into the bank.
++// Returns a new Token with the remaining amount of money.
++// - `token` : A record containing tokens to deposit.
++// - `amount`: The amount of tokens to deposit.
+ @program
+ function deposit(token: Token, amount: u64) -> Token {
+     let difference: u64 = token.amount - amount;
+@@ -26,17 +41,27 @@ function deposit(token: Token, amount: u64) -> Token {
+         amount: difference,
+     };
+ 
++    // Compute the hash of the token owner.
+     let hash: field = BHP256::hash(token.owner);
+ 
+-    finalize(hash, amount);
++    async finalize(hash, amount);
+ 
+     return remaining;
+ }
+ 
++// Updates on-chain state by the amount of tokens deposited.
++// - `hash`  : The hash of the token owner.
++// - `amount`: The amount of tokens that were deposited.
+ finalize deposit(hash: field, amount: u64) {
+     increment(balances, hash, amount);
+ }
+ 
++// Returns a new Token containing the amount of money withdrawn.
++// - `recipient`: The address of the account to withdraw the tokens to.
++// - `amount`   : The amount of tokens to withdraw.
++// - `rate`     : The compound interest rate.
++// - `periods`  : The number of periods to compound the interest over.
++// Requires that the function caller is the bank.
+ @program
+ function withdraw(recipient: address, amount: u64, rate: u64, periods: u64) -> Token {
+     console.assert_eq(self.caller, aleo1t0uer3jgtsgmx5tq6x6f9ecu8tr57rzzfnc2dgmcqldceal0ls9qf6st7a);
+@@ -50,15 +75,22 @@ function withdraw(recipient: address, amount: u64, rate: u64, periods: u64) -> T
+         amount: total,
+     };
+ 
+-    finalize(hash, amount);
++    async finalize(hash, amount);
+ 
+     return token;
+ }
+ 
++// Updates on-chain state by the amount of tokens withdrawn.
++// - `hash`  : The hash of the token owner.
++// - `amount`: The amount of tokens that were withdrawn.
+ finalize withdraw(hash: field, amount: u64) {
+     decrement(balances, hash, amount);
+ }
+ 
++// Returns the total amount of tokens after compounding interest.
++// - `principal`: The amount of tokens to compound interest over.
++// - `rate`     : The compound interest rate.
++// - `periods`  : The number of periods to compound the interest over.
+ function calculate_interest(principal: u64, rate: u64, periods: u64) -> u64 {
+     let amount: u64 = principal;
+ 
+diff --git a/examples/bubblesort/README.md b/examples/bubblesort/README.md
+index 15bc6bfbd1..cbffc77278 100644
+--- a/examples/bubblesort/README.md
++++ b/examples/bubblesort/README.md
+@@ -9,10 +9,10 @@ leo build
+ 
+ To run this program, run:
+ ```bash
+-leo run main
++leo run bubble_sort
+ ```
+ 
+-## Overview 
++## Overview
+ 
+ This example shows how to sort an array.
+ 
+diff --git a/examples/groups/README.md b/examples/groups/README.md
+index 251772baf0..c262b06c54 100644
+--- a/examples/groups/README.md
++++ b/examples/groups/README.md
+@@ -12,7 +12,7 @@ To run this program, run:
+ leo run main
+ ```
+ 
+-## Overview 
++## Overview
+ 
+ This example shows how to do basic operations over groups.
+ 
+@@ -21,7 +21,11 @@ It takes the input data from inputs/groups.in
+ 
+ ## Documentation Group Element
+ 
+-The set of affine points on the elliptic curve passed into the Leo compiler forms a group. Leo supports this set as a primitive data type. Group elements are special since their values can be defined as coordinate pairs ```(x, y)group```. The group type keyword group must be used when specifying a pair of group coordinates since implicit syntax would collide with normal tuple (a, b) values.
++The set of affine points on the elliptic curve passed into the Leo compiler forms a group.
++A subset of those points, defined by a chosen generator point, forms a subgroup of the group.
++Leo supports the set of points in this subgroup as a primitive data type.
++Group elements are special since their values can be defined as coordinate pairs ```(x, y)group```.
++The `group` type keyword group must be used when specifying a pair of group coordinates since implicit syntax would collide with normal tuple `(a, b)` values.
+ 
+ ```
+ let b = 0group; // the zero of the group
+@@ -32,4 +36,3 @@ let c = 2group; // 2 * the group generator
+ 
+ let d = (0, 1)group; // coordinate notation
+ ```
+-
+diff --git a/examples/simple_token/src/main.leo b/examples/simple_token/src/main.leo
+index c0f1c1f24b..8f7bb69188 100644
+--- a/examples/simple_token/src/main.leo
++++ b/examples/simple_token/src/main.leo
+@@ -11,7 +11,7 @@ record Token {
+ }
+ 
+ // The `mint` function initializes a new record with the
+-// to the receiver of tokens in `r1` for the receiver in `r0`.
++// specified number of tokens assigned to the specified receiver.
+ @program
+ function mint(owner: address, amount: u64) -> Token {
+     return Token {
+@@ -48,4 +48,4 @@ function transfer(token: Token, to: address, amount: u64) -> (Token, Token) {
+ 
+     // Output the sender's change record and the receiver's record.
+     return (remaining, transferred);
+-}
+\ No newline at end of file
++}
+diff --git a/examples/tictactoe/README.md b/examples/tictactoe/README.md
+index e2f4d08222..334d73d057 100644
+--- a/examples/tictactoe/README.md
++++ b/examples/tictactoe/README.md
+@@ -1,8 +1,39 @@
+-# tictactoe.aleo
++# Tic Tac Toe
+ 
+-## Build Guide
++A simple Tic Tac Toe game written in Leo.
+ 
+-To compile this Aleo program, run:
++## Representing State
++Leo allows users to define composite data types with the `circuit` keyword. 
++The game board is represented by a circuit called `Board`, which contains three `Row`s.
++An alternative representation would be to use an array, however, these are not yet supported in Leo.
++
++## Language Features
++- `circuit` declarations
++- conditional statements
++- early termination. Leo allows users to return from a function early using the `return` keyword.
++
++## Running the Program
++
++Leo provides users with a command line interface for compiling and running Leo programs.
++Users may either specify input values via the command line or provide an input file in `inputs/`.
++
++### Providing inputs via the command line.
++1. Run 
+ ```bash
+-aleo build
++leo run <function_name> <input_1> <input_2> ...
++```
++See `./run.sh` for an example.
++
++
++### Using an input file.
++1. Modify `inputs/tictactoe.in` with the desired inputs.
++2. Run
++```bash
++leo run <function_name>
++```
++For example,
++```bash
++leo run new
++leo run make_move
++
+ ```
+diff --git a/examples/tictactoe/inputs/tictactoe.in b/examples/tictactoe/inputs/tictactoe.in
+index 41b1e8afed..6973b59374 100644
+--- a/examples/tictactoe/inputs/tictactoe.in
++++ b/examples/tictactoe/inputs/tictactoe.in
+@@ -1,5 +1,7 @@
++// The `new` function does not take any inputs.
+ [new]
+ 
++// Inputs for the `make_move` function.
+ [make_move]
+ player: u8 = 1u8;
+ row: u8 = 1u8;
+diff --git a/examples/tictactoe/src/main.leo b/examples/tictactoe/src/main.leo
+index 601c2dd69f..dd2adc45b1 100644
+--- a/examples/tictactoe/src/main.leo
++++ b/examples/tictactoe/src/main.leo
+@@ -1,15 +1,26 @@
++// A row in a tic tac toe board.
++// - `c1` : The first entry in the row.
++// - `c2` : The second entry in the row.
++// - `c3` : The third entry in the row.
++// A valid entry is either 0, 1, or 2, where 0 is empty, 1 corresponds to player 1, and 2 corresponds to player 2.
++// Any other values are invalid.
+ circuit Row {
+     c1: u8,
+     c2: u8,
+     c3: u8
+ }
+ 
++// A tic tac toe board.
++// - `r1` : The first row in the board.
++// - `r2` : The second row in the board.
++// - `r3` : The third row in the board.
+ circuit Board {
+     r1: Row,
+     r2: Row,
+     r3: Row,
+ }
+ 
++// Returns an empty board.
+ @program
+ function new() -> Board {
+     return Board {
+@@ -19,6 +30,9 @@ function new() -> Board {
+     };
+ }
+ 
++// Returns `true` if there exists a row, column, or diagonal with all entries occupied by the same player.
++// - `b` : A tic tac toe board.
++// - `p` : A number corresponding to a player.
+ function check_for_win(b: Board, p: u8) -> bool {
+     return
+         (b.r1.c1 == p && b.r1.c2 == p && b.r1.c3 == p) || // row 1
+@@ -31,12 +45,23 @@ function check_for_win(b: Board, p: u8) -> bool {
+         (b.r1.c3 == p && b.r2.c2 == p && b.r3.c1 == p); // other diagonal
+ }
+ 
++// Returns an updated tic tac toe board with a move made by a player.
++// Returns a `u8` corresponding to the player who won the game, or 0 if no one has won yet.
++// - `player` : A number corresponding to a player.
++// - `row`    : The row of the move.
++// - `col`    : The column of the move.
++// - `board`  : A tic tac toe board.
++// Assumes that `player` is either 1 or 2.
++// Assumes that `row` and `col` are valid indices into the board.
++// If an entry is already occupied, the move is invalid and the board is returned unchanged.
+ @program
+ function make_move(player: u8, row: u8, col: u8, board: Board) -> (Board, u8) {
+-    console.assert(player == 1u8 || player == 2u8); // 1 for X, 2 for O
++    // Check that inputs are valid.
++    console.assert(player == 1u8 || player == 2u8);
+     console.assert(1u8 <= row && row <= 3u8);
+     console.assert(1u8 <= col && col <= 3u8);
+ 
++    // Unpack the entries in the board into variables.
+     let r1c1: u8 = board.r1.c1;
+     let r1c2: u8 = board.r1.c2;
+     let r1c3: u8 = board.r1.c3;
+@@ -47,6 +72,7 @@ function make_move(player: u8, row: u8, col: u8, board: Board) -> (Board, u8) {
+     let r3c2: u8 = board.r3.c2;
+     let r3c3: u8 = board.r3.c3;
+ 
++    // Update the appropriate entry with the given move.
+     if row == 1u8 && col == 1u8 && r1c1 == 0u8 {
+         r1c1 = player;
+     } else if row == 1u8 && col == 2u8 && r1c2 == 0u8 {
+@@ -67,12 +93,14 @@ function make_move(player: u8, row: u8, col: u8, board: Board) -> (Board, u8) {
+         r3c3 = player;
      }
  
-     fn visit_expression_statement(&mut self, input: &'a ExpressionStatement) -> String {
--        println!("ExpressionStatement: {:?}", input);
-         match input.expression {
--            Expression::Call(_) => self.visit_expression(&input.expression).1,
-+            Expression::Call(_) => {
-+                // Note that codegen for CallExpression in an expression statement does not return any destination registers.
-+                self.visit_expression(&input.expression).1
-+            }
-             _ => unreachable!("ExpressionStatement's can only contain CallExpression's."),
-         }
-     }
++    // Construct the updated game board.
+     let updated: Board = Board {
+         r1: Row { c1: r1c1, c2: r1c2, c3: r1c3 },
+         r2: Row { c1: r2c1, c2: r2c2, c3: r2c3 },
+         r3: Row { c1: r3c1, c2: r2c2, c3: r2c3 },
+     };
+ 
++    // Check if the game is over.
+     if check_for_win(updated, 1u8) {
+         return (updated, 1u8);
+     } else if check_for_win(updated, 2u8) {
+diff --git a/examples/token/src/main.leo b/examples/token/src/main.leo
+index 04b4efc823..b560c132e2 100644
+--- a/examples/token/src/main.leo
++++ b/examples/token/src/main.leo
+@@ -17,7 +17,7 @@ record token {
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+     // Mint the tokens publicly by invoking the computation on-chain.
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public(public receiver: address, public amount: u64) {
+@@ -41,7 +41,7 @@ function mint_private(receiver: address, amount: u64) -> token {
+ @program
+ function transfer_public(public receiver: address, public amount: u64) {
+     // Transfer the tokens publicly, by invoking the computation on-chain.
+-    finalize(self.caller, receiver, amount);
++    async finalize(self.caller, receiver, amount);
+ }
+ 
+ finalize transfer_public(public sender: address, public receiver: address, public amount: u64) {
+@@ -98,7 +98,7 @@ function transfer_private_to_public(sender: token, public receiver: address, pub
+     };
+ 
+     // Increment the token amount publicly for the token receiver.
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ 
+     // Output the sender's change record.
+     return remaining;
+@@ -123,7 +123,7 @@ function transfer_public_to_private(public receiver: address, public amount: u64
+     };
+ 
+     // Decrement the token amount of the caller publicly.
+-    finalize(self.caller, amount);
++    async finalize(self.caller, amount);
+ 
+     // Output the receiver's record.
+     return transferred;
+diff --git a/examples/vote/src/main.leo b/examples/vote/src/main.leo
+index d55de0d691..81ea197d2e 100644
+--- a/examples/vote/src/main.leo
++++ b/examples/vote/src/main.leo
+@@ -42,7 +42,7 @@ function propose(public info: ProposalInfo) -> Proposal {
+     let id: field = BHP256::hash(info.title);
+ 
+     // Finalize the proposal id.
+-    finalize(id);
++    async finalize(id);
+ 
+     // Return a new record for the proposal.
+     return Proposal {
+@@ -64,7 +64,7 @@ function new_ticket(
+     public voter: address,
+ ) -> Ticket {
+     // Finalize the proposal id for the ticket.
+-    finalize(pid);
++    async finalize(pid);
+ 
+     return Ticket {
+         owner: voter,
+@@ -80,7 +80,7 @@ finalize new_ticket(public pid: field) {
+ // Vote to agree with a proposal.
+ @program
+ function agree(ticket: Ticket) {// Privately cast the vote.
+-    finalize(ticket.pid);
++    async finalize(ticket.pid);
+ }
+ finalize agree(public pid: field) {// Publicly increment the number of agree votes.
+     increment(agree_votes, pid, 1u64);
+@@ -89,7 +89,7 @@ finalize agree(public pid: field) {// Publicly increment the number of agree vot
+ // Vote to disagree with a proposal.
+ @program
+ function disagree(ticket: Ticket) {// Privately cast the vote.
+-    finalize(ticket.pid);
++    async finalize(ticket.pid);
+ }
+ finalize disagree(pid: field) {// Publicly increment the number of disagree votes.
+     increment(disagree_votes, pid, 1u64);
+diff --git a/tests/compiler/finalize/closure_with_finalize_fail.leo b/tests/compiler/finalize/closure_with_finalize_fail.leo
+index 0004d79fc2..4d9199aea6 100644
+--- a/tests/compiler/finalize/closure_with_finalize_fail.leo
++++ b/tests/compiler/finalize/closure_with_finalize_fail.leo
+@@ -4,7 +4,7 @@ expectation: Fail
+ */
+ 
+ function foo(a: u8, b: u8) -> u8 {
+-    finalize(a, b);
++    async finalize(a, b);
+     return a + b;
+ }
+ 
+@@ -18,7 +18,7 @@ finalize bar(a: u8, b: u8) -> u8 {
+ 
+ 
+ function mint_public(receiver: address, amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public(receiver: address, amount: u64) {
+diff --git a/tests/compiler/finalize/decrement.leo b/tests/compiler/finalize/decrement.leo
+index ae16281ac6..8b2406936b 100644
+--- a/tests/compiler/finalize/decrement.leo
++++ b/tests/compiler/finalize/decrement.leo
+@@ -7,7 +7,7 @@ mapping amounts: address => u128;
+ 
+ @program
+ function decrease_self(amount: u128) {
+-    finalize(self.caller, amount);
++    async finalize(self.caller, amount);
+ }
+ 
+ finalize decrease_self(addr: address, amount: u128) {
+diff --git a/tests/compiler/finalize/decrement_incorrect_type.leo b/tests/compiler/finalize/decrement_incorrect_type.leo
+index a07f26ffe7..e7b6440388 100644
+--- a/tests/compiler/finalize/decrement_incorrect_type.leo
++++ b/tests/compiler/finalize/decrement_incorrect_type.leo
+@@ -14,7 +14,7 @@ mapping tokens: address => Token;
+ 
+ @program
+ function decrease_self(amount: u128) {
+-    finalize(self.caller, amount);
++    async finalize(self.caller, amount);
+ }
+ 
+ finalize decrease_self(addr: address, amount: u128) {
+diff --git a/tests/compiler/finalize/empty_finalize_fail.leo b/tests/compiler/finalize/empty_finalize_fail.leo
+index aaad487ee4..d136146e61 100644
+--- a/tests/compiler/finalize/empty_finalize_fail.leo
++++ b/tests/compiler/finalize/empty_finalize_fail.leo
+@@ -6,7 +6,7 @@ expectation: Fail
+ 
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public (public receiver: address, public amount: u64) {}
+diff --git a/tests/compiler/finalize/finalize.leo b/tests/compiler/finalize/finalize.leo
+index 2286a3f8ed..761d4b0f8d 100644
+--- a/tests/compiler/finalize/finalize.leo
++++ b/tests/compiler/finalize/finalize.leo
+@@ -8,7 +8,7 @@ mapping values: u8 => u8;
+ 
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public (public receiver: address, public amount: u64) {
+@@ -17,14 +17,14 @@ finalize mint_public (public receiver: address, public amount: u64) {
+ 
+ @program
+ function public_adder(public a: u8, public b: u8) {
+-    finalize(a, b);
++    async finalize(a, b);
+ } finalize public_adder(a: u8, b: u8) -> public u8 {
+     return a + b;
+ }
+ 
+ @program
+ function finalize_no_params() {
+-    finalize();
++    async finalize();
+ }
+ 
+ finalize finalize_no_params() {
+diff --git a/tests/compiler/finalize/finalize_incorrect_modes_fail.leo b/tests/compiler/finalize/finalize_incorrect_modes_fail.leo
+index 66f5481915..87344e2198 100644
+--- a/tests/compiler/finalize/finalize_incorrect_modes_fail.leo
++++ b/tests/compiler/finalize/finalize_incorrect_modes_fail.leo
+@@ -7,7 +7,7 @@ mapping account: address => u64;
+ 
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public (public receiver: address, constant amount: u64) -> constant u64 {
+@@ -16,7 +16,7 @@ finalize mint_public (public receiver: address, constant amount: u64) -> constan
+ 
+ @program
+ function mint_public2(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public2(public receiver: address, amount: u64) -> u64 {
+diff --git a/tests/compiler/finalize/finalize_incorrect_return_fail.leo b/tests/compiler/finalize/finalize_incorrect_return_fail.leo
+index db7a6a3ff8..85b833bbe3 100644
+--- a/tests/compiler/finalize/finalize_incorrect_return_fail.leo
++++ b/tests/compiler/finalize/finalize_incorrect_return_fail.leo
+@@ -7,7 +7,7 @@ mapping account: address => u64;
+ 
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public(public receiver: address, public amount: u64) -> u64 {
+diff --git a/tests/compiler/finalize/finalize_missing_return_fail.leo b/tests/compiler/finalize/finalize_missing_return_fail.leo
+index 77a29be7f8..371e4757b8 100644
+--- a/tests/compiler/finalize/finalize_missing_return_fail.leo
++++ b/tests/compiler/finalize/finalize_missing_return_fail.leo
+@@ -8,7 +8,7 @@ mapping account: address => u64;
+ 
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_public (public receiver: address, public amount: u64) -> u64 {
+diff --git a/tests/compiler/finalize/finalize_name_mismatch_fail.leo b/tests/compiler/finalize/finalize_name_mismatch_fail.leo
+index 1ed395becf..eaa5873118 100644
+--- a/tests/compiler/finalize/finalize_name_mismatch_fail.leo
++++ b/tests/compiler/finalize/finalize_name_mismatch_fail.leo
+@@ -8,7 +8,7 @@ mapping values: u8 => u8;
+ 
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount);
++    async finalize(receiver, amount);
+ }
+ 
+ finalize mint_private (public receiver: address, public amount: u64) {
+diff --git a/tests/compiler/finalize/finalize_statement_incorrect_args_fail.leo b/tests/compiler/finalize/finalize_statement_incorrect_args_fail.leo
+index 96abb0ba26..c1425692c7 100644
+--- a/tests/compiler/finalize/finalize_statement_incorrect_args_fail.leo
++++ b/tests/compiler/finalize/finalize_statement_incorrect_args_fail.leo
+@@ -8,7 +8,7 @@ mapping account: address => u64;
+ 
+ @program
+ function mint_public(public receiver: address, public amount: u64) {
+-    finalize(receiver, amount, amount);
++    async finalize(receiver, amount, amount);
+ }
+ 
+ finalize mint_public (public receiver: address, public amount: u64) {
+diff --git a/tests/compiler/finalize/increment.leo b/tests/compiler/finalize/increment.leo
+index 6b4fbc08aa..18d15c01a9 100644
+--- a/tests/compiler/finalize/increment.leo
++++ b/tests/compiler/finalize/increment.leo
+@@ -7,7 +7,7 @@ mapping amounts: address => u128;
+ 
+ @program
+ function increase_self(amount: u128) {
+-    finalize(self.caller, amount);
++    async finalize(self.caller, amount);
+ }
+ 
+ finalize increase_self(addr: address, amount: u128) {
+diff --git a/tests/compiler/finalize/increment_incorrect_type.leo b/tests/compiler/finalize/increment_incorrect_type.leo
+index a8043b581d..d2bbc7c3ba 100644
+--- a/tests/compiler/finalize/increment_incorrect_type.leo
++++ b/tests/compiler/finalize/increment_incorrect_type.leo
+@@ -14,7 +14,7 @@ mapping tokens: address => Token;
+ 
+ @program
+ function increase_self(amount: u128) {
+-    finalize(self.caller, amount);
++    async finalize(self.caller, amount);
+ }
+ 
+ finalize increase_self(addr: address, amount: u128) {
+diff --git a/tests/compiler/finalize/read_write_mapping_fail.leo b/tests/compiler/finalize/read_write_mapping_fail.leo
+index 1e0e4b7ada..741b3e9011 100644
+--- a/tests/compiler/finalize/read_write_mapping_fail.leo
++++ b/tests/compiler/finalize/read_write_mapping_fail.leo
+@@ -22,7 +22,7 @@ finalize read_in_finalize(public addr: address) -> public u128 {
+ }
+ 
+ function write_in_finalize(public addr: address, public amount: u128) {
+-    finalize(addr, amount);
++    async finalize(addr, amount);
+ }
+ 
+ finalize write_in_finalize(public: addr: address, public amount: u128) {
+diff --git a/tests/compiler/function/self.leo b/tests/compiler/function/self.leo
+index e48a00dcb1..8c8993bed5 100644
+--- a/tests/compiler/function/self.leo
++++ b/tests/compiler/function/self.leo
+@@ -5,7 +5,7 @@ expectation: Pass
+ 
+ @program
+ function matches(addr: address) -> bool {
+-    finalize(self.caller);
++    async finalize(self.caller);
+     return self.caller == addr;
+ } finalize matches(addr: address) -> bool {
+     return addr == self.caller;
+diff --git a/tests/expectations/compiler/finalize/closure_with_finalize_fail.out b/tests/expectations/compiler/finalize/closure_with_finalize_fail.out
+index c6f5ea6982..67db14874c 100644
+--- a/tests/expectations/compiler/finalize/closure_with_finalize_fail.out
++++ b/tests/expectations/compiler/finalize/closure_with_finalize_fail.out
+@@ -2,4 +2,4 @@
+ namespace: Compile
+ expectation: Fail
+ outputs:
+-  - "Error [ETYC0372036]: Cannot use a `finalize` statement without a `finalize` block.\n    --> compiler-test:4:5\n     |\n   4 |     finalize(a, b);\n     |     ^^^^^^^^^^^^^^\nError [ETYC0372044]: Function must contain a `finalize` statement on all execution paths.\n    --> compiler-test:8:1\n     |\n   8 | function bar(a: u8, b: u8) -> u8 {\n   9 |     return a + b;\n  10 | }\n     | ^\nError [ETYC0372032]: Only program functions can have a `finalize` block.\n    --> compiler-test:12:1\n     |\n  12 | finalize bar(a: u8, b: u8) -> u8 {\n  13 |     return a + b;\n  14 | }\n     | ^\n     |\n     = Remove the `finalize` block or add a `@program` annotation to the function.\nError [ETYC0372032]: Only program functions can have a `finalize` block.\n    --> compiler-test:21:1\n     |\n  21 | finalize mint_public(receiver: address, amount: u64) {\n  22 |     increment(account, receiver, amount);\n  23 | }\n     | ^\n     |\n     = Remove the `finalize` block or add a `@program` annotation to the function.\nError [ETYC0372005]: Unknown variable `account`\n    --> compiler-test:22:15\n     |\n  22 |     increment(account, receiver, amount);\n     |               ^^^^^^^\nError [ETYC0372004]: Could not determine the type of `account`\n    --> compiler-test:22:15\n     |\n  22 |     increment(account, receiver, amount);\n     |               ^^^^^^^\n"
++  - "Error [ETYC0372036]: Cannot use a `finalize` statement without a `finalize` block.\n    --> compiler-test:4:11\n     |\n   4 |     async finalize(a, b);\n     |           ^^^^^^^^^^^^^^\nError [ETYC0372044]: Function must contain a `finalize` statement on all execution paths.\n    --> compiler-test:8:1\n     |\n   8 | function bar(a: u8, b: u8) -> u8 {\n   9 |     return a + b;\n  10 | }\n     | ^\nError [ETYC0372032]: Only program functions can have a `finalize` block.\n    --> compiler-test:12:1\n     |\n  12 | finalize bar(a: u8, b: u8) -> u8 {\n  13 |     return a + b;\n  14 | }\n     | ^\n     |\n     = Remove the `finalize` block or add a `@program` annotation to the function.\nError [ETYC0372032]: Only program functions can have a `finalize` block.\n    --> compiler-test:21:1\n     |\n  21 | finalize mint_public(receiver: address, amount: u64) {\n  22 |     increment(account, receiver, amount);\n  23 | }\n     | ^\n     |\n     = Remove the `finalize` block or add a `@program` annotation to the function.\nError [ETYC0372005]: Unknown variable `account`\n    --> compiler-test:22:15\n     |\n  22 |     increment(account, receiver, amount);\n     |               ^^^^^^^\nError [ETYC0372004]: Could not determine the type of `account`\n    --> compiler-test:22:15\n     |\n  22 |     increment(account, receiver, amount);\n     |               ^^^^^^^\n"
+diff --git a/tests/expectations/compiler/finalize/decrement.out b/tests/expectations/compiler/finalize/decrement.out
+index cbc1ed6b2e..43cc2d0770 100644
+--- a/tests/expectations/compiler/finalize/decrement.out
++++ b/tests/expectations/compiler/finalize/decrement.out
+@@ -4,7 +4,7 @@ expectation: Pass
+ outputs:
+   - output:
+       - initial_input_ast: no input
+-    initial_ast: 9498c048747706d4478783a2801179d84243099c3867cb437f4141bf873fc381
+-    unrolled_ast: 9498c048747706d4478783a2801179d84243099c3867cb437f4141bf873fc381
+-    ssa_ast: 9498c048747706d4478783a2801179d84243099c3867cb437f4141bf873fc381
+-    flattened_ast: 30e7fb13033f0a61d999026dbeafff5fe3938e4b6ed2cb709fc0a38ce98c8c57
++    initial_ast: 7bbcb1e7bfda82030ab22d46c5c0ee4d2a54553aae4d581dc78b16663896a5f3
++    unrolled_ast: 7bbcb1e7bfda82030ab22d46c5c0ee4d2a54553aae4d581dc78b16663896a5f3
++    ssa_ast: 7bbcb1e7bfda82030ab22d46c5c0ee4d2a54553aae4d581dc78b16663896a5f3
++    flattened_ast: 71d3b3288fd82eab7ea755fe82ead9a5d3885cdb983488a88b5d677dd80fb1e8
+diff --git a/tests/expectations/compiler/finalize/finalize.out b/tests/expectations/compiler/finalize/finalize.out
+index a71be657f9..1842d37372 100644
+--- a/tests/expectations/compiler/finalize/finalize.out
++++ b/tests/expectations/compiler/finalize/finalize.out
+@@ -4,7 +4,7 @@ expectation: Pass
+ outputs:
+   - output:
+       - initial_input_ast: no input
+-    initial_ast: 4fcaf4a3cc781ca66c4ed30d4704bfa5bc31715a9cce6c12c3b45ba13deebb5c
+-    unrolled_ast: 4fcaf4a3cc781ca66c4ed30d4704bfa5bc31715a9cce6c12c3b45ba13deebb5c
+-    ssa_ast: d511fa6a72cca8b7370691502a92837faac71965312b63e55ce372271720612a
+-    flattened_ast: a085ceac6974fb2a2cbf32de9775e0dbe3c1ca1e1ad184141a8794df6f7bef32
++    initial_ast: 96a5dcffcccc268103191159bbed06386425b092edbd7ffea20f97c80c078f2d
++    unrolled_ast: 96a5dcffcccc268103191159bbed06386425b092edbd7ffea20f97c80c078f2d
++    ssa_ast: 058ff955144948b6b26f3c529e18a4e20e74fcd328bd910f6d5f0771f35298d6
++    flattened_ast: f1b6acd125e8792ea90e5d8d43ce042795402542fa12e85e5644249cd8ae9f3b
+diff --git a/tests/expectations/compiler/finalize/finalize_statement_incorrect_args_fail.out b/tests/expectations/compiler/finalize/finalize_statement_incorrect_args_fail.out
+index bf367b0c1e..418633faa3 100644
+--- a/tests/expectations/compiler/finalize/finalize_statement_incorrect_args_fail.out
++++ b/tests/expectations/compiler/finalize/finalize_statement_incorrect_args_fail.out
+@@ -2,4 +2,4 @@
+ namespace: Compile
+ expectation: Fail
+ outputs:
+-  - "Error [ETYC0372042]: `finalize` expected `2` args, but got `3`\n    --> compiler-test:8:5\n     |\n   8 |     finalize(receiver, amount, amount);\n     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
++  - "Error [ETYC0372042]: `finalize` expected `2` args, but got `3`\n    --> compiler-test:8:11\n     |\n   8 |     async finalize(receiver, amount, amount);\n     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+diff --git a/tests/expectations/compiler/finalize/increment.out b/tests/expectations/compiler/finalize/increment.out
+index bd4bc689b1..15fcae930d 100644
+--- a/tests/expectations/compiler/finalize/increment.out
++++ b/tests/expectations/compiler/finalize/increment.out
+@@ -4,7 +4,7 @@ expectation: Pass
+ outputs:
+   - output:
+       - initial_input_ast: no input
+-    initial_ast: 20577705e80224f486f237ba98fb33550fec7fb0a724eb9c339067a561d426e6
+-    unrolled_ast: 20577705e80224f486f237ba98fb33550fec7fb0a724eb9c339067a561d426e6
+-    ssa_ast: 20577705e80224f486f237ba98fb33550fec7fb0a724eb9c339067a561d426e6
+-    flattened_ast: 6babfacc82c1283848fc1926ca778d6a3c7a46148cfe93fec13927ed31bd950a
++    initial_ast: 07adbfa271d270412b653f4c6d70028eae8bfa4b5228bc18d3059625a6b8b6ad
++    unrolled_ast: 07adbfa271d270412b653f4c6d70028eae8bfa4b5228bc18d3059625a6b8b6ad
++    ssa_ast: 07adbfa271d270412b653f4c6d70028eae8bfa4b5228bc18d3059625a6b8b6ad
++    flattened_ast: a8d61140c04832c275255f8c6cdeadbb99264b67e498a3bfb2ed0d452f21aaf2
+diff --git a/tests/expectations/compiler/function/self.out b/tests/expectations/compiler/function/self.out
+index d6860cc536..68ba1325f6 100644
+--- a/tests/expectations/compiler/function/self.out
++++ b/tests/expectations/compiler/function/self.out
+@@ -4,7 +4,7 @@ expectation: Pass
+ outputs:
+   - output:
+       - initial_input_ast: no input
+-    initial_ast: 6d2ba5e3df5deb29bf51362eea982a821479038d0d30f9257f4e9e8d0940382b
+-    unrolled_ast: 6d2ba5e3df5deb29bf51362eea982a821479038d0d30f9257f4e9e8d0940382b
+-    ssa_ast: ff223290570b6b7fc4129ebe14589d07f6dd82f7adf0b0dfcc396a0adbb0286c
+-    flattened_ast: 1ed84db6d2abc60c44c9780558a1210d29043069f57732f26411f6bdb267bddf
++    initial_ast: 5031143bae1fe94f0e9e01a59caf03a37556f8d62cc1fc6294f553771612300e
++    unrolled_ast: 5031143bae1fe94f0e9e01a59caf03a37556f8d62cc1fc6294f553771612300e
++    ssa_ast: 0e6c2552a18f992e5525b5c0d30665cd671d974713b4bd12b928e1c943bac62c
++    flattened_ast: 01d338d8fdd7f54f884f1e5fc46d80fba52c2005c228f072d5f4a5aabbd40cda
+diff --git a/tests/expectations/parser/finalize/finalize_statement.out b/tests/expectations/parser/finalize/finalize_statement.out
+index 8d3616bc6a..512a777f7f 100644
+--- a/tests/expectations/parser/finalize/finalize_statement.out
++++ b/tests/expectations/parser/finalize/finalize_statement.out
+@@ -5,18 +5,18 @@ outputs:
+   - Finalize:
+       arguments: []
+       span:
+-        lo: 0
+-        hi: 10
++        lo: 6
++        hi: 16
+   - Finalize:
+       arguments:
+-        - Identifier: "{\"name\":\"foo\",\"span\":\"{\\\"lo\\\":9,\\\"hi\\\":12}\"}"
++        - Identifier: "{\"name\":\"foo\",\"span\":\"{\\\"lo\\\":15,\\\"hi\\\":18}\"}"
+       span:
+-        lo: 0
+-        hi: 13
++        lo: 6
++        hi: 19
+   - Finalize:
+       arguments:
+-        - Identifier: "{\"name\":\"foo\",\"span\":\"{\\\"lo\\\":9,\\\"hi\\\":12}\"}"
+-        - Identifier: "{\"name\":\"bar\",\"span\":\"{\\\"lo\\\":14,\\\"hi\\\":17}\"}"
++        - Identifier: "{\"name\":\"foo\",\"span\":\"{\\\"lo\\\":15,\\\"hi\\\":18}\"}"
++        - Identifier: "{\"name\":\"bar\",\"span\":\"{\\\"lo\\\":20,\\\"hi\\\":23}\"}"
+       span:
+-        lo: 0
+-        hi: 18
++        lo: 6
++        hi: 24
+diff --git a/tests/expectations/parser/finalize/finalize_statement_fail.out b/tests/expectations/parser/finalize/finalize_statement_fail.out
+index 86f4be0169..50f4588198 100644
+--- a/tests/expectations/parser/finalize/finalize_statement_fail.out
++++ b/tests/expectations/parser/finalize/finalize_statement_fail.out
+@@ -2,6 +2,9 @@
+ namespace: ParseStatement
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370009]: unexpected string: expected 'expression', found ';'\n    --> test:1:10\n     |\n   1 | finalize(;\n     |          ^"
+-  - "Error [EPAR0370009]: unexpected string: expected 'expression', found ','\n    --> test:1:15\n     |\n   1 | finalize(foo, ,);\n     |               ^"
+-  - "Error [EPAR0370005]: expected ; -- found '<eof>'\n    --> test:1:18\n     |\n   1 | finalize(foo, bar)\n     |                  ^"
++  - "Error [EPAR0370029]: A finalize statement must be preceded by the `async` keyword.\n    --> test:1:1\n     |\n   1 | finalize(;\n     | ^^^^^^^^\n     |\n     = Add the `async` keyword before the `finalize` keyword."
++  - "Error [EPAR0370029]: A finalize statement must be preceded by the `async` keyword.\n    --> test:1:1\n     |\n   1 | finalize(foo, ,);\n     | ^^^^^^^^\n     |\n     = Add the `async` keyword before the `finalize` keyword."
++  - "Error [EPAR0370029]: A finalize statement must be preceded by the `async` keyword.\n    --> test:1:1\n     |\n   1 | finalize(foo, bar)\n     | ^^^^^^^^\n     |\n     = Add the `async` keyword before the `finalize` keyword."
++  - "Error [EPAR0370005]: expected finalize -- found 'async'\n    --> test:1:7\n     |\n   1 | async async finalize(foo);\n     |       ^^^^^"
++  - "Error [EPAR0370029]: A finalize statement must be preceded by the `async` keyword.\n    --> test:1:1\n     |\n   1 | finalize;\n     | ^^^^^^^^\n     |\n     = Add the `async` keyword before the `finalize` keyword."
++  - "Error [EPAR0370005]: expected ; -- found 'finalize'\n    --> test:1:6\n     |\n   1 | asyn finalize(foo);\n     |      ^^^^^^^^"
+diff --git a/tests/parser/finalize/finalize_statement.leo b/tests/parser/finalize/finalize_statement.leo
+index 64e13d4bb8..16e2e579f0 100644
+--- a/tests/parser/finalize/finalize_statement.leo
++++ b/tests/parser/finalize/finalize_statement.leo
+@@ -3,8 +3,8 @@ namespace: ParseStatement
+ expectation: Pass
+ */
+ 
+-finalize();
++async finalize();
+ 
+-finalize(foo);
++async finalize(foo);
+ 
+-finalize(foo, bar);
++async finalize(foo, bar);
+diff --git a/tests/parser/finalize/finalize_statement_fail.leo b/tests/parser/finalize/finalize_statement_fail.leo
+index 02a1eb708f..01c4511e1e 100644
+--- a/tests/parser/finalize/finalize_statement_fail.leo
++++ b/tests/parser/finalize/finalize_statement_fail.leo
+@@ -8,3 +8,9 @@ finalize(;
+ finalize(foo, ,);
+ 
+ finalize(foo, bar)
++
++async async finalize(foo);
++
++finalize;
++
++asyn finalize(foo);

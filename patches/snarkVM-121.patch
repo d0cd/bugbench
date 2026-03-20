@@ -1,62 +1,1056 @@
-diff --git a/vm/package/deploy.rs b/vm/package/deploy.rs
-index 2274e7c6c..abd2b8589 100644
---- a/vm/package/deploy.rs
-+++ b/vm/package/deploy.rs
-@@ -26,17 +26,6 @@ pub struct DeployRequest<N: Network> {
-     program_id: ProgramID<N>,
+diff --git a/Cargo.lock b/Cargo.lock
+index eaa018b62..8dc1e8b6a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2888,7 +2888,6 @@ dependencies = [
+  "once_cell",
+  "serial_test",
+  "sha2",
+- "smallvec",
+  "snarkvm-algorithms",
+  "snarkvm-circuit",
+  "snarkvm-circuit-environment-witness",
+diff --git a/circuit/environment/Cargo.toml b/circuit/environment/Cargo.toml
+index 40a4dde50..7afd381b0 100644
+--- a/circuit/environment/Cargo.toml
++++ b/circuit/environment/Cargo.toml
+@@ -64,9 +64,6 @@ version = "0.10"
+ default-features = false
+ optional = true
+ 
+-[dependencies.smallvec]
+-version = "1.14"
+-
+ [dev-dependencies.snarkvm-algorithms]
+ path = "../../algorithms"
+ features = [ "polycommit_full", "snark", "test" ]
+diff --git a/circuit/environment/src/helpers/assignment.rs b/circuit/environment/src/helpers/assignment.rs
+index 106cc7ead..f4c319a57 100644
+--- a/circuit/environment/src/helpers/assignment.rs
++++ b/circuit/environment/src/helpers/assignment.rs
+@@ -13,24 +13,85 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-use crate::{Constraint, LinearCombination, Variable};
++use crate::Index;
+ use snarkvm_fields::PrimeField;
+ 
+ use indexmap::IndexMap;
+ use std::sync::Arc;
+ 
+-use super::R1CS;
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub enum AssignmentVariable<F: PrimeField> {
++    Constant(F),
++    Public(Index),
++    Private(Index),
++}
++
++impl<F: PrimeField> From<&crate::Variable<F>> for AssignmentVariable<F> {
++    /// Converts a variable to an assignment variable.
++    fn from(variable: &crate::Variable<F>) -> Self {
++        match variable {
++            crate::Variable::Constant(value) => Self::Constant(**value),
++            crate::Variable::Public(index_value) => {
++                let (index, _value) = index_value.as_ref();
++                Self::Public(*index)
++            }
++            crate::Variable::Private(index_value) => {
++                let (index, _value) = index_value.as_ref();
++                Self::Private(*index)
++            }
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct AssignmentLC<F: PrimeField> {
++    constant: F,
++    terms: Vec<(AssignmentVariable<F>, F)>,
++}
++
++impl<F: PrimeField> From<&crate::LinearCombination<F>> for AssignmentLC<F> {
++    /// Converts a linear combination to an assignment linear combination.
++    fn from(lc: &crate::LinearCombination<F>) -> Self {
++        Self {
++            constant: lc.to_constant(),
++            terms: FromIterator::from_iter(
++                lc.to_terms().iter().map(|(variable, coefficient)| (variable.into(), *coefficient)),
++            ),
++        }
++    }
++}
++
++impl<F: PrimeField> AssignmentLC<F> {
++    /// Returns the constant term of the linear combination.
++    pub const fn constant(&self) -> F {
++        self.constant
++    }
++
++    /// Returns the terms of the linear combination.
++    pub const fn terms(&self) -> &Vec<(AssignmentVariable<F>, F)> {
++        &self.terms
++    }
++
++    /// Returns the number of nonzeros in the linear combination.
++    pub(super) fn num_nonzeros(&self) -> u64 {
++        // Increment by one if the constant is nonzero.
++        match self.constant.is_zero() {
++            true => self.terms.len() as u64,
++            false => (self.terms.len() as u64).saturating_add(1),
++        }
++    }
++}
+ 
+ /// A struct that contains public variable assignments, private variable assignments,
+ /// and constraint assignments.
+ #[derive(Clone, Debug)]
+ pub struct Assignment<F: PrimeField> {
+     /// The public variables.
+-    public: Arc<[Variable<F>]>,
++    public: Arc<[(Index, F)]>,
+     /// The private variables.
+-    private: Arc<[Variable<F>]>,
++    private: Arc<[(Index, F)]>,
+     /// The constraints.
+-    constraints: Arc<[Arc<Constraint<F>>]>,
++    constraints: Arc<[(AssignmentLC<F>, AssignmentLC<F>, AssignmentLC<F>)]>,
+     /// The number of constants, public, and private variables in the assignment.
+     num_variables: u64,
+ }
+@@ -41,25 +102,35 @@ impl<F: PrimeField> From<crate::R1CS<F>> for Assignment<F> {
+         #[cfg(feature = "save_r1cs_hashes")]
+         r1cs.save_hash();
+ 
+-        let R1CS { public, private, constraints, num_variables, .. } = r1cs;
+-
+-        Self { public: public.into(), private: private.into(), constraints: constraints.into(), num_variables }
++        Self {
++            public: FromIterator::from_iter(
++                r1cs.to_public_variables().iter().map(|variable| (variable.index(), variable.value())),
++            ),
++            private: FromIterator::from_iter(
++                r1cs.to_private_variables().iter().map(|variable| (variable.index(), variable.value())),
++            ),
++            constraints: FromIterator::from_iter(r1cs.to_constraints().iter().map(|constraint| {
++                let (a, b, c) = constraint.to_terms();
++                (a.into(), b.into(), c.into())
++            })),
++            num_variables: r1cs.num_variables(),
++        }
+     }
  }
  
--impl<N: Network> TryFrom<Deployment<N>> for DeployRequest<N> {
--    type Error = anyhow::Error;
+ impl<F: PrimeField> Assignment<F> {
+     /// Returns the public inputs of the assignment.
+-    pub const fn public_inputs(&self) -> &Arc<[Variable<F>]> {
++    pub const fn public_inputs(&self) -> &Arc<[(Index, F)]> {
+         &self.public
+     }
+ 
+     /// Returns the private inputs of the assignment.
+-    pub const fn private_inputs(&self) -> &Arc<[Variable<F>]> {
++    pub const fn private_inputs(&self) -> &Arc<[(Index, F)]> {
+         &self.private
+     }
+ 
+     /// Returns the constraints of the assignment.
+-    pub const fn constraints(&self) -> &Arc<[Arc<Constraint<F>>]> {
++    pub const fn constraints(&self) -> &Arc<[(AssignmentLC<F>, AssignmentLC<F>, AssignmentLC<F>)]> {
+         &self.constraints
+     }
+ 
+@@ -87,10 +158,7 @@ impl<F: PrimeField> Assignment<F> {
+     pub fn num_nonzeros(&self) -> (u64, u64, u64) {
+         self.constraints
+             .iter()
+-            .map(|constraint| {
+-                let (a, b, c) = constraint.to_terms();
+-                (a.num_nonzeros(), b.num_nonzeros(), c.num_nonzeros())
+-            })
++            .map(|(a, b, c)| (a.num_nonzeros(), b.num_nonzeros(), c.num_nonzeros()))
+             .fold((0, 0, 0), |(a, b, c), (x, y, z)| (a.saturating_add(x), b.saturating_add(y), c.saturating_add(z)))
+     }
+ }
+@@ -119,29 +187,27 @@ impl<F: PrimeField> snarkvm_algorithms::r1cs::ConstraintSynthesizer<F> for Assig
+ 
+         // Allocate the public variables.
+         // NOTE: we skip the first public `One` variable because we already allocated it in the `ConstraintSystem` constructor.
+-        for (i, variable) in self.public.iter().skip(1).enumerate() {
+-            let (index, value) = variable.index_value();
+-            assert_eq!((i + 1) as u64, index, "Public vars in first system must be processed in lexicographic order");
++        for (i, (index, value)) in self.public.iter().skip(1).enumerate() {
++            assert_eq!((i + 1) as u64, *index, "Public vars in first system must be processed in lexicographic order");
+ 
+-            let gadget = cs.alloc_input(|| format!("Public {i}"), || Ok(value))?;
++            let gadget = cs.alloc_input(|| format!("Public {i}"), || Ok(*value))?;
+ 
+             assert_eq!(
+-                snarkvm_algorithms::r1cs::Index::Public(index as usize),
++                snarkvm_algorithms::r1cs::Index::Public(*index as usize),
+                 gadget.get_unchecked(),
+                 "Public variables in the second system must match the first system (with an off-by-1 for the public case)"
+             );
+ 
+-            let result = converter.public.insert(index, gadget);
++            let result = converter.public.insert(*index, gadget);
+ 
+             assert!(result.is_none(), "Overwrote an existing public variable in the converter");
+         }
+ 
+         // Allocate the private variables.
+-        for (i, variable) in self.private.iter().enumerate() {
+-            let (index, value) = variable.index_value();
+-            assert_eq!(i as u64, index, "Private variables in first system must be processed in lexicographic order");
++        for (i, (index, value)) in self.private.iter().enumerate() {
++            assert_eq!(i as u64, *index, "Private variables in first system must be processed in lexicographic order");
+ 
+-            let gadget = cs.alloc(|| format!("Private {i}"), || Ok(value))?;
++            let gadget = cs.alloc(|| format!("Private {i}"), || Ok(*value))?;
+ 
+             assert_eq!(
+                 snarkvm_algorithms::r1cs::Index::Private(i),
+@@ -149,64 +215,58 @@ impl<F: PrimeField> snarkvm_algorithms::r1cs::ConstraintSynthesizer<F> for Assig
+                 "Private variables in the second system must match the first system"
+             );
+ 
+-            let result = converter.private.insert(index, gadget);
++            let result = converter.private.insert(*index, gadget);
+ 
+             assert!(result.is_none(), "Overwrote an existing private variable in the converter");
+         }
+ 
+         // Enforce all of the constraints.
+-        for (i, constraint) in self.constraints.iter().enumerate() {
+-            let (a, b, c) = constraint.to_terms();
++        for (i, (a, b, c)) in self.constraints.iter().enumerate() {
+             // Converts terms from one linear combination in the first system to the second system.
+-            let convert_linear_combination =
+-                |lc: &LinearCombination<F>| -> snarkvm_algorithms::r1cs::LinearCombination<F> {
+-                    // Initialize a linear combination for the second system.
+-                    let mut linear_combination = snarkvm_algorithms::r1cs::LinearCombination::<F>::zero();
 -
--    fn try_from(deployment: Deployment<N>) -> Result<Self, Self::Error> {
--        let program_id = *deployment.program_id();
--        let address = program_id.to_address()?;
+-                    // Process every term in the linear combination.
+-                    for (variable, coefficient) in lc.to_terms() {
+-                        match variable {
+-                            Variable::Constant(_) => {
+-                                unreachable!(
+-                                    "Failed during constraint translation. The first system by definition cannot have constant variables in the terms"
+-                                )
+-                            }
+-                            Variable::Public(index_value) => {
+-                                let (index, _) = index_value.as_ref();
+-                                let gadget = converter.public.get(index).unwrap();
+-                                assert_eq!(
+-                                    snarkvm_algorithms::r1cs::Index::Public(*index as usize),
+-                                    gadget.get_unchecked(),
+-                                    "Failed during constraint translation. The public variable in the second system must match the first system (with an off-by-1 for the public case)"
+-                                );
+-                                linear_combination += (*coefficient, *gadget);
+-                            }
+-                            Variable::Private(index_value) => {
+-                                let (index, _) = index_value.as_ref();
+-                                let gadget = converter.private.get(index).unwrap();
+-                                assert_eq!(
+-                                    snarkvm_algorithms::r1cs::Index::Private(*index as usize),
+-                                    gadget.get_unchecked(),
+-                                    "Failed during constraint translation. The private variable in the second system must match the first system"
+-                                );
+-                                linear_combination += (*coefficient, *gadget);
+-                            }
++            let convert_linear_combination = |lc: &AssignmentLC<F>| -> snarkvm_algorithms::r1cs::LinearCombination<F> {
++                // Initialize a linear combination for the second system.
++                let mut linear_combination = snarkvm_algorithms::r1cs::LinearCombination::<F>::zero();
++
++                // Process every term in the linear combination.
++                for (variable, coefficient) in lc.terms.iter() {
++                    match variable {
++                        AssignmentVariable::Constant(_) => {
++                            unreachable!(
++                                "Failed during constraint translation. The first system by definition cannot have constant variables in the terms"
++                            )
++                        }
++                        AssignmentVariable::Public(index) => {
++                            let gadget = converter.public.get(index).unwrap();
++                            assert_eq!(
++                                snarkvm_algorithms::r1cs::Index::Public(*index as usize),
++                                gadget.get_unchecked(),
++                                "Failed during constraint translation. The public variable in the second system must match the first system (with an off-by-1 for the public case)"
++                            );
++                            linear_combination += (*coefficient, *gadget);
++                        }
++                        AssignmentVariable::Private(index) => {
++                            let gadget = converter.private.get(index).unwrap();
++                            assert_eq!(
++                                snarkvm_algorithms::r1cs::Index::Private(*index as usize),
++                                gadget.get_unchecked(),
++                                "Failed during constraint translation. The private variable in the second system must match the first system"
++                            );
++                            linear_combination += (*coefficient, *gadget);
+                         }
+                     }
 -
--        Ok(Self { deployment, address, program_id })
+-                    // Finally, add the accumulated constant value to the linear combination.
+-                    if !lc.to_constant().is_zero() {
+-                        linear_combination += (
+-                            lc.to_constant(),
+-                            snarkvm_algorithms::r1cs::Variable::new_unchecked(snarkvm_algorithms::r1cs::Index::Public(
+-                                0,
+-                            )),
+-                        );
+-                    }
+-
+-                    // Return the linear combination of the second system.
+-                    linear_combination
+-                };
++                }
++
++                // Finally, add the accumulated constant value to the linear combination.
++                if !lc.constant.is_zero() {
++                    linear_combination += (
++                        lc.constant,
++                        snarkvm_algorithms::r1cs::Variable::new_unchecked(snarkvm_algorithms::r1cs::Index::Public(0)),
++                    );
++                }
++
++                // Return the linear combination of the second system.
++                linear_combination
++            };
+ 
+             cs.enforce(
+                 || format!("Constraint {i}"),
+diff --git a/circuit/environment/src/helpers/counter.rs b/circuit/environment/src/helpers/counter.rs
+index c4115823a..6d013ebe2 100644
+--- a/circuit/environment/src/helpers/counter.rs
++++ b/circuit/environment/src/helpers/counter.rs
+@@ -16,17 +16,17 @@
+ use crate::*;
+ use snarkvm_fields::PrimeField;
+ 
+-use std::{mem, sync::Arc};
++use std::{mem, rc::Rc};
+ 
+ #[derive(Debug, Default, Hash)]
+ pub(crate) struct Counter<F: PrimeField> {
+     scope: Scope,
+-    constraints: Vec<Arc<Constraint<F>>>,
++    constraints: Vec<Rc<Constraint<F>>>,
+     constants: u64,
+     public: u64,
+     private: u64,
+     nonzeros: (u64, u64, u64),
+-    parents: Vec<(Scope, Vec<Arc<Constraint<F>>>, u64, u64, u64, (u64, u64, u64))>,
++    parents: Vec<(Scope, Vec<Rc<Constraint<F>>>, u64, u64, u64, (u64, u64, u64))>,
+ }
+ 
+ impl<F: PrimeField> Counter<F> {
+@@ -93,7 +93,7 @@ impl<F: PrimeField> Counter<F> {
+     }
+ 
+     /// Increments the number of constraints by 1.
+-    pub(crate) fn add_constraint(&mut self, constraint: Arc<Constraint<F>>) {
++    pub(crate) fn add_constraint(&mut self, constraint: Rc<Constraint<F>>) {
+         let (a_nonzeros, b_nonzeros, c_nonzeros) = constraint.num_nonzeros();
+         self.nonzeros.0 += a_nonzeros;
+         self.nonzeros.1 += b_nonzeros;
+diff --git a/circuit/environment/src/helpers/linear_combination.rs b/circuit/environment/src/helpers/linear_combination.rs
+index 17da29ed4..e8c13ee08 100644
+--- a/circuit/environment/src/helpers/linear_combination.rs
++++ b/circuit/environment/src/helpers/linear_combination.rs
+@@ -20,7 +20,6 @@ use core::{
+     fmt,
+     ops::{Add, AddAssign, Mul, Neg, Sub},
+ };
+-use smallvec::SmallVec;
+ 
+ // Before high level program operations are converted into constraints, they are first tracked as linear combinations.
+ // Each linear combination corresponds to a portion or all of a single row of an R1CS matrix, and consists of:
+@@ -36,7 +35,7 @@ use smallvec::SmallVec;
+ pub struct LinearCombination<F: PrimeField> {
+     constant: F,
+     /// The list of terms is kept sorted in order to speed up lookups.
+-    terms: SmallVec<[(Variable<F>, F); 1]>,
++    terms: Vec<(Variable<F>, F)>,
+     /// The value of this linear combination, defined as the sum of the `terms` and `constant`.
+     value: F,
+ }
+@@ -491,7 +490,7 @@ mod tests {
+     use super::*;
+     use snarkvm_fields::{One as O, Zero as Z};
+ 
+-    use std::sync::Arc;
++    use std::rc::Rc;
+ 
+     #[test]
+     fn test_zero() {
+@@ -547,7 +546,7 @@ mod tests {
+         let two = one + one;
+         let four = two + two;
+ 
+-        let start = LinearCombination::from(Variable::Public(Arc::new((1, one))));
++        let start = LinearCombination::from(Variable::Public(Rc::new((1, one))));
+         assert!(!start.is_constant());
+         assert_eq!(one, start.value());
+ 
+diff --git a/circuit/environment/src/helpers/r1cs.rs b/circuit/environment/src/helpers/r1cs.rs
+index 2e9a28582..caecff4ef 100644
+--- a/circuit/environment/src/helpers/r1cs.rs
++++ b/circuit/environment/src/helpers/r1cs.rs
+@@ -21,7 +21,7 @@ use snarkvm_fields::PrimeField;
+ 
+ #[cfg(feature = "save_r1cs_hashes")]
+ use sha2::{Digest, Sha256};
+-use std::sync::Arc;
++use std::rc::Rc;
+ #[cfg(feature = "save_r1cs_hashes")]
+ use std::{
+     hash::{Hash, Hasher},
+@@ -62,11 +62,11 @@ pub static R1CS_HASHES: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+ #[derive(Debug, Hash)]
+ pub struct R1CS<F: PrimeField> {
+     constants: Vec<Variable<F>>,
+-    pub(crate) public: Vec<Variable<F>>,
+-    pub(crate) private: Vec<Variable<F>>,
+-    pub(crate) constraints: Vec<Arc<Constraint<F>>>,
++    public: Vec<Variable<F>>,
++    private: Vec<Variable<F>>,
++    constraints: Vec<Rc<Constraint<F>>>,
+     counter: Counter<F>,
+-    pub(crate) num_variables: u64,
++    num_variables: u64,
+     nonzeros: (u64, u64, u64),
+ }
+ 
+@@ -75,7 +75,7 @@ impl<F: PrimeField> R1CS<F> {
+     pub(crate) fn new() -> Self {
+         Self {
+             constants: Default::default(),
+-            public: vec![Variable::Public(Arc::new((0u64, F::one())))],
++            public: vec![Variable::Public(Rc::new((0u64, F::one())))],
+             private: Default::default(),
+             constraints: Default::default(),
+             counter: Default::default(),
+@@ -96,7 +96,7 @@ impl<F: PrimeField> R1CS<F> {
+ 
+     /// Returns a new constant with the given value and scope.
+     pub(crate) fn new_constant(&mut self, value: F) -> Variable<F> {
+-        let variable = Variable::Constant(Arc::new(value));
++        let variable = Variable::Constant(Rc::new(value));
+         self.constants.push(variable.clone());
+         self.counter.increment_constant();
+         self.num_variables += 1;
+@@ -105,7 +105,7 @@ impl<F: PrimeField> R1CS<F> {
+ 
+     /// Returns a new public variable with the given value and scope.
+     pub(crate) fn new_public(&mut self, value: F) -> Variable<F> {
+-        let variable = Variable::Public(Arc::new((self.public.len() as u64, value)));
++        let variable = Variable::Public(Rc::new((self.public.len() as u64, value)));
+         self.public.push(variable.clone());
+         self.counter.increment_public();
+         self.num_variables += 1;
+@@ -114,7 +114,7 @@ impl<F: PrimeField> R1CS<F> {
+ 
+     /// Returns a new private variable with the given value and scope.
+     pub(crate) fn new_private(&mut self, value: F) -> Variable<F> {
+-        let variable = Variable::Private(Arc::new((self.private.len() as u64, value)));
++        let variable = Variable::Private(Rc::new((self.private.len() as u64, value)));
+         self.private.push(variable.clone());
+         self.counter.increment_private();
+         self.num_variables += 1;
+@@ -128,8 +128,8 @@ impl<F: PrimeField> R1CS<F> {
+         self.nonzeros.1 += b_nonzeros;
+         self.nonzeros.2 += c_nonzeros;
+ 
+-        let constraint = Arc::new(constraint);
+-        self.constraints.push(Arc::clone(&constraint));
++        let constraint = Rc::new(constraint);
++        self.constraints.push(Rc::clone(&constraint));
+         self.counter.add_constraint(constraint);
+     }
+ 
+@@ -242,7 +242,7 @@ impl<F: PrimeField> R1CS<F> {
+     }
+ 
+     /// Returns the constraints in the constraint system.
+-    pub fn to_constraints(&self) -> &Vec<Arc<Constraint<F>>> {
++    pub fn to_constraints(&self) -> &Vec<Rc<Constraint<F>>> {
+         &self.constraints
+     }
+ 
+diff --git a/circuit/environment/src/helpers/variable.rs b/circuit/environment/src/helpers/variable.rs
+index 9e84bf943..3160a41c0 100644
+--- a/circuit/environment/src/helpers/variable.rs
++++ b/circuit/environment/src/helpers/variable.rs
+@@ -21,15 +21,15 @@ use core::{
+     fmt,
+     ops::{Add, Sub},
+ };
+-use std::sync::Arc;
++use std::rc::Rc;
+ 
+ pub type Index = u64;
+ 
+ #[derive(Clone, PartialEq, Eq, Hash)]
+ pub enum Variable<F: PrimeField> {
+-    Constant(Arc<F>),
+-    Public(Arc<(Index, F)>),
+-    Private(Arc<(Index, F)>),
++    Constant(Rc<F>),
++    Public(Rc<(Index, F)>),
++    Private(Rc<(Index, F)>),
+ }
+ 
+ impl<F: PrimeField> Variable<F> {
+@@ -90,19 +90,6 @@ impl<F: PrimeField> Variable<F> {
+             }
+         }
+     }
+-
+-    ///
+-    /// Returns the relative index and value of the variable.
+-    ///
+-    pub fn index_value(&self) -> (Index, F) {
+-        match self {
+-            Self::Constant(value) => (0, **value),
+-            Self::Public(index_value) | Self::Private(index_value) => {
+-                let (index, value) = index_value.as_ref();
+-                (*index, *value)
+-            }
+-        }
 -    }
+ }
+ 
+ impl<F: PrimeField> PartialOrd for Variable<F> {
+@@ -159,7 +146,7 @@ impl<F: PrimeField> Add<&Variable<F>> for &Variable<F> {
+ 
+     fn add(self, other: &Variable<F>) -> Self::Output {
+         match (self, other) {
+-            (Variable::Constant(a), Variable::Constant(b)) => Variable::Constant(Arc::new(**a + **b)).into(),
++            (Variable::Constant(a), Variable::Constant(b)) => Variable::Constant(Rc::new(**a + **b)).into(),
+             (first, second) => LinearCombination::from([first.clone(), second.clone()]),
+         }
+     }
+@@ -232,7 +219,7 @@ impl<F: PrimeField> Sub<&Variable<F>> for &Variable<F> {
+ 
+     fn sub(self, other: &Variable<F>) -> Self::Output {
+         match (self, other) {
+-            (Variable::Constant(a), Variable::Constant(b)) => Variable::Constant(Arc::new(**a - **b)).into(),
++            (Variable::Constant(a), Variable::Constant(b)) => Variable::Constant(Rc::new(**a - **b)).into(),
+             (first, second) => LinearCombination::from(first) - second,
+         }
+     }
+diff --git a/circuit/types/boolean/src/not.rs b/circuit/types/boolean/src/not.rs
+index 149e30431..40e05b98b 100644
+--- a/circuit/types/boolean/src/not.rs
++++ b/circuit/types/boolean/src/not.rs
+@@ -14,7 +14,7 @@
+ // limitations under the License.
+ 
+ use super::*;
+-use std::sync::Arc;
++use std::rc::Rc;
+ 
+ impl<E: Environment> Not for Boolean<E> {
+     type Output = Boolean<E>;
+@@ -39,7 +39,7 @@ impl<E: Environment> Not for &Boolean<E> {
+             // Public and private cases.
+             // Note: We directly instantiate a public variable to correctly represent a boolean in a linear combination.
+             // For more information, see `LinearCombination::is_boolean_type`.
+-            false => Boolean(Variable::Public(Arc::new((0, E::BaseField::one()))) - &self.0),
++            false => Boolean(Variable::Public(Rc::new((0, E::BaseField::one()))) - &self.0),
+         }
+     }
+ }
+diff --git a/console/network/environment/src/helpers/sanitizer.rs b/console/network/environment/src/helpers/sanitizer.rs
+index 92e11259a..c99a497df 100644
+--- a/console/network/environment/src/helpers/sanitizer.rs
++++ b/console/network/environment/src/helpers/sanitizer.rs
+@@ -51,7 +51,7 @@ impl Sanitizer {
+         )(string)
+     }
+ 
+-    /// Parse a safe character (in the sense explained in [is_char_supported]).
++    /// Parse a safe character (in the sense explained in [string_parser::is_char_supported]).
+     /// Returns an error if no character is found or a non-safe character is found.
+     /// The character is returned, along with the remaining input.
+     ///
+@@ -84,8 +84,9 @@ impl Sanitizer {
+         }
+     }
+ 
+-    /// A parser that accepts:
+-    /// - A newline, either `CR LF` or just `LF`.
++    /// A newline parser that accepts:
++    ///
++    /// - A newline.
+     /// - The end of input.
+     fn eol(string: &str) -> ParserResult<()> {
+         alt((
+@@ -112,19 +113,15 @@ impl Sanitizer {
+ 
+     /// Parse a string until the end of line.
+     ///
+-    /// This parser accepts the multiline annotation (`\ LF`) to break the string on several lines.
+-    ///
+-    /// The line may end with a newline (either `CR LF` or just `LF`), or it may end with the input.
++    /// This parser accepts the multiline annotation (\) to break the string on several lines.
+     ///
+-    /// Return the body of the comment, i.e. what is between `//` and the end of line.
+-    /// If the line ends with `CR LF`, the `CR` is included in the returned body.
+-    /// The `LF`, if present, is never included in the returned body.
++    /// Discard any leading newline.
+     fn str_till_eol(string: &str) -> ParserResult<&str> {
+         // A heuristic approach is applied here in order to avoid costly parsing operations in the
+         // most common scenarios: non-parsing methods are used to verify if the string has multiple
+         // lines and if there are any unsafe characters.
+         if let Some((before, after)) = string.split_once('\n') {
+-            let is_multiline = before.ends_with('\\'); // is `LF` preceded by `\`?
++            let is_multiline = before.ends_with('\\');
+ 
+             if !is_multiline {
+                 let contains_unsafe_chars = !before.chars().all(is_char_supported);
+@@ -133,8 +130,7 @@ impl Sanitizer {
+                     Ok((after, before))
+                 } else {
+                     // `eoi` is used here instead of `eol`, since the earlier call to `split_once`
+-                    // already removed the `LF`. This will fail at the first unsafe character,
+-                    // which is known to exist because we are under the condition contains_unsafe_chars.
++                    // already removed the newline
+                     recognize(Self::till(value((), Sanitizer::parse_safe_char), Self::eoi))(before)
+                 }
+             } else {
+@@ -144,19 +140,12 @@ impl Sanitizer {
+                         Self::eol,
+                     )),
+                     |i| {
+-                        // Exclude the final `LF`, if any, from the comment body.
+                         if i.as_bytes().last() == Some(&b'\n') { &i[0..i.len() - 1] } else { i }
+                     },
+                 )(string)
+             }
+-        } else if string.chars().all(is_char_supported) {
+-            // There is no `LF`. We return all the characters up to the end of file.
+-            Ok(("", string))
+         } else {
+-            // `eoi` is used here because we are under the condition that there is no newline.
+-            // This will fail at the first unsafe character, which is known to exist because
+-            // we are under the condition that not all characters are safe.
+-            recognize(Self::till(value((), Sanitizer::parse_safe_char), Self::eoi))(string)
++            Ok((string, ""))
+         }
+     }
+ 
+@@ -314,6 +303,5 @@ mod tests {
+         assert!(Sanitizer::parse_comments("/* hel\u{202d}lo */\nhello world").is_err());
+         assert!(Sanitizer::parse_comments("/** hel\x00lo */\nhello world").is_err());
+         assert!(Sanitizer::parse_comments("/** hel\u{202a}lo */\nhello world").is_err());
+-        assert!(Sanitizer::parse_comments("// unsafe \u{202a} no newline").is_err());
+     }
+ }
+diff --git a/console/network/environment/src/traits/parse_string.rs b/console/network/environment/src/traits/parse_string.rs
+index 88e8ec4a9..405e35f95 100644
+--- a/console/network/environment/src/traits/parse_string.rs
++++ b/console/network/environment/src/traits/parse_string.rs
+@@ -55,7 +55,7 @@ pub mod string_parser {
+     /// Other ASCII control characters
+     /// (except for horizontal tab, space, line feed, and carriage return, which are allowed)
+     /// may or may not present dangers, but we see no good reason for allowing them.
+-    /// At some point we may want to disallow additional non-ASCII characters,
++    /// At some point we may want disallow additional non-ASCII characters,
+     /// if we see no good reason to allow them.
+     ///
+     /// Note that we say 'Unicode scalar values' above,
+@@ -84,8 +84,8 @@ pub mod string_parser {
+         }
+     }
+ 
+-    /// Parse a Unicode sequence, of the form u{XXXX}, where XXXX is 1 to 6
+-    /// hexadecimal numerals. We will combine this later with [parse_escaped_char]
++    /// Parse a unicode sequence, of the form u{XXXX}, where XXXX is 1 to 6
++    /// hexadecimal numerals. We will combine this later with parse_escaped_char
+     /// to parse sequences like \u{00AC}.
+     fn parse_unicode<'a, E>(input: &'a str) -> IResult<&'a str, char, E>
+     where
+@@ -112,7 +112,7 @@ pub mod string_parser {
+ 
+         // map_opt is like map_res, but it takes an Option instead of a Result. If
+         // the function returns None, map_opt returns an error. In this case, because
+-        // not all u32 values are valid Unicode code points, we have to fallibly
++        // not all u32 values are valid unicode code points, we have to fallibly
+         // convert to char with from_u32.
+         map_opt(parse_u32, std::char::from_u32)(input)
+     }
+@@ -130,8 +130,8 @@ pub mod string_parser {
+                 parse_unicode,
+                 // The `value` parser returns a fixed value (the first argument) if its
+                 // parser (the second argument) succeeds. In these cases, it looks for
+-                // the marker characters (n, r, t, etc.) and returns the matching
+-                // character (\n, \r, \t, etc.).
++                // the marker characters (n, r, t, etc) and returns the matching
++                // character (\n, \r, \t, etc).
+                 value('\n', char('n')),
+                 value('\r', char('r')),
+                 value('\t', char('t')),
+@@ -162,7 +162,7 @@ pub mod string_parser {
+         let not_quote_slash = is_not("\"\\");
+ 
+         // `verify` runs a parser, then runs a verification function on the output of
+-        // the parser. The verification function accepts output only if it
++        // the parser. The verification function accepts out output only if it
+         // returns true. In this case, we want to ensure that the output of is_not
+         // is non-empty.
+         verify(not_quote_slash, |s: &str| !s.is_empty())(input)
+diff --git a/ledger/block/src/header/mod.rs b/ledger/block/src/header/mod.rs
+index 22d3abb6a..9b816070a 100644
+--- a/ledger/block/src/header/mod.rs
++++ b/ledger/block/src/header/mod.rs
+@@ -44,7 +44,7 @@ pub struct Header<N: Network> {
+     ratifications_root: Field<N>,
+     /// The solutions root of the puzzle.
+     solutions_root: Field<N>,
+-    /// The subdag Merkle root of the authority.
++    /// The subdag root of the authority.
+     subdag_root: Field<N>,
+     /// The metadata of the block.
+     metadata: Metadata<N>,
+diff --git a/ledger/block/src/lib.rs b/ledger/block/src/lib.rs
+index 961ee7be1..355c09f0d 100644
+--- a/ledger/block/src/lib.rs
++++ b/ledger/block/src/lib.rs
+@@ -141,8 +141,8 @@ impl<N: Network> Block<N> {
+         )
+     }
+ 
+-    /// Initializes a new block from the given previous block hash, block header, authority,
+-    /// ratifications, solutions, aborted solution IDs, transactions, and aborted transaction IDs.
++    /// Initializes a new block from the given previous block hash, block header,
++    /// authority, ratifications, solutions, transactions, and aborted transaction IDs.
+     pub fn from(
+         previous_hash: N::BlockHash,
+         header: Header<N>,
+@@ -155,31 +155,21 @@ impl<N: Network> Block<N> {
+     ) -> Result<Self> {
+         // Ensure the number of aborted solutions IDs is within the allowed range.
+         if aborted_solution_ids.len() > Solutions::<N>::max_aborted_solutions()? {
+-            bail!(
+-                "Cannot initialize a block with {} aborted solutions IDs which exceed the maximum {}",
+-                aborted_solution_ids.len(),
+-                Solutions::<N>::max_aborted_solutions()?
+-            );
++            bail!("Cannot initialize a block with {} aborted solutions IDs", aborted_solution_ids.len());
+         }
+ 
+         // Ensure the number of transactions is within the allowed range.
+         if transactions.len() > Transactions::<N>::MAX_TRANSACTIONS {
+             bail!(
+-                "Cannot initialize a block with {} confirmed transactions which exceed the maximum {}",
+-                transactions.len(),
++                "Cannot initialize a block with more than {} confirmed transactions",
+                 Transactions::<N>::MAX_TRANSACTIONS
+             );
+         }
+ 
+-        // Here we do not check that the number of solutions is within the allowed range,
+-        // because that was already done when constructing [`Solutions`] values,
+-        // specifically in [`PuzzleSolutions::new()`].
+-
+         // Ensure the number of aborted transaction IDs is within the allowed range.
+         if aborted_transaction_ids.len() > Transactions::<N>::max_aborted_transactions()? {
+             bail!(
+-                "Cannot initialize a block with {} aborted transaction IDs which exceed the maximum {}",
+-                aborted_transaction_ids.len(),
++                "Cannot initialize a block with more than {} aborted transaction IDs",
+                 Transactions::<N>::max_aborted_transactions()?
+             );
+         }
+@@ -237,8 +227,7 @@ impl<N: Network> Block<N> {
+ 
+     /// Initializes a new block from the given block hash, previous block hash, block header,
+     /// authority, ratifications, solutions, transactions, and aborted transaction IDs.
+-    /// This is only called by [`Block::from`], which validates the block components.
+-    fn from_unchecked(
++    pub fn from_unchecked(
+         block_hash: N::BlockHash,
+         previous_hash: N::BlockHash,
+         header: Header<N>,
+@@ -470,7 +459,7 @@ impl<N: Network> Block<N> {
+ }
+ 
+ impl<N: Network> Block<N> {
+-    /// Returns an iterator over the solution IDs in this block.
++    /// Returns the solution IDs in this block.
+     pub fn solution_ids(&self) -> Option<impl '_ + Iterator<Item = &SolutionID<N>>> {
+         self.solutions.as_ref().map(|solution| solution.solution_ids())
+     }
+diff --git a/ledger/block/src/transaction/mod.rs b/ledger/block/src/transaction/mod.rs
+index 5ef231d8e..fe730e167 100644
+--- a/ledger/block/src/transaction/mod.rs
++++ b/ledger/block/src/transaction/mod.rs
+@@ -85,7 +85,7 @@ impl<N: Network> Transaction<N> {
+         // Compute the transaction ID
+         let transaction_id = match &fee {
+             Some(fee) => {
+-                // Compute the root of the transaction tree.
++                // Compute the root of the transacton tree.
+                 *Self::transaction_tree(execution_tree, execution.len(), fee)?.root()
+             }
+             None => execution_id,
+diff --git a/ledger/block/src/verify.rs b/ledger/block/src/verify.rs
+index b5e22e2cf..427fa9544 100644
+--- a/ledger/block/src/verify.rs
++++ b/ledger/block/src/verify.rs
+@@ -225,9 +225,6 @@ impl<N: Network> Block<N> {
+                     subdag.leader_address()
+                 );
+                 // Ensure the transmission IDs from the subdag correspond to the block.
+-                // This is redundant if the block has been created via `Block::from()`;
+-                // however, we need to obtain the solution and transaction IDs here,
+-                // so may want to remove the redundant check in `Block::from()` and leave it here.
+                 Self::check_subdag_transmissions(
+                     subdag,
+                     &self.solutions,
+@@ -254,7 +251,7 @@ impl<N: Network> Block<N> {
+                 "Leader certificate has an incorrect committee ID"
+             );
+ 
+-            // Check that all certificates on each round have the same committee ID.
++            // Check that all all certificates on each round have the same committee ID.
+             cfg_iter!(subdag).try_for_each(|(round, certificates)| {
+                 // Check that every certificate for a given round shares the same committee ID.
+                 let expected_committee_id = certificates
+@@ -324,16 +321,13 @@ impl<N: Network> Block<N> {
+         let timestamp = self.timestamp();
+ 
+         // Ensure the number of solutions is within the allowed range.
+-        // This check is redundant if the block has been created via `Block::from()`.
+         ensure!(
+             self.solutions.len() <= N::MAX_SOLUTIONS,
+             "Block {height} contains too many prover solutions (found '{}', expected '{}')",
+             self.solutions.len(),
+             N::MAX_SOLUTIONS
+         );
+-
+         // Ensure the number of aborted solution IDs is within the allowed range.
+-        // This check is redundant if the block has been created via `Block::from()`.
+         ensure!(
+             self.aborted_solution_ids.len() <= Solutions::<N>::max_aborted_solutions()?,
+             "Block {height} contains too many aborted solution IDs (found '{}')",
+@@ -441,7 +435,6 @@ impl<N: Network> Block<N> {
+         let height = self.height();
+ 
+         // Ensure the number of transactions is within the allowed range.
+-        // This check is redundant if the block has been created via `Block::from()`.
+         if self.transactions.len() > Transactions::<N>::MAX_TRANSACTIONS {
+             bail!(
+                 "Cannot validate a block with more than {} confirmed transactions",
+@@ -450,7 +443,6 @@ impl<N: Network> Block<N> {
+         }
+ 
+         // Ensure the number of aborted transaction IDs is within the allowed range.
+-        // This check is redundant if the block has been created via `Block::from()`.
+         if self.aborted_transaction_ids.len() > Transactions::<N>::max_aborted_transactions()? {
+             bail!(
+                 "Cannot validate a block with more than {} aborted transaction IDs",
+@@ -645,9 +637,9 @@ impl<N: Network> Block<N> {
+         }
+ 
+         // Ensure there are no more solutions in the block.
+-        ensure!(solutions.next().is_none(), "There exist more solutions than expected.");
++        ensure!(solutions.next().is_none(), "There exists more solutions than expected.");
+         // Ensure there are no more transactions in the block.
+-        ensure!(unconfirmed_transactions.next().is_none(), "There exist more transactions than expected.");
++        ensure!(unconfirmed_transactions.next().is_none(), "There exists more transactions than expected.");
+ 
+         // Ensure the aborted solution IDs match.
+         for aborted_solution_id in aborted_solution_ids {
+diff --git a/ledger/narwhal/subdag/src/lib.rs b/ledger/narwhal/subdag/src/lib.rs
+index bc1f0587b..82a1e5dbe 100644
+--- a/ledger/narwhal/subdag/src/lib.rs
++++ b/ledger/narwhal/subdag/src/lib.rs
+@@ -118,6 +118,7 @@ pub struct Subdag<N: Network> {
+ 
+ impl<N: Network> PartialEq for Subdag<N> {
+     fn eq(&self, other: &Self) -> bool {
++        // Note: We do not check equality on `election_certificate_ids` as it would cause `Block::eq` to trigger false-positives.
+         self.subdag == other.subdag
+     }
+ }
+diff --git a/synthesizer/process/Cargo.toml b/synthesizer/process/Cargo.toml
+index ce630b2e2..62fb0706a 100644
+--- a/synthesizer/process/Cargo.toml
++++ b/synthesizer/process/Cargo.toml
+@@ -50,11 +50,6 @@ name = "stack_operations"
+ path = "benches/stack_operations.rs"
+ harness = false
+ 
+-[[bench]]
+-name = "check_deployment"
+-path = "benches/check_deployment.rs"
+-harness = false
+-
+ [dependencies.console]
+ package = "snarkvm-console"
+ path = "../../console"
+diff --git a/synthesizer/process/benches/check_deployment.rs b/synthesizer/process/benches/check_deployment.rs
+deleted file mode 100644
+index 0f7442a7e..000000000
+--- a/synthesizer/process/benches/check_deployment.rs
++++ /dev/null
+@@ -1,156 +0,0 @@
+-// Copyright 2024-2025 Aleo Network Foundation
+-// This file is part of the snarkVM library.
+-
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at:
+-
+-// http://www.apache.org/licenses/LICENSE-2.0
+-
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-#[macro_use]
+-extern crate criterion;
+-
+-use snarkvm_synthesizer_process::{Assignments, CallStack, Process, Stack, StackExecute};
+-use synthesizer_program::{Program, StackProgram};
+-
+-use circuit::AleoV0;
+-use console::{
+-    account::{Address, PrivateKey},
+-    network::{MainnetV0, prelude::*},
+-    program::{Identifier, ProgramID, Request, Value},
+-};
+-use criterion::Criterion;
+-use std::{str::FromStr, time::Duration};
+-use utilities::TestRng;
+-
+-type CurrentNetwork = MainnetV0;
+-type CurrentAleo = AleoV0;
+-
+-fn prepare_check_deployment<N: Network, A: circuit::Aleo<Network = N>>(
+-    c: &mut Criterion,
+-    stack: &Stack<N>,
+-    private_key: &PrivateKey<N>,
+-    function_name: Identifier<N>,
+-    inputs: &[Value<N>],
+-    rng: &mut TestRng,
+-) {
+-    // Retrieve the program.
+-    let program = stack.program();
+-    // Get the program ID.
+-    let program_id = *program.id();
+-    // Retrieve the input types.
+-    let input_types = program.get_function(&function_name).unwrap().input_types();
+-    // Sample 'root_tvk'.
+-    let root_tvk = None;
+-    // Sample 'is_root'.
+-    let is_root = true;
+-    // Compute the request.
+-    let request =
+-        Request::sign(private_key, program_id, function_name, inputs.iter(), &input_types, root_tvk, is_root, rng)
+-            .unwrap();
+-    // Initialize the assignments.
+-    let assignments = Assignments::<N>::default();
+-    // Initialize the call stack.
+-    let call_stack = CallStack::CheckDeployment(vec![request], *private_key, assignments.clone(), None, None);
+-
+-    // Benchmark synthesis of the circuit.
+-    c.bench_function(&format!("CheckDeployment for {function_name}"), |b| {
+-        b.iter(|| {
+-            let _response = stack.execute_function::<A, _>(call_stack.clone(), None, None, rng).unwrap();
+-        })
+-    });
 -}
 -
- impl<N: Network> DeployRequest<N> {
-     /// Sends the request to the given endpoint.
-     pub fn new(deployment: Deployment<N>, address: Address<N>, program_id: ProgramID<N>) -> Self {
-@@ -67,7 +56,7 @@ impl<N: Network> DeployRequest<N> {
- impl<N: Network> Serialize for DeployRequest<N> {
-     /// Serializes the deploy request into string or bytes.
-     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
--        let mut request = serializer.serialize_struct("DeployRequest", 1)?;
-+        let mut request = serializer.serialize_struct("DeployRequest", 3)?;
-         // Serialize the deployment.
-         request.serialize_field("deployment", &self.deployment)?;
-         // Serialize the address.
-@@ -140,22 +129,24 @@ impl<N: Network> Package<N> {
-     ) -> Result<Deployment<N>> {
-         // Retrieve the main program.
-         let program = self.program();
+-fn transfer_private(c: &mut Criterion) {
+-    let rng = &mut TestRng::default();
 -
--        // Retrieve the program ID.
-+        // Retrieve the main program ID.
-         let program_id = program.id();
- 
-+        // Retrieve the Aleo address of the deployment caller.
-+        let caller = self.manifest_file().development_address();
-+
-         // Construct the process.
-         let process = Process::<N>::load()?;
-         let rng = &mut test_crypto_rng();
- 
--        // Make the deploy
-+        // Compute the deployment.
-         let deployment = process.deploy::<A, _>(program, rng).unwrap();
- 
-         match endpoint {
-             Some(ref endpoint) => {
--                // Prepare the request
--                let request = DeployRequest::try_from(deployment.clone())?;
--                // Load the proving and verifying keys.
-+                // Construct the deploy request.
-+                let request = DeployRequest::new(deployment.clone(), *caller, *program_id);
-+                // Send the deploy request.
-                 let response = request.send(endpoint)?;
-                 // Ensure the program ID matches.
-                 ensure!(
+-    // Initialize a new caller account.
+-    let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+-    let caller = Address::try_from(&private_key).unwrap();
+-
+-    // Construct a new process.
+-    let process = Process::load().unwrap();
+-    // Retrieve the stack.
+-    let stack = process.get_stack(ProgramID::from_str("credits.aleo").unwrap()).unwrap();
+-
+-    // Declare the function name.
+-    let function_name = Identifier::from_str("transfer_private").unwrap();
+-
+-    // Declare the inputs.
+-    let r0 = Value::from_str(&format!(
+-        "{{ owner: {caller}.private, microcredits: 1_500_000_000_000_000_u64.private, _nonce: {}.public }}",
+-        console::types::Group::<CurrentNetwork>::zero()
+-    ))
+-    .unwrap();
+-    let r1 = Value::<CurrentNetwork>::from_str(&format!("{caller}")).unwrap();
+-    let r2 = Value::<CurrentNetwork>::from_str("1_500_000_000_000_000_u64").unwrap();
+-
+-    // Compute the assignment.
+-    prepare_check_deployment::<_, CurrentAleo>(c, stack, &private_key, function_name, &[r0, r1, r2], rng);
+-}
+-
+-fn transfer_public(c: &mut Criterion) {
+-    let rng = &mut TestRng::default();
+-
+-    // Initialize a new caller account.
+-    let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+-    let caller = Address::try_from(&private_key).unwrap();
+-
+-    // Construct a new process.
+-    let process = Process::load().unwrap();
+-    // Retrieve the stack.
+-    let stack = process.get_stack(ProgramID::from_str("credits.aleo").unwrap()).unwrap();
+-
+-    // Declare the function name.
+-    let function_name = Identifier::from_str("transfer_public").unwrap();
+-
+-    // Declare the inputs.
+-    let r0 = Value::<CurrentNetwork>::from_str(&format!("{caller}")).unwrap();
+-    let r1 = Value::<CurrentNetwork>::from_str("1_500_000_000_000_000_u64").unwrap();
+-
+-    // Compute the assignment.
+-    prepare_check_deployment::<_, CurrentAleo>(c, stack, &private_key, function_name, &[r0, r1], rng);
+-}
+-
+-fn large_program(c: &mut Criterion) {
+-    let rng = &mut TestRng::default();
+-
+-    let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+-
+-    // Construct a new process.
+-    let process = Process::load().unwrap();
+-    // Create the program.
+-    let program = Program::from_str(
+-        r"
+-program synthesis_overload.aleo;
+-function do:
+-    input r0 as [[u128; 32u32]; 2u32].private;
+-    hash.sha3_256 r0 into r1 as field;
+-    output r1 as field.public;",
+-    )
+-    .unwrap();
+-    // Create the stack.
+-    let stack = Stack::new(&process, &program).unwrap();
+-
+-    // Declare the function name.
+-    let function_name = Identifier::from_str("do").unwrap();
+-
+-    // Declare the inputs.
+-    let r0 = Value::<CurrentNetwork>::from_str("[[1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128], [1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128, 1u128]]").unwrap();
+-
+-    // Compute the assignment.
+-    prepare_check_deployment::<_, CurrentAleo>(c, &stack, &private_key, function_name, &[r0], rng);
+-}
+-
+-criterion_group! {
+-    name = check_deployment;
+-    config = Criterion::default().sample_size(10).measurement_time(Duration::from_secs(10));
+-    targets = large_program, transfer_private, transfer_public
+-}
+-criterion_main!(check_deployment);

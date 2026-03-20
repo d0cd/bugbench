@@ -1,6 +1,6 @@
 id: snarkVM-166
 repo: ProvableHQ/snarkVM
-base_commit: dedc4a0a8e072458880ac0256bf1c0607d031f93^
+base_commit: 40891ae94431b69831d62cf7590bb2901a77bfbe
 head_commit: dedc4a0a8e072458880ac0256bf1c0607d031f93
 fix_commit: dedc4a0a8e072458880ac0256bf1c0607d031f93
 category: api-misuse
@@ -31,14 +31,143 @@ expected_findings:
   summary: Parallel execution cfg guard does not account for WASM feature correctly,
     allowing parallel/threaded code paths to be selected in single-threaded WASM builds
   line_side: pre_fix
-stats: null
+stats:
+  lines_added: 903
+  lines_deleted: 637
+  files_changed: 20
+  hunks: 49
 visibility: public
 needs_manual_review: false
-verified: false
-verified_by: auto-heuristic
+verified: true
+verified_by: auto-v3
 valid_for_code_review: true
 introducing_commit: null
-pr_number: null
-reviewer_notes: []
-reviewer_findings: []
+case_type: fix
+pr_number: 1487
+reviewer_notes:
+- "[thread] @iamalwaysuncomfortable Thank you for putting in this work.\r \r Option\
+  \ 1 is my preferred path. I think we should have a conversation with @howardwu &\
+  \ @raychu86 before committing too much to this path. If we don't go down the road\
+  \ of a stateless SDK, our wallet will have to maintain a fork indefinitel"
+- '[thread] > Option 1 is my preferred path. I think we should have a conversation
+  with @howardwu & @raychu86 before committing too much to this path. If we don''t
+  go down the road of a stateless SDK, our wallet will have to maintain a fork indefinitely.
+  This seems like poor design as the wallet should be a prim'
+reviewer_findings:
+- file: parameters/src/testnet3/mod.rs
+  line: 23
+  summary: 'Note: This is only temporary to enforce CORS. Although the original bucket
+    has CORS we need to enforce it also at the CD'
+  line_side: pre_fix
+- file: synthesizer/src/process/mod.rs
+  line: 165
+  summary: Not *strictly* necessary but highly desired. If we desire to do key synthesis
+    in the web resources & speed are at a prem
+  line_side: pre_fix
+- file: parameters/src/macros.rs
+  line: 93
+  summary: 'This is the core of this PR. There are other approaches (like breaking
+    up synthesizer functions so we can yield back to '
+  line_side: pre_fix
+- file: synthesizer/src/process/stack/inclusion/wasm.rs
+  line: 24
+  summary: If we would like enforce getting inclusion proof data from the web, we
+    need an async version of these functions to allow
+  line_side: pre_fix
+- file: synthesizer/src/process/stack/inclusion/wasm.rs
+  line: 24
+  summary: "The asyncify & awaitify idea would be like so, but it seems like trying\
+    \ too hard.\r \r If we do go for making more things "
+  line_side: pre_fix
+- file: utilities/src/parallel.rs
+  line: 81
+  summary: Outside of wasm, `execute_with_threads` starts up an isolated thread pool
+    to churn through all the rayon annotated paral
+  line_side: pre_fix
+- file: parameters/Cargo.toml
+  line: 54
+  summary: Reformat and make optional
+  line_side: pre_fix
+- file: parameters/src/testnet3/mod.rs
+  line: 23
+  summary: Fix URL
+  line_side: pre_fix
 quality_flags: []
+pr_title: Wasm parameter downloads
+pr_body: "## Motivation\r\n\r\nWhen compiling Rust into WebAssembly meant to be used\
+  \ within a JavaScript context, the execution model differs from a `std` environment.\
+  \ It ends up as WebAssembly executing in a single thread (unless web workers are\
+  \ explicitly used) sharing the `Javascript` `event loop` with Javascript code. Key\
+  \ synthesis and function execution within Aleo is done within a largely synchronous\
+  \ codebase, and when compiled into WebAssembly and called from javascript, this\
+  \ blocks the entire event loop during the execution of key synthesis.\r\n\r\nThe\
+  \ [following lines](https://github.com/AleoHQ/snarkVM/blob/testnet3/parameters/src/macros.rs#L92-L109)\
+  \ (macros.rs 92-109) were the previous approach used to download the parameters\
+  \ within a `wasm` environment. It attempted to spawn a local async task to run alongside\
+  \ the synchronous that would download the parameters and store them within a buffer\
+  \ passed into the function.\r\n```rust\r\n        #[cfg(feature = \"wasm\")]\r\n\
+  \        fn remote_fetch(\r\n            buffer: alloc::sync::Weak<parking_lot::RwLock<Vec<u8>>>,\r\
+  \n            url: &'static str,\r\n        ) -> Result<(), $crate::errors::ParameterError>\
+  \ {\r\n            // NOTE(julesdesmit): We spawn a local thread here in order to\
+  \ be\r\n            // able to accommodate the async syntax from reqwest.\r\n  \
+  \          wasm_bindgen_futures::spawn_local(async move {\r\n                let\
+  \ content = reqwest::get(url).await.unwrap().text().await.unwrap();\r\n\r\n    \
+  \            let buffer = buffer.upgrade().unwrap();\r\n                buffer.write().extend_from_slice(content.as_bytes());\r\
+  \n                drop(buffer);\r\n            });\r\n            Ok(())\r\n   \
+  \     }\r\n    };\r\n}\r\n```\r\n\r\nUnfortunately, this fails because the `spawn_local`\
+  \ function schedules a task on the event loop which can only be executed when the\
+  \ key synthesis process has finished. This means that http call won't run until\
+  \ the synthesis function yields back to the event loop, and thus it cannot download\
+  \ the parameters needed for key synthesis with the normal key synthesis flow. \r\
+  \n\r\nThis leads to a situation where alternative approaches are needed.\r\n\r\n\
+  The following approaches are viable:\r\n1. Pass in `proving` & `verifying` keys\
+  \ externally obtained from a javascript (or other) environment. This is possible,\
+  \ but presents some privacy/security considerations and we did not want this to\
+  \ be the default way of doing web-based proving. It is however, something we should\
+  \ potentially consider allowing in the future (with a checksum and maybe proofs\
+  \ of key validity perhaps) to allow developers flexibility in creating caching strategies\
+  \ for their apps.\r\n2. Create a `wasm` specific `asynchronous` flow. The idea here\
+  \ would be to create wasm-specific functions which break up the existing key synthesis\
+  \ and function execution functions to `yield` at specific points so that the `event\
+  \ loop` can schedule an `http call` and then continue execution once it completes.\
+  \ This is a potentially viable approach in which we'd be able to do the same level\
+  \ of encapsulation, but likely to be more messy/error-prone.\r\n3. Use existing\
+  \ block browser apis. Modern browsers purposely discourage synchronous calls in\
+  \ the browser to discourage un-performant web design, however a few still exist\
+  \ (even if they have a downgraded feature set) and enable us to keep existing proof\
+  \ flow.\r\n\r\nOption #3 is the considered approach here. `XmlHttpRequest` via `web_sys`\
+  \ is introduced in order to make the necessary blocking web calls. Although these\
+  \ will block web pages, the ordinary web proving process will also do so, and so\
+  \ this design is done in the hope that web workers are to be used when possible\
+  \ (which should be almost always given most browsers now support them). \r\n\r\n\
+  It is worth of note here that the approach will not work in `nodejs` as designed\
+  \ - for `nodejs` alternative approaches will tested. This likely will require us\
+  \ to introduce a `web` feature on the parameters crate to delineate between browser\
+  \ & nodejs usage.\r\n\r\n### Steps to mark this PR as ready\r\nThis PR is in draft.\
+  \ Before this PR is marked ready the steps in the test plan below will be followed.\r\
+  \n\r\n## Test Plan\r\n1. Test a sample function execution to ensure that this that\
+  \ this works in major browsers and provide a working demo online that can be accessed\
+  \ by several browsers\r\n2. Introduce a nodejs pathway into this PR and fully test\
+  \ it.\r\n\r\n## Related PRs\r\nThe PR in which we attempted to allow parameter injection\
+  \ is here. It's encouraged to reference this to compare and contrast differences\
+  \ in the approach laid out within this PR: https://github.com/AleoHQ/snarkVM/pull/1441"
+pr_commit_messages:
+- Enabled browser-based wasm parameter downloads via web_sys
+- Enable all tests
+- Add a function for loading the process without downloading key material
+- Enable async inclusion proof data fetching wasm environments
+- Remove custom thread pool initialization from wasm parallel contexts
+- Make encoding dependency wasm only
+- Change parameter source to officials source
+- Newline nit
+- Grammar nit
+- Grammar nit
+- Modify code comments in parameter download macro
+- Re-add key download test code
+- Clippy nit
+- Comment reformats
+- Adds sync and async variants, which adds wasm support
+- "Merge branch 'fix/wasm-parameter-downloads' of https://github.com/Ale\u2026"
+- Refactor query
+- Refactors inclusion
+- Resolve merge conflict

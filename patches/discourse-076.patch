@@ -1,0 +1,831 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index faed07d71dc12..a15ea472db208 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -298,7 +298,7 @@ jobs:
+ 
+       - name: Ember Build
+         if: matrix.build_type == 'system' || matrix.build_type == 'frontend'
+-        run: bin/rake assets:precompile:build_plugins && script/assemble_ember_build.rb
++        run: script/assemble_ember_build.rb
+ 
+       - name: Core QUnit
+         if: matrix.build_type == 'frontend' && matrix.target == 'core'
+diff --git a/app/controllers/categories_controller.rb b/app/controllers/categories_controller.rb
+index b58638ae27573..9a642337a0bb2 100644
+--- a/app/controllers/categories_controller.rb
++++ b/app/controllers/categories_controller.rb
+@@ -206,12 +206,14 @@ def update
+       category_params.delete(:position)
+ 
+       old_custom_fields = cat.custom_fields.dup
+-      if category_params[:custom_fields]
+-        category_params[:custom_fields].each do |key, value|
+-          if value.nil? || value == ""
+-            cat.custom_fields.delete(key)
++      category_params[:custom_fields]&.each do |key, value|
++        if value.nil? || value == ""
++          cat.custom_fields.delete(key)
++        else
++          cat.custom_fields[key] = if value.is_a?(TrueClass) || value.is_a?(FalseClass)
++            value.to_s
+           else
+-            cat.custom_fields[key] = value
++            value
+           end
+         end
+       end
+diff --git a/app/controllers/invites_controller.rb b/app/controllers/invites_controller.rb
+index e0c2c15a3e5e4..571ea10727199 100644
+--- a/app/controllers/invites_controller.rb
++++ b/app/controllers/invites_controller.rb
+@@ -430,8 +430,8 @@ def perform_accept_invitation
+   end
+ 
+   def destroy_all_expired
+-    guardian.ensure_can_destroy_all_invites!
+     user = fetch_user_from_params
++    guardian.ensure_can_destroy_all_invites!(user)
+ 
+     Invite
+       .where(invited_by: user)
+diff --git a/app/controllers/stylesheets_controller.rb b/app/controllers/stylesheets_controller.rb
+index a1a077eec0df3..a65ae6fa1e977 100644
+--- a/app/controllers/stylesheets_controller.rb
++++ b/app/controllers/stylesheets_controller.rb
+@@ -24,7 +24,7 @@ def color_scheme
+     params.require("id")
+     params.permit("theme_id")
+ 
+-    manager = Stylesheet::Manager.new(theme_id: params[:theme_id])
++    manager = Stylesheet::Manager.new(theme_id: params[:theme_id]&.to_i)
+     stylesheet = manager.color_scheme_stylesheet_details(params[:id], fallback_to_base: true)
+ 
+     render json: stylesheet
+diff --git a/app/views/layouts/_plugin_js.html.erb b/app/views/layouts/_plugin_js.html.erb
+index d9aacaa1e7310..301d72cc90e2b 100644
+--- a/app/views/layouts/_plugin_js.html.erb
++++ b/app/views/layouts/_plugin_js.html.erb
+@@ -11,7 +11,6 @@
+         rel="modulepreload"
+         href="<%= script_asset_path(asset[:name]) %>"
+         nonce="<%= csp_nonce_placeholder %>"
+-        data-plugin-name="<%= asset[:plugin].directory_name %>"
+         <%= tag.attributes **asset[:plugin_attributes] %>
+       >
+     <% else %>
+diff --git a/bin/qunit b/bin/qunit
+index c075cce983e0f..f737153472252 100755
+--- a/bin/qunit
++++ b/bin/qunit
+@@ -479,8 +479,7 @@ class QunitRunner
+       return
+     end
+ 
+-    system("pnpm", "ember", "build", chdir: frontend_dir, exception: true)
+-    system("bin/rake assets:precompile:build_plugins", exception: true)
++    system("script/assemble_ember_build.rb", chdir: rails_root, exception: true)
+   end
+ 
+   def build_theme_test_pages(query)
+diff --git a/config/routes.rb b/config/routes.rb
+index efe597dd28af1..dc08e0333ca0d 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -1078,6 +1078,7 @@ def patch(*)
+     get "color-scheme-stylesheet/:id(/:theme_id)" => "stylesheets#color_scheme",
+         :constraints => {
+           format: :json,
++          theme_id: /-?\d+/,
+         }
+     get "theme-javascripts/:digest" => "theme_javascripts#show",
+         :constraints => {
+diff --git a/frontend/discourse/admin/controllers/edit-category/tabs.js b/frontend/discourse/admin/controllers/edit-category/tabs.js
+index 798ed4e9821f5..b737d12bd5c08 100644
+--- a/frontend/discourse/admin/controllers/edit-category/tabs.js
++++ b/frontend/discourse/admin/controllers/edit-category/tabs.js
+@@ -111,13 +111,6 @@ export default class EditCategoryTabsController extends Controller {
+       data.category_setting = { ...(this.model.category_setting ?? {}) };
+       data.custom_fields = { ...(this.model.custom_fields ?? {}) };
+ 
+-      Object.entries(data.custom_fields).forEach(([key, value]) => {
+-        // Coerce to boolean otherwise FormKit checkboxes do not work correctly.
+-        if (value === "true" || value === "false") {
+-          data.custom_fields[key] = value === "true";
+-        }
+-      });
+-
+       if (this.siteSettings.enable_category_type_setup) {
+         data.category_type_site_settings = {};
+ 
+diff --git a/frontend/discourse/app/app.js b/frontend/discourse/app/app.js
+index c8d032b85a5b7..da05289858c27 100644
+--- a/frontend/discourse/app/app.js
++++ b/frontend/discourse/app/app.js
+@@ -24,7 +24,7 @@ import { VERSION } from "@ember/version";
+ import { importSync } from "@embroider/macros";
+ import require from "require";
+ import { normalizeEmberEventHandling } from "discourse/lib/ember-events";
+-import { isTesting } from "discourse/lib/environment";
++import { isRailsTesting, isTesting } from "discourse/lib/environment";
+ import { withPluginApi } from "discourse/lib/plugin-api";
+ import { buildResolver } from "discourse/resolver";
+ 
+@@ -71,6 +71,10 @@ async function loadPluginFromModulePreload(link) {
+     );
+ 
+     if (DEBUG) {
++      if (isRailsTesting() || isTesting()) {
++        throw new Error(error);
++      }
++
+       let { addError } = importSync("discourse/static/development-error");
+       addError(error, link.dataset.pluginName, link.href);
+     }
+diff --git a/frontend/discourse/app/form-kit/components/fk/control/checkbox.gjs b/frontend/discourse/app/form-kit/components/fk/control/checkbox.gjs
+index 548498f3dd855..017ed932fff0e 100644
+--- a/frontend/discourse/app/form-kit/components/fk/control/checkbox.gjs
++++ b/frontend/discourse/app/form-kit/components/fk/control/checkbox.gjs
+@@ -4,22 +4,22 @@ import { action } from "@ember/object";
+ import FKLabel from "discourse/form-kit/components/fk/label";
+ import FKOptional from "discourse/form-kit/components/fk/optional";
+ import FKTooltip from "discourse/form-kit/components/fk/tooltip";
+-import { eq } from "discourse/truth-helpers";
++import { eq, or } from "discourse/truth-helpers";
+ import { i18n } from "discourse-i18n";
+ 
+ export default class FKControlCheckbox extends Component {
+   static controlType = "checkbox";
+ 
+   @action
+-  handleInput() {
+-    this.args.field.set(!this.args.field.value);
++  handleInput(event) {
++    this.args.field.set(event.target.checked);
+   }
+ 
+   <template>
+     <FKLabel class="form-kit__control-checkbox-label">
+       <input
+         type="checkbox"
+-        checked={{eq @field.value true}}
++        checked={{or (eq @field.value true) (eq @field.value "true")}}
+         class="form-kit__control-checkbox"
+         disabled={{@field.disabled}}
+         ...attributes
+diff --git a/frontend/discourse/ember-cli-build.js b/frontend/discourse/ember-cli-build.js
+index 70f421fc084bd..fcfc28e266434 100644
+--- a/frontend/discourse/ember-cli-build.js
++++ b/frontend/discourse/ember-cli-build.js
+@@ -18,6 +18,7 @@ const {
+   CustomizeChunkUrlPlugin,
+ } = require("./lib/webpack-customize-chunk-url-plugin");
+ const { BroccoliMergeFiles } = require("broccoli-merge-files");
++const { mkdirSync } = require("fs");
+ 
+ process.env.BROCCOLI_ENABLED_MEMOIZE = true;
+ 
+@@ -49,6 +50,9 @@ function compatModulesFor(name) {
+ 
+ module.exports = function (defaults) {
+   const discourseRoot = path.resolve("../..");
++  mkdirSync(path.join(discourseRoot, "app/assets/generated"), {
++    recursive: true,
++  });
+ 
+   // Silence deprecations which we are aware of - see `lib/deprecation-silencer.js`
+   DeprecationSilencer.silence(console, "warn");
+@@ -107,7 +111,7 @@ module.exports = function (defaults) {
+           compatModulesFor("dialog-holder"),
+         ]),
+         {
+-          watching: ["../discourse-markdown-it"],
++          watching: ["../discourse-markdown-it", "../../app/assets/generated"],
+         }
+       ),
+     },
+diff --git a/frontend/discourse/tests/integration/components/form-kit/controls/checkbox-test.gjs b/frontend/discourse/tests/integration/components/form-kit/controls/checkbox-test.gjs
+index a4385f45bc8c5..4caf312308aff 100644
+--- a/frontend/discourse/tests/integration/components/form-kit/controls/checkbox-test.gjs
++++ b/frontend/discourse/tests/integration/components/form-kit/controls/checkbox-test.gjs
+@@ -35,6 +35,31 @@ module(
+       assert.deepEqual(data, { foo: true });
+     });
+ 
++    test("when value is string 'false'", async function (assert) {
++      let data = { foo: "false" };
++      const mutateData = (x) => (data = x);
++
++      await render(
++        <template>
++          <Form @onSubmit={{mutateData}} @data={{data}} as |form|>
++            <form.Field @name="foo" @title="Foo" as |field|>
++              <field.Checkbox />
++            </form.Field>
++          </Form>
++        </template>
++      );
++
++      assert.form().field("foo").hasValue(false);
++
++      await formKit().field("foo").toggle();
++
++      assert.form().field("foo").hasValue(true);
++
++      await formKit().submit();
++
++      assert.deepEqual(data, { foo: true });
++    });
++
+     test("when disabled", async function (assert) {
+       await render(
+         <template>
+@@ -79,6 +104,31 @@ module(
+       assert.form().field("foo").hasTitle("Foo (optional)");
+     });
+ 
++    test("when value is string 'true'", async function (assert) {
++      let data = { foo: "true" };
++      const mutateData = (x) => (data = x);
++
++      await render(
++        <template>
++          <Form @onSubmit={{mutateData}} @data={{data}} as |form|>
++            <form.Field @name="foo" @title="Foo" as |field|>
++              <field.Checkbox />
++            </form.Field>
++          </Form>
++        </template>
++      );
++
++      assert.form().field("foo").hasValue(true);
++
++      await formKit().field("foo").toggle();
++
++      assert.form().field("foo").hasValue(false);
++
++      await formKit().submit();
++
++      assert.deepEqual(data, { foo: false });
++    });
++
+     test("required", async function (assert) {
+       await render(
+         <template>
+diff --git a/lib/discourse.rb b/lib/discourse.rb
+index 66ce2269b3c72..129453d1c1b64 100644
+--- a/lib/discourse.rb
++++ b/lib/discourse.rb
+@@ -522,6 +522,7 @@ def self.find_plugin_js_assets(args)
+       asset[:plugin_attributes] = {
+         "data-official": !!asset[:plugin].metadata&.official?,
+         "data-preinstalled": asset[:plugin].preinstalled?,
++        "data-plugin-name": asset[:plugin].directory_name,
+       }
+     end
+ 
+diff --git a/lib/guardian/invite_guardian.rb b/lib/guardian/invite_guardian.rb
+index baad73837bdf7..f077adbd47d67 100644
+--- a/lib/guardian/invite_guardian.rb
++++ b/lib/guardian/invite_guardian.rb
+@@ -54,8 +54,8 @@ def can_resend_all_invites?
+     is_staff?
+   end
+ 
+-  def can_destroy_all_invites?
+-    is_staff?
++  def can_destroy_all_invites?(user)
++    is_staff? && (is_admin? || is_me?(user))
+   end
+ 
+   def can_destroy_invite?(invite)
+diff --git a/lib/plugin/instance.rb b/lib/plugin/instance.rb
+index fe0d6489fcc4e..4de61e08a6b0a 100644
+--- a/lib/plugin/instance.rb
++++ b/lib/plugin/instance.rb
+@@ -963,8 +963,7 @@ def css_asset_exists?(target = nil)
+   end
+ 
+   def js_asset_exists?
+-    # If assets/javascripts exists, ember-cli will output a .js file
+-    File.exist?("#{File.dirname(@path)}/assets/javascripts")
++    Plugin::JsManager.js_asset_exists?(directory_name)
+   end
+ 
+   def extra_js_asset_exists?
+@@ -972,11 +971,11 @@ def extra_js_asset_exists?
+   end
+ 
+   def admin_js_asset_exists?
+-    File.exist?("#{File.dirname(@path)}/admin/assets/javascripts")
++    Plugin::JsManager.admin_js_asset_exists?(directory_name)
+   end
+ 
+   def test_js_asset_exists?
+-    File.exist?("#{File.dirname(@path)}/test/javascripts")
++    Plugin::JsManager.test_js_asset_exists?(directory_name)
+   end
+ 
+   # Receives an array with two elements:
+diff --git a/lib/plugin/js_manager.rb b/lib/plugin/js_manager.rb
+index b58e01f730999..12fe506593c50 100644
+--- a/lib/plugin/js_manager.rb
++++ b/lib/plugin/js_manager.rb
+@@ -2,20 +2,32 @@
+ 
+ module Plugin
+   class JsManager
+-    @manifest_data = {}
++    @cache = {}
+ 
+-    def self.read_manifest(plugin_name)
+-      manifest_path = "#{Rails.root}/app/assets/generated/#{plugin_name}/manifest.json"
+-      JSON.parse(File.read(manifest_path))
+-    rescue Errno::ENOENT
+-      {}
++    def self.js_asset_exists?(plugin_name)
++      maybe_cache("js_asset_exists_#{plugin_name}") do
++        has_source_files_in_dir(plugin_name, "assets/javascripts")
++      end
+     end
+ 
+-    def self.parsed_manifest(plugin_name)
+-      if Rails.env.production?
+-        @manifest_data[plugin_name] ||= read_manifest(plugin_name)
+-      else
+-        read_manifest(plugin_name)
++    def self.admin_js_asset_exists?(plugin_name)
++      maybe_cache("admin_js_asset_exists_#{plugin_name}") do
++        has_source_files_in_dir(plugin_name, "admin/assets/javascripts")
++      end
++    end
++
++    def self.test_js_asset_exists?(plugin_name)
++      maybe_cache("test_js_asset_exists_#{plugin_name}") do
++        has_source_files_in_dir(plugin_name, "test/javascripts")
++      end
++    end
++
++    def self.read_manifest(plugin_name)
++      maybe_cache("manifest_#{plugin_name}") do
++        manifest_path = "#{Rails.root}/app/assets/generated/#{plugin_name}/manifest.json"
++        JSON.parse(File.read(manifest_path))
++      rescue Errno::ENOENT
++        {}
+       end
+     end
+ 
+@@ -181,6 +193,8 @@ def watch
+       end
+     end
+ 
++    private
++
+     def minify?
+       Rails.env.production?
+     end
+@@ -192,5 +206,17 @@ def cache?
+     def log(message)
+       STDERR.puts "[Plugin::JsManager] #{message}"
+     end
++
++    private_class_method def self.maybe_cache(key, &blk)
++      if Rails.env.production?
++        @cache.fetch(key, &blk)
++      else
++        blk.call
++      end
++    end
++
++    private_class_method def self.has_source_files_in_dir(plugin_name, dir)
++      Dir.glob("plugins/#{plugin_name}/#{dir}/**/*.{js,hbs,gjs,es6}") { break true } || false
++    end
+   end
+ end
+diff --git a/lib/stylesheet/manager.rb b/lib/stylesheet/manager.rb
+index 637bc1746a433..31fd678a04c19 100644
+--- a/lib/stylesheet/manager.rb
++++ b/lib/stylesheet/manager.rb
+@@ -341,35 +341,23 @@ def stylesheet_details(target = :desktop, media = "all")
+ 
+   def color_scheme_stylesheet_details(color_scheme_id = nil, fallback_to_base: true)
+     theme_id = @theme_id || SiteSetting.default_theme_id
++    theme_id = nil if !Theme.theme_ids.include?(theme_id)
+ 
+     color_scheme = ColorScheme.find_by(id: color_scheme_id)
++    return if !color_scheme && !fallback_to_base
+ 
+-    if !color_scheme
+-      return if !fallback_to_base
+-      color_scheme = get_theme(theme_id)&.color_scheme || ColorScheme.base
+-    end
+-
+-    target = COLOR_SCHEME_STYLESHEET.to_sym
+-    current_hostname = Discourse.current_hostname
++    theme = theme_id ? get_theme(theme_id) : nil
++    color_scheme ||= theme&.color_scheme || ColorScheme.base
+     cache_key = self.class.color_scheme_cache_key(color_scheme, theme_id)
+ 
+     cache.defer_get_set(cache_key) do
+       stylesheet = { color_scheme_id: color_scheme.id }
+ 
+-      theme = get_theme(theme_id)
+-
+       builder =
+-        Builder.new(
+-          target: target,
+-          theme: get_theme(theme_id),
+-          color_scheme: color_scheme,
+-          manager: self,
+-        )
+-
++        Builder.new(target: COLOR_SCHEME_STYLESHEET.to_sym, theme:, color_scheme:, manager: self)
+       builder.compile unless File.exist?(builder.stylesheet_fullpath)
+ 
+-      href = builder.stylesheet_absolute_url
+-      stylesheet[:new_href] = href
++      stylesheet[:new_href] = builder.stylesheet_absolute_url
+ 
+       stylesheet.freeze
+     end
+diff --git a/lib/tasks/assets.rake b/lib/tasks/assets.rake
+index 1f23ebc570112..e8b65a9162edf 100644
+--- a/lib/tasks/assets.rake
++++ b/lib/tasks/assets.rake
+@@ -31,11 +31,7 @@ task "assets:precompile:build_plugins": "environment" do
+   end
+ end
+ 
+-task "assets:precompile:before": %w[
+-       environment
+-       assets:precompile:build
+-       assets:precompile:build_plugins
+-     ]
++task "assets:precompile:before": %w[environment assets:precompile:build]
+ 
+ task "assets:precompile:css" => "environment" do
+   if ENV["DONT_PRECOMPILE_CSS"] == "1" || ENV["SKIP_DB_AND_REDIS"] == "1"
+diff --git a/plugins/chat/assets/javascripts/discourse/initializers/chat-keyboard-shortcuts.js b/plugins/chat/assets/javascripts/discourse/initializers/chat-keyboard-shortcuts.js
+index f28721b46da15..ba79a2452265f 100644
+--- a/plugins/chat/assets/javascripts/discourse/initializers/chat-keyboard-shortcuts.js
++++ b/plugins/chat/assets/javascripts/discourse/initializers/chat-keyboard-shortcuts.js
+@@ -131,6 +131,16 @@ export default {
+         chatThreadListPane.close();
+         return;
+       }
++
++      if (chatStateManager.isPinnedMessagesPaneOpen) {
++        event.preventDefault();
++        event.stopPropagation();
++        router.transitionTo(
++          "chat.channel",
++          ...chatService.activeChannel.routeModels
++        );
++        return;
++      }
+     };
+ 
+     const markAllChannelsRead = (event) => {
+diff --git a/plugins/chat/assets/javascripts/discourse/services/chat-state-manager.js b/plugins/chat/assets/javascripts/discourse/services/chat-state-manager.js
+index d9416556d2691..5cedc9531d6ca 100644
+--- a/plugins/chat/assets/javascripts/discourse/services/chat-state-manager.js
++++ b/plugins/chat/assets/javascripts/discourse/services/chat-state-manager.js
+@@ -165,6 +165,10 @@ export default class ChatStateManager extends Service {
+     return this.isFullPageActive || this.isDrawerActive;
+   }
+ 
++  get isPinnedMessagesPaneOpen() {
++    return this.router.currentRouteName === "chat.channel.pins";
++  }
++
+   storeAppURL(url = null) {
+     if (url) {
+       this._appURL = url;
+diff --git a/plugins/chat/spec/system/shortcuts/full_page_spec.rb b/plugins/chat/spec/system/shortcuts/full_page_spec.rb
+index df32ae4f0c010..930400102d606 100644
+--- a/plugins/chat/spec/system/shortcuts/full_page_spec.rb
++++ b/plugins/chat/spec/system/shortcuts/full_page_spec.rb
+@@ -24,6 +24,25 @@
+     end
+   end
+ 
++  context "when pressing Esc" do
++    fab!(:message) { Fabricate(:chat_message, chat_channel: channel_1, use_service: true) }
++    fab!(:pin) { Fabricate(:chat_pinned_message, chat_message: message, user: current_user) }
++
++    before { SiteSetting.chat_pinned_messages = true }
++
++    it "closes the pinned messages list" do
++      chat.visit_channel(channel_1)
++      find(".c-navbar__pinned-messages-btn").click
++
++      expect(page).to have_css(".c-routes.--channel-pins")
++
++      page.send_keys(:escape)
++
++      expect(page).to have_no_css(".c-routes.--channel-pins")
++      expect(page).to have_current_path(channel_1.url)
++    end
++  end
++
+   context "with chat search" do
+     context "when disabled" do
+       before { SiteSetting.chat_search_enabled = false }
+diff --git a/plugins/discourse-ai/assets/javascripts/discourse/admin/models/ai-embedding.js b/plugins/discourse-ai/assets/javascripts/discourse/admin/models/ai-embedding.js
+index 2d6e1cff5ef64..d518dd292df1c 100644
+--- a/plugins/discourse-ai/assets/javascripts/discourse/admin/models/ai-embedding.js
++++ b/plugins/discourse-ai/assets/javascripts/discourse/admin/models/ai-embedding.js
+@@ -30,6 +30,7 @@ export default class AiEmbedding extends RestModel {
+ 
+   async testConfig() {
+     return await ajax(`/admin/plugins/discourse-ai/ai-embeddings/test.json`, {
++      type: "POST",
+       data: { ai_embedding: this.createProperties() },
+     });
+   }
+diff --git a/plugins/discourse-ai/config/routes.rb b/plugins/discourse-ai/config/routes.rb
+index f888ae2c665e9..e96b4ed1604ca 100644
+--- a/plugins/discourse-ai/config/routes.rb
++++ b/plugins/discourse-ai/config/routes.rb
+@@ -147,7 +147,7 @@
+               only: %i[index new create edit update destroy],
+               path: "ai-embeddings",
+               controller: "discourse_ai/admin/ai_embeddings" do
+-      collection { get :test }
++      collection { post :test }
+     end
+ 
+     resources :ai_features,
+diff --git a/plugins/discourse-ai/spec/requests/admin/ai_embeddings_controller_spec.rb b/plugins/discourse-ai/spec/requests/admin/ai_embeddings_controller_spec.rb
+index aad3b1f70b455..7809b8fc20d60 100644
+--- a/plugins/discourse-ai/spec/requests/admin/ai_embeddings_controller_spec.rb
++++ b/plugins/discourse-ai/spec/requests/admin/ai_embeddings_controller_spec.rb
+@@ -234,15 +234,26 @@
+     end
+   end
+ 
+-  describe "GET #test" do
++  describe "POST #test" do
++    it "is not accessible via GET" do
++      WebMock.stub_request(:post, valid_attrs[:url]).to_return(status: 200, body: [[1]].to_json)
++
++      get "/admin/plugins/discourse-ai/ai-embeddings/test.json",
++          params: {
++            ai_embedding: valid_attrs,
++          }
++
++      expect(response.status).to eq(404)
++    end
++
+     context "when we can generate an embedding" do
+       it "returns a success true flag" do
+         WebMock.stub_request(:post, valid_attrs[:url]).to_return(status: 200, body: [[1]].to_json)
+ 
+-        get "/admin/plugins/discourse-ai/ai-embeddings/test.json",
+-            params: {
+-              ai_embedding: valid_attrs,
+-            }
++        post "/admin/plugins/discourse-ai/ai-embeddings/test.json",
++             params: {
++               ai_embedding: valid_attrs,
++             }
+ 
+         expect(response).to be_successful
+         expect(response.parsed_body["success"]).to eq(true)
+@@ -258,10 +269,10 @@
+           body: error_message.to_json,
+         )
+ 
+-        get "/admin/plugins/discourse-ai/ai-embeddings/test.json",
+-            params: {
+-              ai_embedding: valid_attrs,
+-            }
++        post "/admin/plugins/discourse-ai/ai-embeddings/test.json",
++             params: {
++               ai_embedding: valid_attrs,
++             }
+ 
+         expect(response).to be_successful
+         expect(response.parsed_body["success"]).to eq(false)
+diff --git a/plugins/discourse-solved/app/services/discourse_solved/accept_answer.rb b/plugins/discourse-solved/app/services/discourse_solved/accept_answer.rb
+index c6ec5500db265..378a1028011ad 100644
+--- a/plugins/discourse-solved/app/services/discourse_solved/accept_answer.rb
++++ b/plugins/discourse-solved/app/services/discourse_solved/accept_answer.rb
+@@ -69,7 +69,7 @@ def mark_as_solved(post:, topic:, guardian:)
+   end
+ 
+   def should_notify_post_author(post:, guardian:)
+-    return if guardian.user.id == post.user_id
++    return if guardian.user.id == post.user_id || !User.exists?(post.user_id)
+     screener = UserCommScreener.new(acting_user_id: guardian.user.id, target_user_ids: post.user_id)
+     !screener.ignoring_or_muting_actor?(post.user_id)
+   end
+@@ -91,7 +91,7 @@ def notify_post_author(post:, topic:, guardian:)
+ 
+   def should_notify_topic_owner(topic:, guardian:)
+     return unless SiteSetting.notify_on_staff_accept_solved
+-    return if guardian.user.id == topic.user_id
++    return if guardian.user.id == topic.user_id || !User.exists?(topic.user_id)
+     screener =
+       UserCommScreener.new(acting_user_id: guardian.user.id, target_user_ids: topic.user_id)
+     !screener.ignoring_or_muting_actor?(topic.user_id)
+diff --git a/plugins/discourse-solved/spec/integration/solved_spec.rb b/plugins/discourse-solved/spec/integration/solved_spec.rb
+index 378030a5a9cc1..92dd9acc62797 100644
+--- a/plugins/discourse-solved/spec/integration/solved_spec.rb
++++ b/plugins/discourse-solved/spec/integration/solved_spec.rb
+@@ -366,6 +366,29 @@
+       end
+     end
+ 
++    it "works when the post author has been deleted" do
++      reply = Fabricate(:post, post_number: 2, topic: topic)
++      reply.user.destroy!
++      reply.reload
++
++      post "/solution/accept.json", params: { id: reply.id }
++
++      expect(response.status).to eq(200)
++      expect(topic.solved.answer_post_id).to eq(reply.id)
++    end
++
++    it "works when the topic author has been deleted" do
++      SiteSetting.notify_on_staff_accept_solved = true
++      SiteSetting.solved_topics_auto_close_hours = 0
++      topic.user.destroy!
++      topic.reload
++
++      post "/solution/accept.json", params: { id: p1.id }
++
++      expect(response.status).to eq(200)
++      expect(topic.solved.answer_post_id).to eq(p1.id)
++    end
++
+     it "does not set a timer when the topic is closed" do
+       topic.update!(closed: true)
+       post "/solution/accept.json", params: { id: p1.id }
+diff --git a/script/assemble_ember_build.rb b/script/assemble_ember_build.rb
+index 4d1d1c5ede5b4..435e9c24a3333 100755
+--- a/script/assemble_ember_build.rb
++++ b/script/assemble_ember_build.rb
+@@ -162,6 +162,7 @@ def download_prebuild_assets!
+     system(build_env, *build_cmd, exception: true, chdir: EMBER_APP_DIR)
+     File.write(BUILD_INFO_FILE, JSON.pretty_generate(build_info))
+   end
++  system("bin/rake", "assets:precompile:build_plugins", exception: true)
+ else
+   if core_build_reusable && ENV["LOAD_PLUGINS"] == "0"
+     log "Reusing existing core ember build. Plugins not loaded. All done."
+diff --git a/spec/lib/guardian/invite_guardian_spec.rb b/spec/lib/guardian/invite_guardian_spec.rb
+index b10a31eb19992..1232dadfc6317 100644
+--- a/spec/lib/guardian/invite_guardian_spec.rb
++++ b/spec/lib/guardian/invite_guardian_spec.rb
+@@ -290,16 +290,20 @@
+   ###### DELETION ######
+ 
+   describe "#can_destroy_all_invites?" do
+-    it "returns true for admin users" do
+-      expect(Guardian.new(admin).can_destroy_all_invites?).to be_truthy
++    it "returns true for admin users for any target user" do
++      expect(Guardian.new(admin).can_destroy_all_invites?(user)).to be_truthy
+     end
+ 
+-    it "returns true for moderators" do
+-      expect(Guardian.new(moderator).can_destroy_all_invites?).to be_truthy
++    it "returns true for moderators for their own invites" do
++      expect(Guardian.new(moderator).can_destroy_all_invites?(moderator)).to be_truthy
++    end
++
++    it "returns false for moderators for another user's invites" do
++      expect(Guardian.new(moderator).can_destroy_all_invites?(user)).to be_falsey
+     end
+ 
+     it "returns false for regular users" do
+-      expect(Guardian.new(user).can_destroy_all_invites?).to be_falsey
++      expect(Guardian.new(user).can_destroy_all_invites?(user)).to be_falsey
+     end
+   end
+ end
+diff --git a/spec/requests/categories_controller_spec.rb b/spec/requests/categories_controller_spec.rb
+index 584038303af6c..fdd526eb9a6ef 100644
+--- a/spec/requests/categories_controller_spec.rb
++++ b/spec/requests/categories_controller_spec.rb
+@@ -914,6 +914,7 @@
+                 custom_fields: {
+                   "dancing" => "frogs",
+                   "running" => %w[turtle salamander],
++                  "enable_thingy" => true,
+                 },
+                 minimum_required_tags: "",
+                 allow_global_tags: "true",
+@@ -933,6 +934,7 @@
+           expect(category.custom_fields).to eq(
+             "dancing" => "frogs",
+             "running" => %w[turtle salamander],
++            "enable_thingy" => "true",
+           )
+           expect(category.minimum_required_tags).to eq(0)
+           expect(category.allow_global_tags).to eq(true)
+diff --git a/spec/requests/invites_controller_spec.rb b/spec/requests/invites_controller_spec.rb
+index 37351a0b94c90..7055f52450ceb 100644
+--- a/spec/requests/invites_controller_spec.rb
++++ b/spec/requests/invites_controller_spec.rb
+@@ -1690,6 +1690,25 @@
+       expect(response.status).to eq(403)
+       expect(expired_invite.reload.deleted_at).to eq(nil)
+     end
++
++    it "does not allow a moderator to delete another user's expired invites" do
++      moderator = Fabricate(:moderator)
++      sign_in(moderator)
++      post "/invites/destroy-all-expired", params: { username: user.username }
++
++      expect(response.status).to eq(403)
++      expect(expired_invite.reload.deleted_at).to eq(nil)
++    end
++
++    it "allows a moderator to delete their own expired invites" do
++      moderator = Fabricate(:moderator)
++      mod_expired_invite = Fabricate(:invite, invited_by: moderator, expires_at: 2.days.ago)
++      sign_in(moderator)
++      post "/invites/destroy-all-expired", params: { username: moderator.username }
++
++      expect(response.status).to eq(200)
++      expect(mod_expired_invite.reload.deleted_at).to be_present
++    end
+   end
+ 
+   describe "#resend_invite" do
+diff --git a/spec/requests/stylesheets_controller_spec.rb b/spec/requests/stylesheets_controller_spec.rb
+index 91ee070a11346..3063e2784265b 100644
+--- a/spec/requests/stylesheets_controller_spec.rb
++++ b/spec/requests/stylesheets_controller_spec.rb
+@@ -159,5 +159,21 @@
+       json = JSON.parse(response.body)
+       expect(json["color_scheme_id"]).to eq(scheme.id)
+     end
++
++    it "does not create duplicate cache entries for incorrect theme_ids" do
++      scheme = ColorScheme.create_from_base(name: "test scheme", colors: [])
++      incorrect_theme_id = Theme.maximum(:id).to_i + 100
++
++      Stylesheet::Manager.cache.clear
++      expect(Stylesheet::Manager.cache.hash.size).to eq(0)
++
++      get "/color-scheme-stylesheet/#{scheme.id}/#{incorrect_theme_id}.json"
++      expect(response.status).to eq(200)
++      expect(Stylesheet::Manager.cache.hash.size).to eq(1)
++
++      get "/color-scheme-stylesheet/#{scheme.id}/#{incorrect_theme_id + 1}.json"
++      expect(response.status).to eq(200)
++      expect(Stylesheet::Manager.cache.hash.size).to eq(1)
++    end
+   end
+ end
+diff --git a/spec/support/shared_examples/core_features.rb b/spec/support/shared_examples/core_features.rb
+index bf6b7f3186f64..3776ffe44f4cf 100644
+--- a/spec/support/shared_examples/core_features.rb
++++ b/spec/support/shared_examples/core_features.rb
+@@ -214,4 +214,30 @@
+       end
+     end
+   end
++
++  describe "plugin javascript assets" do
++    it "has expected javascript asset" do
++      enabled_plugins = Discourse.plugins.filter(&:enabled?)
++
++      visit "/"
++      expect(page).to have_css("#site-logo")
++
++      plugin_script_tags =
++        page
++          .all(
++            "script[data-plugin-name], link[rel=modulepreload][data-plugin-name]",
++            visible: :all,
++            minimum: 0,
++          )
++          .map { |tag| tag["data-plugin-name"] }
++
++      enabled_plugins.each do |plugin|
++        if plugin.js_asset_exists?
++          expect(plugin_script_tags).to include(plugin.name)
++        else
++          expect(plugin_script_tags).not_to include(plugin.name)
++        end
++      end
++    end
++  end
+ end
+diff --git a/themes/horizon/scss/main.scss b/themes/horizon/scss/main.scss
+index fabb9f15b4cef..23182217691bd 100644
+--- a/themes/horizon/scss/main.scss
++++ b/themes/horizon/scss/main.scss
+@@ -88,7 +88,7 @@ body:not(.has-full-page-chat, .wizard) {
+       }
+ 
+       @include viewport.from(sm) {
+-        > *:not(.experimental-screen, .activate-account) {
++        > *:not(.experimental-screen, .activate-account, .kanban-board-viewer) {
+           box-sizing: border-box;
+           max-width: 1000px;
+           margin-inline: auto;

@@ -1,0 +1,162 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 5d01fbaa48ff8f..e91892bf45e281 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -100,6 +100,7 @@ dependencies = [
+     "statsd>=3.3.0",
+     "structlog>=22.1.0",
+     "symbolic>=12.14.1",
++    "taskbroker-client>=0.1.4",
+     "tiktoken>=0.8.0",
+     "tokenizers>=0.22.0",
+     "tldextract>=5.1.2",
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 30ed82907c2687..4ae0bbcffa4b20 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -834,6 +834,9 @@ def SOCIAL_AUTH_DEFAULT_USERNAME() -> str:
+ # Expected to be a JSON encoded dictionary of namespace:topic
+ TASKWORKER_ROUTES = os.getenv("TASKWORKER_ROUTES")
+ 
++# Used to switch from sentry.taskworker to taskbroker_client - Temporary
++TASKWORKER_USE_LIBRARY = os.getenv("TASKWORKER_USE_LIBRARY") == "1"
++
+ # The list of modules that workers will import after starting up
+ # Taskworkers need to import task modules to make tasks
+ # accessible to the worker.
+diff --git a/src/sentry/seer/explorer/client.py b/src/sentry/seer/explorer/client.py
+index 8af2248b24d5cf..f7f7dfd80eef75 100644
+--- a/src/sentry/seer/explorer/client.py
++++ b/src/sentry/seer/explorer/client.py
+@@ -523,10 +523,15 @@ def push_changes(
+             SeerApiError: If the Seer API request fails
+         """
+         # Trigger PR creation
++        payload: dict[str, Any] = {"type": "create_pr"}
++        if repo_name:
++            payload["repo_name"] = repo_name
++        if self.on_completion_hook:
++            payload["on_completion_hook"] = extract_hook_definition(self.on_completion_hook).dict()
+         update_body = ExplorerUpdateRequest(
+             run_id=run_id,
+             organization_id=self.organization.id,
+-            payload={"type": "create_pr", "repo_name": repo_name},
++            payload=payload,
+         )
+         response = make_explorer_update_request(update_body)
+         if response.status >= 400:
+diff --git a/src/sentry/utils/snuba_rpc.py b/src/sentry/utils/snuba_rpc.py
+index 850c224a19ec86..ff5654e319267e 100644
+--- a/src/sentry/utils/snuba_rpc.py
++++ b/src/sentry/utils/snuba_rpc.py
+@@ -84,7 +84,7 @@ class SnubaRPCRateLimitExceeded(SnubaRPCError):
+ 
+ 
+ class SnubaRPCRequest(Protocol):
+-    def SerializeToString(self, deterministic: bool = ...) -> bytes: ...
++    def SerializeToString(self, *, deterministic: bool = ...) -> bytes: ...
+ 
+     @property
+     def meta(
+diff --git a/static/app/views/issueDetails/streamline/sidebar/seerDrawer.tsx b/static/app/views/issueDetails/streamline/sidebar/seerDrawer.tsx
+index 05aeeaeaad2e50..d1e8e4e3df0d02 100644
+--- a/static/app/views/issueDetails/streamline/sidebar/seerDrawer.tsx
++++ b/static/app/views/issueDetails/streamline/sidebar/seerDrawer.tsx
+@@ -505,21 +505,14 @@ export const useOpenSeerDrawer = ({
+       return;
+     }
+ 
+-    const isExplorerVersion =
+-      isSeerExplorerEnabled(organization) &&
+-      organization.features.includes('autofix-on-explorer');
+-
+     openDrawer(() => <SeerDrawer group={group} project={project} event={event} />, {
+       ariaLabel: t('Seer drawer'),
+       drawerKey: 'seer-autofix-drawer',
+-      drawerCss: isExplorerVersion
+-        ? undefined
+-        : css`
+-            height: fit-content;
+-            max-height: 100%;
+-          `,
+-      resizable: !isExplorerVersion,
+-      drawerWidth: isExplorerVersion ? '50%' : undefined,
++      drawerCss: css`
++        height: fit-content;
++        max-height: 100%;
++      `,
++      resizable: true,
+       shouldCloseOnInteractOutside: () => {
+         return false;
+       },
+@@ -561,7 +554,7 @@ const StyledCard = styled('div')`
+ const SeerDrawerContainer = styled('div')`
+   height: 100%;
+   display: grid;
+-  grid-template-rows: auto auto auto 1fr;
++  grid-template-rows: max-content max-content auto;
+   position: relative;
+   background: ${p => p.theme.tokens.background.secondary};
+ `;
+diff --git a/uv.lock b/uv.lock
+index 792b155399e8b0..a599de18a6abff 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2194,6 +2194,7 @@ dependencies = [
+     { name = "stripe", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+     { name = "structlog", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+     { name = "symbolic", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "taskbroker-client", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+     { name = "tiktoken", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+     { name = "tldextract", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+     { name = "tokenizers", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+@@ -2359,6 +2360,7 @@ requires-dist = [
+     { name = "stripe", specifier = ">=6.7.0" },
+     { name = "structlog", specifier = ">=22.1.0" },
+     { name = "symbolic", specifier = ">=12.14.1" },
++    { name = "taskbroker-client", specifier = ">=0.1.4" },
+     { name = "tiktoken", specifier = ">=0.8.0" },
+     { name = "tldextract", specifier = ">=5.1.2" },
+     { name = "tokenizers", specifier = ">=0.22.0" },
+@@ -2729,6 +2731,28 @@ wheels = [
+     { url = "https://pypi.devinfra.sentry.io/wheels/symbolic-12.14.1-py2.py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:f13625d3923db47c464db12f3b78d40d6ff9d2be07d1e099d881d00be343b234" },
+ ]
+ 
++[[package]]
++name = "taskbroker-client"
++version = "0.1.4"
++source = { registry = "https://pypi.devinfra.sentry.io/simple" }
++dependencies = [
++    { name = "confluent-kafka", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "cronsim", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "grpcio", version = "1.67.0", source = { registry = "https://pypi.devinfra.sentry.io/simple" }, marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (python_full_version < '3.14' and sys_platform == 'linux')" },
++    { name = "grpcio", version = "1.75.1", source = { registry = "https://pypi.devinfra.sentry.io/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'darwin') or (python_full_version >= '3.14' and sys_platform == 'linux')" },
++    { name = "orjson", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "protobuf", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "redis", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "redis-py-cluster", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "sentry-arroyo", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "sentry-protos", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "sentry-sdk", extra = ["http2"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++    { name = "zstandard", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
++]
++wheels = [
++    { url = "https://pypi.devinfra.sentry.io/wheels/taskbroker_client-0.1.4-py3-none-any.whl", hash = "sha256:60b2e15f6378d2567ccb04d5cf13ffab771d3330baeabf2c54f19a94d2ee944a" },
++]
++
+ [[package]]
+ name = "tiktoken"
+ version = "0.8.0"
+@@ -2907,10 +2931,10 @@ wheels = [
+ 
+ [[package]]
+ name = "types-protobuf"
+-version = "4.23.0.1"
++version = "6.30.2.20250703"
+ source = { registry = "https://pypi.devinfra.sentry.io/simple" }
+ wheels = [
+-    { url = "https://pypi.devinfra.sentry.io/wheels/types_protobuf-4.23.0.1-py3-none-any.whl", hash = "sha256:c926104f69ea62103846681b35b690d8d100ecf86c6cdda16c850a1313a272e4" },
++    { url = "https://pypi.devinfra.sentry.io/wheels/types_protobuf-6.30.2.20250703-py3-none-any.whl", hash = "sha256:fa5aff9036e9ef432d703abbdd801b436a249b6802e4df5ef74513e272434e57" },
+ ]
+ 
+ [[package]]

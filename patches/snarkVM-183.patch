@@ -1,120 +1,1747 @@
-diff --git a/.circleci/config.yml b/.circleci/config.yml
-index 4aad60852..a3937f633 100644
---- a/.circleci/config.yml
-+++ b/.circleci/config.yml
-@@ -15,7 +15,7 @@ parameters:
-     default: xlarge
-   twoxlarge:
-     type: string
--    default: aleonet/2xlarge
-+    default: 2xlarge
+diff --git a/Cargo.lock b/Cargo.lock
+index f9d161a7f..6cb5ae2d8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1896,9 +1896,9 @@ dependencies = [
  
- orbs:
-   windows: circleci/windows@5.0
-@@ -682,10 +682,20 @@ jobs:
-     resource_class: << pipeline.parameters.twoxlarge >>
-     steps:
-       - run_serial:
--          flags: --lib --bins -- --test-threads=2
-+          flags: --lib --bins
-           workspace_member: synthesizer
-           cache_key: v1.0.0-rust-1.81.0-snarkvm-synthesizer-cache
+ [[package]]
+ name = "proc-macro2"
+-version = "1.0.76"
++version = "1.0.78"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "95fc56cda0b5c3325f5fbbd7ff9fda9e02bb00bb3dac51252d2f1bfa1cb8cc8c"
++checksum = "e2422ad645d89c99f8f3e6b88a9fdeca7fabeac836b1002371c4367c8f984aae"
+ dependencies = [
+  "unicode-ident",
+ ]
+@@ -2068,13 +2068,13 @@ dependencies = [
  
-+  synthesizer-mem-heavy:
-+    docker:
-+      - image: cimg/rust:1.81.0 # Attention - Change the MSRV in Cargo.toml and rust-toolchain as well
-+    resource_class: << pipeline.parameters.twoxlarge >>
-+    steps:
-+      - run_serial:
-+          flags: -- --ignored test_deployment_synthesis_overload test_deep_nested_execution_cost
-+          workspace_member: synthesizer
-+          cache_key: v1.0.0-rust-1.81.0-snarkvm-synthesizer-mem-heavy-cache
+ [[package]]
+ name = "regex"
+-version = "1.10.2"
++version = "1.10.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "380b951a9c5e80ddfd6136919eef32310721aa4aacd4889a8d39124b026ab343"
++checksum = "b62dbe01f0b06f9d8dc7d49e05a0785f153b00b2c227856282f671e0318c9b15"
+ dependencies = [
+  "aho-corasick",
+  "memchr",
+- "regex-automata 0.4.3",
++ "regex-automata 0.4.4",
+  "regex-syntax 0.8.2",
+ ]
+ 
+@@ -2089,9 +2089,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "regex-automata"
+-version = "0.4.3"
++version = "0.4.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5f804c7828047e88b2d32e2d7fe5a105da8ee3264f01902f796c8e067dc2483f"
++checksum = "3b7fa1134405e2ec9353fd416b17f8dacd46c473d7d3fd1cf202706a14eb792a"
+ dependencies = [
+  "aho-corasick",
+  "memchr",
+diff --git a/ledger/block/src/ratify/bytes.rs b/ledger/block/src/ratify/bytes.rs
+index bab850390..879c56383 100644
+--- a/ledger/block/src/ratify/bytes.rs
++++ b/ledger/block/src/ratify/bytes.rs
+@@ -41,8 +41,22 @@ impl<N: Network> FromBytes for Ratify<N> {
+                     // Insert the public balance.
+                     public_balances.insert(address, amount);
+                 }
++                // Read the number of bonded balances.
++                let num_bonded_balances: u16 = FromBytes::read_le(&mut reader)?;
++                // Read the bonded balances.
++                let mut bonded_balances = BondedBalances::with_capacity(num_bonded_balances as usize);
++                for _ in 0..num_bonded_balances {
++                    // Read the address.
++                    let address: Address<N> = FromBytes::read_le(&mut reader)?;
++                    // Read the validator address.
++                    let validator_address: Address<N> = FromBytes::read_le(&mut reader)?;
++                    // Read the amount.
++                    let amount: u64 = FromBytes::read_le(&mut reader)?;
++                    // Insert the bonded balance.
++                    bonded_balances.insert(address, (validator_address, amount));
++                }
+                 // Return the ratify object.
+-                Self::Genesis(committee, public_balances)
++                Self::Genesis(Box::new(committee), Box::new(public_balances), Box::new(bonded_balances))
+             }
+             1 => {
+                 // Read the amount.
+@@ -69,12 +83,18 @@ impl<N: Network> ToBytes for Ratify<N> {
+         1u8.write_le(&mut writer)?;
+ 
+         match self {
+-            Self::Genesis(committee, public_balances) => {
++            Self::Genesis(committee, public_balances, bonded_balances) => {
+                 (0 as Variant).write_le(&mut writer)?;
+                 committee.write_le(&mut writer)?;
+                 u16::try_from(public_balances.len()).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?;
+-                for (address, amount) in public_balances {
++                for (address, amount) in public_balances.iter() {
++                    address.write_le(&mut writer)?;
++                    amount.write_le(&mut writer)?;
++                }
++                u16::try_from(bonded_balances.len()).map_err(|e| error(e.to_string()))?.write_le(&mut writer)?;
++                for (address, (validator_address, amount)) in bonded_balances.iter() {
+                     address.write_le(&mut writer)?;
++                    validator_address.write_le(&mut writer)?;
+                     amount.write_le(&mut writer)?;
+                 }
+                 Ok(())
+diff --git a/ledger/block/src/ratify/mod.rs b/ledger/block/src/ratify/mod.rs
+index 0cc1c6f37..a7996250f 100644
+--- a/ledger/block/src/ratify/mod.rs
++++ b/ledger/block/src/ratify/mod.rs
+@@ -24,11 +24,14 @@ use indexmap::IndexMap;
+ type Variant = u8;
+ /// A helper type to represent the public balances.
+ type PublicBalances<N> = IndexMap<Address<N>, u64>;
++/// A helper type to represent the bonded balances.
++type BondedBalances<N> = IndexMap<Address<N>, (Address<N>, u64)>;
+ 
++// Note: The size of the `Ratify` object is 32 bytes.
+ #[derive(Clone, PartialEq, Eq)]
+ pub enum Ratify<N: Network> {
+     /// The genesis.
+-    Genesis(Committee<N>, PublicBalances<N>),
++    Genesis(Box<Committee<N>>, Box<PublicBalances<N>>, Box<BondedBalances<N>>),
+     /// The block reward.
+     BlockReward(u64),
+     /// The puzzle reward.
+@@ -55,11 +58,23 @@ pub(crate) mod test_helpers {
+         for (address, _) in committee.members().iter() {
+             public_balances.insert(*address, rng.gen());
+         }
++        let bonded_balances =
++            committee.members().iter().map(|(address, (amount, _))| (*address, (*address, *amount))).collect();
+ 
+         vec![
+-            Ratify::Genesis(committee, public_balances),
++            Ratify::Genesis(Box::new(committee), Box::new(public_balances), Box::new(bonded_balances)),
+             Ratify::BlockReward(rng.gen()),
+             Ratify::PuzzleReward(rng.gen()),
+         ]
+     }
+ }
 +
-   synthesizer-integration:
-     docker:
-       - image: cimg/rust:1.81.0 # Attention - Change the MSRV in Cargo.toml and rust-toolchain as well
-@@ -966,6 +976,7 @@ workflows:
-       - parameters
-       - parameters-uncached
-       - synthesizer
-+      - synthesizer-mem-heavy
-       - synthesizer-integration
-       - synthesizer-process
-       - synthesizer-process-with-rocksdb
-diff --git a/parameters/src/mainnet/mod.rs b/parameters/src/mainnet/mod.rs
-index 029e0922f..83cb38712 100644
---- a/parameters/src/mainnet/mod.rs
-+++ b/parameters/src/mainnet/mod.rs
-@@ -41,7 +41,12 @@ impl_remote!(Degree24, REMOTE_URL, "resources/", "powers-of-beta-24", "usrs");
- impl_remote!(Degree25, REMOTE_URL, "resources/", "powers-of-beta-25", "usrs");
- impl_remote!(Degree26, REMOTE_URL, "resources/", "powers-of-beta-26", "usrs");
- impl_remote!(Degree27, REMOTE_URL, "resources/", "powers-of-beta-27", "usrs");
--impl_remote!(Degree28, REMOTE_URL, "resources/", "powers-of-beta-28", "usrs");
-+// TODO (nkls): restore on CI.
-+// The SRS is only used for proving and we don't currently support provers of
-+// this size. When a users wants to create a proof, they load the appropriate
-+// powers for the circuit in `batch_circuit_setup` which calls `max_degree`
-+// based on the domain size.
-+// impl_remote!(Degree28, REMOTE_URL, "resources/", "powers-of-beta-28", "usrs");
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn check_ratify_size() {
++        assert_eq!(std::mem::size_of::<Ratify<console::network::MainnetV0>>(), 32);
++    }
++}
+diff --git a/ledger/block/src/ratify/serialize.rs b/ledger/block/src/ratify/serialize.rs
+index a6c4f9a24..3bb89fe5f 100644
+--- a/ledger/block/src/ratify/serialize.rs
++++ b/ledger/block/src/ratify/serialize.rs
+@@ -19,11 +19,12 @@ impl<N: Network> Serialize for Ratify<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => match self {
+-                Self::Genesis(committee, public_balances) => {
+-                    let mut input = serializer.serialize_struct("Ratify", 3)?;
++                Self::Genesis(committee, public_balances, bonded_balances) => {
++                    let mut input = serializer.serialize_struct("Ratify", 4)?;
+                     input.serialize_field("type", "genesis")?;
+                     input.serialize_field("committee", &committee)?;
+                     input.serialize_field("public_balances", &public_balances)?;
++                    input.serialize_field("bonded_balances", &bonded_balances)?;
+                     input.end()
+                 }
+                 Self::BlockReward(amount) => {
+@@ -60,8 +61,11 @@ impl<'de, N: Network> Deserialize<'de> for Ratify<N> {
+                         // Retrieve the public balances.
+                         let public_balances: PublicBalances<N> =
+                             DeserializeExt::take_from_value::<D>(&mut object, "public_balances")?;
++                        // Retrieve the bonded balances.
++                        let bonded_balances: BondedBalances<N> =
++                            DeserializeExt::take_from_value::<D>(&mut object, "bonded_balances")?;
+                         // Construct the ratify object.
+-                        Ratify::Genesis(committee, public_balances)
++                        Ratify::Genesis(Box::new(committee), Box::new(public_balances), Box::new(bonded_balances))
+                     }
+                     Some("block_reward") => {
+                         // Retrieve the amount.
+diff --git a/ledger/committee/src/lib.rs b/ledger/committee/src/lib.rs
+index b360cf3e2..e198b08e7 100644
+--- a/ledger/committee/src/lib.rs
++++ b/ledger/committee/src/lib.rs
+@@ -36,6 +36,8 @@ use std::collections::HashSet;
+ pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000_000u64; // microcredits
+ /// The minimum amount of stake required for a delegator to bond.
+ pub const MIN_DELEGATOR_STAKE: u64 = 10_000_000u64; // microcredits
++/// The maximum number of delegators.
++pub const MAX_DELEGATORS: u32 = 100_000u32;
  
- // Shifted Degrees
- #[cfg(not(feature = "wasm"))]
-@@ -62,7 +67,9 @@ impl_remote!(ShiftedDegree23, REMOTE_URL, "resources/", "shifted-powers-of-beta-
- impl_remote!(ShiftedDegree24, REMOTE_URL, "resources/", "shifted-powers-of-beta-24", "usrs");
- impl_remote!(ShiftedDegree25, REMOTE_URL, "resources/", "shifted-powers-of-beta-25", "usrs");
- impl_remote!(ShiftedDegree26, REMOTE_URL, "resources/", "shifted-powers-of-beta-26", "usrs");
--impl_remote!(ShiftedDegree27, REMOTE_URL, "resources/", "shifted-powers-of-beta-27", "usrs");
-+// TODO (nkls): restore on CI.
-+// See `Degree28` above for context.
-+// impl_remote!(ShiftedDegree27, REMOTE_URL, "resources/", "shifted-powers-of-beta-27", "usrs");
+ #[derive(Clone, PartialEq, Eq)]
+ pub struct Committee<N: Network> {
+diff --git a/ledger/src/advance.rs b/ledger/src/advance.rs
+index ba8de721f..2c15ae0dc 100644
+--- a/ledger/src/advance.rs
++++ b/ledger/src/advance.rs
+@@ -239,7 +239,17 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
+         let next_height = previous_block.height().saturating_add(1);
+         // Determine the timestamp for the next block.
+         let next_timestamp = match subdag {
+-            Some(subdag) => subdag.timestamp(&self.latest_committee()?),
++            Some(subdag) => {
++                // Get the committee lookback round.
++                let committee_lookback_round =
++                    subdag.anchor_round().saturating_sub(Committee::<N>::COMMITTEE_LOOKBACK_RANGE);
++                // Retrieve the committee lookback.
++                let committee_lookback = self
++                    .get_committee_for_round(committee_lookback_round)?
++                    .ok_or(anyhow!("Failed to fetch committee for round {committee_lookback_round}"))?;
++                // Return the timestamp for the given committee lookback.
++                subdag.timestamp(&committee_lookback)
++            }
+             None => OffsetDateTime::now_utc().unix_timestamp(),
+         };
+         // Compute the next cumulative weight.
+diff --git a/ledger/src/tests.rs b/ledger/src/tests.rs
+index be02b0839..26744f15c 100644
+--- a/ledger/src/tests.rs
++++ b/ledger/src/tests.rs
+@@ -15,6 +15,7 @@
+ use crate::{
+     advance::split_candidate_solutions,
+     test_helpers::{CurrentLedger, CurrentNetwork},
++    Ledger,
+     RecordsFilter,
+ };
+ use aleo_std::StorageMode;
+@@ -23,7 +24,9 @@ use console::{
+     network::prelude::*,
+     program::{Entry, Identifier, Literal, Plaintext, ProgramID, Value},
+ };
++use indexmap::IndexMap;
+ use ledger_block::{ConfirmedTransaction, Rejected, Transaction};
++use ledger_committee::{Committee, MIN_VALIDATOR_STAKE};
+ use ledger_store::{helpers::memory::ConsensusMemory, ConsensusStore};
+ use synthesizer::{program::Program, vm::VM};
  
- // Powers of Beta Times Gamma * G
- impl_local!(Gamma, "resources/", "powers-of-beta-gamma", "usrs");
-diff --git a/parameters/src/mainnet/powers.rs b/parameters/src/mainnet/powers.rs
-index c12245f07..a18f6338d 100644
---- a/parameters/src/mainnet/powers.rs
-+++ b/parameters/src/mainnet/powers.rs
-@@ -415,7 +415,8 @@ impl<E: PairingEngine> PowersOfBetaG<E> {
-                 NUM_POWERS_25 => Degree25::load_bytes()?,
-                 NUM_POWERS_26 => Degree26::load_bytes()?,
-                 NUM_POWERS_27 => Degree27::load_bytes()?,
--                NUM_POWERS_28 => Degree28::load_bytes()?,
-+                // TODO (nkls): restore on CI.
-+                // NUM_POWERS_28 => Degree28::load_bytes()?,
-                 _ => bail!("Cannot download an invalid degree of '{num_powers}'"),
-             };
+@@ -544,6 +547,23 @@ fn test_bond_and_unbond_validator() {
+     let committee = ledger.latest_committee().unwrap();
+     assert!(committee.is_committee_member(new_member_address));
  
-@@ -492,7 +493,8 @@ impl<E: PairingEngine> PowersOfBetaG<E> {
-                 NUM_POWERS_24 => ShiftedDegree24::load_bytes()?,
-                 NUM_POWERS_25 => ShiftedDegree25::load_bytes()?,
-                 NUM_POWERS_26 => ShiftedDegree26::load_bytes()?,
--                NUM_POWERS_27 => ShiftedDegree27::load_bytes()?,
-+                // TODO (nkls): restore on CI.
-+                // NUM_POWERS_27 => ShiftedDegree27::load_bytes()?,
-                 _ => bail!("Cannot download an invalid degree of '{num_powers}'"),
-             };
++    // Check that number of validators in the `metadata` mapping in `credtis.aleo` is updated.
++    let program_id = ProgramID::<CurrentNetwork>::from_str("credits.aleo").unwrap();
++    let metadata_mapping_name = Identifier::from_str("metadata").unwrap();
++    let key = Plaintext::<CurrentNetwork>::from_str("aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc")
++        .unwrap();
++    let num_validators = match ledger
++        .vm()
++        .finalize_store()
++        .get_value_confirmed(program_id, metadata_mapping_name, &key)
++        .unwrap()
++        .unwrap()
++    {
++        Value::Plaintext(Plaintext::Literal(Literal::U32(num_validators), _)) => *num_validators as usize,
++        _ => panic!("Unexpected value type"),
++    };
++    assert_eq!(num_validators, committee.num_members());
++
+     // Construct the bond public
+     let unbond_amount = committee.get_stake(new_member_address); // 1 million credits.
+     let inputs = [Value::from_str(&format!("{unbond_amount}u64")).unwrap()];
+@@ -566,6 +586,23 @@ fn test_bond_and_unbond_validator() {
+     // Check that the committee does not include the new member.
+     let committee = ledger.latest_committee().unwrap();
+     assert!(!committee.is_committee_member(new_member_address));
++
++    // Check that number of validators in the `metadata` mapping in `credtis.aleo` is updated.
++    let program_id = ProgramID::<CurrentNetwork>::from_str("credits.aleo").unwrap();
++    let metadata_mapping_name = Identifier::from_str("metadata").unwrap();
++    let key = Plaintext::<CurrentNetwork>::from_str("aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc")
++        .unwrap();
++    let num_validators = match ledger
++        .vm()
++        .finalize_store()
++        .get_value_confirmed(program_id, metadata_mapping_name, &key)
++        .unwrap()
++        .unwrap()
++    {
++        Value::Plaintext(Plaintext::Literal(Literal::U32(num_validators), _)) => *num_validators as usize,
++        _ => panic!("Unexpected value type"),
++    };
++    assert_eq!(num_validators, committee.num_members());
+ }
  
-diff --git a/synthesizer/src/vm/execute.rs b/synthesizer/src/vm/execute.rs
-index 97ab70d37..42d831d10 100644
---- a/synthesizer/src/vm/execute.rs
-+++ b/synthesizer/src/vm/execute.rs
-@@ -915,6 +915,7 @@ finalize test:
+ #[test]
+@@ -1301,3 +1338,162 @@ fn test_split_candidate_solutions() {
+             split_candidate_solutions(candidate_solutions, max_solutions, |candidate| candidate % 2 == 0);
+     }
+ }
++
++#[test]
++fn test_max_committee_limit_with_bonds() {
++    // Initialize an RNG.
++    let rng = &mut TestRng::default();
++
++    // Initialize the VM.
++    let vm = VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
++
++    // Construct the validators, one less than the maximum committee size.
++    let validators = (0..Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE - 1)
++        .map(|_| {
++            let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++            let amount = MIN_VALIDATOR_STAKE;
++            let is_open = true;
++            (private_key, (amount, is_open))
++        })
++        .collect::<IndexMap<_, _>>();
++
++    // Track the allocated amount.
++    let mut allocated_amount = 0;
++
++    // Construct the committee.
++    let mut committee_map = IndexMap::new();
++    for (private_key, (amount, _)) in &validators {
++        let address = Address::try_from(private_key).unwrap();
++        committee_map.insert(address, (*amount, true));
++        allocated_amount += *amount;
++    }
++
++    // Initialize two new validators.
++    let first_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++    let first_address = Address::try_from(&first_private_key).unwrap();
++    let second_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++    let second_address = Address::try_from(&second_private_key).unwrap();
++
++    // Construct the public balances, allocating the remaining supply to the first validator and two new validators.
++    // The remaining validators will have a balance of 0.
++    let mut public_balances = IndexMap::new();
++    for (private_key, _) in &validators {
++        public_balances.insert(Address::try_from(private_key).unwrap(), 0);
++    }
++    let remaining_supply = <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount;
++    let amount = remaining_supply / 3;
++    public_balances.insert(Address::try_from(validators.keys().next().unwrap()).unwrap(), amount);
++    public_balances.insert(first_address, amount);
++    public_balances.insert(second_address, remaining_supply - 2 * amount);
++
++    // Construct the bonded balances.
++    let bonded_balances = validators
++        .iter()
++        .map(|(private_key, (amount, _))| {
++            let address = Address::try_from(private_key).unwrap();
++            (address, (address, *amount))
++        })
++        .collect();
++
++    // Construct the genesis block, which should pass.
++    let genesis_block = vm
++        .genesis_quorum(
++            validators.keys().next().unwrap(),
++            Committee::new_genesis(committee_map).unwrap(),
++            public_balances,
++            bonded_balances,
++            rng,
++        )
++        .unwrap();
++
++    // Initialize a Ledger from the genesis block.
++    let ledger =
++        Ledger::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::load(genesis_block, StorageMode::Production)
++            .unwrap();
++
++    // Bond the first validator.
++    let bond_first_transaction = ledger
++        .vm()
++        .execute(
++            &first_private_key,
++            ("credits.aleo", "bond_public"),
++            vec![
++                Value::<CurrentNetwork>::from_str(&first_address.to_string()).unwrap(),
++                Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap(),
++            ]
++            .iter(),
++            None,
++            0,
++            None,
++            rng,
++        )
++        .unwrap();
++
++    // Create a block.
++    let block = ledger
++        .prepare_advance_to_next_beacon_block(
++            validators.keys().next().unwrap(),
++            vec![],
++            vec![],
++            vec![bond_first_transaction],
++            rng,
++        )
++        .unwrap();
++
++    // Check that the next block is valid.
++    ledger.check_next_block(&block, rng).unwrap();
++
++    // Check that the first validator is not in the committee.
++    let committee = ledger.latest_committee().unwrap();
++    assert!(!committee.is_committee_member(first_address));
++
++    // Add the block to the ledger.
++    ledger.advance_to_next_block(&block).unwrap();
++
++    // Check that the first validator was added to the committee.
++    let committee = ledger.latest_committee().unwrap();
++    assert!(committee.is_committee_member(first_address));
++
++    // Attempt to bond the second validator.
++    let bond_second_transaction = ledger
++        .vm()
++        .execute(
++            &second_private_key,
++            ("credits.aleo", "bond_public"),
++            vec![
++                Value::<CurrentNetwork>::from_str(&second_address.to_string()).unwrap(),
++                Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap(),
++            ]
++            .iter(),
++            None,
++            0,
++            None,
++            rng,
++        )
++        .unwrap();
++
++    // Create a block.
++    let block = ledger
++        .prepare_advance_to_next_beacon_block(
++            validators.keys().next().unwrap(),
++            vec![],
++            vec![],
++            vec![bond_second_transaction],
++            rng,
++        )
++        .unwrap();
++
++    // Check that the next block is valid.
++    ledger.check_next_block(&block, rng).unwrap();
++
++    // Check that the second validator is not in the committee.
++    let committee = ledger.latest_committee().unwrap();
++    assert!(!committee.is_committee_member(second_address));
++
++    // Add the block to the ledger.
++    ledger.advance_to_next_block(&block).unwrap();
++
++    // Check that the second validator was not added to the committee.
++    let committee = ledger.latest_committee().unwrap();
++    assert!(!committee.is_committee_member(second_address));
++}
+diff --git a/parameters/src/mainnet/genesis.rs b/parameters/src/mainnet/genesis.rs
+index bd0dc48cd..523c13a24 100644
+--- a/parameters/src/mainnet/genesis.rs
++++ b/parameters/src/mainnet/genesis.rs
+@@ -27,6 +27,6 @@ mod tests {
+     #[test]
+     fn test_genesis_block() {
+         let bytes = GenesisBytes::load_bytes();
+-        assert_eq!(13925, bytes.len() as u64, "Update me if serialization has changed");
++        assert_eq!(14503, bytes.len() as u64, "Update me if serialization has changed");
+     }
+ }
+diff --git a/parameters/src/mainnet/resources/block.genesis b/parameters/src/mainnet/resources/block.genesis
+index 77027a880..c29a790c8 100644
+Binary files a/parameters/src/mainnet/resources/block.genesis and b/parameters/src/mainnet/resources/block.genesis differ
+diff --git a/synthesizer/src/vm/finalize.rs b/synthesizer/src/vm/finalize.rs
+index 8d759526d..cd353ac1d 100644
+--- a/synthesizer/src/vm/finalize.rs
++++ b/synthesizer/src/vm/finalize.rs
+@@ -14,6 +14,8 @@
+ 
+ use super::*;
+ 
++use ledger_committee::{MAX_DELEGATORS, MIN_DELEGATOR_STAKE, MIN_VALIDATOR_STAKE};
++
+ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+     /// Speculates on the given list of transactions in the VM.
+     ///
+@@ -193,12 +195,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+ 
+             // Initialize an iterator for ratifications before finalize.
+             let pre_ratifications = ratifications.iter().filter(|r| match r {
+-                Ratify::Genesis(_, _) => true,
++                Ratify::Genesis(_, _, _) => true,
+                 Ratify::BlockReward(..) | Ratify::PuzzleReward(..) => false,
+             });
+             // Initialize an iterator for ratifications after finalize.
+             let post_ratifications = ratifications.iter().filter(|r| match r {
+-                Ratify::Genesis(_, _) => false,
++                Ratify::Genesis(_, _, _) => false,
+                 Ratify::BlockReward(..) | Ratify::PuzzleReward(..) => true,
+             });
+ 
+@@ -525,12 +527,12 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+         atomic_finalize!(self.finalize_store(), FinalizeMode::RealRun, {
+             // Initialize an iterator for ratifications before finalize.
+             let pre_ratifications = ratifications.iter().filter(|r| match r {
+-                Ratify::Genesis(_, _) => true,
++                Ratify::Genesis(_, _, _) => true,
+                 Ratify::BlockReward(..) | Ratify::PuzzleReward(..) => false,
+             });
+             // Initialize an iterator for ratifications after finalize.
+             let post_ratifications = ratifications.iter().filter(|r| match r {
+-                Ratify::Genesis(_, _) => false,
++                Ratify::Genesis(_, _, _) => false,
+                 Ratify::BlockReward(..) | Ratify::PuzzleReward(..) => true,
+             });
+ 
+@@ -770,7 +772,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+         // Iterate over the ratifications.
+         for ratify in pre_ratifications {
+             match ratify {
+-                Ratify::Genesis(committee, public_balances) => {
++                Ratify::Genesis(committee, public_balances, bonded_balances) => {
+                     // Ensure this is the genesis block.
+                     ensure!(state.block_height() == 0, "Ratify::Genesis(..) expected a genesis block");
+                     // Ensure the genesis committee round is 0.
+@@ -783,6 +785,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                         committee.members().len() <= Committee::<N>::MAX_COMMITTEE_SIZE as usize,
+                         "Ratify::Genesis(..) exceeds the maximum number of committee members"
+                     );
++                    // Ensure that the number of delegators does not exceed the maximum.
++                    ensure!(
++                        bonded_balances.len().saturating_sub(committee.members().len()) <= MAX_DELEGATORS as usize,
++                        "Ratify::Genesis(..) exceeds the maximum number of delegators"
++                    );
+                     // Ensure genesis has not been ratified yet.
+                     ensure!(!is_genesis_ratified, "Ratify::Genesis(..) has already been ratified");
+ 
+@@ -798,20 +805,62 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                     //     }
+                     // }
+ 
+-                    // Initialize the stakers.
+-                    let mut stakers = IndexMap::with_capacity(committee.members().len());
+-                    // Iterate over the committee members.
+-                    for (validator, (microcredits, _)) in committee.members() {
+-                        // Insert the validator into the stakers.
+-                        stakers.insert(*validator, (*validator, *microcredits));
++                    // Calculate the stake per validator using `bonded_balances`.
++                    let mut stake_per_validator = IndexMap::with_capacity(committee.members().len());
++                    for (address, (validator_address, amount)) in bonded_balances.iter() {
++                        // Check that the amount meets the minimum requirement, depending on whether the address is a validator.
++                        if *address == *validator_address {
++                            ensure!(
++                                *amount >= MIN_VALIDATOR_STAKE,
++                                "Ratify::Genesis(..) the validator {address} must stake at least {MIN_VALIDATOR_STAKE}",
++                            );
++                        } else {
++                            ensure!(
++                                *amount >= MIN_DELEGATOR_STAKE,
++                                "Ratify::Genesis(..) the delegator {address} must stake at least {MIN_DELEGATOR_STAKE}",
++                            );
++                            // If the address is a delegator, check that the corresponding validator is open.
++                            ensure!(
++                                committee.is_committee_member_open(*validator_address),
++                                "Ratify::Genesis(..) the delegator {address} is delegating to a closed validator {validator_address}",
++                            );
++                        }
++                        // Accumulate the staked amount per validator.
++                        let total = stake_per_validator.entry(validator_address).or_insert(0u64);
++                        *total = total.saturating_add(*amount);
+                     }
++                    // Ensure the stake per validator matches the committee.
++                    ensure!(
++                        stake_per_validator.len() == committee.members().len(),
++                        "Ratify::Genesis(..) the number of validators in the committee does not match the number of validators in the bonded balances",
++                    );
++
++                    // Check that `committee` is consistent with `stake_per_validator`.
++                    for (validator_address, amount) in &stake_per_validator {
++                        // Retrieve the expected validator stake from the committee.
++                        let Some((expected_amount, _)) = committee.members().get(*validator_address) else {
++                            bail!(
++                                "Ratify::Genesis(..) found a validator in the bonded balances that is not in the committee"
++                            )
++                        };
++                        // Ensure the staked amount matches the committee.
++                        ensure!(
++                            *expected_amount == *amount,
++                            "Ratify::Genesis(..) inconsistent staked amount for validator {validator_address}",
++                        );
++                    }
++                    // Ensure that the total stake matches the sum of the staked amounts.
++                    ensure!(
++                        committee.total_stake() == stake_per_validator.values().sum::<u64>(),
++                        "Ratify::Genesis(..) incorrect total total stake for the committee"
++                    );
+ 
+                     // Construct the next committee map and next bonded map.
+                     let (next_committee_map, next_bonded_map) =
+-                        to_next_commitee_map_and_bonded_map(committee, &stakers);
++                        to_next_commitee_map_and_bonded_map(committee, bonded_balances);
+ 
+                     // Insert the next committee into storage.
+-                    store.committee_store().insert(state.block_height(), committee.clone())?;
++                    store.committee_store().insert(state.block_height(), *(committee.clone()))?;
+                     // Store the finalize operations for updating the committee and bonded mapping.
+                     finalize_operations.extend(&[
+                         // Replace the committee mapping in storage.
+@@ -831,24 +880,33 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+                         )?,
+                     ]);
+ 
+-                    // Iterate over the public balances.
+-                    for (address, amount) in public_balances {
+-                        // Construct the key.
+-                        let key = Plaintext::from(Literal::Address(*address));
+-                        // Retrieve the current public balance.
+-                        let value = store.get_value_speculative(program_id, account_mapping, &key)?;
+-                        // Compute the next public balance.
+-                        let next_value = Value::from(Literal::U64(U64::new(match value {
+-                            Some(Value::Plaintext(Plaintext::Literal(Literal::U64(value), _))) => {
+-                                (*value).saturating_add(*amount)
+-                            }
+-                            None => *amount,
+-                            v => bail!("Critical bug in pre-ratify - Invalid public balance type ({v:?})"),
+-                        })));
+-                        // Update the public balance in finalize storage.
+-                        let operation = store.update_key_value(program_id, account_mapping, key, next_value)?;
+-                        finalize_operations.push(operation);
+-                    }
++                    // Update the number of delegators.
++                    finalize_operations.extend(&[
++                        // Update the number of delegators in the metadata mapping.
++                        store.update_key_value(
++                            program_id,
++                            metadata_mapping,
++                            Plaintext::from_str("aleo1qgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqanmpl0")?,
++                            Value::from_str(&format!(
++                                "{}u32",
++                                bonded_balances.len().saturating_sub(committee.num_members())
++                            ))?,
++                        )?,
++                    ]);
++
++                    // Map the public balances into the appropriate format.
++                    let public_balances = public_balances
++                        .iter()
++                        .map(|(address, amount)| {
++                            (Plaintext::from(Literal::Address(*address)), Value::from(Literal::U64(U64::new(*amount))))
++                        })
++                        .collect::<Vec<_>>();
++
++                    // Update the public balances.
++                    finalize_operations.extend(&[
++                        // Update the public balances in storage.
++                        store.replace_mapping(program_id, account_mapping, public_balances)?,
++                    ]);
+ 
+                     // Set the genesis ratification flag.
+                     is_genesis_ratified = true;
+@@ -985,7 +1043,7 @@ mod tests {
+         types::Field,
+     };
+     use ledger_block::{Block, Header, Metadata, Transaction, Transition};
+-    use ledger_committee::MIN_VALIDATOR_STAKE;
++    use ledger_committee::{MAX_DELEGATORS, MIN_VALIDATOR_STAKE};
+     use ledger_store::helpers::memory::ConsensusMemory;
+     use synthesizer_program::Program;
+ 
+@@ -1073,7 +1131,7 @@ finalize transfer_public:
+         // Speculate on the candidate ratifications, solutions, and transactions.
+         let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = vm.speculate(
+             sample_finalize_state(previous_block.height() + 1),
+-            Some(0),
++            None,
+             vec![],
+             &None.into(),
+             transactions.iter(),
+@@ -1247,6 +1305,85 @@ finalize transfer_public:
+         }
+     }
+ 
++    /// Samples the validators.
++    fn sample_validators<N: Network>(num_validators: usize, rng: &mut TestRng) -> IndexMap<PrivateKey<N>, (u64, bool)> {
++        (0..num_validators)
++            .map(|_| {
++                let private_key = PrivateKey::new(rng).unwrap();
++                let amount = MIN_VALIDATOR_STAKE;
++                let is_open = true;
++                (private_key, (amount, is_open))
++            })
++            .collect::<IndexMap<_, _>>()
++    }
++
++    /// Returns a `committee_map` and the `allocated_amount` given the validators and delegators.
++    fn sample_committee_map_and_allocated_amount<N: Network>(
++        validators: &IndexMap<PrivateKey<N>, (u64, bool)>,
++        delegators: &IndexMap<PrivateKey<N>, (Address<N>, u64)>,
++    ) -> (IndexMap<Address<N>, (u64, bool)>, u64) {
++        // Reset the tracked amount.
++        let mut allocated_amount = 0;
++
++        // Construct the **correct** committee.
++        let mut committee_map = IndexMap::new();
++        for (private_key, (amount, is_open)) in validators {
++            let address = Address::try_from(private_key).unwrap();
++            committee_map.insert(address, (*amount, *is_open));
++            allocated_amount += amount;
++        }
++        for (delegator, (validator, amount)) in delegators {
++            if let indexmap::map::Entry::Occupied(mut entry) = committee_map.entry(*validator) {
++                let (current_amount, is_open) = entry.get();
++                // Ensure the validator is open.
++                assert!(*is_open, "delegator {delegator} is delegating {amount} microcredits to a closed validator");
++                // Update the committee map.
++                entry.insert((current_amount + amount, *is_open));
++            } else {
++                unreachable!("delegator {delegator} is delegating to a closed validator")
++            }
++            // Accumulate the allocated amount.
++            allocated_amount += amount;
++        }
++
++        (committee_map, allocated_amount)
++    }
++
++    /// Returns the `bonded_balances` given the validators and delegators.
++    fn sample_bonded_balances<N: Network>(
++        validators: &IndexMap<PrivateKey<N>, (u64, bool)>,
++        delegators: &IndexMap<PrivateKey<N>, (Address<N>, u64)>,
++    ) -> IndexMap<Address<N>, (Address<N>, u64)> {
++        let mut bonded_balances = IndexMap::with_capacity(validators.len() + delegators.len());
++        for (private_key, (amount, _)) in validators {
++            let address = Address::try_from(private_key).unwrap();
++            bonded_balances.insert(address, (address, *amount));
++        }
++        for (private_key, (validator, amount)) in delegators {
++            let address = Address::try_from(private_key).unwrap();
++            bonded_balances.insert(address, (*validator, *amount));
++        }
++        bonded_balances
++    }
++
++    /// Returns the `public_balances` given the addresses and total amount.
++    /// Note that the balances are evenly distributed among the addresses.
++    fn sample_public_balances<N: Network>(addresses: &[Address<N>], total_amount: u64) -> IndexMap<Address<N>, u64> {
++        // Check that the addresses are not empty.
++        assert!(!addresses.is_empty(), "must provide at least one address");
++        // Distribute the total amount evenly among the addresses.
++        let amount_per_address = total_amount / addresses.len() as u64;
++        let mut public_balances: IndexMap<_, _> =
++            addresses.iter().map(|address| (*address, amount_per_address)).collect();
++        // Distribute the remainder to the first address.
++        let remaining = total_amount % addresses.len() as u64;
++        if remaining > 0 {
++            *public_balances.get_mut(&addresses[0]).unwrap() += remaining;
++        }
++        // Return the public balances.
++        public_balances
++    }
++
+     #[test]
+     fn test_finalize_duplicate_deployment() {
+         let rng = &mut TestRng::default();
+@@ -1666,11 +1803,6 @@ finalize compute:
+         // Check that the storage was not updated.
+         let program_id = ProgramID::from_str("testing.aleo").unwrap();
+         let mapping_name = Identifier::from_str("entries").unwrap();
+-        let value = vm
+-            .finalize_store()
+-            .get_value_speculative(program_id, mapping_name, &Plaintext::from(Literal::Address(address)))
+-            .unwrap();
+-        println!("{:?}", value);
+         assert!(
+             !vm.finalize_store()
+                 .contains_key_confirmed(program_id, mapping_name, &Plaintext::from(Literal::Address(address)))
+@@ -1777,7 +1909,7 @@ finalize compute:
      }
  
      #[test]
-+    #[ignore = "memory-intensive"]
-     fn test_deep_nested_execution_cost() {
+-    fn test_genesis_ratify_greater_than_max_committee_size() {
++    fn test_ratify_genesis_greater_than_max_committee_size() {
          // Initialize an RNG.
          let rng = &mut TestRng::default();
-diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
-index 72b7166b7..aed27fb2b 100644
---- a/synthesizer/src/vm/mod.rs
-+++ b/synthesizer/src/vm/mod.rs
-@@ -1356,6 +1356,7 @@ function call_fee_private:
+ 
+@@ -1786,14 +1918,8 @@ finalize compute:
+             VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+ 
+         // Construct the validators, greater than the maximum committee size.
+-        let validators = (0..(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE + 1))
+-            .map(|_| {
+-                let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+-                let amount = MIN_VALIDATOR_STAKE;
+-                let is_open = true;
+-                (private_key, (amount, is_open))
+-            })
+-            .collect::<IndexMap<_, _>>();
++        let validators =
++            sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize + 1, rng);
+ 
+         // Construct the committee.
+         let mut committee_map = IndexMap::new();
+@@ -1807,49 +1933,603 @@ finalize compute:
+         assert!(result.is_err());
+ 
+         // Reset the validators.
+-        let validators = (0..Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE)
++        let validators =
++            sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize, rng);
++
++        // Construct the committee.
++        // Track the allocated amount.
++        let (committee_map, allocated_amount) =
++            sample_committee_map_and_allocated_amount(&validators, &IndexMap::new());
++
++        // Construct the public balances, allocating the remaining supply.
++        let public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &IndexMap::new());
++
++        // Construct the genesis block, which should pass.
++        let block = vm
++            .genesis_quorum(
++                validators.keys().next().unwrap(),
++                Committee::new_genesis(committee_map).unwrap(),
++                public_balances,
++                bonded_balances,
++                rng,
++            )
++            .unwrap();
++
++        // Add the block.
++        vm.add_next_block(&block).unwrap();
++    }
++
++    // Note that the maximum delegator size is large enough that the ratification ID cannot be computed.
++    #[test]
++    fn test_ratify_genesis_greater_than_max_delegator_size() {
++        // Initialize an RNG.
++        let rng = &mut TestRng::default();
++
++        // Initialize the VM.
++        let vm =
++            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
++
++        // Construct the validators.
++        let validators =
++            sample_validators::<CurrentNetwork>(Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE as usize, rng);
++
++        // Construct the delegators, greater than the maximum delegator size.
++        let delegators = (0..MAX_DELEGATORS + 1)
+             .map(|_| {
++                let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++                let validator = Address::try_from(validators.keys().next().unwrap()).unwrap();
++                let amount = MIN_DELEGATOR_STAKE;
++                (private_key, (validator, amount))
++            })
++            .collect::<IndexMap<_, _>>();
++
++        // Construct the committee.
++        // Track the allocated amount.
++        let (committee_map, allocated_amount) = sample_committee_map_and_allocated_amount(&validators, &delegators);
++
++        // Construct the public balances, allocating the remaining supply to the validators and zero to the delegators.
++        let mut public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++        public_balances.extend(sample_public_balances(
++            &delegators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            0,
++        ));
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &delegators);
++
++        // Construct the genesis block, which should fail.
++        let result = vm.genesis_quorum(
++            validators.keys().next().unwrap(),
++            Committee::new_genesis(committee_map).unwrap(),
++            public_balances,
++            bonded_balances,
++            rng,
++        );
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn test_ratify_genesis_is_correct() {
++        const NUM_VALIDATORS: usize = 5;
++        const NUM_DELEGATORS: usize = 8;
++
++        // Sample an RNG.
++        let rng = &mut TestRng::default();
++
++        println!("Initializing VMs.");
++
++        // Initialize the VM.
++        let vm =
++            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
++
++        println!("Constructing validator and delegator sets.");
++
++        // Sample the validators.
++        let validators = sample_validators(NUM_VALIDATORS, rng);
++
++        // Sample the delegators, cycling through the validators.
++        let delegators: IndexMap<_, _> = (0..NUM_DELEGATORS)
++            .map(|i| {
++                let private_key = PrivateKey::new(rng).unwrap();
++                let validator = Address::try_from(validators.keys().nth(i % NUM_VALIDATORS).unwrap()).unwrap();
++                let amount = MIN_DELEGATOR_STAKE;
++                (private_key, (validator, amount))
++            })
++            .collect();
++
++        // Sample a genesis block without any delegators.
++        // Specifically, the genesis block will contain a `Ratification` with:
++        //   - the committee state, containing only the validator amounts.
++        //   - the public balances for the delegators, with 10_000_000u64 microcredits each (plus 843_880u64 microcredits for fees).
++        //   - the public balances for the validators dividing up the remaining starting supply.
++        //   - the bonded balances, only containing the validators.
++
++        println!("Initializing the VM.");
++
++        // Construct the committee.
++        // Track the allocated amount.
++        let (committee_map, allocated_amount) = sample_committee_map_and_allocated_amount(&validators, &delegators);
++        let committee = Committee::new_genesis(committee_map).unwrap();
++
++        // Construct the public balances, allocating the remaining supply to the validators and zero to the delegators.
++        let mut public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++        public_balances.extend(sample_public_balances(
++            &delegators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            0,
++        ));
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &delegators);
++
++        println!("Generating the genesis block.");
++
++        let genesis = vm
++            .genesis_quorum(
++                validators.keys().next().unwrap(),
++                committee.clone(),
++                public_balances.clone(),
++                bonded_balances.clone(),
++                rng,
++            )
++            .unwrap();
++
++        println!("Adding the genesis block to the VM.");
++
++        // Add the genesis block to the VM.
++        vm.add_next_block(&genesis).unwrap();
++
++        // Check that the state of the `credits.aleo` program is correct.
++        let program_id = ProgramID::from_str("credits.aleo").unwrap();
++        let committee_mapping_name = Identifier::from_str("committee").unwrap();
++        let account_mapping_name = Identifier::from_str("account").unwrap();
++        let bonded_mapping_name = Identifier::from_str("bonded").unwrap();
++        let metadata_mapping_name = Identifier::from_str("metadata").unwrap();
++        let unbonding_mapping_name = Identifier::from_str("unbonding").unwrap();
++
++        // Get and check the committee mapping.
++        let actual_committee = vm.finalize_store().get_mapping_confirmed(program_id, committee_mapping_name).unwrap();
++        let expected_committee = committee
++            .members()
++            .iter()
++            .map(|(address, (amount, is_open))| {
++                (
++                    Plaintext::from_str(&address.to_string()).unwrap(),
++                    Value::from_str(&format!("{{ microcredits: {amount}u64, is_open: {is_open} }}")).unwrap(),
++                )
++            })
++            .collect_vec();
++        // Note that `actual_committee` and `expected_committee` are vectors and not necessarily in the same order.
++        // By checking that the lengths of the vector are equal and that all entries in `actual_committee` are in `expected_committee`,
++        // we can ensure that the two vectors contain the same data.
++        assert_eq!(actual_committee.len(), expected_committee.len());
++        for entry in actual_committee.iter() {
++            assert!(expected_committee.contains(entry));
++        }
++
++        // Get and check the account mapping.
++        let actual_account = vm.finalize_store().get_mapping_confirmed(program_id, account_mapping_name).unwrap();
++        let expected_account = public_balances
++            .iter()
++            .map(|(address, amount)| {
++                (Plaintext::from_str(&address.to_string()).unwrap(), Value::from_str(&format!("{amount}u64")).unwrap())
++            })
++            .collect_vec();
++        // Note that `actual_account` and `expected_account` are vectors and not necessarily in the same order.
++        // By checking that the lengths of the vector are equal and that all entries in `actual_account` are in `expected_account`,
++        // we can ensure that the two vectors contain the same data.
++        assert_eq!(actual_account.len(), expected_account.len());
++        // Check that all entries except for the first validator are the same.
++        for entry in actual_account.iter() {
++            let first_validator = Address::try_from(validators.keys().next().unwrap()).unwrap();
++            // Note that the first validator is used to execute additional transactions in `VM::genesis_quorum`.
++            // Therefore, the balance of the first validator will be different from the expected balance.
++            if entry.0 == Plaintext::from_str(&first_validator.to_string()).unwrap() {
++                assert_eq!(entry.1, Value::from_str("294999983894244u64").unwrap());
++            } else {
++                assert!(expected_account.contains(entry));
++            }
++        }
++
++        // Get and check the bonded mapping.
++        let actual_bonded = vm.finalize_store().get_mapping_confirmed(program_id, bonded_mapping_name).unwrap();
++        let expected_bonded = bonded_balances
++            .iter()
++            .map(|(address, (validator, amount))| {
++                (
++                    Plaintext::from_str(&address.to_string()).unwrap(),
++                    Value::from_str(&format!("{{ validator: {validator}, microcredits: {amount}u64 }}")).unwrap(),
++                )
++            })
++            .collect_vec();
++        // Note that `actual_bonded` and `expected_bonded` are vectors and not necessarily in the same order.
++        // By checking that the lengths of the vector are equal and that all entries in `actual_bonded` are in `expected_bonded`,
++        // we can ensure that the two vectors contain the same data.
++        assert_eq!(actual_bonded.len(), expected_bonded.len());
++        for entry in actual_bonded.iter() {
++            assert!(expected_bonded.contains(entry));
++        }
++
++        // Get and check the entry in metadata mapping corresponding to the number of validators.
++        let num_validators = vm
++            .finalize_store()
++            .get_value_confirmed(
++                program_id,
++                metadata_mapping_name,
++                &Plaintext::from_str("aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc").unwrap(),
++            )
++            .unwrap()
++            .unwrap();
++        assert_eq!(num_validators, Value::from_str(&format!("{NUM_VALIDATORS}u32")).unwrap());
++
++        // Get and check the entry in metadata mapping corresponding to the number of delegators.
++        let num_delegators = vm
++            .finalize_store()
++            .get_value_confirmed(
++                program_id,
++                metadata_mapping_name,
++                &Plaintext::from_str("aleo1qgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqanmpl0").unwrap(),
++            )
++            .unwrap()
++            .unwrap();
++        assert_eq!(num_delegators, Value::from_str(&format!("{NUM_DELEGATORS}u32")).unwrap());
++
++        // Get and check the unbonding mapping.
++        let actual_unbonding = vm.finalize_store().get_mapping_confirmed(program_id, unbonding_mapping_name).unwrap();
++        assert!(actual_unbonding.is_empty());
++    }
++
++    #[test]
++    fn test_ratify_genesis_is_consistent() {
++        const NUM_VALIDATORS: usize = 5;
++        const NUM_DELEGATORS: usize = 8;
++
++        // Sample an RNG.
++        let rng = &mut TestRng::default();
++
++        println!("Initializing VMs.");
++
++        // Initialize two VMs.
++        let vm_1 =
++            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
++        let vm_2 =
++            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
++
++        println!("Constructing validator and delegator sets.");
++
++        // Sample the validators.
++        let validators = sample_validators(NUM_VALIDATORS, rng);
++
++        // Sample the delegators, cycling through the validators.
++        let delegators: IndexMap<_, _> = (0..NUM_DELEGATORS)
++            .map(|i| {
+                 let private_key = PrivateKey::new(rng).unwrap();
++                let validator = Address::try_from(validators.keys().nth(i % NUM_VALIDATORS).unwrap()).unwrap();
++                let amount = MIN_DELEGATOR_STAKE;
++                (private_key, (validator, amount))
++            })
++            .collect();
++
++        // For the first VM, sample a genesis block without any delegators.
++        // Specifically, the genesis block will contain a `Ratification` with:
++        //   - the committee state, containing only the validator amounts.
++        //   - the public balances for the delegators, with 10_000_000u64 microcredits each (plus 843_880u64 microcredits for fees).
++        //   - the public balances for the validators dividing up the remaining starting supply.
++        //   - the bonded balances, only containing the validators.
++
++        println!("Initializing the first VM.");
++
++        // Construct the committee.
++        // Track the allocated amount.
++        let (committee_map, mut allocated_amount) =
++            sample_committee_map_and_allocated_amount(&validators, &IndexMap::new());
++        let committee = Committee::new_genesis(committee_map).unwrap();
++
++        // Construct the public balances.
++        let mut public_balances = IndexMap::new();
++        for (private_key, (_validator, _amount)) in &delegators {
++            let address = Address::try_from(private_key).unwrap();
++            let amount = MIN_DELEGATOR_STAKE * 2;
++            public_balances.insert(address, amount);
++            allocated_amount += amount;
++        }
++        public_balances.extend(sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        ));
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &IndexMap::new());
++
++        println!("[VM1] Generating the genesis block.");
++
++        let genesis_1 = vm_1
++            .genesis_quorum(validators.keys().next().unwrap(), committee, public_balances, bonded_balances, rng)
++            .unwrap();
++
++        println!("[VM1] Adding the genesis block to the VM.");
++
++        // Add the genesis block to the VM.
++        vm_1.add_next_block(&genesis_1).unwrap();
++
++        println!("[VM1] Generating bond transactions for each of the delegators.");
++
++        // Generate bond transactions for each of the delegators.
++        let mut transactions = Vec::new();
++        for (private_key, (validator, amount)) in &delegators {
++            let transaction = vm_1
++                .execute(
++                    private_key,
++                    ("credits.aleo", "bond_public"),
++                    vec![
++                        Value::<CurrentNetwork>::from_str(&validator.to_string()).unwrap(),
++                        Value::<CurrentNetwork>::from_str(&format!("{amount}u64")).unwrap(),
++                    ]
++                    .into_iter(),
++                    None,
++                    0,
++                    None,
++                    rng,
++                )
++                .unwrap();
++            transactions.push(transaction);
++        }
++
++        println!("[VM1] Generating the next block.");
++        let next_block =
++            sample_next_block(&vm_1, validators.keys().next().unwrap(), &transactions, &genesis_1, &mut vec![], rng)
++                .unwrap();
++
++        println!("[VM1] Adding the next block to the VM.");
++        vm_1.add_next_block(&next_block).unwrap();
++
++        // For the second VM, sample a genesis block with the same validators and delegators.
++        // Specifically, the genesis block will contain a `Ratification` with:
++        //   - the committee state, containing the total staked amount per validator.
++        //   - the public balances for the delegators, with 0 microcredits each.
++        //   - the public balances for the validators dividing up the remaining starting supply.
++        //   - the bonded balances, containing the validators and delegators.
++
++        println!("Initializing the second VM.");
++
++        // Construct the committee.
++        // Track the allocated amount.
++        let (committee_map, allocated_amount) = sample_committee_map_and_allocated_amount(&validators, &delegators);
++        let committee = Committee::new_genesis(committee_map).unwrap();
++
++        // Construct the public balances, allocating the remaining supply to the validators and zero to the delegators.
++        let mut public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++        public_balances.extend(sample_public_balances(
++            &delegators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            0,
++        ));
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &delegators);
++
++        println!("[VM2] Generating the genesis block.");
++
++        // Construct the genesis block.
++        let genesis_2 = vm_2
++            .genesis_quorum(validators.keys().next().unwrap(), committee, public_balances, bonded_balances, rng)
++            .unwrap();
++
++        println!("[VM2] Adding the genesis block to the VM.");
++
++        // Add the genesis block to the VM.
++        vm_2.add_next_block(&genesis_2).unwrap();
++
++        println!("Checking that all mappings in `credits.aleo` are equal across the two VMs.");
++
++        // Check that all mappings in `credits.aleo` are equal across the two VMs.
++        let program_id = ProgramID::from_str("credits.aleo").unwrap();
++        let committee_mapping_name = Identifier::from_str("committee").unwrap();
++        let bonded_mapping_name = Identifier::from_str("bonded").unwrap();
++        let unbonding_mapping_name = Identifier::from_str("unbonding").unwrap();
++        let account_mapping_name = Identifier::from_str("account").unwrap();
++        let metadata_mapping_name = Identifier::from_str("metadata").unwrap();
++
++        let committee_1 = vm_1.finalize_store().get_mapping_confirmed(program_id, committee_mapping_name).unwrap();
++        let committee_2 = vm_2.finalize_store().get_mapping_confirmed(program_id, committee_mapping_name).unwrap();
++        assert_eq!(committee_1, committee_2);
++
++        let bonded_1 = vm_1.finalize_store().get_mapping_confirmed(program_id, bonded_mapping_name).unwrap();
++        let bonded_2 = vm_2.finalize_store().get_mapping_confirmed(program_id, bonded_mapping_name).unwrap();
++        assert_eq!(bonded_1, bonded_2);
++
++        let unbonding_1 = vm_1.finalize_store().get_mapping_confirmed(program_id, unbonding_mapping_name).unwrap();
++        let unbonding_2 = vm_2.finalize_store().get_mapping_confirmed(program_id, unbonding_mapping_name).unwrap();
++        assert_eq!(unbonding_1, unbonding_2);
++
++        // Check that the account mapping across both VMs have the same keys.
++        let account_1 = vm_1
++            .finalize_store()
++            .get_mapping_confirmed(program_id, account_mapping_name)
++            .unwrap()
++            .into_iter()
++            .map(|(k, _)| k.to_string())
++            .collect::<std::collections::HashSet<_>>();
++        let account_2 = vm_2
++            .finalize_store()
++            .get_mapping_confirmed(program_id, account_mapping_name)
++            .unwrap()
++            .into_iter()
++            .map(|(k, _)| k.to_string())
++            .collect::<std::collections::HashSet<_>>();
++        assert_eq!(account_1, account_2);
++
++        // Check that the metadata mapping across both VMs are equal.
++        let metadata_1 = vm_1.finalize_store().get_mapping_confirmed(program_id, metadata_mapping_name).unwrap();
++        let metadata_2 = vm_2.finalize_store().get_mapping_confirmed(program_id, metadata_mapping_name).unwrap();
++        assert_eq!(metadata_1, metadata_2);
++    }
++
++    #[test]
++    fn test_ratify_genesis_with_insufficient_validator_balance() {
++        // Sample an RNG.
++        let rng = &mut TestRng::default();
++
++        // Initialize the VM.
++        let vm =
++            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
++
++        // Attempt to construct a genesis quorum, with a validator with an insufficient amount.
++        let mut validators = (0..3)
++            .map(|_| {
++                let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++                let address = Address::try_from(&private_key).unwrap();
+                 let amount = MIN_VALIDATOR_STAKE;
+                 let is_open = true;
+-                (private_key, (amount, is_open))
++                (address, (amount, is_open))
+             })
+             .collect::<IndexMap<_, _>>();
++        validators.insert(Address::try_from(PrivateKey::new(rng).unwrap()).unwrap(), (MIN_VALIDATOR_STAKE - 1, true));
++
++        // Construct the committee.
++        let result = Committee::new_genesis(validators);
++        assert!(result.is_err());
++
++        // Track the allocated amount.
++        let mut allocated_amount = 0;
++
++        // Reset the validators.
++        let validators = sample_validators(4, rng);
++
++        // Construct the committee.
++        let committee = Committee::new_genesis(
++            validators
++                .iter()
++                .map(|(private_key, (amount, _))| {
++                    let address = Address::try_from(private_key).unwrap();
++                    allocated_amount += *amount;
++                    (address, (*amount, true))
++                })
++                .collect(),
++        )
++        .unwrap();
++
++        // Construct the public balances, allocating the remaining supply to rest of the validators.
++        let public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &IndexMap::new());
++
++        // Construct the genesis block, which should pass.
++        let block = vm
++            .genesis_quorum(validators.keys().next().unwrap(), committee, public_balances, bonded_balances, rng)
++            .unwrap();
++
++        // Add the block.
++        vm.add_next_block(&block).unwrap();
++    }
++
++    #[test]
++    fn test_ratify_genesis_with_insufficient_delegator_balance() {
++        // Sample an RNG.
++        let rng = &mut TestRng::default();
++
++        // Initialize the VM.
++        let vm =
++            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+ 
+         // Track the allocated amount.
+         let mut allocated_amount = 0;
+ 
++        // Sample the validators.
++        let validators = sample_validators(4, rng);
++
++        // Attempt to construct a genesis quorum, with a delegator with an insufficient amount.
++        let mut delegators = IndexMap::new();
++        delegators.insert(
++            PrivateKey::new(rng).unwrap(),
++            (Address::try_from(validators.keys().next().unwrap()).unwrap(), MIN_DELEGATOR_STAKE - 1),
++        );
++
+         // Construct the committee.
+         let mut committee_map = IndexMap::new();
+         for (private_key, (amount, _)) in &validators {
+             let address = Address::try_from(private_key).unwrap();
+-            committee_map.insert(address, (*amount, true));
+-            allocated_amount += *amount;
++            let amount = if address == Address::try_from(validators.keys().next().unwrap()).unwrap() {
++                *amount + MIN_DELEGATOR_STAKE - 1
++            } else {
++                *amount
++            };
++            committee_map.insert(address, (amount, true));
++            allocated_amount += amount;
+         }
++        let committee = Committee::new_genesis(committee_map).unwrap();
+ 
+-        // Construct the public balances, allocating the remaining supply.
+-        let mut public_balances = IndexMap::new();
+-        let remaining_supply = <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount;
+-        for (private_key, _) in &validators {
++        // Construct the public balances, allocating the remaining supply to rest of the validators.
++        let mut public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++        public_balances
++            .extend(sample_public_balances(&[Address::try_from(delegators.keys().next().unwrap()).unwrap()], 0));
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &delegators);
++
++        // Construct the genesis block, which should fail.
++        let result =
++            vm.genesis_quorum(validators.keys().next().unwrap(), committee, public_balances, bonded_balances, rng);
++        assert!(result.is_err());
++
++        // Reset the delegators.
++        let mut delegators = IndexMap::new();
++        delegators.insert(
++            PrivateKey::new(rng).unwrap(),
++            (Address::try_from(validators.keys().next().unwrap()).unwrap(), MIN_DELEGATOR_STAKE),
++        );
++
++        // Track the allocated amount.
++        let mut allocated_amount = 0;
++
++        // Construct the committee.
++        let mut committee_map = IndexMap::new();
++        for (private_key, (amount, _)) in &validators {
+             let address = Address::try_from(private_key).unwrap();
+-            let amount = remaining_supply / validators.len() as u64;
++            let amount = if address == Address::try_from(validators.keys().next().unwrap()).unwrap() {
++                *amount + MIN_DELEGATOR_STAKE
++            } else {
++                *amount
++            };
++            committee_map.insert(address, (amount, true));
+             allocated_amount += amount;
+-            public_balances.insert(address, amount);
+-        }
+-        let remaining_supply = <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount;
+-        if remaining_supply > 0 {
+-            let address = Address::try_from(&PrivateKey::<CurrentNetwork>::new(rng).unwrap()).unwrap();
+-            public_balances.insert(address, remaining_supply);
+         }
++        let committee = Committee::new_genesis(committee_map).unwrap();
++
++        // Construct the public balances, allocating the remaining supply to rest of the validators.
++        let mut public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++        public_balances
++            .extend(sample_public_balances(&[Address::try_from(delegators.keys().next().unwrap()).unwrap()], 0));
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &delegators);
+ 
+         // Construct the genesis block, which should pass.
+         let block = vm
+-            .genesis_quorum(
+-                validators.keys().next().unwrap(),
+-                Committee::new_genesis(committee_map).unwrap(),
+-                public_balances,
+-                rng,
+-            )
++            .genesis_quorum(validators.keys().next().unwrap(), committee, public_balances, bonded_balances, rng)
+             .unwrap();
+ 
+         // Add the block.
+@@ -1857,72 +2537,145 @@ finalize compute:
      }
  
      #[test]
-+    #[ignore = "memory-intensive"]
-     fn test_deployment_synthesis_overload() {
+-    fn test_max_committee_limit_with_bonds() {
+-        // Initialize an RNG.
++    fn test_ratify_genesis_with_incorrect_committee_amounts() {
++        // Sample an RNG.
          let rng = &mut TestRng::default();
  
+         // Initialize the VM.
+         let vm =
+             VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
+ 
+-        // Construct the validators, one less than the maximum committee size.
+-        let validators = (0..Committee::<CurrentNetwork>::MAX_COMMITTEE_SIZE - 1)
++        // Initialize the validators.
++        let validators = sample_validators(4, rng);
++
++        // Initialize the delegators.
++        let delegators = (0..4)
+             .map(|_| {
+-                let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
++                let private_key = PrivateKey::new(rng).unwrap();
++                let validator = Address::try_from(validators.keys().next().unwrap()).unwrap();
++                let amount = MIN_DELEGATOR_STAKE;
++                (private_key, (validator, amount))
++            })
++            .collect::<IndexMap<_, _>>();
++
++        // Construct the **incorrect** committee.
++        // Track the allocated amount.
++        // Note: this committee is missing the additional stake from the delegators.
++        let (committee_map, allocated_amount) =
++            sample_committee_map_and_allocated_amount(&validators, &IndexMap::new());
++        let committee = Committee::new_genesis(committee_map).unwrap();
++
++        // Construct the public balances, allocating the remaining supply to rest of the validators.
++        let mut public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++        public_balances.extend(sample_public_balances(
++            &delegators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            0,
++        ));
++
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &delegators);
++
++        // Construct the genesis block, which should fail.
++        let result = vm.genesis_quorum(
++            validators.keys().next().unwrap(),
++            committee,
++            public_balances,
++            bonded_balances.clone(),
++            rng,
++        );
++        assert!(result.is_err());
++
++        // Construct the **correct** committee.
++        // Reset the tracked amount.
++        let (committee_map, allocated_amount) = sample_committee_map_and_allocated_amount(&validators, &delegators);
++        let committee = Committee::new_genesis(committee_map).unwrap();
++
++        // Construct the public balances, allocating the remaining supply to rest of the validators.
++        let mut public_balances = sample_public_balances(
++            &validators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
++        public_balances.extend(sample_public_balances(
++            &delegators.keys().map(|private_key| Address::try_from(private_key).unwrap()).collect::<Vec<_>>(),
++            0,
++        ));
++
++        // Construct the genesis block, which should pass.
++        let block = vm
++            .genesis_quorum(validators.keys().next().unwrap(), committee, public_balances, bonded_balances, rng)
++            .unwrap();
++
++        // Add the block.
++        vm.add_next_block(&block).unwrap();
++    }
++
++    #[test]
++    fn test_ratify_genesis_with_closed_validator() {
++        // Sample an RNG.
++        let rng = &mut TestRng::default();
++
++        // Initialize the VM.
++        let vm =
++            VM::from(ConsensusStore::<CurrentNetwork, ConsensusMemory<CurrentNetwork>>::open(None).unwrap()).unwrap();
++
++        // Initialize the validators, with one closed.
++        let validators = (0..4)
++            .map(|i| {
++                let private_key = PrivateKey::new(rng).unwrap();
+                 let amount = MIN_VALIDATOR_STAKE;
+-                let is_open = true;
++                let is_open = i != 0;
+                 (private_key, (amount, is_open))
+             })
+             .collect::<IndexMap<_, _>>();
+ 
+-        // Track the allocated amount.
+-        let mut allocated_amount = 0;
++        // Initialize a potential delegator.
++        let delegator_key = PrivateKey::new(rng).unwrap();
++        let delegator_address = Address::try_from(delegator_key).unwrap();
+ 
+         // Construct the committee.
+-        let mut committee_map = IndexMap::new();
+-        for (private_key, (amount, _)) in &validators {
+-            let address = Address::try_from(private_key).unwrap();
+-            committee_map.insert(address, (*amount, true));
+-            allocated_amount += *amount;
+-        }
++        // Track the allocated amount.
++        let (committee_map, allocated_amount) =
++            sample_committee_map_and_allocated_amount(&validators, &IndexMap::new());
+ 
+-        // Initialize two new validators.
+-        let first_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+-        let first_address = Address::try_from(&first_private_key).unwrap();
+-        let second_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+-        let second_address = Address::try_from(&second_private_key).unwrap();
++        // Construct the public balances, allocating half to the first validator and the remaining to the delegator.
++        let public_balances = sample_public_balances(
++            &[Address::try_from(validators.keys().next().unwrap()).unwrap(), delegator_address],
++            <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount,
++        );
+ 
+-        // Construct the public balances, allocating the remaining supply to the first validator and two new validators.
+-        let mut public_balances = IndexMap::new();
+-        let remaining_supply = <CurrentNetwork as Network>::STARTING_SUPPLY - allocated_amount;
+-        let amount = remaining_supply / 3;
+-        public_balances.insert(Address::try_from(validators.keys().next().unwrap()).unwrap(), amount);
+-        public_balances.insert(first_address, amount);
+-        public_balances.insert(second_address, remaining_supply - 2 * amount);
++        // Construct the bonded balances.
++        let bonded_balances = sample_bonded_balances(&validators, &IndexMap::new());
+ 
+         // Construct the genesis block, which should pass.
+-        let genesis_block = vm
++        let block = vm
+             .genesis_quorum(
+                 validators.keys().next().unwrap(),
+                 Committee::new_genesis(committee_map).unwrap(),
+                 public_balances,
++                bonded_balances,
+                 rng,
+             )
+             .unwrap();
+ 
+         // Add the block.
+-        vm.add_next_block(&genesis_block).unwrap();
++        vm.add_next_block(&block).unwrap();
+ 
+-        // Bond the first validator.
+-        let bond_first_transaction = vm
++        // Attempt to bond the potential delegator to the closed validator.
++        let transaction = vm
+             .execute(
+-                &first_private_key,
++                &delegator_key,
+                 ("credits.aleo", "bond_public"),
+                 vec![
+-                    Value::<CurrentNetwork>::from_str(&first_address.to_string()).unwrap(),
+-                    Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap(),
++                    Value::<CurrentNetwork>::from_str(
++                        &Address::try_from(validators.keys().next().unwrap()).unwrap().to_string(),
++                    )
++                    .unwrap(),
++                    Value::<CurrentNetwork>::from_str(&format!("{MIN_DELEGATOR_STAKE}u64")).unwrap(),
+                 ]
+-                .iter(),
++                .into_iter(),
+                 None,
+                 0,
+                 None,
+@@ -1930,37 +2683,37 @@ finalize compute:
+             )
+             .unwrap();
+ 
+-        // Construct the next block.
+-        let next_block = sample_next_block(
+-            &vm,
+-            validators.keys().next().unwrap(),
+-            &[bond_first_transaction],
+-            &genesis_block,
+-            &mut vec![],
+-            rng,
+-        )
+-        .unwrap();
+-
+-        // Check that the transaction was accepted.
+-        assert!(next_block.aborted_transaction_ids().is_empty());
++        // Generate the next block.
++        let next_block =
++            sample_next_block(&vm, validators.keys().next().unwrap(), &vec![transaction], &block, &mut vec![], rng)
++                .unwrap();
+ 
+-        // Add the next block to the VM.
++        // Add the next block.
+         vm.add_next_block(&next_block).unwrap();
+ 
+-        // Check that the first validator was added to the committee.
+-        let committee = vm.finalize_store().committee_store().current_committee().unwrap();
+-        assert!(committee.is_committee_member(first_address));
++        // Check that the delegator is not in the `bonded` mapping.
++        let bonded_mapping = vm
++            .finalize_store()
++            .get_mapping_confirmed(
++                ProgramID::from_str("credits.aleo").unwrap(),
++                Identifier::from_str("bonded").unwrap(),
++            )
++            .unwrap();
++        assert_eq!(bonded_mapping.len(), validators.len());
+ 
+-        // Attempt to bond the second validator.
+-        let bond_second_transaction = vm
++        // Attempt to bond the potential delegator to the open validator.
++        let transaction = vm
+             .execute(
+-                &second_private_key,
++                &delegator_key,
+                 ("credits.aleo", "bond_public"),
+                 vec![
+-                    Value::<CurrentNetwork>::from_str(&second_address.to_string()).unwrap(),
+-                    Value::<CurrentNetwork>::from_str(&format!("{MIN_VALIDATOR_STAKE}u64")).unwrap(),
++                    Value::<CurrentNetwork>::from_str(
++                        &Address::try_from(validators.keys().nth(1).unwrap()).unwrap().to_string(),
++                    )
++                    .unwrap(),
++                    Value::<CurrentNetwork>::from_str(&format!("{MIN_DELEGATOR_STAKE}u64")).unwrap(),
+                 ]
+-                .iter(),
++                .into_iter(),
+                 None,
+                 0,
+                 None,
+@@ -1968,22 +2721,28 @@ finalize compute:
+             )
+             .unwrap();
+ 
+-        // Construct the next block.
++        // Generate the next block.
+         let next_block = sample_next_block(
+             &vm,
+             validators.keys().next().unwrap(),
+-            &[bond_second_transaction],
++            &vec![transaction],
+             &next_block,
+             &mut vec![],
+             rng,
+         )
+         .unwrap();
+ 
+-        // Check that the transaction was rejected.
+-        assert!(next_block.transactions().iter().next().unwrap().is_rejected());
++        // Add the next block.
++        vm.add_next_block(&next_block).unwrap();
+ 
+-        // Check that the second validator was not added to the committee.
+-        let committee = vm.finalize_store().committee_store().current_committee().unwrap();
+-        assert!(!committee.is_committee_member(second_address));
++        // Check that the delegator is in the `bonded` mapping.
++        let bonded_mapping = vm
++            .finalize_store()
++            .get_mapping_confirmed(
++                ProgramID::from_str("credits.aleo").unwrap(),
++                Identifier::from_str("bonded").unwrap(),
++            )
++            .unwrap();
++        assert_eq!(bonded_mapping.len(), validators.len() + 1);
+     }
+ }
+diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
+index c71e4c94e..50eca744f 100644
+--- a/synthesizer/src/vm/mod.rs
++++ b/synthesizer/src/vm/mod.rs
+@@ -256,8 +256,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+             Address::try_from(private_keys[2])? => remaining_supply / 4,
+             Address::try_from(private_keys[3])? => remaining_supply / 4,
+         };
++        // Construct the bonded balances.
++        let bonded_balances =
++            committee.members().iter().map(|(address, (amount, _))| (*address, (*address, *amount))).collect();
+         // Return the genesis block.
+-        self.genesis_quorum(private_key, committee, public_balances, rng)
++        self.genesis_quorum(private_key, committee, public_balances, bonded_balances, rng)
+     }
+ 
+     /// Returns a new genesis block for a quorum chain.
+@@ -266,6 +269,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+         private_key: &PrivateKey<N>,
+         committee: Committee<N>,
+         public_balances: IndexMap<Address<N>, u64>,
++        bonded_balances: IndexMap<Address<N>, (Address<N>, u64)>,
+         rng: &mut R,
+     ) -> Result<Block<N>> {
+         // Retrieve the total stake.
+@@ -275,7 +279,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+         // Compute the total supply.
+         let total_supply = total_stake.checked_add(account_supply).ok_or_else(|| anyhow!("Invalid total supply"))?;
+         // Ensure the total supply matches.
+-        ensure!(total_supply == N::STARTING_SUPPLY, "Invalid total supply");
++        ensure!(
++            total_supply == N::STARTING_SUPPLY,
++            "Invalid total supply. Found {total_supply}, expected {}",
++            N::STARTING_SUPPLY
++        );
+ 
+         // Prepare the caller.
+         let caller = Address::try_from(private_key)?;
+@@ -287,7 +295,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+         let inputs = [caller.to_string(), format!("{amount}_u64")];
+ 
+         // Prepare the ratifications.
+-        let ratifications = vec![Ratify::Genesis(committee, public_balances)];
++        let ratifications =
++            vec![Ratify::Genesis(Box::new(committee), Box::new(public_balances), Box::new(bonded_balances))];
+         // Prepare the solutions.
+         let solutions = Solutions::<N>::from(None); // The genesis block does not require solutions.
+         // Prepare the aborted solution IDs.
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out b/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
+index 94690f11c..43b2ae5b1 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
+@@ -26,7 +26,7 @@ outputs:
+     test_rand.aleo/rand_chacha_check:
+       outputs:
+       - '{"type":"future","id":"4722955375376605065432422068493514420613444220803270858286854080465504837613field","value":"{\n  program_id: test_rand.aleo,\n  function_name: rand_chacha_check,\n  arguments: [\n    1field,\n    true\n  ]\n}"}'
+-  speculate: the execution was accepted
++  speculate: the execution was rejected
+   add_next_block: succeeded.
+ additional:
+ - child_outputs:

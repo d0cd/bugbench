@@ -1,54 +1,2582 @@
-diff --git a/src/sentry/users/api/serializers/user.py b/src/sentry/users/api/serializers/user.py
-index 7ed86267bca..caff0ddfb4c 100644
---- a/src/sentry/users/api/serializers/user.py
-+++ b/src/sentry/users/api/serializers/user.py
-@@ -183,11 +183,13 @@ class UserSerializer(Serializer):
-             "experiments": {},
+diff --git a/src/sentry/dashboards/endpoints/organization_dashboards.py b/src/sentry/dashboards/endpoints/organization_dashboards.py
+index 4c5f03a2c49b99..1b00ec2502d094 100644
+--- a/src/sentry/dashboards/endpoints/organization_dashboards.py
++++ b/src/sentry/dashboards/endpoints/organization_dashboards.py
+@@ -96,7 +96,6 @@ class PrebuiltDashboardId(IntEnum):
+ class PrebuiltDashboard(TypedDict, total=False):
+     prebuilt_id: Required[PrebuiltDashboardId]
+     title: Required[str]
+-    pre_favorited: bool
+ 
+ 
+ # Prebuilt dashboards store minimal fields in the database. The actual dashboard and widget settings are
+@@ -132,7 +131,6 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.WEB_VITALS,
+         "title": "Web Vitals",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.WEB_VITALS_SUMMARY,
+@@ -141,7 +139,6 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.MOBILE_VITALS,
+         "title": "Mobile Vitals",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.MOBILE_VITALS_APP_STARTS,
+@@ -158,7 +155,6 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.BACKEND_OVERVIEW,
+         "title": "Backend Overview",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.MOBILE_SESSION_HEALTH,
+@@ -195,12 +191,10 @@ class PrebuiltDashboard(TypedDict, total=False):
+     {
+         "prebuilt_id": PrebuiltDashboardId.AI_AGENTS_OVERVIEW,
+         "title": "AI Agents Overview",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.MCP_OVERVIEW,
+         "title": "MCP Overview",
+-        "pre_favorited": True,
+     },
+     {
+         "prebuilt_id": PrebuiltDashboardId.LARAVEL_OVERVIEW,
+@@ -297,41 +291,6 @@ def sync_prebuilt_dashboards(organization: Organization) -> None:
+         ).exclude(prebuilt_id__in=prebuilt_ids).delete()
+ 
+ 
+-def sync_prebuilt_dashboards_favorited(organization: Organization, user_id: int) -> None:
+-    """
+-    Checks if pre-favorited prebuilt dashboards have a DashboardFavoriteUser record for the
+-    user, and creates them if they don't. This ensures that certain prebuilt dashboards are
+-    favorited by default for all users.
+-    """
+-    enabled_prebuilt_dashboards = get_enabled_prebuilt_dashboards(organization)
+-    pre_favorited_ids = [
+-        d["prebuilt_id"] for d in enabled_prebuilt_dashboards if d.get("pre_favorited")
+-    ]
+-    if not pre_favorited_ids:
+-        return
+-
+-    with transaction.atomic(router.db_for_write(DashboardFavoriteUser)):
+-        prebuilt_dashboards_without_favorite = (
+-            Dashboard.objects.filter(
+-                organization=organization,
+-                prebuilt_id__in=pre_favorited_ids,
+-            )
+-            .exclude(
+-                id__in=DashboardFavoriteUser.objects.filter(
+-                    organization=organization,
+-                    user_id=user_id,
+-                ).values_list("dashboard_id", flat=True)
+-            )
+-            .order_by("prebuilt_id")
+-        )
+-        for dashboard in prebuilt_dashboards_without_favorite:
+-            DashboardFavoriteUser.objects.insert_favorite_dashboard(
+-                organization=organization,
+-                user_id=user_id,
+-                dashboard=dashboard,
+-            )
+-
+-
+ class OrganizationDashboardsPermission(OrganizationPermission):
+     scope_map = {
+         "GET": ["org:read", "org:write", "org:admin"],
+@@ -421,20 +380,6 @@ def get(self, request: Request, organization: Organization) -> Response:
+             except Exception as err:
+                 sentry_sdk.capture_exception(err)
+ 
+-            # Favorite pre-favorited prebuilt dashboards for the user
+-            try:
+-                favorite_lock = locks.get(
+-                    f"dashboards:sync_prebuilt_dashboards_favorited:{organization.id}:{request.user.id}",
+-                    duration=10,
+-                    name="sync_prebuilt_dashboards_favorited",
+-                )
+-                with favorite_lock.acquire():
+-                    sync_prebuilt_dashboards_favorited(organization, request.user.id)
+-            except UnableToAcquireLock:
+-                pass
+-            except Exception as err:
+-                sentry_sdk.capture_exception(err)
+-
+         filters = request.query_params.getlist("filter")
+ 
+         dashboards = Dashboard.objects.filter(organization_id=organization.id)
+@@ -455,6 +400,8 @@ def get(self, request: Request, organization: Organization) -> Response:
+                 dashboards = dashboards.exclude(created_by_id=request.user.id)
+             elif f == "excludePrebuilt":
+                 dashboards = dashboards.exclude(prebuilt_id__isnull=False)
++            elif f == "onlyPrebuilt":
++                dashboards = dashboards.filter(prebuilt_id__isnull=False)
+ 
+         query = request.GET.get("query")
+         prebuilt_ids = request.GET.getlist("prebuiltId")
+@@ -623,7 +570,7 @@ def handle_results(results: list[Dashboard | dict[str, Any]]) -> list[dict[str,
+             )
+             return serialized
+ 
+-        HIDE_PREBUILT_FILTERS = {"onlyFavorites", "owned", "excludePrebuilt"}
++        HIDE_PREBUILT_FILTERS = {"onlyFavorites", "owned", "excludePrebuilt", "onlyPrebuilt"}
+         render_pre_built_dashboard = True
+         if HIDE_PREBUILT_FILTERS.intersection(filters) or should_filter_by_prebuilt_ids:
+             render_pre_built_dashboard = False
+diff --git a/src/sentry/discover/arithmetic.py b/src/sentry/discover/arithmetic.py
+index 9db6256686f3d8..0857481d8aa9dd 100644
+--- a/src/sentry/discover/arithmetic.py
++++ b/src/sentry/discover/arithmetic.py
+@@ -193,8 +193,9 @@ class ArithmeticVisitor(NodeVisitor):
+         "eps",
+         "epm",
+         "count_miserable",
+-        "count_web_vitals",
+         "percentile_range",
++        # Web vitals uses these functions
++        "count_web_vitals",
+         "performance_score",
+         "opportunity_score",
+         # Frontend overview uses these functions
+@@ -211,6 +212,8 @@ class ArithmeticVisitor(NodeVisitor):
+         # Mobile vitals uses these functions
+         "ttid_contribution_rate",
+         "ttfd_contribution_rate",
++        # AI Agents overview uses these functions
++        "trace_status_rate",
+     }
+ 
+     def __init__(self, max_operators: int | None, custom_measurements: set[str] | None):
+diff --git a/src/sentry/notifications/notifications/activity/release.py b/src/sentry/notifications/notifications/activity/release.py
+index 02693eaa02d95e..baf2174584c9b8 100644
+--- a/src/sentry/notifications/notifications/activity/release.py
++++ b/src/sentry/notifications/notifications/activity/release.py
+@@ -33,6 +33,7 @@ class ReleaseActivityNotification(ActivityNotification):
+     metrics_key = "release_activity"
+     notification_setting_type_enum = NotificationSettingEnum.DEPLOY
+     template_path = "sentry/emails/activity/release"
++    max_subject_projects = 2
+ 
+     def __init__(self, activity: Activity) -> None:
+         super().__init__(activity)
+@@ -110,10 +111,18 @@ def get_projects(self, recipient: Actor) -> set[Project]:
+         )
+         return set(projects)
+ 
++    def get_subject_project_text(self, project_slugs: Sequence[str]) -> str:
++        visible_project_slugs = list(project_slugs[: self.max_subject_projects])
++        remaining_projects = len(project_slugs) - len(visible_project_slugs)
++        projects_text = ", ".join(visible_project_slugs)
++        if remaining_projects > 0:
++            projects_text = f"{projects_text} +{remaining_projects} more"
++        return projects_text
++
+     def get_recipient_context(
+         self, recipient: Actor, extra_context: Mapping[str, Any]
+     ) -> MutableMapping[str, Any]:
+-        projects = self.get_projects(recipient)
++        projects = sorted(self.get_projects(recipient), key=lambda project: project.slug)
+         release_links = [
+             self.organization.absolute_url(
+                 f"/organizations/{self.organization.slug}/releases/{self.version}/?project={p.id}",
+@@ -129,9 +138,14 @@ def get_recipient_context(
+             **super().get_recipient_context(recipient, extra_context),
+             "projects": list(zip(projects, release_links, resolved_issue_counts)),
+             "project_count": len(projects),
++            "subject_project_slugs": [project.slug for project in projects],
          }
  
--        if self._user_is_requester(obj, user):
-+        if self._user_is_requester(obj, user) or user.is_superuser:
-             d["emails"] = [
-                 {"id": str(e.id), "email": e.email, "is_verified": e.is_verified}
-                 for e in attrs["emails"]
-             ]
-+
-+        if self._user_is_requester(obj, user):
-             d = cast(UserSerializerResponseSelf, d)
-             options = {
-                 o.key: o.value
-diff --git a/tests/sentry/users/api/serializers/test_user.py b/tests/sentry/users/api/serializers/test_user.py
-index 8236160f3bd..bc558dd5acd 100644
---- a/tests/sentry/users/api/serializers/test_user.py
-+++ b/tests/sentry/users/api/serializers/test_user.py
-@@ -49,6 +49,30 @@ class UserSerializerTest(TestCase):
-         result = serialize(user)
-         assert result["isSuperuser"] is True
+     def get_subject(self, context: Mapping[str, Any] | None = None) -> str:
++        project_slugs = context.get("subject_project_slugs", []) if context else []
++        if project_slugs:
++            projects_text = self.get_subject_project_text(project_slugs)
++            return f"Deployed {projects_text} version {self.version_parsed} to {self.environment}"
+         return f"Deployed version {self.version_parsed} to {self.environment}"
  
-+    def test_superuser_can_see_other_user_emails(self) -> None:
-+        superuser = self.create_user(is_superuser=True)
-+        other_user = self.create_user()
+     @property
+diff --git a/src/sentry/preprod/url_utils.py b/src/sentry/preprod/url_utils.py
+index 995963b39534e6..31a9fce9ddad49 100644
+--- a/src/sentry/preprod/url_utils.py
++++ b/src/sentry/preprod/url_utils.py
+@@ -1,10 +1,16 @@
+ from __future__ import annotations
+ 
++from typing import Literal
 +
-+        result = serialize(other_user, superuser)
-+        assert len(result["emails"]) == 1
-+        assert result["emails"][0]["email"] == other_user.email
-+        assert result["emails"][0]["is_verified"]
-+
-+    def test_non_requester_cannot_see_emails(self) -> None:
-+        viewer = self.create_user()
-+        other_user = self.create_user()
-+
-+        result = serialize(other_user, viewer)
-+        assert result["emails"] == []
-+
-+    def test_superuser_does_not_get_self_fields_for_other_user(self) -> None:
-+        superuser = self.create_user(is_superuser=True)
-+        other_user = self.create_user()
-+
-+        result = serialize(other_user, superuser)
-+        assert "options" not in result
-+        assert "flags" not in result
+ from sentry.models.organization import Organization
+ from sentry.preprod.models import PreprodArtifact
+ 
++ViewType = Literal["size", "snapshots", "install"]
 +
  
- @control_silo_test
- class DetailedUserSerializerTest(TestCase):
+-def get_preprod_artifact_url(preprod_artifact: PreprodArtifact, view_type: str = "size") -> str:
++def get_preprod_artifact_url(
++    preprod_artifact: PreprodArtifact, view_type: ViewType = "size"
++) -> str:
+     """
+     Build a region/customer-domain aware absolute URL for the preprod artifact UI.
+     """
+@@ -17,7 +23,9 @@ def get_preprod_artifact_url(preprod_artifact: PreprodArtifact, view_type: str =
+ 
+ 
+ def get_preprod_artifact_comparison_url(
+-    preprod_artifact: PreprodArtifact, base_artifact: PreprodArtifact, comparison_type: str = "size"
++    preprod_artifact: PreprodArtifact,
++    base_artifact: PreprodArtifact,
++    comparison_type: ViewType = "size",
+ ) -> str:
+     """
+     Build a region/customer-domain aware absolute URL for the preprod artifact comparison UI.
+@@ -25,5 +33,9 @@ def get_preprod_artifact_comparison_url(
+     organization: Organization = Organization.objects.get_from_cache(
+         id=preprod_artifact.project.organization_id
+     )
+-    path = f"/organizations/{organization.slug}/preprod/{comparison_type}/compare/{preprod_artifact.id}/{base_artifact.id}"
++    if comparison_type == "snapshots":
++        path = f"/organizations/{organization.slug}/preprod/{comparison_type}/{preprod_artifact.id}"
++    else:
++        path = f"/organizations/{organization.slug}/preprod/{comparison_type}/compare/{preprod_artifact.id}/{base_artifact.id}"
++
+     return organization.absolute_url(path)
+diff --git a/src/sentry/sentry_apps/api/bases/sentryapps.py b/src/sentry/sentry_apps/api/bases/sentryapps.py
+index 9ef6881403b2a4..637d0a27d64515 100644
+--- a/src/sentry/sentry_apps/api/bases/sentryapps.py
++++ b/src/sentry/sentry_apps/api/bases/sentryapps.py
+@@ -22,7 +22,7 @@
+ )
+ from sentry.sentry_apps.models.sentry_app import SentryApp
+ from sentry.sentry_apps.services.app import RpcSentryApp, app_service
+-from sentry.sentry_apps.services.region.model import RpcSentryAppError
++from sentry.sentry_apps.services.cell.model import RpcSentryAppError
+ from sentry.sentry_apps.utils.errors import (
+     SentryAppError,
+     SentryAppIntegratorError,
+@@ -96,7 +96,7 @@ class SentryAppsAndStaffPermission(StaffPermissionMixin, SentryAppsPermission):
+ class IntegrationPlatformEndpoint(Endpoint):
+     def respond_rpc_sentry_app_error(self, rpc_error: RpcSentryAppError) -> Response:
+         """
+-        Surfaces errors from the region-side Sentry App RPC to the client.
++        Surfaces errors from the cell-side Sentry App RPC to the client.
+         """
+         response_body = rpc_error.get_public_dict()
+         status_code = rpc_error.status_code or 500
+@@ -286,7 +286,7 @@ def convert_args(
+         return (args, kwargs)
+ 
+ 
+-class RegionSentryAppBaseEndpoint(IntegrationPlatformEndpoint):
++class CellSentryAppBaseEndpoint(IntegrationPlatformEndpoint):
+     def convert_args(
+         self, request: Request, sentry_app_id_or_slug: int | str, *args: Any, **kwargs: Any
+     ):
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py
+index 60fc0118dfefd5..73c95280274c68 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py
+@@ -11,7 +11,7 @@
+ from sentry.sentry_apps.api.serializers.platform_external_issue import (
+     PlatformExternalIssueSerializer,
+ )
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.users.models.user import User
+ from sentry.users.services.user.serial import serialize_rpc_user
+ 
+@@ -61,7 +61,7 @@ def post(self, request: Request, installation) -> Response:
+         if isinstance(user, User):
+             user = serialize_rpc_user(user)
+ 
+-        result = sentry_app_region_service.create_issue_link(
++        result = sentry_app_cell_service.create_issue_link(
+             organization_id=installation.organization_id,
+             installation=installation,
+             group_id=int(group_id),
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py
+index 5b347568ad9a11..b00b450121a5d9 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py
+@@ -6,7 +6,7 @@
+ from sentry.sentry_apps.api.bases.sentryapps import (
+     SentryAppInstallationExternalIssueBaseEndpoint as ExternalIssueBaseEndpoint,
+ )
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.sentry_apps.utils.errors import SentryAppError
+ 
+ 
+@@ -25,7 +25,7 @@ def delete(self, request: Request, installation, external_issue_id) -> Response:
+                 status_code=400,
+             )
+ 
+-        result = sentry_app_region_service.delete_external_issue(
++        result = sentry_app_cell_service.delete_external_issue(
+             organization_id=installation.organization_id,
+             installation=installation,
+             external_issue_id=external_issue_id,
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py b/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py
+index 091d36410dce64..e2ebf39ad904b5 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_issues.py
+@@ -13,7 +13,7 @@
+ from sentry.sentry_apps.api.serializers.platform_external_issue import (
+     PlatformExternalIssueSerializer as ResponsePlatformExternalIssueSerializer,
+ )
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ 
+ 
+ class PlatformExternalIssueSerializer(serializers.Serializer):
+@@ -41,7 +41,7 @@ def post(self, request: Request, installation) -> Response:
+         except Exception:
+             return Response({"detail": "issueId is required, and must be an integer"}, status=400)
+ 
+-        result = sentry_app_region_service.create_external_issue(
++        result = sentry_app_cell_service.create_external_issue(
+             organization_id=installation.organization_id,
+             installation=installation,
+             group_id=group_id,
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py b/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py
+index 0b8f966d6774a8..8ac4f0c23999d5 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_external_requests.py
+@@ -9,7 +9,7 @@
+ from sentry.api.base import control_silo_endpoint
+ from sentry.sentry_apps.api.bases.sentryapps import SentryAppInstallationBaseEndpoint
+ from sentry.sentry_apps.services.app.model import RpcSentryAppInstallation
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ 
+ logger = logging.getLogger("sentry.sentry-apps")
+ 
+@@ -26,7 +26,7 @@ def get(self, request: Request, installation: RpcSentryAppInstallation) -> Respo
+         if not uri:
+             return Response({"detail": "uri query parameter is required"}, status=400)
+ 
+-        result = sentry_app_region_service.get_select_options(
++        result = sentry_app_cell_service.get_select_options(
+             organization_id=installation.organization_id,
+             installation=installation,
+             uri=request.GET.get("uri"),
+diff --git a/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py b/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py
+index 11d206dca23e3b..35e78fd6e6c883 100644
+--- a/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py
++++ b/src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py
+@@ -10,7 +10,7 @@
+ from sentry.sentry_apps.api.bases.sentryapps import SentryAppInstallationBaseEndpoint
+ from sentry.sentry_apps.api.serializers.servicehookproject import ServiceHookProjectSerializer
+ from sentry.sentry_apps.services.app.model import RpcSentryAppInstallation
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.users.services.user.serial import serialize_generic_user
+ 
+ 
+@@ -62,7 +62,7 @@ def _get_auth_context(self, request: Request) -> AuthenticationContext:
+         )
+ 
+     def get(self, request: Request, installation: RpcSentryAppInstallation) -> Response:
+-        result = sentry_app_region_service.get_service_hook_projects(
++        result = sentry_app_cell_service.get_service_hook_projects(
+             organization_id=installation.organization_id,
+             installation=installation,
+             auth_context=self._get_auth_context(request),
+@@ -89,7 +89,7 @@ def post(self, request: Request, installation: RpcSentryAppInstallation) -> Resp
+             return Response(serializer.errors, status=400)
+ 
+         projects = serializer.validated_data["projects"]
+-        result = sentry_app_region_service.set_service_hook_projects(
++        result = sentry_app_cell_service.set_service_hook_projects(
+             organization_id=installation.organization_id,
+             installation=installation,
+             project_identifiers=projects,
+@@ -109,7 +109,7 @@ def post(self, request: Request, installation: RpcSentryAppInstallation) -> Resp
+         )
+ 
+     def delete(self, request: Request, installation: RpcSentryAppInstallation) -> Response:
+-        result = sentry_app_region_service.delete_service_hook_projects(
++        result = sentry_app_cell_service.delete_service_hook_projects(
+             organization_id=installation.organization_id,
+             installation=installation,
+             auth_context=self._get_auth_context(request),
+diff --git a/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py b/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py
+index 6e7ff09c458614..a0655dc730cac6 100644
+--- a/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py
++++ b/src/sentry/sentry_apps/api/endpoints/sentry_app_interaction.py
+@@ -7,17 +7,17 @@
+ from sentry.api.api_publish_status import ApiPublishStatus
+ from sentry.api.base import StatsMixin, control_silo_endpoint
+ from sentry.sentry_apps.api.bases.sentryapps import (
+-    RegionSentryAppBaseEndpoint,
++    CellSentryAppBaseEndpoint,
+     SentryAppStatsPermission,
+ )
+ from sentry.sentry_apps.services.app import app_service
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ @control_silo_endpoint
+-class SentryAppInteractionEndpoint(RegionSentryAppBaseEndpoint, StatsMixin):
++class SentryAppInteractionEndpoint(CellSentryAppBaseEndpoint, StatsMixin):
+     owner = ApiOwner.INTEGRATIONS
+     publish_status = {
+         "GET": ApiPublishStatus.PRIVATE,
+@@ -36,7 +36,7 @@ def get(self, request: Request, sentry_app) -> Response:
+         components = app_service.find_app_components(app_id=sentry_app.id)
+         component_types = [component.type for component in components]
+ 
+-        result = sentry_app_region_service.get_interaction_stats(
++        result = sentry_app_cell_service.get_interaction_stats(
+             sentry_app=sentry_app,
+             component_types=component_types,
+             since=args["start"].timestamp(),
+@@ -66,7 +66,7 @@ def post(self, request: Request, sentry_app) -> Response:
+         tsdb_field = request.data.get("tsdbField", "")
+         component_type = request.data.get("componentType")
+ 
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=sentry_app,
+             tsdb_field=tsdb_field,
+             component_type=component_type,
+diff --git a/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py b/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py
+index 112a7a9a72712f..c736fd9abd9b13 100644
+--- a/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py
++++ b/src/sentry/sentry_apps/api/endpoints/sentry_app_webhook_requests.py
+@@ -17,8 +17,8 @@
+ from sentry.sentry_apps.api.utils.webhook_requests import (
+     BufferedRequest,
+     DatetimeOrganizationFilterArgs,
++    get_buffer_requests_from_cells,
+     get_buffer_requests_from_control,
+-    get_buffer_requests_from_regions,
+ )
+ from sentry.sentry_apps.models.sentry_app import SentryApp
+ from sentry.sentry_apps.services.app_request import SentryAppRequestFilterArgs
+@@ -90,8 +90,8 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+ 
+         requests: list[BufferedRequest] = []
+         control_filter: SentryAppRequestFilterArgs = {}
+-        region_filter: SentryAppRequestFilterArgs = {}
+-        control_filter["errors_only"] = region_filter["errors_only"] = errors_only
++        cell_filter: SentryAppRequestFilterArgs = {}
++        control_filter["errors_only"] = cell_filter["errors_only"] = errors_only
+         datetime_org_filter: DatetimeOrganizationFilterArgs = {
+             "start_time": start_time,
+             "end_time": end_time,
+@@ -106,9 +106,9 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+             )
+         # If event type has been specified, we only need to fetch requests from region buffers
+         elif event_type:
+-            region_filter["event"] = event_type
++            cell_filter["event"] = event_type
+             requests.extend(
+-                get_buffer_requests_from_regions(sentry_app.id, region_filter, datetime_org_filter)
++                get_buffer_requests_from_cells(sentry_app.id, cell_filter, datetime_org_filter)
+             )
+         else:
+             control_filter["event"] = [
+@@ -118,7 +118,7 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+             requests.extend(
+                 get_buffer_requests_from_control(sentry_app, control_filter, datetime_org_filter)
+             )
+-            region_filter["event"] = list(
++            cell_filter["event"] = list(
+                 set(EXTENDED_VALID_EVENTS)
+                 - {
+                     "installation.created",
+@@ -126,7 +126,7 @@ def get(self, request: Request, sentry_app: SentryApp) -> Response:
+                 }
+             )
+             requests.extend(
+-                get_buffer_requests_from_regions(sentry_app.id, region_filter, datetime_org_filter)
++                get_buffer_requests_from_cells(sentry_app.id, cell_filter, datetime_org_filter)
+             )
+ 
+         requests.sort(key=lambda x: parse_date(x.data.date), reverse=True)
+diff --git a/src/sentry/sentry_apps/api/serializers/platform_external_issue.py b/src/sentry/sentry_apps/api/serializers/platform_external_issue.py
+index 27b91fffc3b30c..2f47224e82b86a 100644
+--- a/src/sentry/sentry_apps/api/serializers/platform_external_issue.py
++++ b/src/sentry/sentry_apps/api/serializers/platform_external_issue.py
+@@ -5,7 +5,7 @@
+ 
+ from sentry.api.serializers import Serializer, register
+ from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+-from sentry.sentry_apps.services.region.model import RpcPlatformExternalIssue
++from sentry.sentry_apps.services.cell.model import RpcPlatformExternalIssue
+ from sentry.users.models.user import User
+ from sentry.users.services.user.model import RpcUser
+ 
+diff --git a/src/sentry/sentry_apps/api/serializers/servicehookproject.py b/src/sentry/sentry_apps/api/serializers/servicehookproject.py
+index 1e4e5012f2144f..c8cff88f8e4a8f 100644
+--- a/src/sentry/sentry_apps/api/serializers/servicehookproject.py
++++ b/src/sentry/sentry_apps/api/serializers/servicehookproject.py
+@@ -1,6 +1,6 @@
+ from sentry.api.serializers import Serializer, register
+ from sentry.sentry_apps.models.servicehook import ServiceHookProject
+-from sentry.sentry_apps.services.region.model import RpcServiceHookProject
++from sentry.sentry_apps.services.cell.model import RpcServiceHookProject
+ 
+ 
+ @register(ServiceHookProject)
+diff --git a/src/sentry/sentry_apps/api/utils/webhook_requests.py b/src/sentry/sentry_apps/api/utils/webhook_requests.py
+index 26a6b9c99c5ceb..266eaaf7e25850 100644
+--- a/src/sentry/sentry_apps/api/utils/webhook_requests.py
++++ b/src/sentry/sentry_apps/api/utils/webhook_requests.py
+@@ -82,16 +82,16 @@ def get_buffer_requests_from_control(
+     )
+ 
+ 
+-def get_buffer_requests_from_regions(
++def get_buffer_requests_from_cells(
+     sentry_app_id: int,
+     filter: SentryAppRequestFilterArgs,
+     datetime_org_filter: DatetimeOrganizationFilterArgs,
+ ) -> list[BufferedRequest]:
+     requests: list[RpcSentryAppRequest] = []
+-    for region_name in find_all_cell_names():
++    for cell_name in find_all_cell_names():
+         buffer_requests = app_request_service.get_buffer_requests_for_region(
+             sentry_app_id=sentry_app_id,
+-            region_name=region_name,
++            region_name=cell_name,
+             filter=filter,
+         )
+         if buffer_requests:
+diff --git a/src/sentry/sentry_apps/logic.py b/src/sentry/sentry_apps/logic.py
+index a11c23414ceee4..16436e90d546a0 100644
+--- a/src/sentry/sentry_apps/logic.py
++++ b/src/sentry/sentry_apps/logic.py
+@@ -214,12 +214,12 @@ def _update_service_hooks(self) -> None:
+ 
+     def _update_service_hooks_via_outbox(self) -> None:
+         if installations := SentryAppInstallation.objects.filter(sentry_app_id=self.sentry_app.id):
+-            org_ids_and_region_names = OrganizationMapping.objects.filter(
++            org_ids_and_cell_names = OrganizationMapping.objects.filter(
+                 organization_id__in=installations.values_list("organization_id", flat=True)
+             ).values_list("organization_id", "cell_name")
+ 
+-            installation_org_id_to_region_name = {
+-                org_id: region_name for org_id, region_name in org_ids_and_region_names
++            installation_org_id_to_cell_name = {
++                org_id: cell_name for org_id, cell_name in org_ids_and_cell_names
+             }
+ 
+             with outbox_context(
+@@ -227,7 +227,7 @@ def _update_service_hooks_via_outbox(self) -> None:
+             ):
+                 for installation in installations:
+                     assert (
+-                        installation_org_id_to_region_name.get(installation.organization_id)
++                        installation_org_id_to_cell_name.get(installation.organization_id)
+                         is not None
+                     ), (
+                         f"OrganizationMapping must exist for installation {installation.id} and organization {installation.organization_id}"
+@@ -238,7 +238,7 @@ def _update_service_hooks_via_outbox(self) -> None:
+                         shard_identifier=self.sentry_app.id,
+                         object_identifier=installation.id,
+                         category=OutboxCategory.SERVICE_HOOK_UPDATE,
+-                        cell_name=installation_org_id_to_region_name[installation.organization_id],
++                        cell_name=installation_org_id_to_cell_name[installation.organization_id],
+                     ).save()
+                     logger.info(
+                         "_update_service_hooks_via_outbox.created_outbox_entry",
+@@ -247,7 +247,7 @@ def _update_service_hooks_via_outbox(self) -> None:
+                             "sentry_app_id": self.sentry_app.id,
+                             "events": self.sentry_app.events,
+                             "application_id": self.sentry_app.application_id,
+-                            "region_name": installation_org_id_to_region_name[
++                            "cell_name": installation_org_id_to_cell_name[
+                                 installation.organization_id
+                             ],
+                         },
+diff --git a/src/sentry/sentry_apps/models/sentry_app.py b/src/sentry/sentry_apps/models/sentry_app.py
+index 48e6e8631f0a85..49a67aa509c220 100644
+--- a/src/sentry/sentry_apps/models/sentry_app.py
++++ b/src/sentry/sentry_apps/models/sentry_app.py
+@@ -32,7 +32,7 @@
+ from sentry.hybridcloud.outbox.category import OutboxCategory, OutboxScope
+ from sentry.models.apiscopes import HasApiScopes
+ from sentry.sentry_apps.utils.webhooks import EVENT_EXPANSION
+-from sentry.types.region import find_all_cell_names, find_regions_for_sentry_app
++from sentry.types.region import find_all_cell_names, find_cells_for_sentry_app
+ from sentry.utils import metrics
+ 
+ REQUIRED_EVENT_PERMISSIONS = {
+@@ -235,8 +235,8 @@ def outboxes_for_delete(self) -> list[ControlOutbox]:
+             for cell_name in find_all_cell_names()
+         ]
+ 
+-    def regions_with_installations(self) -> set[str]:
+-        return find_regions_for_sentry_app(self)
++    def cells_with_installations(self) -> set[str]:
++        return find_cells_for_sentry_app(self)
+ 
+     def delete(self, *args, **kwargs):
+         from sentry.sentry_apps.models.sentry_app_avatar import SentryAppAvatar
+diff --git a/src/sentry/sentry_apps/models/sentry_app_installation.py b/src/sentry/sentry_apps/models/sentry_app_installation.py
+index 31f80e02cf30c0..93dd7b57a4b64f 100644
+--- a/src/sentry/sentry_apps/models/sentry_app_installation.py
++++ b/src/sentry/sentry_apps/models/sentry_app_installation.py
+@@ -163,13 +163,13 @@ def outboxes_for_delete(self) -> list[ControlOutbox]:
+                 shard_identifier=self.api_application_id or 0,
+                 object_identifier=self.id,
+                 category=OutboxCategory.SENTRY_APP_INSTALLATION_DELETE,
+-                cell_name=region_name,
++                cell_name=cell_name,
+                 payload={
+                     "sentry_app_id": self.sentry_app_id,
+                     "organization_id": self.organization_id,
+                 },
+             )
+-            for region_name in find_all_cell_names()
++            for cell_name in find_all_cell_names()
+         ]
+ 
+     def prepare_ui_component(
+diff --git a/src/sentry/sentry_apps/services/region/__init__.py b/src/sentry/sentry_apps/services/cell/__init__.py
+similarity index 100%
+rename from src/sentry/sentry_apps/services/region/__init__.py
+rename to src/sentry/sentry_apps/services/cell/__init__.py
+diff --git a/src/sentry/sentry_apps/services/region/impl.py b/src/sentry/sentry_apps/services/cell/impl.py
+similarity index 98%
+rename from src/sentry/sentry_apps/services/region/impl.py
+rename to src/sentry/sentry_apps/services/cell/impl.py
+index ced38c3b7a7ee9..e9a5e444a9f002 100644
+--- a/src/sentry/sentry_apps/services/region/impl.py
++++ b/src/sentry/sentry_apps/services/cell/impl.py
+@@ -16,7 +16,7 @@
+ from sentry.sentry_apps.models.servicehook import ServiceHook, ServiceHookProject
+ from sentry.sentry_apps.services.app import RpcSentryAppInstallation
+ from sentry.sentry_apps.services.app.model import RpcSentryApp
+-from sentry.sentry_apps.services.region.model import (
++from sentry.sentry_apps.services.cell.model import (
+     RpcEmptyResult,
+     RpcInteractionStatsResult,
+     RpcPlatformExternalIssueResult,
+@@ -25,11 +25,11 @@
+     RpcServiceHookProjectsResult,
+     RpcTimeSeriesPoint,
+ )
+-from sentry.sentry_apps.services.region.serial import (
++from sentry.sentry_apps.services.cell.serial import (
+     serialize_platform_external_issue,
+     serialize_service_hook_project,
+ )
+-from sentry.sentry_apps.services.region.service import SentryAppRegionService
++from sentry.sentry_apps.services.cell.service import SentryAppCellService
+ from sentry.sentry_apps.utils.errors import SentryAppIntegratorError, SentryAppSentryError
+ from sentry.tsdb.base import TSDBModel
+ from sentry.users.services.user import RpcUser
+@@ -37,7 +37,7 @@
+ COMPONENT_TYPES = ["stacktrace-link", "issue-link"]
+ 
+ 
+-class DatabaseBackedSentryAppRegionService(SentryAppRegionService):
++class DatabaseBackedSentryAppCellService(SentryAppCellService):
+     def get_select_options(
+         self,
+         *,
+diff --git a/src/sentry/sentry_apps/services/region/model.py b/src/sentry/sentry_apps/services/cell/model.py
+similarity index 100%
+rename from src/sentry/sentry_apps/services/region/model.py
+rename to src/sentry/sentry_apps/services/cell/model.py
+diff --git a/src/sentry/sentry_apps/services/region/serial.py b/src/sentry/sentry_apps/services/cell/serial.py
+similarity index 86%
+rename from src/sentry/sentry_apps/services/region/serial.py
+rename to src/sentry/sentry_apps/services/cell/serial.py
+index 585a63c6866a5f..1d0c6630fbfb05 100644
+--- a/src/sentry/sentry_apps/services/region/serial.py
++++ b/src/sentry/sentry_apps/services/cell/serial.py
+@@ -1,6 +1,6 @@
+ from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+ from sentry.sentry_apps.models.servicehook import ServiceHookProject
+-from sentry.sentry_apps.services.region.model import RpcPlatformExternalIssue, RpcServiceHookProject
++from sentry.sentry_apps.services.cell.model import RpcPlatformExternalIssue, RpcServiceHookProject
+ 
+ 
+ def serialize_service_hook_project(project: ServiceHookProject) -> RpcServiceHookProject:
+diff --git a/src/sentry/sentry_apps/services/region/service.py b/src/sentry/sentry_apps/services/cell/service.py
+similarity index 94%
+rename from src/sentry/sentry_apps/services/region/service.py
+rename to src/sentry/sentry_apps/services/cell/service.py
+index 07f2be7825b9bd..7a3fedcdf09e31 100644
+--- a/src/sentry/sentry_apps/services/region/service.py
++++ b/src/sentry/sentry_apps/services/cell/service.py
+@@ -10,7 +10,7 @@
+ from sentry.hybridcloud.rpc.resolvers import ByOrganizationId, ByOrganizationIdAttribute
+ from sentry.hybridcloud.rpc.service import RpcService, regional_rpc_method
+ from sentry.sentry_apps.services.app import RpcSentryApp, RpcSentryAppInstallation
+-from sentry.sentry_apps.services.region.model import (
++from sentry.sentry_apps.services.cell.model import (
+     RpcEmptyResult,
+     RpcInteractionStatsResult,
+     RpcPlatformExternalIssueResult,
+@@ -21,7 +21,7 @@
+ from sentry.users.services.user import RpcUser
+ 
+ 
+-class SentryAppRegionService(RpcService):
++class SentryAppCellService(RpcService):
+     """
+     Region silo service for Sentry App operations that require access to region-specific data
+     (like projects, issues, etc.).
+@@ -35,9 +35,9 @@ class SentryAppRegionService(RpcService):
+ 
+     @classmethod
+     def get_local_implementation(cls) -> RpcService:
+-        from sentry.sentry_apps.services.region.impl import DatabaseBackedSentryAppRegionService
++        from sentry.sentry_apps.services.cell.impl import DatabaseBackedSentryAppCellService
+ 
+-        return DatabaseBackedSentryAppRegionService()
++        return DatabaseBackedSentryAppCellService()
+ 
+     def get_component_interaction_key(self, sentry_app_slug: str, component_type: str) -> str:
+         """Combines SentryApp.slug and SentryAppComponent.type to create a unique key for TSDB metrics."""
+@@ -179,4 +179,4 @@ def record_interaction(
+         pass
+ 
+ 
+-sentry_app_region_service = SentryAppRegionService.create_delegation()
++sentry_app_cell_service = SentryAppCellService.create_delegation()
+diff --git a/src/sentry/spans/buffer.py b/src/sentry/spans/buffer.py
+index 9c56a281f42da2..8ad77d4fa858b5 100644
+--- a/src/sentry/spans/buffer.py
++++ b/src/sentry/spans/buffer.py
+@@ -761,6 +761,13 @@ def _add_spans(key: SegmentKey, raw_data: bytes) -> bool:
+                         category=DataCategory.SPAN_INDEXED,
+                         quantity=dropped,
+                     )
++            elif not payloads.get(key):
++                # BUG DETECTION: Segment was in the flush queue but both the data
++                # (span-buf:s:*) and metadata (span-buf:ic:*) keys are missing.
++                # This means the Redis keys expired before the flusher could process
++                # them, resulting in silent data loss. The spans were already committed
++                # from the ingest Kafka topic, so they cannot be recovered.
++                metrics.incr("spans.buffer.segment_expired_before_flush")
+ 
+         for key, spans in payloads.items():
+             if not spans:
+diff --git a/src/sentry/types/region.py b/src/sentry/types/region.py
+index 03defe5dfb4ef7..8ac70ffe6d1191 100644
+--- a/src/sentry/types/region.py
++++ b/src/sentry/types/region.py
+@@ -475,7 +475,7 @@ def find_regions_for_user(user_id: int) -> set[str]:
+ 
+ 
+ @control_silo_function
+-def find_regions_for_sentry_app(sentry_app: SentryApp) -> set[str]:
++def find_cells_for_sentry_app(sentry_app: SentryApp) -> set[str]:
+     from sentry.models.organizationmapping import OrganizationMapping
+     from sentry.sentry_apps.models.sentry_app_installation import SentryAppInstallation
+ 
+diff --git a/src/sentry/utils/email/message_builder.py b/src/sentry/utils/email/message_builder.py
+index e296d74f1b67a0..1a6c592106f8fd 100644
+--- a/src/sentry/utils/email/message_builder.py
++++ b/src/sentry/utils/email/message_builder.py
+@@ -190,7 +190,8 @@ def build(
+         reference = self.reference
+         if isinstance(reference, Activity):
+             reference = reference.group
+-            subject = f"Re: {subject}"
++            if reference is not None:
++                subject = f"Re: {subject}"
+ 
+         if isinstance(reference, Group):
+             thread, created = GroupEmailThread.objects.get_or_create(
+diff --git a/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts b/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
+index ce2702b3339093..474e12d1f7aab2 100644
+--- a/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
++++ b/static/app/components/events/autofix/preferences/hooks/useUpdateProjectSeerPreferences.ts
+@@ -6,8 +6,8 @@ import {
+ } from 'sentry/components/events/autofix/preferences/hooks/useProjectSeerPreferences';
+ import type {ProjectSeerPreferences} from 'sentry/components/events/autofix/types';
+ import type {Project} from 'sentry/types/project';
+-import apiFetch from 'sentry/utils/api/apiFetch';
+ import {
++  fetchDataQuery,
+   fetchMutation,
+   getApiQueryData,
+   setApiQueryData,
+@@ -32,12 +32,12 @@ export function useFetchProjectSeerPreferences({project}: {project: Project}) {
+   const queryKey = makeProjectSeerPreferencesQueryKey(organization.slug, project.slug);
+ 
+   return useCallback(async () => {
+-    const response = await queryClient.fetchQuery({
++    const [data] = await queryClient.fetchQuery({
+       queryKey,
+-      queryFn: apiFetch<SeerPreferencesResponse>,
++      queryFn: fetchDataQuery<SeerPreferencesResponse>,
+       staleTime: 0,
+     });
+-    return response.json.preference;
++    return data?.preference;
+   }, [queryClient, queryKey]);
+ }
+ 
+diff --git a/static/app/components/events/autofix/v3/drawer.tsx b/static/app/components/events/autofix/v3/drawer.tsx
+index f9e0deaa4b6f27..8e5c4f7c7b7e90 100644
+--- a/static/app/components/events/autofix/v3/drawer.tsx
++++ b/static/app/components/events/autofix/v3/drawer.tsx
+@@ -1,4 +1,4 @@
+-import {useMemo} from 'react';
++import {useCallback, useMemo} from 'react';
+ 
+ import {Flex} from '@sentry/scraps/layout';
+ 
+@@ -34,6 +34,7 @@ export function SeerDrawer({event, group, project}: SeerDrawerProps) {
+   const aiAutofix = useExplorerAutofix(group.id);
+ 
+   const handleCopyMarkdown = useHandleCopyMarkdown({aiAutofix});
++  const handleRestart = useHandleRestart({aiAutofix});
+ 
+   return (
+     <Flex
+@@ -44,10 +45,7 @@ export function SeerDrawer({event, group, project}: SeerDrawerProps) {
+       direction="column"
+       background="secondary"
+     >
+-      <SeerDrawerHeader
+-        onCopyMarkdown={handleCopyMarkdown}
+-        onReset={aiAutofix.runState ? aiAutofix.reset : undefined}
+-      />
++      <SeerDrawerHeader onCopyMarkdown={handleCopyMarkdown} onReset={handleRestart} />
+       <SeerDrawerBody>
+         <InnerSeerDrawer
+           group={group}
+@@ -143,3 +141,15 @@ function useHandleCopyMarkdown({
+     };
+   }, [aiAutofix, copy]);
+ }
++
++function useHandleRestart({
++  aiAutofix,
++}: {
++  aiAutofix: ReturnType<typeof useExplorerAutofix>;
++}): () => void {
++  const {startStep} = aiAutofix;
++
++  return useCallback(() => {
++    startStep('root_cause');
++  }, [startStep]);
++}
+diff --git a/static/app/stores/projectsStore.tsx b/static/app/stores/projectsStore.tsx
+index bac6ca04e86ce8..34950e406cec7c 100644
+--- a/static/app/stores/projectsStore.tsx
++++ b/static/app/stores/projectsStore.tsx
+@@ -13,8 +13,6 @@ type State = {
+   projects: Project[];
+ };
+ 
+-type StatsData = Record<string, Project['stats']>;
+-
+ /**
+  * Attributes that need typing but aren't part of the external interface,
+  */
+@@ -35,7 +33,6 @@ interface ProjectsStoreDefinition
+   onDeleteProject(projectSlug: string): void;
+   onDeleteTeam(slug: string): void;
+   onRemoveTeam(teamSlug: string, projectSlug: string): void;
+-  onStatsLoadSuccess(data: StatsData): void;
+   onUpdateSuccess(data: Partial<Project>): void;
+   reset(): void;
+ }
+@@ -117,18 +114,6 @@ const storeConfig: ProjectsStoreDefinition = {
+     clearQueryCache();
+   },
+ 
+-  onStatsLoadSuccess(data) {
+-    const statsData = data || {};
+-
+-    // Assign stats into projects
+-    const newProjects = this.state.projects.map(project =>
+-      statsData[project.id] ? {...project, stats: data[project.id]} : project
+-    );
+-    this.state = {...this.state, projects: newProjects};
+-
+-    this.trigger(new Set(Object.keys(data)));
+-  },
+-
+   onDeleteProject(projectSlug: string) {
+     const project = this.getBySlug(projectSlug);
+     if (!project) {
+diff --git a/static/app/utils/discover/fieldRenderers.tsx b/static/app/utils/discover/fieldRenderers.tsx
+index 83dcee57ba980d..80999ea3412af0 100644
+--- a/static/app/utils/discover/fieldRenderers.tsx
++++ b/static/app/utils/discover/fieldRenderers.tsx
+@@ -822,9 +822,10 @@ const SPECIAL_FIELDS: Record<string, SpecialField> = {
+     sortField: null,
+     renderFunc: data => (
+       <StarredSegmentCell
+-        projectSlug={data.project}
+-        segmentName={data.transaction}
+-        isStarred={data.is_starred_transaction}
++        projectSlug={data[SpanFields.PROJECT]}
++        projectId={data[SpanFields.PROJECT_ID]?.toString()}
++        segmentName={data[SpanFields.TRANSACTION]}
++        isStarred={data[SpanFields.IS_STARRED_TRANSACTION]}
+       />
+     ),
+   },
+diff --git a/static/app/views/alerts/rules/metric/eapMetricsField.tsx b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+index 7c2a5c4396c7c6..ac23bf880f8692 100644
+--- a/static/app/views/alerts/rules/metric/eapMetricsField.tsx
++++ b/static/app/views/alerts/rules/metric/eapMetricsField.tsx
+@@ -125,11 +125,13 @@ export default function EAPMetricsField({
+         trailingItems: (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/dashboards/components/genericOnboarding.tsx b/static/app/views/dashboards/components/genericOnboarding.tsx
+new file mode 100644
+index 00000000000000..71ad22e426145d
+--- /dev/null
++++ b/static/app/views/dashboards/components/genericOnboarding.tsx
+@@ -0,0 +1,47 @@
++import emptyStateImg from 'sentry-images/spot/performance-waiting-for-span.svg';
++
++import {LinkButton} from '@sentry/scraps/button';
++import {Image} from '@sentry/scraps/image';
++import {Flex} from '@sentry/scraps/layout';
++import {Heading, Text} from '@sentry/scraps/text';
++
++import Panel from 'sentry/components/panels/panel';
++import {t} from 'sentry/locale';
++
++interface OverviewOnboardingPanelProps {
++  heading: string;
++}
++
++export function GenericOnboarding({heading}: OverviewOnboardingPanelProps) {
++  return (
++    <Panel>
++      <Flex justify="center">
++        <Flex padding="xl" align="center" wrap="wrap-reverse" gap="3xl" maxWidth="1000px">
++          <Flex direction="column" gap="xl" flex="5" align="start">
++            <Heading as="h3" size="xl">
++              {heading}
++            </Heading>
++
++            <Text as="p" size="md">
++              {t(
++                'Send telemetry data to Sentry for this project to start using this dashboard. Set up your SDK to begin monitoring your application.'
++              )}
++            </Text>
++
++            <LinkButton
++              priority="primary"
++              external
++              href="https://docs.sentry.io/product/dashboards/"
++            >
++              {t('Read the Docs')}
++            </LinkButton>
++          </Flex>
++
++          <Flex flex="3" justify="center">
++            <Image src={emptyStateImg} alt="" width="100%" />
++          </Flex>
++        </Flex>
++      </Flex>
++    </Panel>
++  );
++}
+diff --git a/static/app/views/dashboards/components/prebuiltDashboardOnboardingGate.tsx b/static/app/views/dashboards/components/prebuiltDashboardOnboardingGate.tsx
+new file mode 100644
+index 00000000000000..0fe6448b94d48f
+--- /dev/null
++++ b/static/app/views/dashboards/components/prebuiltDashboardOnboardingGate.tsx
+@@ -0,0 +1,91 @@
++import usePageFilters from 'sentry/components/pageFilters/usePageFilters';
++import {getSelectedProjectList} from 'sentry/utils/project/useSelectedProjectsHaveField';
++import useOrganization from 'sentry/utils/useOrganization';
++import useProjects from 'sentry/utils/useProjects';
++import type {PrebuiltDashboardId} from 'sentry/views/dashboards/utils/prebuiltConfigs';
++import {PREBUILT_DASHBOARDS} from 'sentry/views/dashboards/utils/prebuiltConfigs';
++import * as ModuleLayout from 'sentry/views/insights/common/components/moduleLayout';
++import {ModulesOnboardingPanel} from 'sentry/views/insights/common/components/modulesOnboarding';
++import {useHasFirstSpan} from 'sentry/views/insights/common/queries/useHasFirstSpan';
++import {useOnboardingProject} from 'sentry/views/insights/common/queries/useOnboardingProject';
++import {Onboarding as AgentOnboarding} from 'sentry/views/insights/pages/agents/onboarding';
++import {Onboarding as MCPOnboarding} from 'sentry/views/insights/pages/mcp/onboarding';
++import {ModuleName} from 'sentry/views/insights/types';
++import {LegacyOnboarding} from 'sentry/views/performance/onboarding';
++
++import {GenericOnboarding} from './genericOnboarding';
++
++interface PrebuiltDashboardOnboardingGateProps {
++  children: React.ReactNode;
++  prebuiltId?: PrebuiltDashboardId;
++}
++
++export function PrebuiltDashboardOnboardingGate({
++  prebuiltId,
++  children,
++}: PrebuiltDashboardOnboardingGateProps) {
++  const organization = useOrganization();
++  const {projects} = useProjects();
++  const pageFilters = usePageFilters();
++
++  const onboarding = prebuiltId ? PREBUILT_DASHBOARDS[prebuiltId]?.onboarding : undefined;
++
++  const moduleName =
++    onboarding?.type === 'module' ? onboarding.moduleName : ModuleName.OTHER;
++
++  // First project that doesn't have any span data at all
++  const onboardingProject = useOnboardingProject();
++  const hasAnySpanData = !onboardingProject;
++
++  // Whether the selected projects have span of the required type
++  const hasFirstSpan = useHasFirstSpan(moduleName);
++
++  if (!onboarding) {
++    return children;
++  }
++
++  // If the dashboard uses module-specific onboarding, check whether
++  // module-specific data is available
++  if (onboarding.type === 'module') {
++    if (!hasAnySpanData) {
++      return (
++        <ModuleLayout.Full>
++          <LegacyOnboarding organization={organization} project={onboardingProject} />
++        </ModuleLayout.Full>
++      );
++    }
++
++    if (!hasFirstSpan) {
++      return (
++        <ModuleLayout.Full>
++          <ModulesOnboardingPanel moduleName={onboarding.moduleName} />
++        </ModuleLayout.Full>
++      );
++    }
++
++    return children;
++  }
++
++  const selectedProjects = getSelectedProjectList(
++    pageFilters.selection.projects,
++    projects
++  );
++
++  const hasData = onboarding.requiredProjectFlags.some(flag =>
++    selectedProjects.some(p => p[flag] === true)
++  );
++
++  if (hasData) {
++    return children;
++  }
++
++  if (onboarding.type === 'custom') {
++    if (onboarding.componentId === 'agent-monitoring') {
++      return <AgentOnboarding />;
++    }
++
++    return <MCPOnboarding />;
++  }
++
++  return <GenericOnboarding heading={onboarding.description} />;
++}
+diff --git a/static/app/views/dashboards/detail.tsx b/static/app/views/dashboards/detail.tsx
+index 4856b8c42d7c37..d4ab49092b5538 100644
+--- a/static/app/views/dashboards/detail.tsx
++++ b/static/app/views/dashboards/detail.tsx
+@@ -78,6 +78,7 @@ import {MetricsDataSwitcher} from 'sentry/views/performance/landing/metricsDataS
+ import {MetricsDataSwitcherAlert} from 'sentry/views/performance/landing/metricsDataSwitcherAlert';
+ import {DiscoverQueryPageSource} from 'sentry/views/performance/utils';
+ 
++import {PrebuiltDashboardOnboardingGate} from './components/prebuiltDashboardOnboardingGate';
+ import Controls from './controls';
+ import Dashboard from './dashboard';
+ import {DEFAULT_STATS_PERIOD} from './data';
+@@ -997,17 +998,21 @@ class DashboardDetail extends Component<Props, State> {
+                         location={location}
+                         forceTransactions={metricsDataSide.forceTransactionsOnly}
+                       >
+-                        <Dashboard
+-                          dashboard={modifiedDashboard ?? dashboard}
+-                          isEditingDashboard={this.isEditingDashboard}
+-                          widgetLimitReached={widgetLimitReached}
+-                          onUpdate={this.handleUpdateEditStateWidgets}
+-                          handleUpdateWidgetList={this.handleUpdateWidgetList}
+-                          handleAddCustomWidget={this.handleAddCustomWidget}
+-                          isEmbedded={this.isEmbedded}
+-                          isPreview={this.isPreview}
+-                          widgetLegendState={this.state.widgetLegendState}
+-                        />
++                        <PrebuiltDashboardOnboardingGate
++                          prebuiltId={dashboard.prebuiltId}
++                        >
++                          <Dashboard
++                            dashboard={modifiedDashboard ?? dashboard}
++                            isEditingDashboard={this.isEditingDashboard}
++                            widgetLimitReached={widgetLimitReached}
++                            onUpdate={this.handleUpdateEditStateWidgets}
++                            handleUpdateWidgetList={this.handleUpdateWidgetList}
++                            handleAddCustomWidget={this.handleAddCustomWidget}
++                            isEmbedded={this.isEmbedded}
++                            isPreview={this.isPreview}
++                            widgetLegendState={this.state.widgetLegendState}
++                          />
++                        </PrebuiltDashboardOnboardingGate>
+                       </MEPSettingProvider>
+                     )}
+                   </MetricsDataSwitcher>
+@@ -1224,24 +1229,28 @@ class DashboardDetail extends Component<Props, State> {
+ 
+                           <Fragment>
+                             <WidgetQueryQueueProvider>
+-                              <Dashboard
+-                                dashboard={modifiedDashboard ?? dashboard}
+-                                isEditingDashboard={this.isEditingDashboard}
+-                                widgetLimitReached={widgetLimitReached}
+-                                onUpdate={this.handleUpdateEditStateWidgets}
+-                                handleUpdateWidgetList={this.handleUpdateWidgetList}
+-                                handleAddCustomWidget={this.handleAddCustomWidget}
+-                                onAddWidget={this.onAddWidget}
+-                                isEmbedded={this.isEmbedded}
+-                                isPreview={this.isPreview}
+-                                widgetLegendState={this.state.widgetLegendState}
+-                                onEditWidget={this.onEditWidget}
+-                                newlyAddedWidget={newlyAddedWidget}
+-                                onNewWidgetScrollComplete={
+-                                  this.handleScrollToNewWidgetComplete
+-                                }
+-                                widgetInterval={this.props.widgetInterval}
+-                              />
++                              <PrebuiltDashboardOnboardingGate
++                                prebuiltId={dashboard.prebuiltId}
++                              >
++                                <Dashboard
++                                  dashboard={modifiedDashboard ?? dashboard}
++                                  isEditingDashboard={this.isEditingDashboard}
++                                  widgetLimitReached={widgetLimitReached}
++                                  onUpdate={this.handleUpdateEditStateWidgets}
++                                  handleUpdateWidgetList={this.handleUpdateWidgetList}
++                                  handleAddCustomWidget={this.handleAddCustomWidget}
++                                  onAddWidget={this.onAddWidget}
++                                  isEmbedded={this.isEmbedded}
++                                  isPreview={this.isPreview}
++                                  widgetLegendState={this.state.widgetLegendState}
++                                  onEditWidget={this.onEditWidget}
++                                  newlyAddedWidget={newlyAddedWidget}
++                                  onNewWidgetScrollComplete={
++                                    this.handleScrollToNewWidgetComplete
++                                  }
++                                  widgetInterval={this.props.widgetInterval}
++                                />
++                              </PrebuiltDashboardOnboardingGate>
+                             </WidgetQueryQueueProvider>
+ 
+                             <WidgetBuilderV2
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs.tsx b/static/app/views/dashboards/utils/prebuiltConfigs.tsx
+index d57df569bfbaf2..f5ef68c59578b5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs.tsx
++++ b/static/app/views/dashboards/utils/prebuiltConfigs.tsx
+@@ -1,3 +1,4 @@
++import type {Project} from 'sentry/types/project';
+ import {type DashboardDetails} from 'sentry/views/dashboards/types';
+ import {AI_AGENTS_MODELS_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels';
+ import {AI_AGENTS_OVERVIEW_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview';
+@@ -27,6 +28,7 @@ import {QUEUE_SUMMARY_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebu
+ import {SESSION_HEALTH_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/sessionHealth';
+ import {WEB_VITALS_SUMMARY_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary';
+ import {WEB_VITALS_PREBUILT_CONFIG} from 'sentry/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals';
++import type {ModulesWithOnboarding} from 'sentry/views/insights/common/components/modulesOnboarding';
+ 
+ export enum PrebuiltDashboardId {
+   FRONTEND_SESSION_HEALTH = 1,
+@@ -59,7 +61,36 @@ export enum PrebuiltDashboardId {
+   BACKEND_CACHES = 28,
+ }
+ 
+-export type PrebuiltDashboard = Omit<DashboardDetails, 'id'>;
++/** Boolean flags on Project that indicate whether telemetry data has been received. */
++type ProjectTelemetryFlag = Extract<
++  keyof Project,
++  `hasInsights${string}` | 'hasSessions'
++>;
++
++export type OnboardingConfig =
++  | {
++      moduleName: ModulesWithOnboarding;
++      // Single-module onboarding: shows ModulesOnboardingPanel
++      type: 'module';
++      requiredProjectFlags?: ProjectTelemetryFlag[];
++    }
++  | {
++      componentId: 'agent-monitoring' | 'mcp';
++      requiredProjectFlags: ProjectTelemetryFlag[];
++      // Custom onboarding component (AI Agents, MCP)
++      type: 'custom';
++    }
++  | {
++      description: string;
++      requiredProjectFlags: ProjectTelemetryFlag[];
++      // Overview dashboard onboarding: shows a generic onboarding panel
++      // when NONE of the listed project flags are set
++      type: 'overview';
++    };
++
++export type PrebuiltDashboard = Omit<DashboardDetails, 'id'> & {
++  onboarding?: OnboardingConfig;
++};
+ 
+ // NOTE: These configs must be in sync with the prebuilt dashboards declared in
+ // the backend in the `PREBUILT_DASHBOARDS` constant.
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts
+index f2fe57a2a503f5..19fc8befedce15 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsModels.ts
+@@ -172,4 +172,9 @@ export const AI_AGENTS_MODELS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, MODELS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'agent-monitoring',
++    requiredProjectFlags: ['hasInsightsAgentMonitoring'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
+index febe4a7a77ec59..df246c52e555f5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsOverview.ts
+@@ -215,4 +215,9 @@ export const AI_AGENTS_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     globalFilter: DEFAULT_GLOBAL_FILTERS,
+   },
+   widgets: [...FIRST_ROW_WIDGETS, ...SECOND_ROW_WIDGETS, AGENTS_TRACES_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'agent-monitoring',
++    requiredProjectFlags: ['hasInsightsAgentMonitoring'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts
+index 942a2e1194ebc6..51c5c36c72fcff 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/aiAgentsTools.ts
+@@ -109,4 +109,9 @@ export const AI_AGENTS_TOOLS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, TOOLS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'agent-monitoring',
++    requiredProjectFlags: ['hasInsightsAgentMonitoring'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts
+index 72b491f5d0b538..6ae6acd1ae986f 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpOverview.ts
+@@ -214,4 +214,9 @@ export const MCP_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+   title: 'MCP Overview',
+   filters: {},
+   widgets: [...FIRST_ROW_WIDGETS, ...SECOND_ROW_WIDGETS, OVERVIEW_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts
+index b96a251c202cb3..c16868690dfc37 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpPrompts.ts
+@@ -138,4 +138,9 @@ export const MCP_PROMPTS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, PROMPTS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts
+index 72feb12c870818..fc9a64ee00c4c1 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpResources.ts
+@@ -138,4 +138,9 @@ export const MCP_RESOURCES_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, RESOURCES_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts
+index f0fa7cd0e02ddf..b58719881ec187 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/ai/mcpTools.ts
+@@ -138,4 +138,9 @@ export const MCP_TOOLS_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, TOOLS_TABLE],
++  onboarding: {
++    type: 'custom',
++    componentId: 'mcp',
++    requiredProjectFlags: ['hasInsightsMCP'],
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts
+index 3a694a730c902e..c9aabf89aef7f1 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/backendOverview/backendOverview.ts
+@@ -301,4 +301,9 @@ export const BACKEND_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ...BACKEND_OVERVIEW_SECOND_ROW_WIDGETS,
+     TRANSACTIONS_TABLE,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsDb', 'hasInsightsHttp'],
++    description: 'Get started with backend tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts b/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
+index c15acecc305dbe..3fbf0280cb8c16 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/caches/caches.ts
+@@ -4,7 +4,7 @@ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConf
+ import {DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/caches/settings';
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const BASE_CONDITION = `${SpanFields.SPAN_OP}:[cache.get,cache.get_item]`;
+ 
+@@ -112,4 +112,5 @@ export const CACHES_PREBUILT_CONFIG: PrebuiltDashboard = {
+   title: DASHBOARD_TITLE,
+   filters: {},
+   widgets: [...FIRST_ROW_WIDGETS, TRANSACTION_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.CACHE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts
+index 91466a3f226bd8..6fcd2b2c984d13 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssets.ts
+@@ -7,7 +7,7 @@ import {DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/fro
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import {DEFAULT_RESOURCE_TYPES} from 'sentry/views/insights/browser/resources/settings';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_QUERY = MutableSearch.fromQueryObject({
+   has: SpanFields.NORMALIZED_DESCRIPTION,
+@@ -167,4 +167,5 @@ export const FRONTEND_ASSETS_PREBUILT_CONFIG: PrebuiltDashboard = {
+   },
+   title: DASHBOARD_TITLE,
+   widgets: [...FIRST_ROW_WIDGETS, ASSETS_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.RESOURCE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts
+index 7bd16547f7c293..79aa12a2adcae6 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/frontendAssets/frontendAssetsSummary.ts
+@@ -5,7 +5,7 @@ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConf
+ import {SUMMARY_DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/frontendAssets/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import type {DefaultDetailWidgetFields} from 'sentry/views/dashboards/widgets/detailsWidget/types';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const ASSET_DESCRIPTION_WIDGET: Widget = {
+   id: 'domain-widget',
+@@ -302,4 +302,5 @@ export const FRONTEND_ASSETS_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ...THIRD_ROW_WIDGETS,
+     ASSETS_TABLE_WIDGET,
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.RESOURCE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts
+index c3cab19156a77c..90063e327f4e70 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/frontendOverview/frontendOverview.ts
+@@ -255,4 +255,9 @@ export const FRONTEND_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, ...SECOND_ROW_WIDGETS, TRANSACTIONS_TABLE],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsVitals', 'hasInsightsAssets'],
++    description: 'Get started with frontend tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
+index d3b9bb144f0ac5..49628fa49ce7bb 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/http/domainSummary.ts
+@@ -19,7 +19,7 @@ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/se
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import type {DefaultDetailWidgetFields} from 'sentry/views/dashboards/widgets/detailsWidget/types';
+ import {DataTitles} from 'sentry/views/insights/common/views/spans/types';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_STRING = MutableSearch.fromQueryObject(BASE_FILTERS).formatString();
+ 
+@@ -330,4 +330,5 @@ export const HTTP_DOMAIN_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ...CHART_ROW_WIDGETS,
+     TRANSACTIONS_TABLE,
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.HTTP},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts b/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts
+index 14be625dbb8875..d2bb7dd58c9cbe 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/http/http.ts
+@@ -19,7 +19,7 @@ import {
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+ import {DataTitles} from 'sentry/views/insights/common/views/spans/types';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_STRING = MutableSearch.fromQueryObject(BASE_FILTERS).formatString();
+ 
+@@ -192,4 +192,5 @@ export const HTTP_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, DOMAIN_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.HTTP},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts
+index 5aa3a6a40ce18b..8b09ad8e571501 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/laravelOverview/laravelOverview.ts
+@@ -179,4 +179,9 @@ export const LARAVEL_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     COMMANDS_TABLE,
+     JOBS_TABLE,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsDb', 'hasInsightsHttp'],
++    description: 'Get started with Laravel tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts
+index 4b10045c329d10..2686e41c1d28d5 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileSessionHealth.ts
+@@ -200,4 +200,9 @@ export const MOBILE_SESSION_HEALTH_PREBUILT_CONFIG: PrebuiltDashboard = {
+     CRASH_RATE_TABLE,
+     RELEASE_TABLE,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasSessions'],
++    description: 'Get started with mobile session health',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
+index 393559d59c27a5..8c413903fa7abb 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/appStarts.ts
+@@ -3,7 +3,7 @@ import {FieldKind} from 'sentry/utils/fields';
+ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const TRANSACTION_OP_CONDITION = `${SpanFields.TRANSACTION_OP}:[ui.load,navigation]`;
+ const COLD_START_CONDITION = `${SpanFields.SPAN_OP}:app.start.cold ${SpanFields.SPAN_DESCRIPTION}:["Cold Start","Cold App Start"]`;
+@@ -363,4 +363,5 @@ export const MOBILE_VITALS_APP_STARTS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.APP_START},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
+index cef665ba590dcb..f844d42ea8c276 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/mobileVitals.ts
+@@ -4,7 +4,7 @@ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const TRANSACTION_OP_CONDITION = `${SpanFields.TRANSACTION_OP}:[ui.load,navigation]`;
+ 
+@@ -474,4 +474,5 @@ export const MOBILE_VITALS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.MOBILE_VITALS},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+index 5762a455132f88..a2a1882974545a 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenLoads.ts
+@@ -3,7 +3,7 @@ import {FieldKind} from 'sentry/utils/fields';
+ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const TRANSACTION_CONDITION = `is_transaction:true ${SpanFields.TRANSACTION_OP}:[ui.load,navigation]`;
+ const SPAN_OPERATIONS_CONDITION = `${SpanFields.TRANSACTION_OP}:[ui.load,navigation] has:${SpanFields.SPAN_DESCRIPTION} ${SpanFields.SPAN_OP}:[file.read,file.write,ui.load,navigation,http.client,db,db.sql.room,db.sql.query,db.sql.transaction]`;
+@@ -337,4 +337,5 @@ export const MOBILE_VITALS_SCREEN_LOADS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.SCREEN_LOAD},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts
+index f71eba378a5d4d..a0c43f2939302b 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/mobileVitals/screenRendering.ts
+@@ -3,7 +3,7 @@ import {FieldKind} from 'sentry/utils/fields';
+ import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+ import type {Widget} from 'sentry/views/dashboards/types';
+ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const SPAN_OPERATIONS_CONDITION = `${SpanFields.SPAN_OP}:[app.start.cold,app.start.warm,contentprovider.load,application.load,activity.load,ui.load,process.load]`;
+ 
+@@ -111,4 +111,5 @@ export const MOBILE_VITALS_SCREEN_RENDERING_PREBUILT_CONFIG: PrebuiltDashboard =
+       },
+     ],
+   },
++  onboarding: {type: 'module', moduleName: ModuleName.SCREEN_RENDERING},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts b/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts
+index 7e40a6a1a5888b..3d16421c62d67e 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/nextJsOverview/nextJsOverview.ts
+@@ -267,4 +267,9 @@ export const NEXTJS_FRONTEND_OVERVIEW_PREBUILT_CONFIG: PrebuiltDashboard = {
+     SERVER_TRANSACTIONS_TABLE,
+     SERVER_TREE_WIDGET,
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasInsightsVitals', 'hasInsightsAssets'],
++    description: 'Get started with Next.js tracing',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts
+index 533034ca895a84..3a6c17497ddc32 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queries/queries.ts
+@@ -150,4 +150,5 @@ export const QUERIES_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.DB},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts
+index ee78d9a5f434d9..a36f1b855b4554 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queries/querySummary.ts
+@@ -8,7 +8,7 @@ import {
+   QUERIES_PER_MINUTE_TEXT,
+ } from 'sentry/views/dashboards/utils/prebuiltConfigs/queries/constants';
+ import {BASE_FILTERS} from 'sentry/views/dashboards/utils/prebuiltConfigs/queries/queries';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FILTER_STRING = MutableSearch.fromQueryObject(BASE_FILTERS).formatString();
+ 
+@@ -189,4 +189,5 @@ export const QUERIES_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+       layout: {y: 3, x: 3, h: 2, w: 3, minH: 2},
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.DB},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts
+index 49927d0eff768f..1c5dd46846b9c0 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queueSummary.ts
+@@ -4,7 +4,7 @@ import type {PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConf
+ import {QUEUE_CHARTS} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues/queueCharts';
+ import {SUMMARY_DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const SPAN_OP_FILTER = `${SpanFields.SPAN_OP}:[queue.process,queue.publish]`;
+ 
+@@ -224,4 +224,5 @@ export const QUEUE_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+   title: SUMMARY_DASHBOARD_TITLE,
+   filters: {},
+   widgets: [...FIRST_ROW_WIDGTS, ...SECOND_ROW_WIDGETS, CONSUMER_TABLE, PRODUCER_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.QUEUE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts
+index e07b4164e84123..3adfbaf715b564 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/queues/queues.ts
+@@ -6,7 +6,7 @@ import {QUEUE_CHARTS} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues
+ import {DASHBOARD_TITLE} from 'sentry/views/dashboards/utils/prebuiltConfigs/queues/settings';
+ import {TABLE_MIN_HEIGHT} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+ import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ const FIRST_ROW_WIDGETS = spaceWidgetsEquallyOnRow([...QUEUE_CHARTS], 0);
+ 
+@@ -93,4 +93,5 @@ export const QUEUES_PREBUILT_CONFIG: PrebuiltDashboard = {
+     ],
+   },
+   widgets: [...FIRST_ROW_WIDGETS, DESTINATION_TABLE],
++  onboarding: {type: 'module', moduleName: ModuleName.QUEUE},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts b/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts
+index 7fdad9a15ff601..62be6c86405ccb 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/sessionHealth.ts
+@@ -155,4 +155,9 @@ export const SESSION_HEALTH_PREBUILT_CONFIG: PrebuiltDashboard = {
+       layout: {x: 4, y: 5, w: 2, h: 3, minH: 2},
+     },
+   ],
++  onboarding: {
++    type: 'overview',
++    requiredProjectFlags: ['hasSessions'],
++    description: 'Get started with session health',
++  },
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
+index 1bd509f861a8fc..3a1d8cd8d170db 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/pageSummary.ts
+@@ -3,6 +3,7 @@ import {DisplayType, SlideoutId, WidgetType} from 'sentry/views/dashboards/types
+ import {type PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+ import {ISSUE_TYPES} from 'sentry/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals';
+ import {DEFAULT_QUERY_FILTER} from 'sentry/views/insights/browser/webVitals/settings';
++import {ModuleName} from 'sentry/views/insights/types';
+ 
+ export const WEB_VITALS_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+   dateCreated: '',
+@@ -433,4 +434,5 @@ export const WEB_VITALS_SUMMARY_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.VITAL},
+ };
+diff --git a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts
+index 6c17df4da2370d..f38dcbcecf6f10 100644
+--- a/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts
++++ b/static/app/views/dashboards/utils/prebuiltConfigs/webVitals/webVitals.ts
+@@ -4,7 +4,7 @@ import {DisplayType, SlideoutId, WidgetType} from 'sentry/views/dashboards/types
+ import {type PrebuiltDashboard} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+ import {SCORE_BREAKDOWN_WHEEL_WIDGET} from 'sentry/views/dashboards/widgetLibrary/webVitalsWidgets';
+ import {DEFAULT_QUERY_FILTER} from 'sentry/views/insights/browser/webVitals/settings';
+-import {SpanFields} from 'sentry/views/insights/types';
++import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+ 
+ export const ISSUE_TYPES = [
+   'web_vitals',
+@@ -326,4 +326,5 @@ export const WEB_VITALS_PREBUILT_CONFIG: PrebuiltDashboard = {
+       },
+     },
+   ],
++  onboarding: {type: 'module', moduleName: ModuleName.VITAL},
+ };
+diff --git a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+index 59324a865d1bbe..32ec8af6080ff4 100644
+--- a/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
++++ b/static/app/views/detectors/components/forms/metric/metricsVisualize.tsx
+@@ -129,11 +129,13 @@ export function MetricsVisualize() {
+         trailingItems: (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx b/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx
+index b538d04ed0b002..eb37b1f50705dd 100644
+--- a/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx
++++ b/static/app/views/detectors/components/forms/mobileBuild/detectSection.tsx
+@@ -116,6 +116,22 @@ type SupportedPriorityLevel = Extract<
+   DetectorPriorityLevel.HIGH | DetectorPriorityLevel.LOW
+ >;
+ 
++function validateAtLeastOneThreshold({
++  id,
++  form,
++}: {
++  form: Record<string, any>;
++  id: string;
++}): Array<[string, string]> {
++  const high = form[PREPROD_DETECTOR_FORM_FIELDS.highThreshold];
++  const low = form[PREPROD_DETECTOR_FORM_FIELDS.lowThreshold];
++
++  if (!high && !low) {
++    return [[id, t('At least one threshold is required')]];
++  }
++  return [];
++}
++
+ function PriorityRow({
+   priority,
+   isPercentage,
+@@ -123,19 +139,16 @@ function PriorityRow({
+   isPercentage: boolean;
+   priority: SupportedPriorityLevel;
+ }) {
+-  let required: boolean;
+   let priorityLabel: string;
+   let thresholdFieldName: string;
+   switch (priority) {
+     case DetectorPriorityLevel.HIGH:
+       priorityLabel = t('High priority');
+       thresholdFieldName = PREPROD_DETECTOR_FORM_FIELDS.highThreshold;
+-      required = true;
+       break;
+     case DetectorPriorityLevel.LOW:
+       priorityLabel = t('Low priority');
+       thresholdFieldName = PREPROD_DETECTOR_FORM_FIELDS.lowThreshold;
+-      required = false;
+       break;
+     default:
+       return null;
+@@ -144,17 +157,19 @@ function PriorityRow({
+   return (
+     <Flex align="center" gap="md">
+       <PriorityDot priority={DETECTOR_PRIORITY_LEVEL_TO_PRIORITY_LEVEL[priority]} />
+-      <PriorityLabel>
+-        {priorityLabel}
+-        {required && <RequiredAsterisk>*</RequiredAsterisk>}
+-      </PriorityLabel>
++      <PriorityLabel>{priorityLabel}</PriorityLabel>
+       <Flex align="center" gap="md">
+         <ThresholdField
+           name={thresholdFieldName}
+           placeholder="-"
+           hideLabel
+           inline
+-          required={required}
++          required={false}
++          validate={
++            priority === DetectorPriorityLevel.HIGH
++              ? validateAtLeastOneThreshold
++              : undefined
++          }
+           preserveOnUnmount
+         />
+         <ThresholdSuffix>{isPercentage ? '%' : 'MB'}</ThresholdSuffix>
+@@ -200,11 +215,6 @@ const PriorityLabel = styled('span')`
+   font-weight: ${p => p.theme.font.weight.sans.regular};
+ `;
+ 
+-const RequiredAsterisk = styled('span')`
+-  color: ${p => p.theme.tokens.content.danger};
+-  margin-left: ${p => p.theme.space['2xs']};
+-`;
+-
+ const ThresholdField = styled(NumberField)`
+   padding: 0;
+   margin: 0;
+diff --git a/static/app/views/explore/constants.tsx b/static/app/views/explore/constants.tsx
+index 2116ebe2911e96..db009892b8758c 100644
+--- a/static/app/views/explore/constants.tsx
++++ b/static/app/views/explore/constants.tsx
+@@ -72,6 +72,14 @@ export const SENTRY_SPAN_NUMBER_TAGS: string[] = [...SENTRY_SEARCHABLE_SPAN_NUMB
+ export const SENTRY_SPAN_BOOLEAN_TAGS: string[] = [
+   // duplicating until we've fully rolled out boolean attributes
+   SpanFields.IS_TRANSACTION,
++  SpanFields.IS_STARRED_TRANSACTION,
++];
++
++// Span attributes that should only appear in dashboards, not in Explore.
++// is_starred_transaction relies on the dashboard widget query cache for
++// starring mutations and is not supported in Explore.
++export const DASHBOARD_ONLY_SPAN_ATTRIBUTES: string[] = [
++  SpanFields.IS_STARRED_TRANSACTION,
+ ];
+ 
+ export const SENTRY_LOG_STRING_TAGS: string[] = [
+diff --git a/static/app/views/explore/contexts/traceItemAttributeContext.tsx b/static/app/views/explore/contexts/traceItemAttributeContext.tsx
+index b6341d4f4f842e..3fe5405c53e7b6 100644
+--- a/static/app/views/explore/contexts/traceItemAttributeContext.tsx
++++ b/static/app/views/explore/contexts/traceItemAttributeContext.tsx
+@@ -5,6 +5,7 @@ import type {Project} from 'sentry/types/project';
+ import {FieldKind} from 'sentry/utils/fields';
+ import useOrganization from 'sentry/utils/useOrganization';
+ import {
++  DASHBOARD_ONLY_SPAN_ATTRIBUTES,
+   SENTRY_LOG_BOOLEAN_TAGS,
+   SENTRY_LOG_NUMBER_TAGS,
+   SENTRY_LOG_STRING_TAGS,
+@@ -264,7 +265,19 @@ export function useSpanItemAttributes(
+   type?: TraceItemAttributeType,
+   hiddenKeys?: string[]
+ ): TraceItemAttributeResult {
+-  return useTraceItemDatasetAttributes(TraceItemDataset.SPANS, options, type, hiddenKeys);
++  const mergedHiddenKeys = useMemo(() => {
++    if (!hiddenKeys?.length) {
++      return DASHBOARD_ONLY_SPAN_ATTRIBUTES;
++    }
++    return [...hiddenKeys, ...DASHBOARD_ONLY_SPAN_ATTRIBUTES];
++  }, [hiddenKeys]);
++
++  return useTraceItemDatasetAttributes(
++    TraceItemDataset.SPANS,
++    options,
++    type,
++    mergedHiddenKeys
++  );
+ }
+ 
+ export function useLogItemAttributes(
+diff --git a/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx b/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
+index 6fb1579070b4df..510e13cfaaee0c 100644
+--- a/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
++++ b/static/app/views/explore/metrics/hooks/useMetricSamplesTable.tsx
+@@ -107,7 +107,11 @@ function useMetricsQueryKey({
+             traceMetric.unit
+           );
+         } else if (traceMetric.unit === NONE_UNIT) {
++          newSearch.addOp('(');
+           newSearch.addFilterValue('!has', TraceMetricKnownFieldKey.METRIC_UNIT);
++          newSearch.addOp('OR');
++          newSearch.addFilterValue(TraceMetricKnownFieldKey.METRIC_UNIT, NONE_UNIT);
++          newSearch.addOp(')');
+         }
+       }
+     }
+diff --git a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+index c5d25c5c55b965..57a8ec6b8d6c85 100644
+--- a/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
++++ b/static/app/views/explore/metrics/metricToolbar/metricSelector.tsx
+@@ -99,11 +99,13 @@ export function MetricSelector({
+         trailingItems: () => (
+           <Fragment>
+             <MetricTypeBadge metricType={option[TraceMetricKnownFieldKey.METRIC_TYPE]} />
+-            {hasMetricUnitsUI && option[TraceMetricKnownFieldKey.METRIC_UNIT] && (
+-              <Tag variant="promotion">
+-                {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
+-              </Tag>
+-            )}
++            {hasMetricUnitsUI &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] &&
++              option[TraceMetricKnownFieldKey.METRIC_UNIT] !== NONE_UNIT && (
++                <Tag variant="promotion">
++                  {option[TraceMetricKnownFieldKey.METRIC_UNIT]}
++                </Tag>
++              )}
+           </Fragment>
+         ),
+       })) ?? []),
+diff --git a/static/app/views/insights/common/components/modulesOnboarding.tsx b/static/app/views/insights/common/components/modulesOnboarding.tsx
+index a8b694d9be0751..a82a3a1f4e2848 100644
+--- a/static/app/views/insights/common/components/modulesOnboarding.tsx
++++ b/static/app/views/insights/common/components/modulesOnboarding.tsx
+@@ -38,7 +38,7 @@ import {
+ import {ModuleName} from 'sentry/views/insights/types';
+ import {LegacyOnboarding} from 'sentry/views/performance/onboarding';
+ 
+-type ModulesWithOnboarding = Exclude<
++export type ModulesWithOnboarding = Exclude<
+   ModuleName,
+   | ModuleName.AGENT_MODELS
+   | ModuleName.AGENT_TOOLS
+diff --git a/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx b/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
+index 43b00e8f080fa5..b4c923c68098c8 100644
+--- a/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
++++ b/static/app/views/insights/common/components/tableCells/starredSegmentCell.tsx
+@@ -13,8 +13,9 @@ import type {SpanResponse} from 'sentry/views/insights/types';
+ 
+ interface Props {
+   isStarred: boolean;
+-  projectSlug: string;
+   segmentName: string;
++  projectId?: string;
++  projectSlug?: string;
+ }
+ 
+ type TableRow = Simplify<
+@@ -26,18 +27,23 @@ type TableResponse = [{confidence: any; meta: EventsMetaType; data?: TableRow[]}
+ // The query key used for the starred segments table request, this key is used to reference that query and update the starred segment state
+ export const STARRED_SEGMENT_TABLE_QUERY_KEY = ['starred-segment-table'];
+ 
+-export function StarredSegmentCell({segmentName, isStarred, projectSlug}: Props) {
++export function StarredSegmentCell({
++  segmentName,
++  isStarred,
++  projectSlug,
++  projectId,
++}: Props) {
+   const queryClient = useQueryClient();
+   const {projects} = useProjects();
+   const project = projects.find(p => p.slug === projectSlug);
+ 
+   const {setStarredSegment, isPending} = useStarredSegment({
+-    projectId: project?.id,
++    projectId: project?.id || projectId,
+     segmentName,
+     onError: () => updateTableData(!isStarred),
+   });
+ 
+-  const disabled = !project || !segmentName || isPending;
++  const disabled = (!project && !projectId) || !segmentName || isPending;
+ 
+   const updateTableData = (newIsStarred: boolean) => {
+     queryClient.setQueriesData(
+diff --git a/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx b/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
+index d08c24e959bb47..98457d25cfc329 100644
+--- a/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
++++ b/static/app/views/navigation/secondary/sections/dashboards/dashboardsSecondaryNavigation.tsx
+@@ -1,4 +1,4 @@
+-import {Fragment, useMemo} from 'react';
++import {Fragment} from 'react';
+ import * as Sentry from '@sentry/react';
+ 
+ import ErrorBoundary from 'sentry/components/errorBoundary';
+@@ -23,14 +23,6 @@ export function DashboardsSecondaryNavigation() {
+ 
+   const {data: starredDashboards = []} = useGetStarredDashboards();
+ 
+-  const {prebuiltDashboards, customDashboards} = useMemo(
+-    () => ({
+-      prebuiltDashboards: starredDashboards.filter(d => defined(d.prebuiltId)),
+-      customDashboards: starredDashboards.filter(d => !defined(d.prebuiltId)),
+-    }),
+-    [starredDashboards]
+-  );
+-
+   return (
+     <Fragment>
+       <SecondaryNavigation.Header>
+@@ -46,17 +38,17 @@ export function DashboardsSecondaryNavigation() {
+             {t('All Dashboards')}
+           </SecondaryNavigation.Item>
+         </SecondaryNavigation.Section>
+-        {customDashboards.length > 0 ? (
++        {starredDashboards.length > 0 ? (
+           <SecondaryNavigation.Section
+             id="dashboards-starred"
+             title={t('Starred Dashboards')}
+           >
+             <ErrorBoundary mini>
+               {organization.features.includes('dashboards-starred-reordering') ? (
+-                <DashboardsNavigationItems initialDashboards={customDashboards} />
++                <DashboardsNavigationItems initialDashboards={starredDashboards} />
+               ) : (
+                 <StarredDashboardItems
+-                  dashboards={customDashboards}
++                  dashboards={starredDashboards}
+                   projects={projects}
+                   organizationSlug={organization.slug}
+                   organizationId={organization.id}
+@@ -66,22 +58,6 @@ export function DashboardsSecondaryNavigation() {
+             </ErrorBoundary>
+           </SecondaryNavigation.Section>
+         ) : null}
+-        {prebuiltDashboards.length > 0 ? (
+-          <SecondaryNavigation.Section
+-            id="dashboards-starred-sentry"
+-            title={t('Starred Sentry Built')}
+-          >
+-            <ErrorBoundary mini>
+-              <StarredDashboardItems
+-                dashboards={prebuiltDashboards}
+-                projects={projects}
+-                organizationSlug={organization.slug}
+-                organizationId={organization.id}
+-                userId={user.id}
+-              />
+-            </ErrorBoundary>
+-          </SecondaryNavigation.Section>
+-        ) : null}
+       </SecondaryNavigation.Body>
+     </Fragment>
+   );
+diff --git a/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx b/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
+index fbbb131f9a06b1..e74baa04f4b568 100644
+--- a/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
++++ b/static/gsApp/views/seerAutomation/components/projectDetails/autofixAgent.tsx
+@@ -77,7 +77,7 @@ export default function AutofixAgent({canWrite, preference, project}: Props) {
+ 
+   return (
+     <PanelNoMargin>
+-      <PanelHeader>{t('Autofix Agent')}</PanelHeader>
++      <PanelHeader>{t('Autofix Handoff')}</PanelHeader>
+       <PanelBody>
+         {isPending ? (
+           <Flex justify="center" align="center" padding="xl">
+@@ -92,9 +92,9 @@ export default function AutofixAgent({canWrite, preference, project}: Props) {
+               disabled={Boolean(disabledReason)}
+               disabledReason={disabledReason}
+               name="autofixAgent"
+-              label={t('Autofix Agent')}
++              label={t('Autofix Handoff')}
+               help={tct(
+-                'Seer will orchestrate the autofix process, and automatically hand off issue data coding agent for processing. You can choose to automatically process Issues, and which agent to use here. You can also manually trigger autofix with different agents from the Issue Details page. [docsLink:Read the docs] to learn more.',
++                'Seer will orchestrate the autofix process, and automatically hand off issue data to the coding agent for processing. You can choose to automatically process Issues, and which agent to use here. You can also manually trigger autofix with different agents from the Issue Details page. [docsLink:Read the docs] to learn more.',
+                 {
+                   docsLink: (
+                     <ExternalLink href="https://docs.sentry.io/product/ai-in-sentry/" />
+diff --git a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+index 09806c531d2d47..4bdb9c5b494658 100644
+--- a/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
++++ b/static/gsApp/views/seerAutomation/components/projectTable/seerProjectTableHeader.tsx
+@@ -30,14 +30,14 @@ interface Props {
+ 
+ const COLUMNS = [
+   {title: t('Project'), key: 'project', sortKey: 'project'},
+-  {title: t('Autofix Agent'), key: 'fixes'},
++  {title: t('Autofix Handoff'), key: 'fixes'},
+   {
+     title: (
+       <Flex gap="sm" align="center">
+         {t('PR Creation')}
+         <InfoTip
+           title={t(
+-            'This setting only applies when an Autofix Agent is configured to run automatically.'
++            'This setting only applies when an Autofix Handoff is configured to run automatically.'
+           )}
+         />
+       </Flex>
+diff --git a/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx b/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
+index b1b3c1e727b364..80aea1f2069603 100644
+--- a/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
++++ b/static/gsApp/views/seerAutomation/components/seerAgentHooks.spec.tsx
+@@ -51,7 +51,7 @@ describe('seerAgentHooks', () => {
+       expect(options[0]).toEqual({value: 'seer', label: expect.any(String)});
+       expect(options[1]).toMatchObject({
+         value: {id: '42', name: 'Cursor', provider: 'cursor'},
+-        label: 'Cursor (42)',
++        label: 'Cursor',
+       });
+       expect(options[2]).toEqual({value: 'none', label: expect.any(String)});
+     });
+diff --git a/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx b/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
+index a6c21914805cfb..02d20203a46df3 100644
+--- a/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
++++ b/static/gsApp/views/seerAutomation/components/seerAgentHooks.tsx
+@@ -30,7 +30,7 @@ export function useAgentOptions({
+         .filter(integration => integration.id)
+         .map(integration => ({
+           value: integration,
+-          label: `${integration.name} (${integration.id})`,
++          label: integration.name,
+         })),
+       {value: 'none' as const, label: t('Manual Agent Selection')},
+     ];
+diff --git a/tests/sentry/dashboards/endpoints/test_organization_dashboards.py b/tests/sentry/dashboards/endpoints/test_organization_dashboards.py
+index 810b7f05a0131f..3ed70de46ce660 100644
+--- a/tests/sentry/dashboards/endpoints/test_organization_dashboards.py
++++ b/tests/sentry/dashboards/endpoints/test_organization_dashboards.py
+@@ -2269,36 +2269,19 @@ def test_get_with_exclude_prebuilt(self) -> None:
+                 assert response.status_code == 200
+                 assert len(response.data) == total_count - prebuilt_dashboards_count
+ 
+-    def test_endpoint_creates_favorites_for_pre_favorited_prebuilt_dashboards(self) -> None:
+-        assert (
+-            DashboardFavoriteUser.objects.filter(
+-                organization=self.organization, user_id=self.user.id
+-            ).count()
+-            == 0
+-        )
+-
+-        pre_favorited_prebuilt_ids = {
+-            d["prebuilt_id"] for d in PREBUILT_DASHBOARDS if d.get("pre_favorited")
+-        }
++    def test_get_with_only_prebuilt(self) -> None:
++        with self.feature("organizations:dashboards-prebuilt-insights-dashboards"):
++            with override_options({"dashboards.prebuilt-dashboard-ids": [1, 2, 3]}):
++                response = self.do_request("get", self.url, {"filter": "onlyPrebuilt"})
+ 
+-        with self.feature(
+-            [
+-                "organizations:dashboards-prebuilt-insights-dashboards",
+-                "organizations:dashboards-sync-all-registered-prebuilt-dashboards",
+-            ]
+-        ):
+-            response = self.do_request("get", self.url)
+-        assert response.status_code == 200
++                prebuilt_dashboards_count = Dashboard.objects.filter(
++                    organization=self.organization, prebuilt_id__isnull=False
++                ).count()
++                assert prebuilt_dashboards_count == 3
+ 
+-        favorites = DashboardFavoriteUser.objects.filter(
+-            organization=self.organization, user_id=self.user.id
+-        )
+-        favorited_prebuilt_ids = set(
+-            Dashboard.objects.filter(
+-                id__in=favorites.values_list("dashboard_id", flat=True)
+-            ).values_list("prebuilt_id", flat=True)
+-        )
+-        assert favorited_prebuilt_ids == pre_favorited_prebuilt_ids
++                assert response.status_code == 200
++                assert len(response.data) == prebuilt_dashboards_count
++                assert all(d.get("prebuiltId") is not None for d in response.data)
+ 
+     def test_post_with_text_widget(self) -> None:
+         with self.feature("organizations:dashboards-text-widgets"):
+diff --git a/tests/sentry/mail/activity/test_release.py b/tests/sentry/mail/activity/test_release.py
+index 54e4e6cede2666..64d9e863375023 100644
+--- a/tests/sentry/mail/activity/test_release.py
++++ b/tests/sentry/mail/activity/test_release.py
+@@ -1,6 +1,7 @@
+ from django.core import mail
+ 
+ from sentry.integrations.types import ExternalProviderEnum, ExternalProviders
++from sentry.mail.notifications import build_subject_prefix
+ from sentry.models.activity import Activity
+ from sentry.models.environment import Environment
+ from sentry.models.release import Release
+@@ -23,6 +24,9 @@
+ 
+ 
+ class ReleaseTestCase(ActivityTestCase):
++    def get_prefixed_subject(self, subject: str) -> str:
++        return f"{build_subject_prefix(self.project).rstrip()} {subject}"
++
+     def setUp(self) -> None:
+         super().setUp()
+ 
+@@ -152,6 +156,7 @@ def test_simple(self) -> None:
+         # make sure this only includes projects user has access to
+         assert len(user_context["projects"]) == 1
+         assert user_context["projects"][0][0] == self.project
++        assert email.title == f"Deployed version {email.version_parsed} to {self.environment.name}"
+ 
+         with self.tasks():
+             email.send()
+@@ -165,6 +170,11 @@ def test_simple(self) -> None:
+             self.user3.email,
+             self.user5.email,
+         }
++        expected_subject = self.get_prefixed_subject(
++            f"Deployed {self.project.slug} version {email.version_parsed} to {self.environment.name}"
++        )
++        assert {msg.subject for msg in mail.outbox} == {expected_subject}
++        assert all(not msg.subject.startswith("Re:") for msg in mail.outbox)
+ 
+     def test_prevent_duplicate_projects(self) -> None:
+         email = ReleaseActivityNotification(
+@@ -185,6 +195,76 @@ def test_prevent_duplicate_projects(self) -> None:
+         assert len(user_context["projects"]) == 1
+         assert user_context["projects"][0][0] == self.project
+ 
++    def test_subject_uses_recipient_visible_projects(self) -> None:
++        mail.outbox.clear()
++        self.create_team_membership(user=self.user1, team=self.team2)
++
++        email = ReleaseActivityNotification(
++            Activity(
++                project=self.project,
++                user_id=self.user1.id,
++                type=ActivityType.RELEASE.value,
++                data={"version": self.release.version, "deploy_id": self.deploy.id},
++            )
++        )
++
++        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
++        expected_project_slugs = sorted([self.project.slug, self.project2.slug])
++
++        assert [
++            project.slug for project, _, _ in user_context["projects"]
++        ] == expected_project_slugs
++        assert user_context["subject_project_slugs"] == expected_project_slugs
++
++        with self.tasks():
++            email.send()
++
++        subjects_by_recipient = {message.to[0]: message.subject for message in mail.outbox}
++
++        assert subjects_by_recipient[self.user1.email] == self.get_prefixed_subject(
++            f"Deployed {', '.join(expected_project_slugs)} version {email.version_parsed} to {self.environment.name}"
++        )
++        assert subjects_by_recipient[self.user3.email] == self.get_prefixed_subject(
++            f"Deployed {self.project.slug} version {email.version_parsed} to {self.environment.name}"
++        )
++        assert all(not subject.startswith("Re:") for subject in subjects_by_recipient.values())
++
++    def test_subject_caps_projects_at_two(self) -> None:
++        mail.outbox.clear()
++        team3 = self.create_team(organization=self.org)
++        project3 = self.create_project(
++            organization=self.org,
++            teams=[team3],
++            name="AAA Third",
++            slug="aaa-third",
++        )
++        self.release.add_project(project3)
++        self.create_team_membership(user=self.user1, team=self.team2)
++        self.create_team_membership(user=self.user1, team=team3)
++
++        email = ReleaseActivityNotification(
++            Activity(
++                project=self.project,
++                user_id=self.user1.id,
++                type=ActivityType.RELEASE.value,
++                data={"version": self.release.version, "deploy_id": self.deploy.id},
++            )
++        )
++
++        expected_project_slugs = sorted([self.project.slug, self.project2.slug, project3.slug])
++        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
++
++        assert user_context["subject_project_slugs"] == expected_project_slugs
++
++        with self.tasks():
++            email.send()
++
++        subjects_by_recipient = {message.to[0]: message.subject for message in mail.outbox}
++
++        assert subjects_by_recipient[self.user1.email] == self.get_prefixed_subject(
++            f"Deployed {expected_project_slugs[0]}, {expected_project_slugs[1]} +1 more version {email.version_parsed} to {self.environment.name}"
++        )
++
+     def test_does_not_generate_on_no_release(self) -> None:
+         email = ReleaseActivityNotification(
+             Activity(
+diff --git a/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py b/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
+index 92af7e4c4cd5e1..bc2850428d2d57 100644
+--- a/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
++++ b/tests/sentry/preprod/vcs/status_checks/snapshots/test_templates.py
+@@ -560,7 +560,7 @@ def test_summary_uses_comparison_url_when_base_artifact_exists(self):
+             base_artifact_map,
+         )
+ 
+-        expected_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/compare/{head_artifact.id}/{base_artifact.id}"
++        expected_url = f"http://testserver/organizations/{self.organization.slug}/preprod/snapshots/{head_artifact.id}"
+         assert expected_url in summary
+ 
+     def test_summary_uses_artifact_url_when_no_base(self):
+diff --git a/tests/sentry/sentry_apps/models/test_sentryapp.py b/tests/sentry/sentry_apps/models/test_sentryapp.py
+index edc1ed12a6d114..ce56074d654254 100644
+--- a/tests/sentry/sentry_apps/models/test_sentryapp.py
++++ b/tests/sentry/sentry_apps/models/test_sentryapp.py
+@@ -93,15 +93,15 @@ def test_save_outbox_update(self) -> None:
+         assert outboxes[0].shard_identifier == self.sentry_app.id
+         assert outboxes[0].cell_name
+ 
+-    def test_regions_with_installations(self) -> None:
++    def test_cells_with_installations(self) -> None:
+         self.us_org = self.create_organization(name="us test name", region="us")
+         self.create_sentry_app_installation(
+             organization=self.us_org, slug=self.sentry_app.slug, prevent_token_exchange=True
+         )
+-        assert self.sentry_app.regions_with_installations() == {"us"}
++        assert self.sentry_app.cells_with_installations() == {"us"}
+ 
+         self.eu_org = self.create_organization(name="eu test name", region="eu")
+         self.create_sentry_app_installation(
+             organization=self.eu_org, slug=self.sentry_app.slug, prevent_token_exchange=True
+         )
+-        assert self.sentry_app.regions_with_installations() == {"us", "eu"}
++        assert self.sentry_app.cells_with_installations() == {"us", "eu"}
+diff --git a/tests/sentry/sentry_apps/services/test_region_service.py b/tests/sentry/sentry_apps/services/test_cell_service.py
+similarity index 92%
+rename from tests/sentry/sentry_apps/services/test_region_service.py
+rename to tests/sentry/sentry_apps/services/test_cell_service.py
+index 9316766623bc68..32d8afdd01b379 100644
+--- a/tests/sentry/sentry_apps/services/test_region_service.py
++++ b/tests/sentry/sentry_apps/services/test_cell_service.py
+@@ -10,7 +10,7 @@
+ from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+ from sentry.sentry_apps.models.servicehook import ServiceHook, ServiceHookProject
+ from sentry.sentry_apps.services.app.serial import serialize_sentry_app_installation
+-from sentry.sentry_apps.services.region import sentry_app_region_service
++from sentry.sentry_apps.services.cell import sentry_app_cell_service
+ from sentry.testutils.cases import TestCase
+ from sentry.testutils.helpers.datetime import before_now
+ from sentry.testutils.silo import all_silo_test, assume_test_silo_mode_of
+@@ -18,7 +18,7 @@
+ 
+ 
+ @all_silo_test
+-class TestSentryAppRegionService(TestCase):
++class TestSentryAppCellService(TestCase):
+     def setUp(self) -> None:
+         self.user = self.create_user(email="boop@example.com")
+         self.org = self.create_organization(owner=self.user)
+@@ -56,7 +56,7 @@ def test_get_select_options(self) -> None:
+             content_type="application/json",
+         )
+ 
+-        result = sentry_app_region_service.get_select_options(
++        result = sentry_app_cell_service.get_select_options(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             uri="/get-projects",
+@@ -77,7 +77,7 @@ def test_get_select_options_error(self) -> None:
+             content_type="application/json",
+         )
+ 
+-        result = sentry_app_region_service.get_select_options(
++        result = sentry_app_cell_service.get_select_options(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             uri="/get-projects",
+@@ -105,7 +105,7 @@ def test_create_issue_link(self) -> None:
+ 
+         with assume_test_silo_mode_of(PlatformExternalIssue):
+             assert PlatformExternalIssue.objects.filter(group_id=self.group.id).exists() is False
+-        result = sentry_app_region_service.create_issue_link(
++        result = sentry_app_cell_service.create_issue_link(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=self.group.id,
+@@ -133,7 +133,7 @@ def test_create_issue_link_error(self) -> None:
+             content_type="application/json",
+         )
+ 
+-        result = sentry_app_region_service.create_issue_link(
++        result = sentry_app_cell_service.create_issue_link(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=self.group.id,
+@@ -152,7 +152,7 @@ def test_create_external_issue(self) -> None:
+         with assume_test_silo_mode_of(PlatformExternalIssue):
+             assert PlatformExternalIssue.objects.filter(group_id=self.group.id).exists() is False
+ 
+-        result = sentry_app_region_service.create_external_issue(
++        result = sentry_app_cell_service.create_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=self.group.id,
+@@ -171,7 +171,7 @@ def test_create_external_issue(self) -> None:
+         assert result.external_issue.display_name == "ProjectName#issue-1"
+ 
+     def test_create_external_issue_group_not_found(self) -> None:
+-        result = sentry_app_region_service.create_external_issue(
++        result = sentry_app_cell_service.create_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             group_id=99999999,
+@@ -194,7 +194,7 @@ def test_delete_external_issue(self) -> None:
+                 web_url="https://example.com/issue/123",
+             )
+ 
+-        result = sentry_app_region_service.delete_external_issue(
++        result = sentry_app_cell_service.delete_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             external_issue_id=external_issue.id,
+@@ -206,7 +206,7 @@ def test_delete_external_issue(self) -> None:
+             assert not PlatformExternalIssue.objects.filter(id=external_issue.id).exists()
+ 
+     def test_delete_external_issue_not_found(self) -> None:
+-        result = sentry_app_region_service.delete_external_issue(
++        result = sentry_app_cell_service.delete_external_issue(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             external_issue_id=99999999,
+@@ -226,7 +226,7 @@ def test_get_service_hook_projects(self) -> None:
+             installation_id=self.install.id, project_id=project2.id
+         )
+ 
+-        result = sentry_app_region_service.get_service_hook_projects(
++        result = sentry_app_cell_service.get_service_hook_projects(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             auth_context=self.auth_context,
+@@ -257,7 +257,7 @@ def test_set_service_hook_projects(self) -> None:
+             installation_id=self.install.id, project_id=project2.id
+         )
+ 
+-        result = sentry_app_region_service.set_service_hook_projects(
++        result = sentry_app_cell_service.set_service_hook_projects(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             project_identifiers=[project2.id, project3.slug],
+@@ -301,7 +301,7 @@ def test_set_service_hook_projects_access(self) -> None:
+ 
+         # Member user should not have access to set service hook projects
+         rpc_installation = serialize_sentry_app_installation(install)
+-        result = sentry_app_region_service.set_service_hook_projects(
++        result = sentry_app_cell_service.set_service_hook_projects(
+             organization_id=organization.id,
+             installation=rpc_installation,
+             project_identifiers=[project2.id],
+@@ -328,7 +328,7 @@ def test_delete_service_hook_projects(self) -> None:
+             installation_id=self.install.id, project_id=project2.id
+         )
+ 
+-        result = sentry_app_region_service.delete_service_hook_projects(
++        result = sentry_app_cell_service.delete_service_hook_projects(
+             organization_id=self.org.id,
+             installation=self.rpc_installation,
+             auth_context=self.auth_context,
+@@ -343,7 +343,7 @@ def test_delete_service_hook_projects(self) -> None:
+     def test_get_interaction_stats(self) -> None:
+         now = before_now(days=1)
+         since = (now - timedelta(minutes=5)).timestamp()
+-        result = sentry_app_region_service.get_interaction_stats(
++        result = sentry_app_cell_service.get_interaction_stats(
+             sentry_app=self.rpc_installation.sentry_app,
+             component_types=["issue-link", "stacktrace-link"],
+             since=since,
+@@ -355,7 +355,7 @@ def test_get_interaction_stats(self) -> None:
+         assert set(result.component_interactions.keys()) == {"issue-link", "stacktrace-link"}
+ 
+     def test_record_interaction(self) -> None:
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="sentry_app_viewed",
+         )
+@@ -363,7 +363,7 @@ def test_record_interaction(self) -> None:
+         assert result.success is True
+         assert result.error is None
+ 
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="sentry_app_component_interacted",
+             component_type="issue-link",
+@@ -373,7 +373,7 @@ def test_record_interaction(self) -> None:
+         assert result.error is None
+ 
+     def test_record_interaction_error(self) -> None:
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="invalid_field",
+         )
+@@ -383,7 +383,7 @@ def test_record_interaction_error(self) -> None:
+         assert result.error.status_code == 400
+         assert "tsdbField must be one of" in result.error.message
+ 
+-        result = sentry_app_region_service.record_interaction(
++        result = sentry_app_cell_service.record_interaction(
+             sentry_app=self.rpc_installation.sentry_app,
+             tsdb_field="sentry_app_component_interacted",
+         )
+diff --git a/tests/sentry/types/test_region.py b/tests/sentry/types/test_region.py
+index 8997ae999f8c8c..5acf6aa4aee3a6 100644
+--- a/tests/sentry/types/test_region.py
++++ b/tests/sentry/types/test_region.py
+@@ -22,7 +22,7 @@
+     RegionResolutionError,
+     find_all_cell_names,
+     find_all_multitenant_region_names,
+-    find_regions_for_sentry_app,
++    find_cells_for_sentry_app,
+     find_regions_for_user,
+     get_cell_by_name,
+     get_cell_for_organization,
+@@ -185,7 +185,7 @@ def test_find_regions_for_user(self) -> None:
+             find_regions_for_user(user_id=user.id)
+ 
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+-    def test_find_regions_for_sentry_app(self) -> None:
++    def test_find_cells_for_sentry_app(self) -> None:
+         with override_settings(SENTRY_MONOLITH_REGION="us"):
+             directory = load_from_config(self._INPUTS, [])
+         with self._in_global_state(directory):
+@@ -196,26 +196,26 @@ def test_find_regions_for_sentry_app(self) -> None:
+                 organization=self.organization,
+                 scopes=["project:write"],
+             )
+-            actual_regions = find_regions_for_sentry_app(sentry_app=sentry_app)
+-            assert actual_regions == set()
++            actual_cells = find_cells_for_sentry_app(sentry_app=sentry_app)
++            assert actual_cells == set()
+ 
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=us_org_1)
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=us_org_2)
+-            actual_regions = find_regions_for_sentry_app(sentry_app=sentry_app)
+-            assert actual_regions == {"us"}
++            actual_cells = find_cells_for_sentry_app(sentry_app=sentry_app)
++            assert actual_cells == {"us"}
+ 
+             eu_org_1 = self.create_organization(name="eu test name", region="eu")
+             eu_org_2 = self.create_organization(name="eu test name", region="eu")
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=eu_org_1)
+             self.create_sentry_app_installation(slug=sentry_app.slug, organization=eu_org_2)
+-            actual_regions = find_regions_for_sentry_app(sentry_app=sentry_app)
+-            assert actual_regions == {"us", "eu"}
++            actual_cells = find_cells_for_sentry_app(sentry_app=sentry_app)
++            assert actual_cells == {"us", "eu"}
+ 
+         with (
+             override_settings(SILO_MODE=SiloMode.REGION),
+             pytest.raises(SiloLimit.AvailabilityError),
+         ):
+-            find_regions_for_sentry_app(sentry_app=sentry_app)
++            find_cells_for_sentry_app(sentry_app=sentry_app)
+ 
+     @override_settings(SILO_MODE=SiloMode.CONTROL)
+     def test_find_all_cell_names(self) -> None:
+diff --git a/tests/sentry/utils/email/test_message_builder.py b/tests/sentry/utils/email/test_message_builder.py
+index c310f73093ea8d..14e6caf7b88c01 100644
+--- a/tests/sentry/utils/email/test_message_builder.py
++++ b/tests/sentry/utils/email/test_message_builder.py
+@@ -5,6 +5,7 @@
+ from django.core.mail.message import EmailMultiAlternatives
+ 
+ from sentry import options
++from sentry.models.activity import Activity
+ from sentry.models.groupemailthread import GroupEmailThread
+ from sentry.silo.base import SiloMode
+ from sentry.testutils.cases import TestCase
+@@ -258,6 +259,31 @@ def test_reply_reference(self, make_msgid: MagicMock) -> None:
+             "msgid should not have changed"
+         )
+ 
++    @patch("sentry.utils.email.message_builder.make_msgid")
++    def test_group_less_activity_reference_does_not_prefix_subject(
++        self, make_msgid: MagicMock
++    ) -> None:
++        make_msgid.return_value = "abc123"
++
++        msg = MessageBuilder(
++            subject="Test",
++            body="hello world",
++            html_body="<b>hello world</b>",
++            reference=Activity(project=self.project),
++        )
++        msg.send(["foo@example.com"])
++
++        assert len(mail.outbox) == 1
++
++        out = mail.outbox[0]
++        assert isinstance(out, EmailMultiAlternatives)
++        assert out.to == ["foo@example.com"]
++        assert out.subject == "Test"
++        assert out.extra_headers["Message-Id"] == "abc123"
++        assert "In-Reply-To" not in out.extra_headers
++        assert "References" not in out.extra_headers
++        assert GroupEmailThread.objects.count() == 0
++
+     def test_get_built_messages(self) -> None:
+         msg = MessageBuilder(
+             subject="Test",

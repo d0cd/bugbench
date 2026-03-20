@@ -1,119 +1,715 @@
-diff --git a/compiler/span/src/source_map.rs b/compiler/span/src/source_map.rs
-index f125887c2b..56fcf5f322 100644
---- a/compiler/span/src/source_map.rs
-+++ b/compiler/span/src/source_map.rs
-@@ -14,6 +14,16 @@
- // You should have received a copy of the GNU General Public License
+diff --git a/ast/src/input/input.rs b/ast/src/input/input_ast.rs
+similarity index 100%
+rename from ast/src/input/input.rs
+rename to ast/src/input/input_ast.rs
+diff --git a/ast/src/input/mod.rs b/ast/src/input/mod.rs
+index dbfe148acb..2b9c2bd8f0 100644
+--- a/ast/src/input/mod.rs
++++ b/ast/src/input/mod.rs
+@@ -17,8 +17,8 @@
+ pub mod definition;
+ pub use definition::*;
+ 
+-pub mod input;
+-pub use input::*;
++pub mod input_ast;
++pub use input_ast::*;
+ 
+ pub mod input_value;
+ pub use input_value::*;
+diff --git a/errors/src/parser/parser_errors.rs b/errors/src/parser/parser_errors.rs
+index 17757a94ba..15cbb19241 100644
+--- a/errors/src/parser/parser_errors.rs
++++ b/errors/src/parser/parser_errors.rs
+@@ -16,7 +16,7 @@
+ 
+ use crate::create_errors;
+ 
+-use std::fmt::Display;
++use std::fmt::{Debug, Display};
+ 
+ create_errors!(
+     /// ParserError enum that represents all the errors for the `leo-parser` crate.
+@@ -223,4 +223,76 @@ create_errors!(
+         msg: "Array dimensions specified as a tuple cannot be empty.",
+         help: None,
+     }
++
++    /// When an empty input tendril was expected but not found.
++    @backtraced
++    lexer_empty_input_tendril {
++        args: (),
++        msg: "Expected more characters to lex but found none.",
++        help: None,
++    }
++
++    /// When an integer is started with a leading zero.
++    @backtraced
++    lexer_eat_integer_leading_zero {
++    args: (input: impl Display),
++    msg: format!("Tried to eat integer but found a leading zero on {}.", input),
++    help: None,
++    }
++
++    /// When an integer is started with a leading zero.
++    @backtraced
++     lexer_expected_valid_escaped_char {
++    args: (input: impl Display),
++    msg: format!("Expected a valid escape character but found {}.", input),
++    help: None,
++     }
++
++    /// When a string is not properly closed.
++    @backtraced
++    lexer_string_not_closed {
++    args: (input: impl Display),
++    msg: format!("Expected a closed string but found {}.", input),
++    help: None,
++    }
++
++    /// When a string is not properly closed.
++    @backtraced
++    lexer_char_not_closed {
++    args: (input: impl Display),
++    msg: format!("Expected a closed char but found {}.", input),
++    help: None,
++    }
++
++    /// When a string is not properly closed.
++    @backtraced
++    lexer_invalid_char {
++    args: (input: impl Display),
++    msg: format!("Expected valid character but found {}.", input),
++    help: None,
++    }
++
++    /// When a block comment is empty.
++    @backtraced
++    lexer_empty_block_comment {
++    args: (),
++    msg: "Empty block comment.",
++    help: None,
++    }
++
++    /// When a block comment is not closed before end of file.
++    @backtraced
++    lexer_block_comment_does_not_close_before_eof {
++    args: (input: impl Display),
++    msg: format!("Block comment does not close with content: {}.", input),
++    help: None,
++    }
++
++    /// When the lexer could not lex some text.
++    @backtraced
++    could_not_lex {
++    args: (input: impl Display),
++    msg: format!("Could not lex the following content: {}.", input),
++    help: None,
++    }
+ );
+diff --git a/grammar/README.md b/grammar/README.md
+index 105de2cbe4..9f10032127 100644
+--- a/grammar/README.md
++++ b/grammar/README.md
+@@ -1598,7 +1598,7 @@ The latter takes either no argument,
+ or a format string followed by expressions,
+ whose number must match the number of containers `{}` in the format string.
+ Note that the console function names are identifiers, not keywords.
+-There are three kinds of print commands.
++There are two kinds of print commands.
+ 
+ <a name="console-statement"></a>
+ ```abnf
+@@ -1627,7 +1627,7 @@ Go to: _[expression](#user-content-expression)_;
+ 
+ <a name="print-function"></a>
+ ```abnf
+-print-function = %s"debug" / %s"error" / %s"log"
++print-function = %s"error" / %s"log"
+ ```
+ 
+ <a name="print-arguments"></a>
+diff --git a/grammar/abnf-grammar.txt b/grammar/abnf-grammar.txt
+index af4bd430a1..b5f0993019 100644
+--- a/grammar/abnf-grammar.txt
++++ b/grammar/abnf-grammar.txt
+@@ -962,7 +962,7 @@ assignment-statement = expression assignment-operator expression ";"
+ ; or a format string followed by expressions,
+ ; whose number must match the number of containers `{}` in the format string.
+ ; Note that the console function names are identifiers, not keywords.
+-; There are three kinds of print commands.
++; There are two kinds of print commands.
+ 
+ console-statement = %s"console" "." console-call ";"
+ 
+@@ -971,7 +971,7 @@ console-call = assert-call
+ 
+ assert-call = %s"assert" "(" expression ")"
+ 
+-print-function = %s"debug" / %s"error" / %s"log"
++print-function = %s"error" / %s"log"
+ 
+ print-arguments = "(" string-literal  *( "," expression ) ")"
+ 
+diff --git a/parser/src/parser/input.rs b/parser/src/parser/input.rs
+index 4d6b1c6a1a..66b81896e0 100644
+--- a/parser/src/parser/input.rs
++++ b/parser/src/parser/input.rs
+@@ -57,7 +57,7 @@ impl ParserContext<'_> {
+ 
+         Ok(Section {
+             name: section.name,
+-            span: section.span.clone(),
++            span: section.span,
+             definitions,
+         })
+     }
+diff --git a/parser/src/tokenizer/lexer.rs b/parser/src/tokenizer/lexer.rs
+index 37e899a03f..be73b78d95 100644
+--- a/parser/src/tokenizer/lexer.rs
++++ b/parser/src/tokenizer/lexer.rs
+@@ -15,6 +15,7 @@
  // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
  
-+//! The source map provides an address space for positions in spans
-+//! that is global across the source files that are compiled together.
-+//! The source files are organized in a sequence,
-+//! with the positions of each source following the ones of the previous source
-+//! in the address space of positions
-+//! (except for the first source, which starts at the beginning of the address space).
-+//! This way, any place in any source is identified by a single position
-+//! within the address space covered by the sequence of sources;
-+//! the source file is determined from the position.
-+
- use crate::span::{BytePos, CharPos, Pos, Span};
- use std::{
-     cell::RefCell,
-@@ -84,7 +94,7 @@ impl SourceMap {
-         Some(LineCol { source_file, line, col })
-     }
+ use crate::tokenizer::{Char, Token};
++use leo_errors::{ParserError, Result};
+ use leo_span::{Span, Symbol};
  
--    /// Retrieves the location (source file, line, col) on the given span.
-+    /// Retrieves the location (source file, lines, columns) on the given span.
-     pub fn span_to_location(&self, sp: Span) -> Option<SpanLocation> {
-         let lo = self.find_line_col(sp.lo)?;
-         let hi = self.find_line_col(sp.hi)?;
-@@ -156,8 +166,8 @@ impl SourceMapInner {
- 
- /// A file name.
- ///
--/// For now it's simply a wrapper around `PathBuf`,
--/// but may become more complicated in the future.
-+/// This is either a wrapper around `PathBuf`,
-+/// or a custom string description.
- #[derive(Clone)]
- pub enum FileName {
-     /// A real file.
-@@ -198,7 +208,7 @@ pub struct SourceFile {
- }
- 
- impl SourceFile {
--    /// Creates a new `SourceMap` given the file `name`,
-+    /// Creates a new `SourceFile` given the file `name`,
-     /// source contents, and the `start_pos`ition.
+ use serde::{Deserialize, Serialize};
+@@ -147,13 +148,13 @@ impl Token {
+     /// Returns a tuple: [(integer length, integer token)] if an integer can be eaten, otherwise returns [`None`].
+     /// An integer can be eaten if its bytes are at the front of the given `input_tendril` string.
      ///
-     /// This position is used for analysis purposes.
-@@ -233,7 +243,7 @@ impl SourceFile {
+-    fn eat_integer(input_tendril: &StrTendril) -> (usize, Option<Token>) {
++    fn eat_integer(input_tendril: &StrTendril) -> Result<(usize, Token)> {
+         if input_tendril.is_empty() {
+-            return (0, None);
++            return Err(ParserError::lexer_empty_input_tendril().into());
+         }
+         let input = input_tendril[..].as_bytes();
+         if !input[0].is_ascii_digit() {
+-            return (0, None);
++            return Err(ParserError::lexer_eat_integer_leading_zero(String::from_utf8_lossy(input)).into());
+         }
+         let mut i = 1;
+         let mut is_hex = false;
+@@ -173,7 +174,7 @@ impl Token {
  
-     /// Finds the line containing the given position. The return value is the
-     /// index into the `lines` array of this `SourceFile`, not the 1-based line
--    /// number. If the source_file is empty or the position is located before the
-+    /// number. If the source file is empty or the position is located before the
-     /// first line, `None` is returned.
-     fn lookup_line(&self, pos: BytePos) -> Option<usize> {
-         match self.lines.binary_search(&pos) {
-@@ -324,7 +334,7 @@ fn remove_bom(src: &mut String) {
- 
- /// Replaces `\r\n` with `\n` in-place in `src`.
- ///
--/// Returns error if there's a lone `\r` in the string.
-+/// Isolated carriage returns are left alone.
- fn normalize_newlines(src: &mut String) {
-     if !src.as_bytes().contains(&b'\r') {
-         return;
-diff --git a/compiler/span/src/span_json.rs b/compiler/span/src/span_json.rs
-index 79a6c2cab0..91c820b43d 100644
---- a/compiler/span/src/span_json.rs
-+++ b/compiler/span/src/span_json.rs
-@@ -50,7 +50,7 @@ impl<'de> Visitor<'de> for SpanMapVisitor {
-     type Value = Span;
- 
-     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
--        formatter.write_str("Mapping from `span` keyword to span information")
-+        formatter.write_str("mapping from `span` keyword to span information")
+             i += 1;
+         }
+-        (i, Some(Token::Int(input_tendril.subtendril(0, i as u32))))
++        Ok((i, Token::Int(input_tendril.subtendril(0, i as u32))))
      }
  
-     fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Self::Value, M::Error> {
-diff --git a/compiler/span/src/symbol.rs b/compiler/span/src/symbol.rs
-index fe34d6a5d1..458e30c4f1 100644
---- a/compiler/span/src/symbol.rs
-+++ b/compiler/span/src/symbol.rs
-@@ -31,7 +31,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
- use std::cell::RefCell;
+     /// Returns the number of bytes in an emoji via a bit mask.
+@@ -197,13 +198,13 @@ impl Token {
+     /// Returns a tuple: [(token length, token)] if the next token can be eaten, otherwise returns [`None`].
+     /// The next token can be eaten if the bytes at the front of the given `input_tendril` string can be scanned into a token.
+     ///
+-    pub(crate) fn eat(input_tendril: StrTendril) -> (usize, Option<Token>) {
++    pub(crate) fn eat(input_tendril: StrTendril) -> Result<(usize, Token)> {
+         if input_tendril.is_empty() {
+-            return (0, None);
++            return Err(ParserError::lexer_empty_input_tendril().into());
+         }
+         let input = input_tendril[..].as_bytes();
+         match input[0] {
+-            x if x.is_ascii_whitespace() => return (1, None),
++            x if x.is_ascii_whitespace() => return Ok((1, Token::WhiteSpace)),
+             b'"' => {
+                 let mut i = 1;
+                 let mut len: u8 = 1;
+@@ -270,7 +271,12 @@ impl Token {
+                                 unicode = false;
+                                 string.push(character.into());
+                             }
+-                            None => return (0, None),
++                            None => {
++                                return Err(ParserError::lexer_expected_valid_escaped_char(
++                                    input_tendril.subtendril(start as u32, len as u32),
++                                )
++                                .into())
++                            }
+                         }
+                     }
  
- /// A helper for `symbols` defined below.
--/// The macro's job is to bind conveniently  usable `const` items to the symbol names provided.
-+/// The macro's job is to bind conveniently usable `const` items to the symbol names provided.
- /// For example, with `symbol { a, b }` you'd have `sym::a` and `sym::b`.
- macro_rules! consts {
-     ($val: expr, $sym:ident $(,)?) => {
-@@ -52,7 +52,7 @@ macro_rules! consts {
+@@ -282,10 +288,10 @@ impl Token {
+                 }
+ 
+                 if i == input.len() || !end {
+-                    return (0, None);
++                    return Err(ParserError::lexer_string_not_closed(String::from_utf8_lossy(&input[0..i])).into());
+                 }
+ 
+-                return (i + 1, Some(Token::StringLit(string)));
++                return Ok((i + 1, Token::StringLit(string)));
+             }
+             b'\'' => {
+                 let mut i = 1;
+@@ -310,7 +316,7 @@ impl Token {
+                             if input[i + 1] == b'{' {
+                                 unicode = true;
+                             } else {
+-                                return (0, None);
++                                return Err(ParserError::lexer_expected_valid_escaped_char(input[i]).into());
+                             }
+                         } else {
+                             escaped = true;
+@@ -323,12 +329,12 @@ impl Token {
+                 }
+ 
+                 if !end {
+-                    return (0, None);
++                    return Err(ParserError::lexer_char_not_closed(String::from_utf8_lossy(&input[0..i])).into());
+                 }
+ 
+                 return match Self::eat_char(input_tendril.subtendril(1, (i - 1) as u32), escaped, hex, unicode) {
+-                    Some(character) => (i + 1, Some(Token::CharLit(character))),
+-                    None => (0, None),
++                    Some(character) => Ok((i + 1, Token::CharLit(character))),
++                    None => Err(ParserError::lexer_invalid_char(String::from_utf8_lossy(&input[0..i - 1])).into()),
+                 };
+             }
+             x if x.is_ascii_digit() => {
+@@ -336,119 +342,122 @@ impl Token {
+             }
+             b'!' => {
+                 if let Some(len) = eat(input, "!=") {
+-                    return (len, Some(Token::NotEq));
++                    return Ok((len, Token::NotEq));
+                 }
+-                return (1, Some(Token::Not));
++                return Ok((1, Token::Not));
+             }
+             b'?' => {
+-                return (1, Some(Token::Question));
++                return Ok((1, Token::Question));
+             }
+             b'&' => {
+                 if let Some(len) = eat(input, "&&") {
+-                    return (len, Some(Token::And));
++                    return Ok((len, Token::And));
+                 }
+-                return (1, Some(Token::Ampersand));
++                return Ok((1, Token::Ampersand));
+             }
+-            b'(' => return (1, Some(Token::LeftParen)),
+-            b')' => return (1, Some(Token::RightParen)),
+-            b'_' => return (1, Some(Token::Underscore)),
++            b'(' => return Ok((1, Token::LeftParen)),
++            b')' => return Ok((1, Token::RightParen)),
++            b'_' => return Ok((1, Token::Underscore)),
+             b'*' => {
+                 if let Some(len) = eat(input, "**") {
+                     if let Some(inner_len) = eat(&input[len..], "=") {
+-                        return (len + inner_len, Some(Token::ExpEq));
++                        return Ok((len + inner_len, Token::ExpEq));
+                     }
+-                    return (len, Some(Token::Exp));
++                    return Ok((len, Token::Exp));
+                 } else if let Some(len) = eat(input, "*=") {
+-                    return (len, Some(Token::MulEq));
++                    return Ok((len, Token::MulEq));
+                 }
+-                return (1, Some(Token::Mul));
++                return Ok((1, Token::Mul));
+             }
+             b'+' => {
+                 if let Some(len) = eat(input, "+=") {
+-                    return (len, Some(Token::AddEq));
++                    return Ok((len, Token::AddEq));
+                 }
+-                return (1, Some(Token::Add));
++                return Ok((1, Token::Add));
+             }
+-            b',' => return (1, Some(Token::Comma)),
++            b',' => return Ok((1, Token::Comma)),
+             b'-' => {
+                 if let Some(len) = eat(input, "->") {
+-                    return (len, Some(Token::Arrow));
++                    return Ok((len, Token::Arrow));
+                 } else if let Some(len) = eat(input, "-=") {
+-                    return (len, Some(Token::MinusEq));
++                    return Ok((len, Token::MinusEq));
+                 }
+-                return (1, Some(Token::Minus));
++                return Ok((1, Token::Minus));
+             }
+             b'.' => {
+                 if let Some(len) = eat(input, "...") {
+-                    return (len, Some(Token::DotDotDot));
++                    return Ok((len, Token::DotDotDot));
+                 } else if let Some(len) = eat(input, "..") {
+-                    return (len, Some(Token::DotDot));
++                    return Ok((len, Token::DotDot));
+                 }
+-                return (1, Some(Token::Dot));
++                return Ok((1, Token::Dot));
+             }
+             b'/' => {
+                 if eat(input, "//").is_some() {
+                     let eol = input.iter().position(|x| *x == b'\n');
+                     let len = if let Some(eol) = eol { eol + 1 } else { input.len() };
+-                    return (len, Some(Token::CommentLine(input_tendril.subtendril(0, len as u32))));
++                    return Ok((len, Token::CommentLine(input_tendril.subtendril(0, len as u32))));
+                 } else if eat(input, "/*").is_some() {
+                     if input.is_empty() {
+-                        return (0, None);
++                        return Err(ParserError::lexer_empty_block_comment().into());
+                     }
+                     let eol = input.windows(2).skip(2).position(|x| x[0] == b'*' && x[1] == b'/');
+                     let len = if let Some(eol) = eol {
+                         eol + 4
+                     } else {
+-                        return (0, None);
++                        return Err(ParserError::lexer_block_comment_does_not_close_before_eof(
++                            String::from_utf8_lossy(&input[0..]),
++                        )
++                        .into());
+                     };
+-                    return (len, Some(Token::CommentBlock(input_tendril.subtendril(0, len as u32))));
++                    return Ok((len, Token::CommentBlock(input_tendril.subtendril(0, len as u32))));
+                 } else if let Some(len) = eat(input, "/=") {
+-                    return (len, Some(Token::DivEq));
++                    return Ok((len, Token::DivEq));
+                 }
+-                return (1, Some(Token::Div));
++                return Ok((1, Token::Div));
+             }
+             b':' => {
+                 if let Some(len) = eat(input, "::") {
+-                    return (len, Some(Token::DoubleColon));
++                    return Ok((len, Token::DoubleColon));
+                 } else {
+-                    return (1, Some(Token::Colon));
++                    return Ok((1, Token::Colon));
+                 }
+             }
+-            b';' => return (1, Some(Token::Semicolon)),
++            b';' => return Ok((1, Token::Semicolon)),
+             b'<' => {
+                 if let Some(len) = eat(input, "<=") {
+-                    return (len, Some(Token::LtEq));
++                    return Ok((len, Token::LtEq));
+                 }
+-                return (1, Some(Token::Lt));
++                return Ok((1, Token::Lt));
+             }
+             b'>' => {
+                 if let Some(len) = eat(input, ">=") {
+-                    return (len, Some(Token::GtEq));
++                    return Ok((len, Token::GtEq));
+                 }
+-                return (1, Some(Token::Gt));
++                return Ok((1, Token::Gt));
+             }
+             b'=' => {
+                 if let Some(len) = eat(input, "==") {
+-                    return (len, Some(Token::Eq));
++                    return Ok((len, Token::Eq));
+                 }
+-                return (1, Some(Token::Assign));
++                return Ok((1, Token::Assign));
+             }
+-            b'@' => return (1, Some(Token::At)),
+-            b'[' => return (1, Some(Token::LeftSquare)),
+-            b']' => return (1, Some(Token::RightSquare)),
+-            b'{' => return (1, Some(Token::LeftCurly)),
+-            b'}' => return (1, Some(Token::RightCurly)),
++            b'@' => return Ok((1, Token::At)),
++            b'[' => return Ok((1, Token::LeftSquare)),
++            b']' => return Ok((1, Token::RightSquare)),
++            b'{' => return Ok((1, Token::LeftCurly)),
++            b'}' => return Ok((1, Token::RightCurly)),
+             b'|' => {
+                 if let Some(len) = eat(input, "||") {
+-                    return (len, Some(Token::Or));
++                    return Ok((len, Token::Or));
+                 }
+             }
+             _ => (),
+         }
+         if let Some(ident) = eat_identifier(&input_tendril) {
+-            return (
++            return Ok((
+                 ident.len(),
+-                Some(match &*ident {
++                match &*ident {
+                     x if x.starts_with("aleo1") => Token::AddressLit(ident),
+                     "address" => Token::Address,
+                     "as" => Token::As,
+@@ -486,11 +495,11 @@ impl Token {
+                     "u64" => Token::U64,
+                     "u128" => Token::U128,
+                     _ => Token::Ident(Symbol::intern(&ident)),
+-                }),
+-            );
++                },
++            ));
+         }
+ 
+-        (0, None)
++        Err(ParserError::could_not_lex(String::from_utf8_lossy(&input[0..])).into())
+     }
  }
  
- /// A helper for `symbols` defined below.
--/// The macro's job is to merge all the hard coded strings into a single array of strings.
-+/// The macro's job is to merge all the hard-coded strings into a single array of strings.
- /// The strategy applied is [push-down accumulation](https://danielkeep.github.io/tlborm/book/pat-push-down-accumulation.html).
- macro_rules! strings {
-     // Final step 0) in the push-down accumulation.
-@@ -83,12 +83,12 @@ macro_rules! strings {
- }
+diff --git a/parser/src/tokenizer/mod.rs b/parser/src/tokenizer/mod.rs
+index 52fded2834..f48b3222e4 100644
+--- a/parser/src/tokenizer/mod.rs
++++ b/parser/src/tokenizer/mod.rs
+@@ -28,21 +28,55 @@ pub(crate) use self::token::*;
+ pub(crate) mod lexer;
+ pub(crate) use self::lexer::*;
  
- /// Creates predefined symbols used throughout the Leo compiler and language.
--/// Broadly speaking, any hard coded string in the compiler should be defined here.
-+/// Broadly speaking, any hard-coded string in the compiler should be defined here.
- ///
- /// The macro accepts symbols separated by commas,
- /// and a symbol is either specified as a Rust identifier, in which case it is `stringify!`ed,
--/// or as `ident: "string"` where `"string"` is the actual hard coded string.
--/// The latter case can be used when the hard coded string is not a valid identifier.
-+/// or as `ident: "string"` where `"string"` is the actual hard-coded string.
-+/// The latter case can be used when the hard-coded string is not a valid identifier.
- /// In either case, a `const $ident: Symbol` will be created that you can access as `sym::$ident`.
- macro_rules! symbols {
-     ($($symbols:tt)*) => {
+-use leo_errors::{LeoError, ParserError};
++use leo_errors::{ParserError, Result};
+ use leo_span::Span;
+ 
+ use tendril::StrTendril;
+ 
+ /// Creates a new vector of spanned tokens from a given file path and source code text.
+-pub(crate) fn tokenize(path: &str, input: StrTendril) -> Result<Vec<SpannedToken>, LeoError> {
++pub(crate) fn tokenize(path: &str, input: StrTendril) -> Result<Vec<SpannedToken>> {
+     let path = Arc::new(path.to_string());
+     let mut tokens = vec![];
+     let mut index = 0usize;
+     let mut line_no = 1usize;
+     let mut line_start = 0usize;
+     while input.len() > index {
+-        match Token::eat(input.subtendril(index as u32, (input.len() - index) as u32)) {
+-            (token_len, Some(token)) => {
++        match Token::eat(input.subtendril(index as u32, (input.len() - index) as u32))? {
++            (token_len, Token::WhiteSpace) => {
++                if token_len == 0 && index == input.len() {
++                    break;
++                } else if token_len == 0 {
++                    return Err(ParserError::unexpected_token(
++                        &input[index..].chars().next().unwrap(),
++                        &Span::new(
++                            line_no,
++                            line_no,
++                            index - line_start + 1,
++                            index - line_start + 2,
++                            path,
++                            input.subtendril(
++                                line_start as u32,
++                                input[line_start..].find('\n').unwrap_or_else(|| input.len()) as u32,
++                            ),
++                        ),
++                    )
++                    .into());
++                }
++
++                let bytes = input.as_bytes();
++                if bytes[index] == 0x000D && matches!(bytes.get(index + 1), Some(0x000A)) {
++                    // Check carriage return followed by newline.
++                    line_no += 1;
++                    line_start = index + token_len;
++                    index += token_len;
++                } else if matches!(bytes[index], 0x000A | 0x000D) {
++                    // Check new-line or carriage-return
++                    line_no += 1;
++                    line_start = index + token_len;
++                }
++                index += token_len;
++            }
++            (token_len, token) => {
+                 let mut span = Span::new(
+                     line_no,
+                     line_no,
+@@ -79,32 +113,6 @@ pub(crate) fn tokenize(path: &str, input: StrTendril) -> Result<Vec<SpannedToken
+                 tokens.push(SpannedToken { token, span });
+                 index += token_len;
+             }
+-            (token_len, None) => {
+-                if token_len == 0 && index == input.len() {
+-                    break;
+-                } else if token_len == 0 {
+-                    return Err(ParserError::unexpected_token(
+-                        &input[index..].chars().next().unwrap(),
+-                        &Span::new(
+-                            line_no,
+-                            line_no,
+-                            index - line_start + 1,
+-                            index - line_start + 2,
+-                            path,
+-                            input.subtendril(
+-                                line_start as u32,
+-                                input[line_start..].find('\n').unwrap_or_else(|| input.len()) as u32,
+-                            ),
+-                        ),
+-                    )
+-                    .into());
+-                }
+-                if input.as_bytes()[index] == b'\n' {
+-                    line_no += 1;
+-                    line_start = index + token_len;
+-                }
+-                index += token_len;
+-            }
+         }
+     }
+     Ok(tokens)
+@@ -214,7 +222,7 @@ mod tests {
+             .unwrap();
+             let mut output = String::new();
+             for SpannedToken { token, .. } in tokens.iter() {
+-                output += &format!("{} ", token.to_string());
++                output += &format!("{} ", token);
+             }
+ 
+             assert_eq!(
+@@ -229,7 +237,7 @@ mod tests {
+     fn test_spans() {
+         create_session_if_not_set_then(|_| {
+             let raw = r#"
+-            test
++ppp            test
+             // test
+             test
+             /* test */
+diff --git a/parser/src/tokenizer/token.rs b/parser/src/tokenizer/token.rs
+index ce3347beb0..3dca55e1cf 100644
+--- a/parser/src/tokenizer/token.rs
++++ b/parser/src/tokenizer/token.rs
+@@ -59,6 +59,7 @@ pub enum Token {
+     False,
+     AddressLit(#[serde(with = "leo_span::tendril_json")] StrTendril),
+     CharLit(Char),
++    WhiteSpace,
+ 
+     // Symbols
+     At,
+@@ -200,6 +201,7 @@ impl Token {
+         Some(match self {
+             Token::Address => sym::address,
+             Token::As => sym::As,
++            Token::At => sym::At,
+             Token::Bool => sym::bool,
+             Token::Char => sym::char,
+             Token::Circuit => sym::circuit,
+@@ -258,6 +260,7 @@ impl fmt::Display for Token {
+             False => write!(f, "false"),
+             AddressLit(s) => write!(f, "{}", s),
+             CharLit(s) => write!(f, "{}", s),
++            WhiteSpace => write!(f, "whitespace"),
+ 
+             At => write!(f, "@"),
+ 
+diff --git a/span/src/symbol.rs b/span/src/symbol.rs
+index 74ee62d6cf..0c7f0068e1 100644
+--- a/span/src/symbol.rs
++++ b/span/src/symbol.rs
+@@ -101,10 +101,11 @@ macro_rules! symbols {
+ symbols! {
+     address,
+     AlwaysConst,
+-    Ampersand: "@",
++    Ampersand: "&",
+     array,
+     As: "as",
+     assert,
++    At: "@",
+     bool,
+     char,
+     circuit,
+diff --git a/tests/expectations/parser/parser/expression/literal/char_fail.leo.out b/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
+index 46390f4fb9..4642d0114d 100644
+--- a/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
++++ b/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
+@@ -2,38 +2,38 @@
+ namespace: Token
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | 'a\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | ''\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\x9A'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\x7'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\x7g'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\xz'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\x80'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\xc1'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\xc2'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\xDF'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\xC0'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\xe0'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\x9f'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | 'abcdefg'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\t\\t'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\a'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\z'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\A'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\Z'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\1'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\9'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\*'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\x'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u{bbbbb}\\u{aaaa}'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\uz'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u1'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u123'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u{2764z'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u{276g}'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u00000000'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u01000000'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '\\u9999999'\n     | ^"
+-  - "Error [EPAR0370000]: '\n    --> test:1:1\n     |\n   1 | '😭😂😘'\n     | ^"
++  - "Error [EPAR0370028]: Expected a closed char but found '\\'."
++  - "Error [EPAR0370028]: Expected a closed char but found 'a."
++  - "Error [EPAR0370029]: Expected valid character but found ."
++  - "Error [EPAR0370029]: Expected valid character but found '\\x9."
++  - "Error [EPAR0370029]: Expected valid character but found '\\x."
++  - "Error [EPAR0370029]: Expected valid character but found '\\x7."
++  - "Error [EPAR0370029]: Expected valid character but found '\\x."
++  - "Error [EPAR0370029]: Expected valid character but found '\\x8."
++  - "Error [EPAR0370029]: Expected valid character but found '\\xc."
++  - "Error [EPAR0370029]: Expected valid character but found '\\xc."
++  - "Error [EPAR0370029]: Expected valid character but found '\\xD."
++  - "Error [EPAR0370029]: Expected valid character but found '\\xC."
++  - "Error [EPAR0370029]: Expected valid character but found '\\xe."
++  - "Error [EPAR0370029]: Expected valid character but found '\\x9."
++  - "Error [EPAR0370029]: Expected valid character but found 'abcdef."
++  - "Error [EPAR0370029]: Expected valid character but found '\\t\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370029]: Expected valid character but found '\\."
++  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
++  - "Error [EPAR0370029]: Expected valid character but found '\\u{bbbbb}\\u{aaaa."
++  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
++  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
++  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
++  - "Error [EPAR0370029]: Expected valid character but found '\\u{2764."
++  - "Error [EPAR0370029]: Expected valid character but found '\\u{276g."
++  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
++  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
++  - "Error [EPAR0370026]: Expected a valid escape character but found 117."
++  - "Error [EPAR0370029]: Expected valid character but found '😭😂�."
+diff --git a/tests/expectations/parser/parser/expression/literal/string_fail.leo.out b/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
+index 4d8c97fc71..2b1fcd8d31 100644
+--- a/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
++++ b/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
+@@ -2,10 +2,10 @@
+ namespace: Token
+ expectation: Fail
+ outputs:
+-  - "Error [EPAR0370000]: \"\n    --> test:1:1\n     |\n   1 | \"Hello world!\n     | ^"
+-  - "Error [EPAR0370000]: \"\n    --> test:1:1\n     |\n   1 | \"\\\"\n     | ^"
+-  - "Error [EPAR0370000]: \"\n    --> test:1:1\n     |\n   1 | \"\\l\"\n     | ^"
+-  - "Error [EPAR0370000]: \"\n    --> test:1:1\n     |\n   1 | \"\\uaaa\"\n     | ^"
+-  - "Error [EPAR0370000]: \"\n    --> test:1:1\n     |\n   1 | \"\\u\"\n     | ^"
+-  - "Error [EPAR0370000]: \"\n    --> test:1:1\n     |\n   1 | \"\\xFF\"\n     | ^"
+-  - "Error [EPAR0370000]: \"\n    --> test:1:1\n     |\n   1 | \"\\x\"\n     | ^"
++  - "Error [EPAR0370027]: Expected a closed string but found \"Hello world!."
++  - "Error [EPAR0370027]: Expected a closed string but found \"\\\"."
++  - "Error [EPAR0370026]: Expected a valid escape character but found \\l."
++  - "Error [EPAR0370027]: Expected a closed string but found \"\\uaaa\"."
++  - "Error [EPAR0370027]: Expected a closed string but found \"\\u\"."
++  - "Error [EPAR0370026]: Expected a valid escape character but found \\xFF."
++  - "Error [EPAR0370027]: Expected a closed string but found \"\\x\"."

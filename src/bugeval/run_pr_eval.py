@@ -11,16 +11,19 @@ from typing import Any
 
 import click
 
-from bugeval.io import load_all_cases, write_run_metadata
+from bugeval.io import load_eval_cases, write_run_metadata
 from bugeval.manage_forks import fork_name
+from bugeval.manage_fresh_repos import fresh_repo_name, push_case_branches
 from bugeval.models import TestCase
 from bugeval.pr_eval_models import (
     CaseToolState,
     CaseToolStatus,
     EvalConfig,
-    RunState,
     ToolDef,
+    is_case_done,
     load_eval_config,
+    parse_case_ids,
+    write_error_marker,
 )
 from bugeval.pr_lifecycle import (
     apply_patch_to_branch,
@@ -28,8 +31,10 @@ from bugeval.pr_lifecycle import (
     make_branch_name,
     open_pr,
     poll_for_review,
+    request_review,
     scrape_review_comments,
 )
+from bugeval.repo_setup import get_or_create_cached_repo
 
 
 def make_run_id() -> str:
@@ -38,10 +43,13 @@ def make_run_id() -> str:
 
 
 def load_cases(cases_dir: Path) -> list[TestCase]:
-    """Load all test cases from a directory. Returns empty list if dir missing."""
+    """Load eval-eligible test cases from a directory.
+
+    Thin wrapper around ``load_eval_cases`` for backward compatibility.
+    """
     if not cases_dir.exists():
         return []
-    return load_all_cases(cases_dir)
+    return load_eval_cases(cases_dir)
 
 
 def process_case_tool(
@@ -52,6 +60,7 @@ def process_case_tool(
     run_dir: Path,
     repo_dir: Path | None,
     dry_run: bool,
+    cache_dir: Path | None = None,
 ) -> CaseToolState:
     """Run the state machine for one (case, tool) pair. Returns final state."""
     now = datetime.now(tz=UTC).isoformat()
@@ -65,24 +74,53 @@ def process_case_tool(
         state.completed_at = datetime.now(tz=UTC).isoformat()
         return state
 
-    fork_repo = f"{config.eval_org}/{fork_name(case.repo, tool.name)}"
     upstream_repo = config.repos.get(case.repo.split("/")[-1]) or case.repo
     branch = make_branch_name(case.id, tool.name)
 
     try:
-        # --- branching + applying ---
-        if repo_dir is not None:
-            state.status = CaseToolStatus.branching
-            state.status = CaseToolStatus.applying
+        if tool.fresh_repo:
+            # --- fresh repo path: orphan commits, no git history ---
+            target_repo = f"{config.eval_org}/{fresh_repo_name(case.repo, tool.name)}"
+            base_branch = f"bugeval-base/{case.id}"
+
+            state.status = CaseToolStatus.preparing
             if not dry_run:
-                fork_url = f"git@github.com:{fork_repo}.git"
-                apply_patch_to_branch(branch, case.base_commit, patch_path, fork_url, repo_dir)
+                if cache_dir is None:
+                    raise ValueError("--cache-dir is required for fresh_repo tools")
+                upstream_cache = get_or_create_cached_repo(upstream_repo, cache_dir)
+                fresh_url = f"git@github.com:{target_repo}.git"
+                tmp_parent = cache_dir / "_tmp"
+                tmp_parent.mkdir(parents=True, exist_ok=True)
+                _, branch = push_case_branches(
+                    upstream_cache, case.base_commit, patch_path,
+                    case.id, tool.name, fresh_url, tmp_parent,
+                )
+        else:
+            # --- fork path: existing behavior ---
+            target_repo = f"{config.eval_org}/{fork_name(case.repo, tool.name)}"
+            base_branch = "main"
+
+            if repo_dir is not None:
+                state.status = CaseToolStatus.branching
+                state.status = CaseToolStatus.applying
+                if not dry_run:
+                    fork_url = f"git@github.com:{target_repo}.git"
+                    apply_patch_to_branch(
+                        branch, case.base_commit, patch_path, fork_url, repo_dir
+                    )
 
         # --- open PR ---
         state.status = CaseToolStatus.pr_open
-        pr_number = open_pr(fork_repo, upstream_repo, branch, case, dry_run=dry_run)
+        pr_number = open_pr(
+            target_repo, upstream_repo, branch, case,
+            dry_run=dry_run, base_branch=base_branch,
+        )
         state.pr_number = pr_number
         state.branch_name = branch
+
+        # --- request review (for tools that need explicit reviewer assignment) ---
+        if tool.reviewer:
+            request_review(target_repo, pr_number, tool.reviewer, dry_run=dry_run)
 
         if dry_run:
             state.status = CaseToolStatus.done
@@ -91,14 +129,11 @@ def process_case_tool(
 
         # --- polling ---
         state.status = CaseToolStatus.polling
-        poll_for_review(fork_repo, pr_number)  # waits for tool to respond; scrape regardless
+        poll_for_review(target_repo, pr_number)
 
         # --- scraping ---
-        # Always scrape all three endpoints (reviews, inline, issue_comments).
-        # Some tools post findings only to issue_comments without a formal review,
-        # so conditioning on poll result would silently miss their output.
         state.status = CaseToolStatus.scraping
-        comments: list[dict[str, Any]] = scrape_review_comments(fork_repo, pr_number)
+        comments: list[dict[str, Any]] = scrape_review_comments(target_repo, pr_number)
 
         # Save comments
         out_dir = run_dir / "raw" / f"{case.id}-{tool.name}"
@@ -107,7 +142,7 @@ def process_case_tool(
 
         # --- closing ---
         state.status = CaseToolStatus.closing
-        close_pr_delete_branch(fork_repo, pr_number, branch, dry_run=False)
+        close_pr_delete_branch(target_repo, pr_number, branch, dry_run=False)
 
     except Exception as exc:
         state.status = CaseToolStatus.failed
@@ -127,17 +162,15 @@ async def _eval_tool(
     patches_dir: Path,
     run_dir: Path,
     repo_dir: Path | None,
-    run_state: RunState,
-    checkpoint_path: Path,
     dry_run: bool,
     semaphore: asyncio.Semaphore,
     fail_after: int = 5,
+    cache_dir: Path | None = None,
 ) -> None:
     """Evaluate all cases against one tool, sequentially."""
     consecutive_failures = 0
     for case in cases:
-        existing = run_state.get(case.id, tool.name)
-        if existing.status == CaseToolStatus.done:
+        if is_case_done(run_dir, case.id, tool.name):
             click.echo(f"[skip] {case.id} x {tool.name} (already done)")
             continue
 
@@ -152,12 +185,13 @@ async def _eval_tool(
                 run_dir,
                 repo_dir,
                 dry_run,
+                cache_dir,
             )
-        run_state.set(final_state)
-        run_state.save(checkpoint_path)
         click.echo(f"[{final_state.status}] {case.id} x {tool.name}")
 
         if final_state.status == CaseToolStatus.failed:
+            if not is_case_done(run_dir, case.id, tool.name):
+                write_error_marker(run_dir, case.id, tool.name, final_state.error or "unknown")
             consecutive_failures += 1
             if fail_after > 0 and consecutive_failures >= fail_after:
                 click.echo(f"[abort] {tool.name}: {fail_after} consecutive failures, aborting")
@@ -228,6 +262,21 @@ async def _eval_tool(
     type=int,
     help="Max simultaneous PR submissions (overrides config max_concurrent; default: 1).",
 )
+@click.option(
+    "--case-ids",
+    "case_ids_raw",
+    default=None,
+    help=(
+        "Filter to specific case IDs. Comma-separated: 'leo-001,leo-002'. "
+        "Or a file (one ID per line, # comments): '@pilot-step1.txt'."
+    ),
+)
+@click.option(
+    "--cache-dir",
+    default=None,
+    type=click.Path(dir_okay=True, file_okay=False),
+    help="Cache dir for upstream repo clones (required for fresh_repo tools)",
+)
 def run_pr_eval(
     config_path: str,
     cases_dir: str,
@@ -239,6 +288,8 @@ def run_pr_eval(
     limit: int,
     fail_after: int,
     max_concurrent: int | None,
+    case_ids_raw: str | None,
+    cache_dir: str | None,
 ) -> None:
     """Async orchestrator: run PR-mode evaluation across all (case × tool) pairs."""
     config: EvalConfig = load_eval_config(Path(config_path))
@@ -248,14 +299,18 @@ def run_pr_eval(
     resolved_run_dir = Path(run_dir) if run_dir else Path("results") / run_id
     resolved_run_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = resolved_run_dir / "checkpoint.yaml"
-    run_state = RunState.load(checkpoint_path)
-
     # Load cases
     cases = load_cases(Path(cases_dir))
     if not cases:
         click.echo(f"No cases found in {cases_dir}")
         return
+
+    if case_ids_raw:
+        allowed_ids = set(parse_case_ids(case_ids_raw))
+        cases = [c for c in cases if c.id in allowed_ids]
+        if not cases:
+            click.echo("No cases matched --case-ids filter")
+            return
 
     if limit > 0:
         cases = cases[:limit]
@@ -281,6 +336,7 @@ def run_pr_eval(
 
     resolved_repo_dir = Path(repo_dir) if repo_dir else None
     resolved_patches_dir = Path(patches_dir)
+    resolved_cache_dir = Path(cache_dir) if cache_dir else None
     concurrency = max_concurrent if max_concurrent is not None else config.max_concurrent
 
     async def _run() -> None:
@@ -294,11 +350,10 @@ def run_pr_eval(
                     resolved_patches_dir,
                     resolved_run_dir,
                     resolved_repo_dir,
-                    run_state,
-                    checkpoint_path,
                     dry_run,
                     semaphore,
                     fail_after,
+                    resolved_cache_dir,
                 )
                 for tool in pr_tools
             ]

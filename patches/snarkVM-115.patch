@@ -1,22 +1,215 @@
-diff --git a/circuit/environment/src/helpers/linear_combination.rs b/circuit/environment/src/helpers/linear_combination.rs
-index 0de3d6d53..d42dbd2f0 100644
---- a/circuit/environment/src/helpers/linear_combination.rs
-+++ b/circuit/environment/src/helpers/linear_combination.rs
-@@ -87,7 +87,6 @@ impl<F: PrimeField> LinearCombination<F> {
-     /// 1. Either `constant` or `terms` is utilized, however never both.
-     /// 2. Every individual variable in the linear combination must always be either `0` or `1`.
-     /// 3. The value of the linear combination must always be either `0` or `1`.
--    ///
-     pub fn is_boolean_type(&self) -> bool {
-         // Constant case (enforce Property 1)
-         if self.terms.is_empty() {
-@@ -96,7 +95,8 @@ impl<F: PrimeField> LinearCombination<F> {
-         // Public and private cases (enforce Property 1)
-         else if self.constant.is_zero() {
-             // Enforce property 2.
--            if self.terms.iter().all(|(v, _)| !(v.value().is_zero() || v.value().is_one())) {
-+            // Note: This branch is triggered if ANY term is not (zero or one).
-+            if self.terms.iter().any(|(v, _)| !(v.value().is_zero() || v.value().is_one())) {
-                 eprintln!("Property 2 of the `Boolean` type was violated in {self}");
-                 return false;
-             }
+diff --git a/console/network/environment/src/lib.rs b/console/network/environment/src/lib.rs
+index 05f748ab7..4a7aad0f8 100644
+--- a/console/network/environment/src/lib.rs
++++ b/console/network/environment/src/lib.rs
+@@ -76,6 +76,7 @@ pub mod prelude {
+         FromBits as _,
+         FromBytes,
+         FromBytesDeserializer,
++        LimitedWriter,
+         TestRng,
+         ToBits as _,
+         ToBytes,
+diff --git a/console/network/src/lib.rs b/console/network/src/lib.rs
+index 63af2ab15..a2aab373e 100644
+--- a/console/network/src/lib.rs
++++ b/console/network/src/lib.rs
+@@ -192,6 +192,10 @@ pub trait Network:
+     /// The maximum number of certificates in a batch.
+     const MAX_CERTIFICATES: u16;
+ 
++    /// The maximum number of bytes in a transaction.
++    // Note: This value must **not** be decreased as it would invalidate existing transactions.
++    const MAX_TRANSACTION_SIZE: usize = 128_000; // 128 kB
++
+     /// The state root type.
+     type StateRoot: Bech32ID<Field<Self>>;
+     /// The block hash type.
+diff --git a/ledger/block/src/transition/serialize.rs b/ledger/block/src/transition/serialize.rs
+index fa7ebd38e..619615a32 100644
+--- a/ledger/block/src/transition/serialize.rs
++++ b/ledger/block/src/transition/serialize.rs
+@@ -19,7 +19,7 @@ impl<N: Network> Serialize for Transition<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut transition = serializer.serialize_struct("Transition", 7)?;
++                let mut transition = serializer.serialize_struct("Transition", 8)?;
+                 transition.serialize_field("id", &self.id)?;
+                 transition.serialize_field("program", &self.program_id)?;
+                 transition.serialize_field("function", &self.function_name)?;
+diff --git a/synthesizer/src/vm/mod.rs b/synthesizer/src/vm/mod.rs
+index 5c78a84fb..8d3c37cc7 100644
+--- a/synthesizer/src/vm/mod.rs
++++ b/synthesizer/src/vm/mod.rs
+@@ -2253,6 +2253,107 @@ finalize transfer_public_to_private:
+         );
+     }
+ 
++    #[test]
++    fn test_large_transaction_is_aborted() {
++        let rng = &mut TestRng::default();
++
++        // Initialize a new caller.
++        let caller_private_key = crate::vm::test_helpers::sample_genesis_private_key(rng);
++
++        // Initialize the genesis block.
++        let genesis = crate::vm::test_helpers::sample_genesis_block(rng);
++
++        // Initialize the VM.
++        let vm = crate::vm::test_helpers::sample_vm();
++
++        // Update the VM.
++        vm.add_next_block(&genesis).unwrap();
++
++        // Deploy a program that produces large transactions.
++        let program = Program::from_str(
++            r"
++program testing.aleo;
++
++function small_transaction:
++    cast 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field into r0 as [field; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r1 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r2 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r3 as [[field; 32u32]; 32u32];
++    output r1 as [[field; 32u32]; 32u32].public;
++    output r2 as [[field; 32u32]; 32u32].public;
++    output r3 as [[field; 32u32]; 32u32].public;
++
++function large_transaction:
++    cast 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field 0field into r0 as [field; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r1 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r2 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r3 as [[field; 32u32]; 32u32];
++    cast r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 r0 into r4 as [[field; 32u32]; 32u32];
++    output r1 as [[field; 32u32]; 32u32].public;
++    output r2 as [[field; 32u32]; 32u32].public;
++    output r3 as [[field; 32u32]; 32u32].public;
++    output r4 as [[field; 32u32]; 32u32].public;").unwrap();
++
++        // Deploy the program.
++        let deployment = vm.deploy(&caller_private_key, &program, None, 0, None, rng).unwrap();
++
++        // Add the deployment to a block and update the VM.
++        let block = sample_next_block(&vm, &caller_private_key, &[deployment], rng).unwrap();
++
++        // Update the VM.
++        vm.add_next_block(&block).unwrap();
++
++        // Call the program to produce the small transaction.
++        let transaction = vm
++            .execute(
++                &caller_private_key,
++                ("testing.aleo", "small_transaction"),
++                Vec::<Value<CurrentNetwork>>::new().iter(),
++                None,
++                0,
++                None,
++                rng,
++            )
++            .unwrap();
++
++        // Verify the transaction.
++        vm.check_transaction(&transaction, None, rng).unwrap();
++
++        // Add the transaction to a block and update the VM.
++        let block = sample_next_block(&vm, &caller_private_key, &[transaction], rng).unwrap();
++
++        // Check that the transaction was accepted.
++        assert_eq!(block.transactions().num_accepted(), 1);
++
++        // Update the VM.
++        vm.add_next_block(&block).unwrap();
++
++        // Call the program to produce a large transaction.
++        let transaction = vm
++            .execute(
++                &caller_private_key,
++                ("testing.aleo", "large_transaction"),
++                Vec::<Value<CurrentNetwork>>::new().iter(),
++                None,
++                0,
++                None,
++                rng,
++            )
++            .unwrap();
++
++        // Verify that the transaction is invalid.
++        assert!(vm.check_transaction(&transaction, None, rng).is_err());
++
++        // Add the transaction to a block and update the VM.
++        let block = sample_next_block(&vm, &caller_private_key, &[transaction], rng).unwrap();
++
++        // Check that the transaction was aborted.
++        assert_eq!(block.aborted_transaction_ids().len(), 1);
++
++        // Update the VM.
++        vm.add_next_block(&block).unwrap();
++    }
++
+     #[test]
+     fn test_vm_puzzle() {
+         // Attention: This test is used to ensure that the VM has performed downcasting correctly for
+diff --git a/synthesizer/src/vm/verify.rs b/synthesizer/src/vm/verify.rs
+index 5979498bd..2e74251ca 100644
+--- a/synthesizer/src/vm/verify.rs
++++ b/synthesizer/src/vm/verify.rs
+@@ -76,6 +76,13 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+ 
+         /* Transaction */
+ 
++        // Allocate a buffer to write the transaction.
++        let mut buffer = Vec::with_capacity(N::MAX_TRANSACTION_SIZE);
++        // Ensure that the transaction is well formed and does not exceed the maximum size.
++        if let Err(error) = transaction.write_le(LimitedWriter::new(&mut buffer, N::MAX_TRANSACTION_SIZE)) {
++            bail!("Transaction '{}' is not well-formed: {error}", transaction.id())
++        }
++
+         // Ensure the transaction ID is unique.
+         if self.block_store().contains_transaction_id(&transaction.id())? {
+             bail!("Transaction '{}' already exists in the ledger", transaction.id())
+diff --git a/utilities/src/bytes.rs b/utilities/src/bytes.rs
+index d49bea08f..d49ac74db 100644
+--- a/utilities/src/bytes.rs
++++ b/utilities/src/bytes.rs
+@@ -478,6 +478,40 @@ pub fn bytes_from_bits_le(bits: &[bool]) -> Vec<u8> {
+     bytes
+ }
+ 
++/// A wrapper around a `Write` instance that limits the number of bytes that can be written.
++pub struct LimitedWriter<W: Write> {
++    writer: W,
++    limit: usize,
++    remaining: usize,
++}
++
++impl<W: Write> LimitedWriter<W> {
++    pub fn new(writer: W, limit: usize) -> Self {
++        Self { writer, limit, remaining: limit }
++    }
++}
++
++impl<W: Write> Write for LimitedWriter<W> {
++    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
++        if self.remaining == 0 && !buf.is_empty() {
++            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Byte limit exceeded: {}", self.limit)));
++        }
++
++        let max_write = std::cmp::min(buf.len(), self.remaining);
++        match self.writer.write(&buf[..max_write]) {
++            Ok(n) => {
++                self.remaining -= n;
++                Ok(n)
++            }
++            Err(e) => Err(e),
++        }
++    }
++
++    fn flush(&mut self) -> IoResult<()> {
++        self.writer.flush()
++    }
++}
++
+ #[cfg(test)]
+ mod test {
+     use super::*;

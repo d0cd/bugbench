@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -49,12 +51,55 @@ def load_candidates(path: Path) -> list[Candidate]:
     return [Candidate(**item) for item in data]
 
 
+def extract_json_from_text(text: str) -> dict[str, Any] | None:
+    """Extract a JSON object or array from a text response (e.g. LLM output).
+
+    Handles fenced code blocks, bare objects, and bare arrays.
+    A bare array is wrapped as ``{"expected_findings": [...]}``.
+    """
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1)
+
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(0))  # type: ignore[no-any-return]
+        except json.JSONDecodeError:
+            pass
+
+    arr_match = re.search(r"\[.*\]", text, re.DOTALL)
+    if arr_match:
+        try:
+            parsed = json.loads(arr_match.group(0))
+            if isinstance(parsed, list):
+                return {"expected_findings": parsed}
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
 def load_all_cases(cases_dir: Path) -> list[TestCase]:
-    """Load all TestCase YAML files from a directory."""
+    """Load all TestCase YAML files from a directory (unfiltered)."""
     cases: list[TestCase] = []
     for yaml_file in sorted(cases_dir.rglob("*.yaml")):
         cases.append(load_case(yaml_file))
     return cases
+
+
+def load_eval_cases(cases_dir: Path) -> list[TestCase]:
+    """Load test cases suitable for evaluation, filtering out invalid ones.
+
+    Excludes cases where ``valid_for_code_review`` is False or
+    ``expected_findings`` is empty — unless ``case_type`` is ``"clean"``
+    (negative controls have no expected findings by design).
+    """
+    return [
+        c
+        for c in load_all_cases(cases_dir)
+        if c.valid_for_code_review and (c.expected_findings or c.case_type == "clean")
+    ]
 
 
 def write_run_metadata(
@@ -67,6 +112,7 @@ def write_run_metadata(
     patches_dir: Path | None = None,
     config_path: str = "config/config.yaml",
     allowed_tools: str = "",
+    blind: bool = False,
 ) -> None:
     """Write run_metadata.json for reproducibility tracing."""
     git_sha = ""
@@ -136,6 +182,7 @@ def write_run_metadata(
         "total_cases": total_cases,
         "agent_prompt_file": agent_prompt_file,
         "agent_prompt_hash": agent_prompt_hash,
+        "blind": blind,
         "python_version": sys.version.split()[0],
     }
     (run_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))

@@ -55,6 +55,7 @@ def open_pr(
     branch: str,
     case: TestCase,
     dry_run: bool = False,
+    base_branch: str = "main",
 ) -> int:
     """Open a PR on fork_repo against upstream_repo. Returns PR number.
 
@@ -63,21 +64,22 @@ def open_pr(
     if dry_run:
         return 0
 
-    title = f"[bugeval] {case.id} — {case.description[:60]}"
-    body = (
-        f"Automated bugeval PR for case `{case.id}`.\n\n"
-        f"Repo: {upstream_repo}\n"
-        f"Base commit: `{case.base_commit}`\n"
-    )
-    # PR is opened on the fork repo (tools are installed there).
-    # --base main: intra-fork PR from bug branch → fork's main (clean state).
+    title = case.pr_title or f"[bugeval] {case.id} — {case.description[:60]}"
+    sections: list[str] = []
+    if case.pr_body:
+        sections.append(case.pr_body[:3000])
+    if case.pr_commit_messages:
+        sections.append("**Commits:**\n" + "\n".join(f"- {m}" for m in case.pr_commit_messages))
+    body = "\n\n".join(sections) if sections else case.description
+    # PR is opened on the target repo (tools are installed there).
+    # --base: intra-repo PR from bug branch → base (clean state).
     output = run_gh(
         "pr",
         "create",
         "--repo",
         fork_repo,
         "--base",
-        "main",
+        base_branch,
         "--head",
         branch,
         "--title",
@@ -174,6 +176,31 @@ def scrape_review_comments(fork_repo: str, pr_number: int) -> list[dict[str, Any
         pass
 
     return results
+
+
+def request_review(
+    fork_repo: str,
+    pr_number: int,
+    reviewer: str,
+    dry_run: bool = False,
+) -> None:
+    """Request a review from a specific user or bot (e.g. 'copilot').
+
+    Some tools (like GitHub Copilot) don't auto-trigger on PR creation
+    and require an explicit review request.
+
+    Uses the REST API directly because ``gh pr edit --add-reviewer`` can
+    fail on orgs with Projects Classic enabled (GraphQL deprecation bug).
+    """
+    if dry_run:
+        return
+    owner, repo = fork_repo.split("/", 1)
+    run_gh(
+        "api",
+        f"repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers",
+        "--method", "POST",
+        "-f", f"reviewers[]={reviewer}",
+    )
 
 
 def close_pr_delete_branch(

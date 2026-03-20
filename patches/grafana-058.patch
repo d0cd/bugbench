@@ -1,0 +1,2085 @@
+diff --git a/Makefile b/Makefile
+index 82cddd58c509b..06d9a8af788aa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,7 +23,8 @@ BUILD_STAMP := $(shell echo $${SOURCE_DATE_EPOCH:-$$(date +%s 2>/dev/null)})
+ GO_LDFLAGS = -X main.version=$(BUILD_VERSION) \
+ 	-X main.commit=$(BUILD_COMMIT) \
+ 	-X main.buildBranch=$(BUILD_BRANCH) \
+-	-X main.buildstamp=$(BUILD_STAMP)
++	-X main.buildstamp=$(BUILD_STAMP) \
++	$(if $(LDFLAGS),-extldflags \"$(LDFLAGS)\")
+ GO_TEST_FLAGS += $(if $(GO_BUILD_TAGS),-tags=$(GO_BUILD_TAGS))
+ GIT_BASE = remotes/origin/main
+ 
+@@ -285,7 +286,7 @@ update-workspace: gen-go
+ .PHONY: build-go
+ build-go: gen-themes ## Build all Go binaries (grafana, grafana-server, grafana-cli).
+ 	@echo "build go binaries"
+-	$(if $(GO_BUILD_OS),GOOS=$(GO_BUILD_OS)) $(if $(GO_BUILD_ARCH),GOARCH=$(GO_BUILD_ARCH)) $(GO) build -buildvcs=false -trimpath $(GO_RACE_FLAG) $(if $(GO_BUILD_TAGS),-tags $(GO_BUILD_TAGS)) $(if $(GO_BUILD_GCFLAGS),-gcflags "$(GO_BUILD_GCFLAGS)") -ldflags "$(GO_LDFLAGS)" -o ./bin/grafana ./pkg/cmd/grafana
++	$(if $(CGO_ENABLED),CGO_ENABLED=$(CGO_ENABLED)) $(if $(GO_BUILD_OS),GOOS=$(GO_BUILD_OS)) $(if $(GO_BUILD_ARCH),GOARCH=$(GO_BUILD_ARCH)) $(GO) build -buildvcs=false -trimpath $(GO_RACE_FLAG) $(if $(GO_BUILD_TAGS),-tags $(GO_BUILD_TAGS)) $(if $(GO_BUILD_GCFLAGS),-gcflags "$(GO_BUILD_GCFLAGS)") -ldflags "$(GO_LDFLAGS)" -o ./bin/grafana ./pkg/cmd/grafana
+ 
+ .PHONY: build-backend
+ build-backend: build-go
+diff --git a/apps/alerting/historian/go.mod b/apps/alerting/historian/go.mod
+index 681765adc014f..6f8fffb60894a 100644
+--- a/apps/alerting/historian/go.mod
++++ b/apps/alerting/historian/go.mod
+@@ -14,6 +14,7 @@ require (
+ 	go.opentelemetry.io/otel v1.40.0
+ 	go.opentelemetry.io/otel/trace v1.40.0
+ 	k8s.io/apimachinery v0.35.1
++	k8s.io/client-go v0.35.1
+ 	k8s.io/kube-openapi v0.0.0-20251125145642-4e65d59e963e
+ )
+ 
+@@ -177,7 +178,6 @@ require (
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+ 	k8s.io/api v0.35.1 // indirect
+ 	k8s.io/apiextensions-apiserver v0.35.1 // indirect
+-	k8s.io/client-go v0.35.1 // indirect
+ 	k8s.io/klog/v2 v2.130.1 // indirect
+ 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
+ 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
+diff --git a/apps/alerting/historian/pkg/apis/alertinghistorian/v0alpha1/client.go b/apps/alerting/historian/pkg/apis/alertinghistorian/v0alpha1/client.go
+new file mode 100644
+index 0000000000000..90270cf74c387
+--- /dev/null
++++ b/apps/alerting/historian/pkg/apis/alertinghistorian/v0alpha1/client.go
+@@ -0,0 +1,78 @@
++package v0alpha1
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/client-go/rest"
++)
++
++// Note that this file is currently hand written, custom routes do not generate clients:
++// https://github.com/grafana/grafana-app-sdk/issues/1277
++
++// Client is a thin typed wrapper around a namespaced rest.Interface
++type Client struct {
++	client    rest.Interface
++	namespace string
++}
++
++// NewClient creates a Client for a for a specific namespace.
++func NewClient(cfg rest.Config, namespace string) (*Client, error) {
++	cfg.GroupVersion = &schema.GroupVersion{
++		Group:   APIGroup,
++		Version: APIVersion,
++	}
++
++	client, err := rest.RESTClientFor(&cfg)
++	if err != nil {
++		return nil, err
++	}
++
++	return &Client{client: client, namespace: namespace}, nil
++}
++
++// NotificationQuery invokes POST /notification/query.
++func (h *Client) NotificationQuery(ctx context.Context, body CreateNotificationqueryRequestBody) (*CreateNotificationqueryResponse, error) {
++	var resp CreateNotificationqueryResponse
++	if err := h.post(ctx, "/notification/query", body, &resp); err != nil {
++		return nil, err
++	}
++	return &resp, nil
++}
++
++// NotificationsQueryAlerts invokes POST /notifications/queryalerts.
++func (h *Client) NotificationsQueryAlerts(ctx context.Context, body CreateNotificationsqueryalertsRequestBody) (*CreateNotificationsqueryalertsResponse, error) {
++	var resp CreateNotificationsqueryalertsResponse
++	if err := h.post(ctx, "/notifications/queryalerts", body, &resp); err != nil {
++		return nil, err
++	}
++	return &resp, nil
++}
++
++func (h *Client) post(ctx context.Context, path string, body any, resp any) error {
++	encoded, err := json.Marshal(body)
++	if err != nil {
++		return fmt.Errorf("marshal [%s]: %w", path, err)
++	}
++	result := h.client.Post().
++		Namespace(h.namespace).
++		Suffix(path).
++		SetHeader("Content-Type", "application/json").
++		Body(bytes.NewReader(encoded)).
++		Do(ctx)
++	if err := result.Error(); err != nil {
++		return fmt.Errorf("request [%s]: %w", path, err)
++	}
++	raw, err := result.Raw()
++	if err != nil {
++		// Should be caught above, but check anyway.
++		return fmt.Errorf("request [%s]: %w", path, err)
++	}
++	if err := json.Unmarshal(raw, resp); err != nil {
++		return fmt.Errorf("unmarshal [%s]: %w", path, err)
++	}
++	return nil
++}
+diff --git a/apps/alerting/historian/pkg/apis/alertinghistorian/v0alpha1/client_test.go b/apps/alerting/historian/pkg/apis/alertinghistorian/v0alpha1/client_test.go
+new file mode 100644
+index 0000000000000..a57f993ed3ad2
+--- /dev/null
++++ b/apps/alerting/historian/pkg/apis/alertinghistorian/v0alpha1/client_test.go
+@@ -0,0 +1,74 @@
++package v0alpha1
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/client-go/rest"
++)
++
++func newTestClient(t *testing.T, handler http.Handler) *Client {
++	t.Helper()
++	srv := httptest.NewServer(handler)
++	t.Cleanup(srv.Close)
++
++	cfg := rest.Config{
++		Host:    srv.URL,
++		APIPath: "/apis",
++		ContentConfig: rest.ContentConfig{
++			NegotiatedSerializer: &fakeNegotiatedSerializer{},
++		},
++	}
++	client, err := NewClient(cfg, "test-ns")
++	require.NoError(t, err)
++	return client
++}
++
++func TestHistorianClient_NotificationQuery(t *testing.T) {
++	var gotPath string
++	var gotMethod string
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotPath = r.URL.Path
++		gotMethod = r.Method
++		resp := CreateNotificationqueryResponse{}
++		require.NoError(t, json.NewEncoder(w).Encode(resp))
++	})
++
++	client := newTestClient(t, handler)
++	_, err := client.NotificationQuery(context.Background(), CreateNotificationqueryRequestBody{})
++	require.NoError(t, err)
++	require.Equal(t, "POST", gotMethod)
++	require.Equal(t, "/apis/historian.alerting.grafana.app/v0alpha1/namespaces/test-ns/notification/query", gotPath)
++}
++
++func TestHistorianClient_NotificationsQueryAlerts(t *testing.T) {
++	var gotPath string
++	var gotMethod string
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotPath = r.URL.Path
++		gotMethod = r.Method
++		resp := CreateNotificationsqueryalertsResponse{}
++		require.NoError(t, json.NewEncoder(w).Encode(resp))
++	})
++
++	client := newTestClient(t, handler)
++	_, err := client.NotificationsQueryAlerts(context.Background(), CreateNotificationsqueryalertsRequestBody{})
++	require.NoError(t, err)
++	require.Equal(t, "POST", gotMethod)
++	require.Equal(t, "/apis/historian.alerting.grafana.app/v0alpha1/namespaces/test-ns/notifications/queryalerts", gotPath)
++}
++
++type fakeNegotiatedSerializer struct{}
++
++func (f *fakeNegotiatedSerializer) SupportedMediaTypes() []runtime.SerializerInfo { return nil }
++func (f *fakeNegotiatedSerializer) EncoderForVersion(serializer runtime.Encoder, gv runtime.GroupVersioner) runtime.Encoder {
++	return serializer
++}
++func (f *fakeNegotiatedSerializer) DecoderToVersion(serializer runtime.Decoder, gv runtime.GroupVersioner) runtime.Decoder {
++	return serializer
++}
+diff --git a/apps/provisioning/pkg/repository/github/client.go b/apps/provisioning/pkg/repository/github/client.go
+index 14baed47f2bfd..d8c15f4bb5336 100644
+--- a/apps/provisioning/pkg/repository/github/client.go
++++ b/apps/provisioning/pkg/repository/github/client.go
+@@ -4,18 +4,7 @@ package github
+ 
+ import (
+ 	"context"
+-	"errors"
+ 	"time"
+-
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+-)
+-
+-// API errors that we need to convey after parsing real GH errors (or faking them).
+-var (
+-	ErrResourceNotFound   = errors.New("the resource does not exist")
+-	ErrUnauthorized       = errors.New("unauthorized")
+-	ErrServiceUnavailable = apierrors.NewServiceUnavailable("github is unavailable")
+-	ErrTooManyItems       = errors.New("maximum number of items exceeded")
+ )
+ 
+ //go:generate mockery --name Client --structname MockClient --inpackage --filename mock_client.go --with-expecter
+diff --git a/apps/provisioning/pkg/repository/github/error_translation_test.go b/apps/provisioning/pkg/repository/github/error_translation_test.go
+new file mode 100644
+index 0000000000000..159a696764944
+--- /dev/null
++++ b/apps/provisioning/pkg/repository/github/error_translation_test.go
+@@ -0,0 +1,159 @@
++package github
++
++import (
++	"errors"
++	"net/http"
++	"testing"
++
++	"github.com/google/go-github/v82/github"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	repo "github.com/grafana/grafana/apps/provisioning/pkg/repository"
++)
++
++func TestTranslateGitHubError(t *testing.T) {
++	tests := []struct {
++		name                string
++		inputErr            error
++		expectedErr         error
++		expectedMsgContains string
++	}{
++		{
++			name:        "nil error returns nil",
++			inputErr:    nil,
++			expectedErr: nil,
++		},
++		{
++			name:                "non-GitHub error returns as-is",
++			inputErr:            errors.New("some other error"),
++			expectedMsgContains: "some other error",
++		},
++		{
++			name: "401 with 'expired' returns descriptive error",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusUnauthorized},
++				Message:  "expired",
++			},
++			expectedErr:         repo.ErrUnauthorized,
++			expectedMsgContains: "authentication token has expired",
++		},
++		{
++			name: "401 with 'Expired' (capital) returns descriptive error",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusUnauthorized},
++				Message:  "Token Expired",
++			},
++			expectedErr:         repo.ErrUnauthorized,
++			expectedMsgContains: "authentication token has expired",
++		},
++		{
++			name: "401 without 'expired' returns generic unauthorized",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusUnauthorized},
++				Message:  "Bad credentials",
++			},
++			expectedErr: repo.ErrUnauthorized,
++		},
++		{
++			name: "403 with 'rate limit' returns descriptive error",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusForbidden},
++				Message:  "API rate limit exceeded",
++			},
++			expectedErr:         repo.ErrPermissionDenied,
++			expectedMsgContains: "API rate limit exceeded",
++		},
++		{
++			name: "403 without 'rate limit' returns generic permission denied",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusForbidden},
++				Message:  "Resource protected",
++			},
++			expectedErr: repo.ErrPermissionDenied,
++		},
++		{
++			name: "404 returns file not found",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusNotFound},
++				Message:  "Not Found",
++			},
++			expectedErr: repo.ErrFileNotFound,
++		},
++		{
++			name: "503 returns server unavailable",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusServiceUnavailable},
++				Message:  "Service Unavailable",
++			},
++			expectedErr: repo.ErrServerUnavailable,
++		},
++		{
++			name: "502 returns server unavailable",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusBadGateway},
++				Message:  "Bad Gateway",
++			},
++			expectedErr: repo.ErrServerUnavailable,
++		},
++		{
++			name: "504 returns server unavailable",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusGatewayTimeout},
++				Message:  "Gateway Timeout",
++			},
++			expectedErr: repo.ErrServerUnavailable,
++		},
++		{
++			name: "500 returns GitHub API error with message",
++			inputErr: &github.ErrorResponse{
++				Response: &http.Response{StatusCode: http.StatusInternalServerError},
++				Message:  "Internal server error",
++			},
++			expectedMsgContains: "GitHub API error (HTTP 500: Internal server error)",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			result := translateGitHubError(tt.inputErr)
++
++			if tt.expectedErr == nil && tt.expectedMsgContains == "" {
++				assert.NoError(t, result)
++				return
++			}
++
++			require.Error(t, result)
++
++			// Check if the expected error is in the error chain (for wrapped errors)
++			if tt.expectedErr != nil {
++				assert.ErrorIs(t, result, tt.expectedErr,
++					"Expected error %v to be in chain of %v", tt.expectedErr, result)
++			}
++
++			// Check if the error message contains expected text
++			if tt.expectedMsgContains != "" {
++				assert.Contains(t, result.Error(), tt.expectedMsgContains,
++					"Expected error message to contain '%s', got: %s", tt.expectedMsgContains, result.Error())
++			}
++		})
++	}
++}
++
++func TestTranslateGitHubError_PreservesErrorChain(t *testing.T) {
++	// Test that wrapped errors preserve the error chain for errors.Is() checks
++	expiredErr := &github.ErrorResponse{
++		Response: &http.Response{StatusCode: http.StatusUnauthorized},
++		Message:  "Token has expired",
++	}
++
++	result := translateGitHubError(expiredErr)
++
++	// The result should be an error chain that can be checked with errors.Is()
++	assert.ErrorIs(t, result, repo.ErrUnauthorized,
++		"Expected repo.ErrUnauthorized to be in error chain")
++
++	// The error message should contain both the descriptive text and the wrapped error
++	assert.Contains(t, result.Error(), "authentication token has expired")
++	assert.Contains(t, result.Error(), "authentication failed")
++}
+diff --git a/apps/provisioning/pkg/repository/github/impl.go b/apps/provisioning/pkg/repository/github/impl.go
+index 33979f6690e68..308e49a151e5e 100644
+--- a/apps/provisioning/pkg/repository/github/impl.go
++++ b/apps/provisioning/pkg/repository/github/impl.go
+@@ -6,10 +6,12 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"net/http"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/google/go-github/v82/github"
+ 	"github.com/grafana/grafana-app-sdk/logging"
++	repo "github.com/grafana/grafana/apps/provisioning/pkg/repository"
+ )
+ 
+ type githubClient struct {
+@@ -20,6 +22,55 @@ func NewClient(client *github.Client) Client {
+ 	return &githubClient{client}
+ }
+ 
++// translateGitHubError converts GitHub API errors into common repository errors
++// For "expired" errors, it returns a more descriptive wrapped error
++func translateGitHubError(err error) error {
++	if err == nil {
++		return nil
++	}
++
++	var ghErr *github.ErrorResponse
++	if !errors.As(err, &ghErr) {
++		// Not a GitHub API error, return as-is
++		return err
++	}
++
++	// Extract GitHub's error message for context
++	ghMessage := ghErr.Message
++	statusCode := ghErr.Response.StatusCode
++
++	// Map to common repository errors
++	switch statusCode {
++	case http.StatusUnauthorized:
++		// 401 - Authentication failed
++		// Special case: "expired" is cryptic, so add helpful context
++		if strings.Contains(strings.ToLower(ghMessage), "expired") {
++			return fmt.Errorf("authentication token has expired: %w", repo.ErrUnauthorized)
++		}
++		return repo.ErrUnauthorized
++
++	case http.StatusForbidden:
++		// 403 - Permission denied
++		// Special case: rate limit gets additional context
++		if strings.Contains(strings.ToLower(ghMessage), "rate limit") {
++			return fmt.Errorf("API rate limit exceeded: %w", repo.ErrPermissionDenied)
++		}
++		return repo.ErrPermissionDenied
++
++	case http.StatusNotFound:
++		// 404 - Resource not found
++		return repo.ErrFileNotFound
++
++	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
++		// 503, 502, 504 - Service unavailable
++		return repo.ErrServerUnavailable
++
++	default:
++		// Other errors - return with GitHub message context
++		return fmt.Errorf("GitHub API error (HTTP %d: %s)", statusCode, ghMessage)
++	}
++}
++
+ const (
+ 	maxCommits  = 1000 // Maximum number of commits to fetch
+ 	maxWebhooks = 100  // Maximum number of webhooks allowed per repository
+@@ -34,12 +85,12 @@ func (r *githubClient) GetBranchProtection(ctx context.Context, owner, repositor
+ 			return nil, nil
+ 		}
+ 
+-		// Return custom errors for common cases (similar to webhook operations).
++		// Return custom errors for common cases
+ 		var ghErr *github.ErrorResponse
+ 		if errors.As(err, &ghErr) {
+ 			switch ghErr.Response.StatusCode {
+ 			case http.StatusUnauthorized:
+-				return nil, ErrUnauthorized
++				return nil, repo.ErrUnauthorized
+ 			case http.StatusForbidden:
+ 				// User lacks admin permissions to view branch protection.
+ 				// Skip check gracefully - if protection rules block pushes, they'll find out at push time.
+@@ -49,9 +100,9 @@ func (r *githubClient) GetBranchProtection(ctx context.Context, owner, repositor
+ 					slog.String("branch", branch))
+ 				return nil, nil
+ 			case http.StatusNotFound:
+-				return nil, ErrResourceNotFound
++				return nil, repo.ErrFileNotFound
+ 			case http.StatusServiceUnavailable:
+-				return nil, ErrServiceUnavailable
++				return nil, repo.ErrServerUnavailable
+ 			}
+ 		}
+ 
+@@ -69,7 +120,7 @@ func (r *githubClient) GetBranchProtection(ctx context.Context, owner, repositor
+ func (r *githubClient) GetRepository(ctx context.Context, owner, repository string) (Repository, error) {
+ 	repo, _, err := r.gh.Repositories.Get(ctx, owner, repository)
+ 	if err != nil {
+-		return Repository{}, fmt.Errorf("failed to get repository: %w", err)
++		return Repository{}, translateGitHubError(err)
+ 	}
+ 
+ 	return Repository{
+@@ -94,7 +145,7 @@ func (r *githubClient) Commits(ctx context.Context, owner, repository, path, bra
+ 		listFn,
+ 		defaultListOptions(maxCommits),
+ 	)
+-	if errors.Is(err, ErrTooManyItems) {
++	if errors.Is(err, repo.ErrTooManyItems) {
+ 		return nil, fmt.Errorf("too many commits to fetch (more than %d)", maxCommits)
+ 	}
+ 	if err != nil {
+@@ -148,11 +199,11 @@ func (r *githubClient) ListWebhooks(ctx context.Context, owner, repository strin
+ 		listFn,
+ 		defaultListOptions(maxWebhooks),
+ 	)
+-	if errors.Is(err, ErrTooManyItems) {
++	if errors.Is(err, repo.ErrTooManyItems) {
+ 		return nil, fmt.Errorf("too many webhooks configured (more than %d)", maxWebhooks)
+ 	}
+ 	if err != nil {
+-		return nil, err
++		return nil, translateGitHubError(err)
+ 	}
+ 
+ 	// Pre-allocate the result slice
+@@ -192,12 +243,8 @@ func (r *githubClient) CreateWebhook(ctx context.Context, owner, repository stri
+ 	}
+ 
+ 	createdHook, _, err := r.gh.Repositories.CreateHook(ctx, owner, repository, hook)
+-	var ghErr *github.ErrorResponse
+-	if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusServiceUnavailable {
+-		return WebhookConfig{}, ErrServiceUnavailable
+-	}
+ 	if err != nil {
+-		return WebhookConfig{}, err
++		return WebhookConfig{}, translateGitHubError(err)
+ 	}
+ 
+ 	return WebhookConfig{
+@@ -215,14 +262,7 @@ func (r *githubClient) CreateWebhook(ctx context.Context, owner, repository stri
+ func (r *githubClient) GetWebhook(ctx context.Context, owner, repository string, webhookID int64) (WebhookConfig, error) {
+ 	hook, _, err := r.gh.Repositories.GetHook(ctx, owner, repository, webhookID)
+ 	if err != nil {
+-		var ghErr *github.ErrorResponse
+-		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusServiceUnavailable {
+-			return WebhookConfig{}, ErrServiceUnavailable
+-		}
+-		if ghErr.Response.StatusCode == http.StatusNotFound {
+-			return WebhookConfig{}, ErrResourceNotFound
+-		}
+-		return WebhookConfig{}, err
++		return WebhookConfig{}, translateGitHubError(err)
+ 	}
+ 
+ 	contentType := hook.GetConfig().GetContentType()
+@@ -244,20 +284,10 @@ func (r *githubClient) GetWebhook(ctx context.Context, owner, repository string,
+ 
+ func (r *githubClient) DeleteWebhook(ctx context.Context, owner, repository string, webhookID int64) error {
+ 	_, err := r.gh.Repositories.DeleteHook(ctx, owner, repository, webhookID)
+-	var ghErr *github.ErrorResponse
+-	if !errors.As(err, &ghErr) {
+-		return err
+-	}
+-	if ghErr.Response.StatusCode == http.StatusServiceUnavailable {
+-		return ErrServiceUnavailable
+-	}
+-	if ghErr.Response.StatusCode == http.StatusNotFound {
+-		return ErrResourceNotFound
+-	}
+-	if ghErr.Response.StatusCode == http.StatusUnauthorized || ghErr.Response.StatusCode == http.StatusForbidden {
+-		return ErrUnauthorized
++	if err != nil {
++		return translateGitHubError(err)
+ 	}
+-	return err
++	return nil
+ }
+ 
+ func (r *githubClient) EditWebhook(ctx context.Context, owner, repository string, cfg WebhookConfig) error {
+@@ -276,11 +306,10 @@ func (r *githubClient) EditWebhook(ctx context.Context, owner, repository string
+ 		},
+ 	}
+ 	_, _, err := r.gh.Repositories.EditHook(ctx, owner, repository, cfg.ID, hook)
+-	var ghErr *github.ErrorResponse
+-	if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusServiceUnavailable {
+-		return ErrServiceUnavailable
++	if err != nil {
++		return translateGitHubError(err)
+ 	}
+-	return err
++	return nil
+ }
+ 
+ func (r *githubClient) ListPullRequestFiles(ctx context.Context, owner, repository string, number int) ([]CommitFile, error) {
+@@ -293,11 +322,11 @@ func (r *githubClient) ListPullRequestFiles(ctx context.Context, owner, reposito
+ 		listFn,
+ 		defaultListOptions(maxPRFiles),
+ 	)
+-	if errors.Is(err, ErrTooManyItems) {
++	if errors.Is(err, repo.ErrTooManyItems) {
+ 		return nil, fmt.Errorf("pull request contains too many files (more than %d)", maxPRFiles)
+ 	}
+ 	if err != nil {
+-		return nil, err
++		return nil, translateGitHubError(err)
+ 	}
+ 
+ 	// Convert to the interface type
+@@ -315,11 +344,7 @@ func (r *githubClient) CreatePullRequestComment(ctx context.Context, owner, repo
+ 	}
+ 
+ 	if _, _, err := r.gh.Issues.CreateComment(ctx, owner, repository, number, comment); err != nil {
+-		var ghErr *github.ErrorResponse
+-		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusServiceUnavailable {
+-			return ErrServiceUnavailable
+-		}
+-		return err
++		return translateGitHubError(err)
+ 	}
+ 
+ 	return nil
+@@ -353,17 +378,7 @@ func paginatedList[T any](
+ 	for {
+ 		items, resp, err := listFn(ctx, &opts.ListOptions)
+ 		if err != nil {
+-			var ghErr *github.ErrorResponse
+-			if !errors.As(err, &ghErr) {
+-				return nil, err
+-			}
+-			if ghErr.Response.StatusCode == http.StatusServiceUnavailable {
+-				return nil, ErrServiceUnavailable
+-			}
+-			if ghErr.Response.StatusCode == http.StatusNotFound {
+-				return nil, ErrResourceNotFound
+-			}
+-			return nil, err
++			return nil, translateGitHubError(err)
+ 		}
+ 
+ 		// Pre-allocate the slice if this is the first page
+@@ -375,7 +390,7 @@ func paginatedList[T any](
+ 
+ 		// Check if we've exceeded the maximum allowed items
+ 		if len(allItems) > opts.MaxItems {
+-			return nil, ErrTooManyItems
++			return nil, repo.ErrTooManyItems
+ 		}
+ 
+ 		// If there are no more pages, break
+diff --git a/apps/provisioning/pkg/repository/github/impl_test.go b/apps/provisioning/pkg/repository/github/impl_test.go
+index dd7ae804da852..becc82ebaa596 100644
+--- a/apps/provisioning/pkg/repository/github/impl_test.go
++++ b/apps/provisioning/pkg/repository/github/impl_test.go
+@@ -14,6 +14,8 @@ import (
+ 	mockhub "github.com/migueleliasweb/go-github-mock/src/mock"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++
++	repo "github.com/grafana/grafana/apps/provisioning/pkg/repository"
+ )
+ 
+ func TestGithubClient_GetCommits(t *testing.T) {
+@@ -153,7 +155,7 @@ func TestGithubClient_GetCommits(t *testing.T) {
+ 			since:       time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC),
+ 			until:       time.Date(2023, 1, 3, 0, 0, 0, 0, time.UTC),
+ 			wantCommits: nil,
+-			wantErr:     ErrResourceNotFound,
++			wantErr:     repo.ErrFileNotFound,
+ 		},
+ 		{
+ 			name: "commits missing author",
+@@ -303,7 +305,7 @@ func TestGithubClient_GetCommits(t *testing.T) {
+ 			since:       time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC),
+ 			until:       time.Date(2023, 1, 3, 0, 0, 0, 0, time.UTC),
+ 			wantCommits: nil,
+-			wantErr:     ErrServiceUnavailable,
++			wantErr:     repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -328,7 +330,7 @@ func TestGithubClient_GetCommits(t *testing.T) {
+ 			since:       time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC),
+ 			until:       time.Date(2023, 1, 3, 0, 0, 0, 0, time.UTC),
+ 			wantCommits: nil,
+-			wantErr:     errors.New("Internal server error"),
++			wantErr:     errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -484,7 +486,7 @@ func TestGithubClient_ListWebhooks(t *testing.T) {
+ 			owner:        "test-owner",
+ 			repository:   "test-repo",
+ 			wantWebhooks: nil,
+-			wantErr:      ErrServiceUnavailable,
++			wantErr:      repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -505,7 +507,7 @@ func TestGithubClient_ListWebhooks(t *testing.T) {
+ 			owner:        "test-owner",
+ 			repository:   "test-repo",
+ 			wantWebhooks: nil,
+-			wantErr:      errors.New("Internal server error"),
++			wantErr:      errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -522,9 +524,13 @@ func TestGithubClient_ListWebhooks(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
++				// Check if it's a wrapped/standard repository error or generic error
+ 				if errors.Is(err, tt.wantErr) {
+-					assert.Equal(t, tt.wantErr, err)
++					// Error is in the chain (for wrapped errors) or exact match (for standard errors)
++					// Verify errors.Is() works for error type checking (used by upper layers)
++					assert.ErrorIs(t, err, tt.wantErr)
+ 				} else {
++					// For generic errors not in the chain, verify message content
+ 					assert.Contains(t, err.Error(), tt.wantErr.Error())
+ 				}
+ 			} else {
+@@ -677,7 +683,7 @@ func TestGithubClient_CreateWebhook(t *testing.T) {
+ 				Secret:      "secret123",
+ 			},
+ 			want:    WebhookConfig{},
+-			wantErr: ErrServiceUnavailable,
++			wantErr: repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -705,7 +711,7 @@ func TestGithubClient_CreateWebhook(t *testing.T) {
+ 				Secret:      "secret123",
+ 			},
+ 			want:    WebhookConfig{},
+-			wantErr: errors.New("Internal server error"),
++			wantErr: errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -722,9 +728,13 @@ func TestGithubClient_CreateWebhook(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
++				// Check if it's a wrapped/standard repository error or generic error
+ 				if errors.Is(err, tt.wantErr) {
+-					assert.Equal(t, tt.wantErr, err)
++					// Error is in the chain (for wrapped errors) or exact match (for standard errors)
++					// Verify errors.Is() works for error type checking (used by upper layers)
++					assert.ErrorIs(t, err, tt.wantErr)
+ 				} else {
++					// For generic errors not in the chain, verify message content
+ 					assert.Contains(t, err.Error(), tt.wantErr.Error())
+ 				}
+ 			} else {
+@@ -833,7 +843,7 @@ func TestGithubClient_GetWebhook(t *testing.T) {
+ 			repository: "test-repo",
+ 			webhookID:  999,
+ 			want:       WebhookConfig{},
+-			wantErr:    ErrResourceNotFound,
++			wantErr:    repo.ErrFileNotFound,
+ 		},
+ 		{
+ 			name: "service unavailable",
+@@ -855,7 +865,7 @@ func TestGithubClient_GetWebhook(t *testing.T) {
+ 			repository: "test-repo",
+ 			webhookID:  123,
+ 			want:       WebhookConfig{},
+-			wantErr:    ErrServiceUnavailable,
++			wantErr:    repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -877,7 +887,7 @@ func TestGithubClient_GetWebhook(t *testing.T) {
+ 			repository: "test-repo",
+ 			webhookID:  123,
+ 			want:       WebhookConfig{},
+-			wantErr:    errors.New("Internal server error"),
++			wantErr:    errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -894,9 +904,13 @@ func TestGithubClient_GetWebhook(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
++				// Check if it's a wrapped/standard repository error or generic error
+ 				if errors.Is(err, tt.wantErr) {
+-					assert.Equal(t, tt.wantErr, err)
++					// Error is in the chain (for wrapped errors) or exact match (for standard errors)
++					// Verify errors.Is() works for error type checking (used by upper layers)
++					assert.ErrorIs(t, err, tt.wantErr)
+ 				} else {
++					// For generic errors not in the chain, verify message content
+ 					assert.Contains(t, err.Error(), tt.wantErr.Error())
+ 				}
+ 			} else {
+@@ -952,7 +966,7 @@ func TestGithubClient_DeleteWebhook(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "test-repo",
+ 			webhookID:  456,
+-			wantErr:    ErrResourceNotFound,
++			wantErr:    repo.ErrFileNotFound,
+ 		},
+ 		{
+ 			name: "service unavailable",
+@@ -973,7 +987,7 @@ func TestGithubClient_DeleteWebhook(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "test-repo",
+ 			webhookID:  789,
+-			wantErr:    ErrServiceUnavailable,
++			wantErr:    repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "unauthorized to delete the webhook",
+@@ -994,7 +1008,7 @@ func TestGithubClient_DeleteWebhook(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "test-repo",
+ 			webhookID:  789,
+-			wantErr:    ErrUnauthorized,
++			wantErr:    repo.ErrUnauthorized,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -1015,7 +1029,7 @@ func TestGithubClient_DeleteWebhook(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "test-repo",
+ 			webhookID:  101,
+-			wantErr:    errors.New("Internal server error"),
++			wantErr:    errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -1032,9 +1046,13 @@ func TestGithubClient_DeleteWebhook(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
++				// Check if it's a wrapped/standard repository error or generic error
+ 				if errors.Is(err, tt.wantErr) {
+-					assert.Equal(t, tt.wantErr, err)
++					// Error is in the chain (for wrapped errors) or exact match (for standard errors)
++					// Verify errors.Is() works for error type checking (used by upper layers)
++					assert.ErrorIs(t, err, tt.wantErr)
+ 				} else {
++					// For generic errors not in the chain, verify message content
+ 					assert.Contains(t, err.Error(), tt.wantErr.Error())
+ 				}
+ 			} else {
+@@ -1176,7 +1194,7 @@ func TestGithubClient_EditWebhook(t *testing.T) {
+ 				ContentType: "json",
+ 				Secret:      "secret123",
+ 			},
+-			wantErr: ErrServiceUnavailable,
++			wantErr: repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -1204,7 +1222,7 @@ func TestGithubClient_EditWebhook(t *testing.T) {
+ 				ContentType: "json",
+ 				Secret:      "secret123",
+ 			},
+-			wantErr: errors.New("Internal server error"),
++			wantErr: errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -1221,9 +1239,13 @@ func TestGithubClient_EditWebhook(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
++				// Check if it's a wrapped/standard repository error or generic error
+ 				if errors.Is(err, tt.wantErr) {
+-					assert.Equal(t, tt.wantErr, err)
++					// Error is in the chain (for wrapped errors) or exact match (for standard errors)
++					// Verify errors.Is() works for error type checking (used by upper layers)
++					assert.ErrorIs(t, err, tt.wantErr)
+ 				} else {
++					// For generic errors not in the chain, verify message content
+ 					assert.Contains(t, err.Error(), tt.wantErr.Error())
+ 				}
+ 			} else {
+@@ -1361,7 +1383,7 @@ func TestGithubClient_ListPullRequestFiles(t *testing.T) {
+ 			repository: "test-repo",
+ 			number:     101,
+ 			wantFiles:  nil,
+-			wantErr:    ErrServiceUnavailable,
++			wantErr:    repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -1383,7 +1405,7 @@ func TestGithubClient_ListPullRequestFiles(t *testing.T) {
+ 			repository: "test-repo",
+ 			number:     202,
+ 			wantFiles:  nil,
+-			wantErr:    errors.New("Internal server error"),
++			wantErr:    errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -1400,9 +1422,13 @@ func TestGithubClient_ListPullRequestFiles(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
++				// Check if it's a wrapped/standard repository error or generic error
+ 				if errors.Is(err, tt.wantErr) {
+-					assert.Equal(t, tt.wantErr, err)
++					// Error is in the chain (for wrapped errors) or exact match (for standard errors)
++					// Verify errors.Is() works for error type checking (used by upper layers)
++					assert.ErrorIs(t, err, tt.wantErr)
+ 				} else {
++					// For generic errors not in the chain, verify message content
+ 					assert.Contains(t, err.Error(), tt.wantErr.Error())
+ 				}
+ 			} else {
+@@ -1476,7 +1502,7 @@ func TestCreatePullRequestComment(t *testing.T) {
+ 			repository: "test-repo",
+ 			number:     101,
+ 			body:       "Test comment",
+-			wantErr:    ErrServiceUnavailable,
++			wantErr:    repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "other error",
+@@ -1498,7 +1524,7 @@ func TestCreatePullRequestComment(t *testing.T) {
+ 			repository: "test-repo",
+ 			number:     101,
+ 			body:       "Test comment",
+-			wantErr:    errors.New("Internal server error"),
++			wantErr:    errors.New("GitHub API error (HTTP 500: Internal server error)"),
+ 		},
+ 	}
+ 
+@@ -1515,9 +1541,13 @@ func TestCreatePullRequestComment(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
++				// Check if it's a wrapped/standard repository error or generic error
+ 				if errors.Is(err, tt.wantErr) {
+-					assert.Equal(t, tt.wantErr, err)
++					// Error is in the chain (for wrapped errors) or exact match (for standard errors)
++					// Verify errors.Is() works for error type checking (used by upper layers)
++					assert.ErrorIs(t, err, tt.wantErr)
+ 				} else {
++					// For generic errors not in the chain, verify message content
+ 					assert.Contains(t, err.Error(), tt.wantErr.Error())
+ 				}
+ 			} else {
+@@ -1606,7 +1636,7 @@ func TestPaginatedList(t *testing.T) {
+ 				return listFn, defaultListOptions(100)
+ 			},
+ 			want:    nil,
+-			wantErr: ErrServiceUnavailable,
++			wantErr: repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "resource not found error",
+@@ -1621,7 +1651,7 @@ func TestPaginatedList(t *testing.T) {
+ 				return listFn, defaultListOptions(100)
+ 			},
+ 			want:    nil,
+-			wantErr: ErrResourceNotFound,
++			wantErr: repo.ErrFileNotFound,
+ 		},
+ 		{
+ 			name: "too many items error",
+@@ -1645,7 +1675,7 @@ func TestPaginatedList(t *testing.T) {
+ 				}
+ 			},
+ 			want:    nil,
+-			wantErr: ErrTooManyItems,
++			wantErr: repo.ErrTooManyItems,
+ 		},
+ 	}
+ 
+@@ -1849,7 +1879,7 @@ func TestGithubClient_GetRepository(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "nonexistent-repo",
+ 			wantRepo:   Repository{},
+-			wantErr:    errors.New("failed to get repository"),
++			wantErr:    repo.ErrFileNotFound,
+ 		},
+ 		{
+ 			name: "service unavailable error",
+@@ -1870,7 +1900,7 @@ func TestGithubClient_GetRepository(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "test-repo",
+ 			wantRepo:   Repository{},
+-			wantErr:    errors.New("failed to get repository"),
++			wantErr:    repo.ErrServerUnavailable,
+ 		},
+ 		{
+ 			name: "unauthorized access",
+@@ -1891,7 +1921,7 @@ func TestGithubClient_GetRepository(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "private-repo",
+ 			wantRepo:   Repository{},
+-			wantErr:    errors.New("failed to get repository"),
++			wantErr:    repo.ErrUnauthorized,
+ 		},
+ 		{
+ 			name: "forbidden access",
+@@ -1912,7 +1942,7 @@ func TestGithubClient_GetRepository(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "restricted-repo",
+ 			wantRepo:   Repository{},
+-			wantErr:    errors.New("failed to get repository"),
++			wantErr:    repo.ErrPermissionDenied,
+ 		},
+ 		{
+ 			name: "rate limit exceeded",
+@@ -1933,7 +1963,7 @@ func TestGithubClient_GetRepository(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "test-repo",
+ 			wantRepo:   Repository{},
+-			wantErr:    errors.New("failed to get repository"),
++			wantErr:    repo.ErrPermissionDenied,
+ 		},
+ 		{
+ 			name: "internal server error",
+@@ -1954,7 +1984,7 @@ func TestGithubClient_GetRepository(t *testing.T) {
+ 			owner:      "test-owner",
+ 			repository: "test-repo",
+ 			wantRepo:   Repository{},
+-			wantErr:    errors.New("failed to get repository"),
++			wantErr:    errors.New("GitHub API error (HTTP 500: Internal Server Error)"),
+ 		},
+ 		{
+ 			name: "repository with special characters in name",
+@@ -1996,7 +2026,13 @@ func TestGithubClient_GetRepository(t *testing.T) {
+ 			// Check the error
+ 			if tt.wantErr != nil {
+ 				assert.Error(t, err)
+-				assert.Contains(t, err.Error(), tt.wantErr.Error())
++				// Verify errors.Is() works for error type checking (used by upper layers)
++				// For generic errors, verify the error message contains expected text
++				if errors.Is(err, tt.wantErr) {
++					assert.ErrorIs(t, err, tt.wantErr)
++				} else {
++					assert.Contains(t, err.Error(), tt.wantErr.Error())
++				}
+ 				assert.Equal(t, tt.wantRepo, got)
+ 			} else {
+ 				assert.NoError(t, err)
+diff --git a/apps/provisioning/pkg/repository/github/repository.go b/apps/provisioning/pkg/repository/github/repository.go
+index f5b31bf9458c0..dc35c38bf7951 100644
+--- a/apps/provisioning/pkg/repository/github/repository.go
++++ b/apps/provisioning/pkg/repository/github/repository.go
+@@ -202,7 +202,7 @@ func (r *githubRepository) History(ctx context.Context, path, ref string) ([]pro
+ 	finalPath := safepath.Join(r.config.Spec.GitHub.Path, path)
+ 	commits, err := r.gh.Commits(ctx, r.owner, r.repo, finalPath, ref)
+ 	if err != nil {
+-		if errors.Is(err, ErrResourceNotFound) {
++		if errors.Is(err, repository.ErrFileNotFound) {
+ 			return nil, repository.ErrFileNotFound
+ 		}
+ 
+diff --git a/apps/provisioning/pkg/repository/github/repository_test.go b/apps/provisioning/pkg/repository/github/repository_test.go
+index 4873c9e10392a..f76118d0ab755 100644
+--- a/apps/provisioning/pkg/repository/github/repository_test.go
++++ b/apps/provisioning/pkg/repository/github/repository_test.go
+@@ -14,7 +14,7 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
+-	"github.com/grafana/grafana/apps/provisioning/pkg/repository"
++	repo "github.com/grafana/grafana/apps/provisioning/pkg/repository"
+ 	"github.com/grafana/grafana/apps/provisioning/pkg/repository/git"
+ 	common "github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1"
+ )
+@@ -337,9 +337,9 @@ func TestGitHubRepositoryHistory(t *testing.T) {
+ 			ref:  "main",
+ 			mockSetup: func(m *MockClient) {
+ 				m.On("Commits", mock.Anything, "grafana", "grafana", "dashboards/nonexistent.json", "main").
+-					Return(nil, ErrResourceNotFound)
++					Return(nil, repo.ErrFileNotFound)
+ 			},
+-			expectedError: repository.ErrFileNotFound,
++			expectedError: repo.ErrFileNotFound,
+ 		},
+ 		{
+ 			name: "use default branch when ref is empty",
+@@ -530,14 +530,14 @@ func TestGitHubRepositoryHistory(t *testing.T) {
+ func TestGitHubRepositoryResourceURLs(t *testing.T) {
+ 	tests := []struct {
+ 		name          string
+-		file          *repository.FileInfo
++		file          *repo.FileInfo
+ 		config        *provisioning.Repository
+ 		expectedURLs  *provisioning.RepositoryURLs
+ 		expectedError error
+ 	}{
+ 		{
+ 			name: "file with ref",
+-			file: &repository.FileInfo{
++			file: &repo.FileInfo{
+ 				Path: "dashboards/test.json",
+ 				Ref:  "feature-branch",
+ 			},
+@@ -558,7 +558,7 @@ func TestGitHubRepositoryResourceURLs(t *testing.T) {
+ 		},
+ 		{
+ 			name: "file without ref uses default branch",
+-			file: &repository.FileInfo{
++			file: &repo.FileInfo{
+ 				Path: "dashboards/test.json",
+ 				Ref:  "",
+ 			},
+@@ -577,7 +577,7 @@ func TestGitHubRepositoryResourceURLs(t *testing.T) {
+ 		},
+ 		{
+ 			name: "empty path returns nil",
+-			file: &repository.FileInfo{
++			file: &repo.FileInfo{
+ 				Path: "",
+ 				Ref:  "feature-branch",
+ 			},
+@@ -593,7 +593,7 @@ func TestGitHubRepositoryResourceURLs(t *testing.T) {
+ 		},
+ 		{
+ 			name: "nil github config returns nil",
+-			file: &repository.FileInfo{
++			file: &repo.FileInfo{
+ 				Path: "dashboards/test.json",
+ 				Ref:  "feature-branch",
+ 			},
+@@ -747,7 +747,7 @@ func TestGitHubRepositoryDelegation(t *testing.T) {
+ 
+ 	t.Run("Read delegates to git repo", func(t *testing.T) {
+ 		mockGitRepo := git.NewMockGitRepository(t)
+-		expectedFileInfo := &repository.FileInfo{
++		expectedFileInfo := &repo.FileInfo{
+ 			Path: "test.yaml",
+ 			Data: []byte("test data"),
+ 			Ref:  "main",
+@@ -768,7 +768,7 @@ func TestGitHubRepositoryDelegation(t *testing.T) {
+ 
+ 	t.Run("ReadTree delegates to git repo", func(t *testing.T) {
+ 		mockGitRepo := git.NewMockGitRepository(t)
+-		expectedEntries := []repository.FileTreeEntry{
++		expectedEntries := []repo.FileTreeEntry{
+ 			{Path: "file1.yaml", Size: 100, Hash: "hash1", Blob: true},
+ 		}
+ 		mockGitRepo.On("ReadTree", ctx, "main").Return(expectedEntries, nil)
+@@ -895,9 +895,9 @@ func TestGitHubRepositoryDelegation(t *testing.T) {
+ 
+ 	t.Run("CompareFiles delegates to git repo", func(t *testing.T) {
+ 		mockGitRepo := git.NewMockGitRepository(t)
+-		expectedChanges := []repository.VersionedFileChange{
++		expectedChanges := []repo.VersionedFileChange{
+ 			{
+-				Action: repository.FileActionCreated,
++				Action: repo.FileActionCreated,
+ 				Path:   "new-file.yaml",
+ 				Ref:    "feature-branch",
+ 			},
+@@ -917,9 +917,9 @@ func TestGitHubRepositoryDelegation(t *testing.T) {
+ 
+ 	t.Run("Stage delegates to git repo", func(t *testing.T) {
+ 		mockGitRepo := git.NewMockGitRepository(t)
+-		mockStagedRepo := repository.NewMockStagedRepository(t)
+-		opts := repository.StageOptions{
+-			Mode:    repository.StageModeCommitOnEach,
++		mockStagedRepo := repo.NewMockStagedRepository(t)
++		opts := repo.StageOptions{
++			Mode:    repo.StageModeCommitOnEach,
+ 			Timeout: 10 * time.Second,
+ 		}
+ 		mockGitRepo.On("Stage", ctx, opts).Return(mockStagedRepo, nil)
+@@ -1075,7 +1075,7 @@ func TestGitHubRepository_GetDefaultBranch(t *testing.T) {
+ 			name: "handles not found error",
+ 			mockSetup: func(m *MockClient) {
+ 				m.On("GetRepository", mock.Anything, "grafana", "grafana").
+-					Return(Repository{}, ErrResourceNotFound)
++					Return(Repository{}, repo.ErrFileNotFound)
+ 			},
+ 			expectedError: "failed to get repository metadata:",
+ 		},
+@@ -1294,7 +1294,7 @@ func TestGitHubRepository_Test_BranchProtection(t *testing.T) {
+ 			name:             "GetBranchProtection unauthorized (401) returns test failure",
+ 			workflows:        []provisioning.Workflow{provisioning.WriteWorkflow},
+ 			branch:           "main",
+-			bpError:          ErrUnauthorized,
++			bpError:          repo.ErrUnauthorized,
+ 			expectBPCall:     true,
+ 			expectedSuccess:  false,
+ 			expectedErrField: "spec.github.branch",
+diff --git a/apps/provisioning/pkg/repository/github/webhook.go b/apps/provisioning/pkg/repository/github/webhook.go
+index f788c88fc4abe..23677b7660c52 100644
+--- a/apps/provisioning/pkg/repository/github/webhook.go
++++ b/apps/provisioning/pkg/repository/github/webhook.go
+@@ -236,7 +236,7 @@ func (r *githubWebhookRepository) updateWebhook(ctx context.Context) (WebhookCon
+ 
+ 	hook, err := r.gh.GetWebhook(ctx, r.owner, r.repo, r.config.Status.Webhook.ID)
+ 	switch {
+-	case errors.Is(err, ErrResourceNotFound):
++	case errors.Is(err, repository.ErrFileNotFound):
+ 		hook, err := r.createWebhook(ctx)
+ 		if err != nil {
+ 			return WebhookConfig{}, false, err
+@@ -285,14 +285,14 @@ func (r *githubWebhookRepository) deleteWebhook(ctx context.Context) error {
+ 	id := r.config.Status.Webhook.ID
+ 
+ 	err := r.gh.DeleteWebhook(ctx, r.owner, r.repo, id)
+-	if err != nil && !errors.Is(err, ErrResourceNotFound) && !errors.Is(err, ErrUnauthorized) {
++	if err != nil && !errors.Is(err, repository.ErrFileNotFound) && !errors.Is(err, repository.ErrUnauthorized) {
+ 		return fmt.Errorf("delete webhook: %w", err)
+ 	}
+-	if errors.Is(err, ErrResourceNotFound) {
++	if errors.Is(err, repository.ErrFileNotFound) {
+ 		logger.Warn("webhook no longer exists", "url", r.config.Status.Webhook.URL, "id", id)
+ 		return nil
+ 	}
+-	if errors.Is(err, ErrUnauthorized) {
++	if errors.Is(err, repository.ErrUnauthorized) {
+ 		logger.Warn("webhook deletion failed. no longer authorized to delete this webhook", "url", r.config.Status.Webhook.URL, "id", id)
+ 		return nil
+ 	}
+diff --git a/apps/provisioning/pkg/repository/github/webhook_test.go b/apps/provisioning/pkg/repository/github/webhook_test.go
+index f564182aaebe5..4e8bcbaee664a 100644
+--- a/apps/provisioning/pkg/repository/github/webhook_test.go
++++ b/apps/provisioning/pkg/repository/github/webhook_test.go
+@@ -21,6 +21,7 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	provisioning "github.com/grafana/grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1"
++	repo "github.com/grafana/grafana/apps/provisioning/pkg/repository"
+ 	common "github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1"
+ )
+ 
+@@ -1207,7 +1208,7 @@ func TestGitHubRepository_OnUpdate(t *testing.T) {
+ 			setupMock: func(m *MockClient) {
+ 				// Mock webhook not found
+ 				m.On("GetWebhook", mock.Anything, "grafana", "grafana", int64(123)).
+-					Return(WebhookConfig{}, ErrResourceNotFound)
++					Return(WebhookConfig{}, repo.ErrFileNotFound)
+ 
+ 				// Mock creating a new webhook
+ 				m.On("CreateWebhook", mock.Anything, "grafana", "grafana", mock.MatchedBy(func(hook WebhookConfig) bool {
+@@ -1400,11 +1401,11 @@ func TestGitHubRepository_OnUpdate(t *testing.T) {
+ 			expectedError: fmt.Errorf("failed to create webhook"),
+ 		},
+ 		{
+-			name: "creates webhook when ErrResourceNotFound",
++			name: "creates webhook when repo.ErrFileNotFound",
+ 			setupMock: func(m *MockClient) {
+ 				// Mock webhook not found
+ 				m.On("GetWebhook", mock.Anything, "grafana", "grafana", int64(123)).
+-					Return(WebhookConfig{}, ErrResourceNotFound)
++					Return(WebhookConfig{}, repo.ErrFileNotFound)
+ 
+ 				// Mock creating a new webhook
+ 				m.On("CreateWebhook", mock.Anything, "grafana", "grafana", mock.MatchedBy(func(hook WebhookConfig) bool {
+@@ -1445,7 +1446,7 @@ func TestGitHubRepository_OnUpdate(t *testing.T) {
+ 			setupMock: func(m *MockClient) {
+ 				// Mock webhook not found
+ 				m.On("GetWebhook", mock.Anything, "grafana", "grafana", int64(123)).
+-					Return(WebhookConfig{}, ErrResourceNotFound)
++					Return(WebhookConfig{}, repo.ErrFileNotFound)
+ 
+ 				// Mock error when creating a new webhook
+ 				m.On("CreateWebhook", mock.Anything, "grafana", "grafana", mock.MatchedBy(func(hook WebhookConfig) bool {
+@@ -1650,7 +1651,7 @@ func TestGitHubRepository_OnDelete(t *testing.T) {
+ 			name: "webhook not found during deletion",
+ 			setupMock: func(m *MockClient) {
+ 				m.On("DeleteWebhook", mock.Anything, "grafana", "grafana", int64(123)).
+-					Return(ErrResourceNotFound)
++					Return(repo.ErrFileNotFound)
+ 			},
+ 			config: &provisioning.Repository{
+ 				ObjectMeta: metav1.ObjectMeta{
+@@ -1676,7 +1677,7 @@ func TestGitHubRepository_OnDelete(t *testing.T) {
+ 			name: "unauthorized to delete the webhook",
+ 			setupMock: func(m *MockClient) {
+ 				m.On("DeleteWebhook", mock.Anything, "grafana", "grafana", int64(123)).
+-					Return(ErrUnauthorized)
++					Return(repo.ErrUnauthorized)
+ 			},
+ 			config: &provisioning.Repository{
+ 				ObjectMeta: metav1.ObjectMeta{
+diff --git a/apps/provisioning/pkg/repository/repository.go b/apps/provisioning/pkg/repository/repository.go
+index c7be2fc254b68..65f39715c9ebd 100644
+--- a/apps/provisioning/pkg/repository/repository.go
++++ b/apps/provisioning/pkg/repository/repository.go
+@@ -68,6 +68,14 @@ var ErrServerUnavailable error = &apierrors.StatusError{ErrStatus: metav1.Status
+ 	Message: "server unavailable",
+ }}
+ 
++// ErrTooManyItems indicates that pagination limits were exceeded.
++var ErrTooManyItems error = &apierrors.StatusError{ErrStatus: metav1.Status{
++	Status:  metav1.StatusFailure,
++	Code:    http.StatusBadRequest,
++	Reason:  metav1.StatusReasonBadRequest,
++	Message: "maximum number of items exceeded",
++}}
++
+ type FileInfo struct {
+ 	// Path to the file on disk.
+ 	// No leading or trailing slashes will be contained within.
+diff --git a/contribute/developer-guide.md b/contribute/developer-guide.md
+index d50047f87ac0a..d66bc038aaf70 100644
+--- a/contribute/developer-guide.md
++++ b/contribute/developer-guide.md
+@@ -9,7 +9,7 @@ Make sure you have the following dependencies installed before setting up your d
+ - [Git](https://git-scm.com/)
+ - [Go](https://golang.org/dl/) (see [go.mod](../go.mod#L3) for minimum required version)
+ - [Node.js (Long Term Support)](https://nodejs.org), with [corepack enabled](https://nodejs.org/api/corepack.html#enabling-the-feature). See [.nvmrc](../.nvmrc) for supported version. We recommend that you use a version manager such as [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), or similar.
+-- [GCC](https://gcc.gnu.org/) (required for Cgo] dependencies)
++- [GCC](https://gcc.gnu.org/) (optional, not recommded; enables CGO for smaller, dynamically linked binaries)
+ 
+ ### macOS
+ 
+@@ -154,6 +154,22 @@ Log in using the default credentials:
+ 
+ When you log in for the first time, Grafana asks you to change your password.
+ 
++#### CGO and static builds
++
++By default, `make build-go` (and `make run`) does **not** set `CGO_ENABLED`. Go's default behavior is to enable CGO when a C compiler (GCC) is detected on the system, and disable it otherwise. For local development this is fine — CGO gives you a working SQLite driver for the embedded database.
++
++In **production**, Grafana is built with `CGO_ENABLED=0` to produce a fully static, pure Go binary. This is important because the build environment and the runtime environment are often different (for example, building on Debian but running on Alpine or a scratch container).
++
++You can control both `CGO_ENABLED` and `LDFLAGS` when invoking Make:
++
++```sh
++# Static build without CGO (production-style)
++CGO_ENABLED=0 make build-go
++
++# Build with Go defaults
++unset CGO_ENABLED && make build-go
++```
++
+ #### Build on Windows
+ 
+ The Grafana backend includes SQLite, a database which requires GCC to compile. So in order to compile Grafana on Windows you need to install GCC with binutils version 2.37 or later.
+diff --git a/docs/sources/_index.md b/docs/sources/_index.md
+index 6cdd507945483..7702aaa62121e 100644
+--- a/docs/sources/_index.md
++++ b/docs/sources/_index.md
+@@ -46,15 +46,15 @@ cards:
+       description: Manage data sources and how to configure or query the built-in data sources.
+       height: 24
+     - title: Dashboards
+-      href: ./dashboards/
++      href: ./visualizations/dashboards/
+       description: Query, transform, visualize, and understand your data no matter where it's stored.
+       height: 24
+     - title: Panels and Visualizations
+-      href: ./panels-visualizations/
++      href: ./visualizations/panels-visualizations/
+       description: Easily collect, correlate, and visualize data to make informed decisions in real-time.
+       height: 24
+     - title: Explore
+-      href: ./explore/
++      href: ./visualizations/explore/
+       description: Explore your data using a query instead of creating a dashboard.
+       height: 24
+     - title: Alerting
+diff --git a/docs/sources/setup-grafana/configure-grafana/_index.md b/docs/sources/setup-grafana/configure-grafana/_index.md
+index 79c9d8441a8e9..4c1304b24f798 100644
+--- a/docs/sources/setup-grafana/configure-grafana/_index.md
++++ b/docs/sources/setup-grafana/configure-grafana/_index.md
+@@ -370,6 +370,10 @@ Grafana needs a database to store users and dashboards (and other
+ things). By default it is configured to use [`sqlite3`](https://www.sqlite.org/index.html) which is an
+ embedded database (included in the main Grafana binary).
+ 
++{{< admonition type="caution" >}}
++SQLite isn't recommended for production environments; use MySQL or PostgreSQL for production deployments.
++{{< /admonition >}}
++
+ #### `type`
+ 
+ Either `mysql`, `postgres` or `sqlite3`, it's your choice.
+diff --git a/docs/sources/setup-grafana/installation/_index.md b/docs/sources/setup-grafana/installation/_index.md
+index 75577d3aed1b3..20ca825460d51 100644
+--- a/docs/sources/setup-grafana/installation/_index.md
++++ b/docs/sources/setup-grafana/installation/_index.md
+@@ -66,8 +66,8 @@ Grafana supports the following databases:
+ 
+ By default Grafana uses an embedded SQLite database, which is stored in the Grafana installation location. If you need to migrate to a different database later, note that database schema and data migrations are customer-managed operations and fall outside the scope of Grafana Support.
+ 
+-{{< admonition type="note" >}}
+-SQLite works well if your environment is small, but is not recommended when your environment starts growing. For more information about the limitations of SQLite, refer to [Appropriate Uses For SQLite](https://www.sqlite.org/whentouse.html). If you want [high availability](/docs/grafana/latest/setup-grafana/set-up-for-high-availability), you must use either a MySQL or PostgreSQL database. For information about how to define the database configuration parameters inside the `grafana.ini` file, refer to [[database]](/docs/grafana/latest/setup-grafana/configure-grafana/#database).
++{{< admonition type="caution" >}}
++SQLite isn't recommended for production environments. It works well for local development and small evaluation instances, but it doesn't scale for production workloads. If you want [high availability](/docs/grafana/latest/setup-grafana/set-up-for-high-availability), you must use either a MySQL or PostgreSQL database. For information about how to define the database configuration parameters inside the `grafana.ini` file, refer to [[database]](/docs/grafana/latest/setup-grafana/configure-grafana/#database).
+ {{< /admonition >}}
+ 
+ Grafana supports the versions of these databases that are officially supported by the project at the time a version of Grafana is released. When a Grafana version becomes unsupported, Grafana Labs might also drop support for that database version. See the links above for the support policies for each project.
+diff --git a/docs/sources/visualizations/dashboards/create-manage-playlists/index.md b/docs/sources/visualizations/dashboards/create-manage-playlists/index.md
+index 0e0ce99919fab..9817d32c98363 100644
+--- a/docs/sources/visualizations/dashboards/create-manage-playlists/index.md
++++ b/docs/sources/visualizations/dashboards/create-manage-playlists/index.md
+@@ -61,12 +61,12 @@ The playlist displays each dashboard for the time specified in the **Interval**
+ 
+ <!-- prettier-ignore-start -->
+ 
+-| Mode                               | Description                                                                          |
+-| ---------------------------------- | ------------------------------------------------------------------------------------ |
+-| Normal mode                        | <ul><li>The main menu and navbar remain visible.</li><li>Dashboard controls are hidden.</li><li>Playlist controls are displayed at the top of the screen.<li><ul> |
+-| Normal mode (with auto fit panels) | <ul><li>The main menu and navbar remain visible.</li><li>Dashboard controls are hidden.</li><li>Playlist controls are displayed at the top of the screen.</li><li>Dashboard panels automatically adjust to optimize space on screen.</li></ul> |
+-| Kiosk mode                         | <ul><li>The main menu, navbar, and dashboard controls are hidden.</li><li>You can disable the playlist manually by pressing the `Esc` key after the playlist has started. Doing so causes the playlist controls to be displayed at the top of the screen briefly.</li></ul> |
+-| Kiosk mode (with auto fit panels)  | <ul><<li>The main menu, navbar, and dashboard controls are hidden.</li><li>You can disable the playlist manually by pressing the `Esc` key after the playlist has started. Doing so causes the playlist controls to be displayed at the top of the screen briefly.</li><li>Dashboard panels automatically adjust to optimize space on screen.</li></ul> |
++| Mode             | Description                        |
++| ---------------------------------- | -------------------- |
++| Normal mode                        | <ul><li>The main menu and navigation bar remain visible.</li><li>Dashboard controls are hidden.</li><li>Playlist controls are displayed at the top of the screen.</li></ul> |
++| Normal mode (with auto fit panels) | <ul><li>The main menu and navigation bar remain visible.</li><li>Dashboard controls are hidden.</li><li>Playlist controls are displayed at the top of the screen.</li><li>Dashboard panels automatically adjust to optimize space on screen.</li></ul> |
++| Kiosk mode                         | <ul><li>The main menu, navigation bar, and dashboard controls are hidden.</li><li>You can disable the playlist manually by pressing the `Esc` key after the playlist has started. Doing so causes the playlist controls to be displayed at the top of the screen briefly.</li></ul> |
++| Kiosk mode (with auto fit panels)  | <ul><li>The main menu, navigation bar, and dashboard controls are hidden.</li><li>You can disable the playlist manually by pressing the `Esc` key after the playlist has started. Doing so causes the playlist controls to be displayed at the top of the screen briefly.</li><li>Dashboard panels automatically adjust to optimize space on screen.</li></ul> |
+ 
+ <!-- prettier-ignore-end -->
+ 
+@@ -75,7 +75,7 @@ The playlist displays each dashboard for the time specified in the **Interval**
+ You can control a playlist in **Normal** mode after it's started, using the buttons at the top of your screen. Press the `Esc` key to stop the playlist.
+ 
+ - **Next (double-right arrow)** - Advances to the next dashboard.
+-- **Back (doublt-left arrow)** - Returns to the previous dashboard.
++- **Back (double-left arrow)** - Returns to the previous dashboard.
+ - **Stop playlist** - Ends the playlist, and exits to the current dashboard.
+ 
+ ## Create a playlist
+diff --git a/pkg/tsdb/jaeger/callresource.go b/pkg/tsdb/jaeger/callresource.go
+index 9b9cd2aa7463e..1cee1fd9462fc 100644
+--- a/pkg/tsdb/jaeger/callresource.go
++++ b/pkg/tsdb/jaeger/callresource.go
+@@ -31,13 +31,14 @@ func (s *Service) withDatasourceHandlerFunc(getHandler func(d *datasourceInfo) h
+ 
+ func getServicesHandler(ds *datasourceInfo) http.HandlerFunc {
+ 	return func(rw http.ResponseWriter, r *http.Request) {
+-		cfg := backend.GrafanaConfigFromContext(r.Context())
++		ctx := r.Context()
++		cfg := backend.GrafanaConfigFromContext(ctx)
+ 		var services []string
+ 		var err error
+ 		if cfg.FeatureToggles().IsEnabled("jaegerEnableGrpcEndpoint") {
+-			services, err = ds.JaegerClient.GrpcServices()
++			services, err = ds.JaegerClient.GrpcServices(ctx)
+ 		} else {
+-			services, err = ds.JaegerClient.Services()
++			services, err = ds.JaegerClient.Services(ctx)
+ 		}
+ 		writeResponse(services, err, rw, ds.JaegerClient.logger)
+ 	}
+@@ -45,14 +46,15 @@ func getServicesHandler(ds *datasourceInfo) http.HandlerFunc {
+ 
+ func getOperationsHandler(ds *datasourceInfo) http.HandlerFunc {
+ 	return func(rw http.ResponseWriter, r *http.Request) {
+-		cfg := backend.GrafanaConfigFromContext(r.Context())
++		ctx := r.Context()
++		cfg := backend.GrafanaConfigFromContext(ctx)
+ 		service := strings.TrimSpace(r.PathValue("service"))
+ 		var operations []string
+ 		var err error
+ 		if cfg.FeatureToggles().IsEnabled("jaegerEnableGrpcEndpoint") {
+-			operations, err = ds.JaegerClient.GrpcOperations(service)
++			operations, err = ds.JaegerClient.GrpcOperations(ctx, service)
+ 		} else {
+-			operations, err = ds.JaegerClient.Operations(service)
++			operations, err = ds.JaegerClient.Operations(ctx, service)
+ 		}
+ 		writeResponse(operations, err, rw, ds.JaegerClient.logger)
+ 	}
+diff --git a/pkg/tsdb/jaeger/client.go b/pkg/tsdb/jaeger/client.go
+index b2fe40e5eca6c..fd10edae7458b 100644
+--- a/pkg/tsdb/jaeger/client.go
++++ b/pkg/tsdb/jaeger/client.go
+@@ -33,7 +33,25 @@ func New(hc *http.Client, logger log.Logger, settings backend.DataSourceInstance
+ 	return client, nil
+ }
+ 
+-func (j *JaegerClient) Services() ([]string, error) {
++// doGet performs a GET request with the given context so that contextual HTTP middleware
++// (e.g. Forward OAuth Identity, x-grafana-id) can attach headers to the outgoing request.
++func (j *JaegerClient) doGet(ctx context.Context, rawURL string) (*http.Response, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
++	if err != nil {
++		return nil, err
++	}
++	res, err := j.httpClient.Do(req)
++	if err != nil {
++		j.logger.Error("Jaeger request failed", "error", err)
++		return nil, err
++	}
++	if res != nil && res.StatusCode/100 != 2 {
++		j.logger.Warn("Jaeger request returned non-2xx status", "status", res.StatusCode, "statusText", res.Status)
++	}
++	return res, nil
++}
++
++func (j *JaegerClient) Services(ctx context.Context) ([]string, error) {
+ 	var response types.ServicesResponse
+ 	services := []string{}
+ 
+@@ -42,7 +60,7 @@ func (j *JaegerClient) Services() ([]string, error) {
+ 		return services, backend.DownstreamErrorf("failed to join url: %w", err)
+ 	}
+ 
+-	res, err := j.httpClient.Get(u)
++	res, err := j.doGet(ctx, u)
+ 	if err != nil {
+ 		return services, err
+ 	}
+@@ -61,7 +79,7 @@ func (j *JaegerClient) Services() ([]string, error) {
+ 	return services, err
+ }
+ 
+-func (j *JaegerClient) Operations(s string) ([]string, error) {
++func (j *JaegerClient) Operations(ctx context.Context, s string) ([]string, error) {
+ 	var response types.ServicesResponse
+ 	operations := []string{}
+ 
+@@ -70,7 +88,7 @@ func (j *JaegerClient) Operations(s string) ([]string, error) {
+ 		return operations, backend.DownstreamErrorf("failed to join url: %w", err)
+ 	}
+ 
+-	res, err := j.httpClient.Get(u)
++	res, err := j.doGet(ctx, u)
+ 	if err != nil {
+ 		return operations, err
+ 	}
+@@ -89,7 +107,7 @@ func (j *JaegerClient) Operations(s string) ([]string, error) {
+ 	return operations, err
+ }
+ 
+-func (j *JaegerClient) Search(query *JaegerQuery, start, end int64) (*data.Frame, error) {
++func (j *JaegerClient) Search(ctx context.Context, query *JaegerQuery, start, end int64) (*data.Frame, error) {
+ 	u, err := url.JoinPath(j.url, "/api/traces")
+ 	if err != nil {
+ 		return nil, backend.DownstreamErrorf("failed to join url path: %w", err)
+@@ -147,7 +165,7 @@ func (j *JaegerClient) Search(query *JaegerQuery, start, end int64) (*data.Frame
+ 	}
+ 
+ 	jaegerURL.RawQuery = urlQuery.Encode()
+-	resp, err := j.httpClient.Get(jaegerURL.String())
++	resp, err := j.doGet(ctx, jaegerURL.String())
+ 	if err != nil {
+ 		if backend.IsDownstreamHTTPError(err) {
+ 			return nil, backend.DownstreamError(err)
+@@ -217,7 +235,7 @@ func (j *JaegerClient) Trace(ctx context.Context, traceID string, start, end int
+ 		}
+ 	}
+ 
+-	res, err := j.httpClient.Get(traceUrl)
++	res, err := j.doGet(ctx, traceUrl)
+ 	if err != nil {
+ 		if backend.IsDownstreamHTTPError(err) {
+ 			return nil, backend.DownstreamError(err)
+@@ -276,7 +294,7 @@ func (j *JaegerClient) Dependencies(ctx context.Context, start, end int64) (type
+ 	parsedURL.RawQuery = query.Encode()
+ 	u = parsedURL.String()
+ 
+-	res, err := j.httpClient.Get(u)
++	res, err := j.doGet(ctx, u)
+ 	if err != nil {
+ 		if backend.IsDownstreamHTTPError(err) {
+ 			return dependencies, backend.DownstreamError(err)
+diff --git a/pkg/tsdb/jaeger/client_test.go b/pkg/tsdb/jaeger/client_test.go
+index 54d3091f07e94..dc1c767593893 100644
+--- a/pkg/tsdb/jaeger/client_test.go
++++ b/pkg/tsdb/jaeger/client_test.go
+@@ -1,7 +1,6 @@
+ package jaeger
+ 
+ import (
+-	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -67,7 +66,7 @@ func TestJaegerClient_Services(t *testing.T) {
+ 			client, err := New(server.Client(), log.NewNullLogger(), settings)
+ 			assert.NoError(t, err)
+ 
+-			services, err := client.Services()
++			services, err := client.Services(t.Context())
+ 
+ 			if tt.expectError {
+ 				assert.Error(t, err)
+@@ -159,7 +158,7 @@ func TestJaegerClient_Operations(t *testing.T) {
+ 			client, err := New(server.Client(), log.NewNullLogger(), settings)
+ 			assert.NoError(t, err)
+ 
+-			operations, err := client.Operations(tt.service)
++			operations, err := client.Operations(t.Context(), tt.service)
+ 
+ 			if tt.expectError {
+ 				assert.Error(t, err)
+@@ -265,7 +264,7 @@ func TestJaegerClient_Search(t *testing.T) {
+ 
+ 			client, err := New(server.Client(), log.NewNullLogger(), settings)
+ 			assert.NoError(t, err)
+-			traces, err := client.Search(tt.query, tt.start, tt.end)
++			traces, err := client.Search(t.Context(), tt.query, tt.start, tt.end)
+ 
+ 			if tt.expectError {
+ 				assert.Error(t, err)
+@@ -379,7 +378,7 @@ func TestJaegerClient_Trace(t *testing.T) {
+ 			client, err := New(server.Client(), log.NewNullLogger(), settings)
+ 			assert.NoError(t, err)
+ 
+-			trace, err := client.Trace(context.Background(), tt.traceId, tt.start, tt.end, "A")
++			trace, err := client.Trace(t.Context(), tt.traceId, tt.start, tt.end, "A")
+ 
+ 			if tt.expectError {
+ 				assert.Error(t, err)
+@@ -491,7 +490,7 @@ func TestJaegerClient_Dependencies(t *testing.T) {
+ 			client, err := New(server.Client(), log.NewNullLogger(), settings)
+ 			assert.NoError(t, err)
+ 
+-			dependencies, err := client.Dependencies(context.Background(), tt.start, tt.end)
++			dependencies, err := client.Dependencies(t.Context(), tt.start, tt.end)
+ 
+ 			if tt.expectError {
+ 				assert.Error(t, err)
+diff --git a/pkg/tsdb/jaeger/grpc_client.go b/pkg/tsdb/jaeger/grpc_client.go
+index ec3e7214aa4a0..1c93f65cfd56c 100644
+--- a/pkg/tsdb/jaeger/grpc_client.go
++++ b/pkg/tsdb/jaeger/grpc_client.go
+@@ -16,7 +16,7 @@ import (
+ 	"github.com/grafana/grafana/pkg/tsdb/jaeger/utils"
+ )
+ 
+-func (j *JaegerClient) GrpcServices() ([]string, error) {
++func (j *JaegerClient) GrpcServices(ctx context.Context) ([]string, error) {
+ 	var response types.GrpcServicesResponse
+ 	services := []string{}
+ 
+@@ -25,7 +25,7 @@ func (j *JaegerClient) GrpcServices() ([]string, error) {
+ 		return services, backend.DownstreamErrorf("failed to join url: %w", err)
+ 	}
+ 
+-	res, err := j.httpClient.Get(u)
++	res, err := j.doGet(ctx, u)
+ 	if err != nil {
+ 		if backend.IsDownstreamHTTPError(err) {
+ 			return services, backend.DownstreamError(err)
+@@ -55,7 +55,7 @@ func (j *JaegerClient) GrpcServices() ([]string, error) {
+ 	return services, nil
+ }
+ 
+-func (j *JaegerClient) GrpcOperations(s string) ([]string, error) {
++func (j *JaegerClient) GrpcOperations(ctx context.Context, s string) ([]string, error) {
+ 	var response types.GrpcOperationsResponse
+ 	operations := []string{}
+ 
+@@ -73,7 +73,7 @@ func (j *JaegerClient) GrpcOperations(s string) ([]string, error) {
+ 	urlQuery.Set("service", s)
+ 	jaegerURL.RawQuery = urlQuery.Encode()
+ 
+-	res, err := j.httpClient.Get(jaegerURL.String())
++	res, err := j.doGet(ctx, jaegerURL.String())
+ 	if err != nil {
+ 		if backend.IsDownstreamHTTPError(err) {
+ 			return operations, backend.DownstreamError(err)
+@@ -109,7 +109,7 @@ func (j *JaegerClient) GrpcOperations(s string) ([]string, error) {
+ 
+ // Note that this and all functionality around search is not yet being used. Once Jaeger adds support for attributes and limit parameters
+ // we will be able to start using this and routing traffic to the new API based on the feature flag.
+-func (j *JaegerClient) GrpcSearch(query *JaegerQuery, start, end time.Time) (*data.Frame, error) {
++func (j *JaegerClient) GrpcSearch(ctx context.Context, query *JaegerQuery, start, end time.Time) (*data.Frame, error) {
+ 	u, err := url.JoinPath(j.url, "/api/v3/traces")
+ 	if err != nil {
+ 		return nil, backend.DownstreamErrorf("failed to join url path: %w", err)
+@@ -159,7 +159,7 @@ func (j *JaegerClient) GrpcSearch(query *JaegerQuery, start, end time.Time) (*da
+ 	jaegerURL.RawQuery = urlQuery.Encode()
+ 	// jaeger will not be able to process the request if the time is encoded, all other parameters are encoded except for the start and end time
+ 	jaegerURL.RawQuery += fmt.Sprintf("&query.start_time_min=%s&query.start_time_max=%s", start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
+-	resp, err := j.httpClient.Get(jaegerURL.String())
++	resp, err := j.doGet(ctx, jaegerURL.String())
+ 	if err != nil {
+ 		if backend.IsDownstreamHTTPError(err) {
+ 			return nil, backend.DownstreamError(err)
+@@ -231,7 +231,7 @@ func (j *JaegerClient) GrpcTrace(ctx context.Context, traceID string, start, end
+ 		}
+ 	}
+ 
+-	res, err := j.httpClient.Get(traceUrl)
++	res, err := j.doGet(ctx, traceUrl)
+ 	if err != nil {
+ 		if backend.IsDownstreamHTTPError(err) {
+ 			return nil, backend.DownstreamError(err)
+diff --git a/pkg/tsdb/jaeger/grpc_client_test.go b/pkg/tsdb/jaeger/grpc_client_test.go
+index c467284a7b5d2..2d9565d0ee441 100644
+--- a/pkg/tsdb/jaeger/grpc_client_test.go
++++ b/pkg/tsdb/jaeger/grpc_client_test.go
+@@ -69,7 +69,7 @@ func TestJaegerGrpcClient_Services(t *testing.T) {
+ 			client, err := New(server.Client(), log.NewNullLogger(), settings)
+ 			assert.NoError(t, err)
+ 
+-			services, err := client.GrpcServices()
++			services, err := client.GrpcServices(context.Background())
+ 
+ 			if tt.expectError {
+ 				assert.Error(t, err)
+@@ -387,7 +387,7 @@ func TestJaegerGrpcClient_Operations(t *testing.T) {
+ 			client, err := New(server.Client(), log.NewNullLogger(), settings)
+ 			assert.NoError(t, err)
+ 
+-			operations, err := client.GrpcOperations(tt.service)
++			operations, err := client.GrpcOperations(context.Background(), tt.service)
+ 
+ 			if tt.expectError {
+ 				assert.Error(t, err)
+diff --git a/pkg/tsdb/jaeger/jaeger.go b/pkg/tsdb/jaeger/jaeger.go
+index 4855af4a91f9d..52fc41f735fe5 100644
+--- a/pkg/tsdb/jaeger/jaeger.go
++++ b/pkg/tsdb/jaeger/jaeger.go
+@@ -93,9 +93,9 @@ func (s *Service) CheckHealth(ctx context.Context, req *backend.CheckHealthReque
+ 
+ 	var servicesErr error
+ 	if cfg.FeatureToggles().IsEnabled("jaegerEnableGrpcEndpoint") {
+-		_, servicesErr = client.JaegerClient.GrpcServices()
++		_, servicesErr = client.JaegerClient.GrpcServices(ctx)
+ 	} else {
+-		_, servicesErr = client.JaegerClient.Services()
++		_, servicesErr = client.JaegerClient.Services(ctx)
+ 	}
+ 
+ 	if servicesErr != nil {
+diff --git a/pkg/tsdb/jaeger/querydata.go b/pkg/tsdb/jaeger/querydata.go
+index dcba098a7a877..90480cbf9c3cc 100644
+--- a/pkg/tsdb/jaeger/querydata.go
++++ b/pkg/tsdb/jaeger/querydata.go
+@@ -51,7 +51,7 @@ func queryData(ctx context.Context, dsInfo *datasourceInfo, req *backend.QueryDa
+ 		// Handle "Search" query type
+ 		if query.QueryType == "search" {
+ 			// TODO: enable routing to gRPC when ready, currently pending on: https://github.com/jaegertracing/jaeger/issues/7594
+-			frames, err := dsInfo.JaegerClient.Search(&query, q.TimeRange.From.UnixMicro(), q.TimeRange.To.UnixMicro())
++			frames, err := dsInfo.JaegerClient.Search(ctx, &query, q.TimeRange.From.UnixMicro(), q.TimeRange.To.UnixMicro())
+ 			if err != nil {
+ 				response.Responses[q.RefID] = backend.ErrorResponseWithErrorSource(err)
+ 				continue
+diff --git a/public/app/features/plugins/loader/sharedDependencies.ts b/public/app/features/plugins/loader/sharedDependencies.ts
+index c83ac72f65105..3f2261d87d6c9 100644
+--- a/public/app/features/plugins/loader/sharedDependencies.ts
++++ b/public/app/features/plugins/loader/sharedDependencies.ts
+@@ -106,6 +106,8 @@ export const sharedDependenciesMap = {
+   'react/jsx-runtime': () => import('react/jsx-runtime'),
+   'react/jsx-dev-runtime': () => import('react/jsx-dev-runtime'),
+   'react-dom': () => import('react-dom'),
++  'react-dom/client': () => import('react-dom/client'),
++  'react-dom/server': () => import('react-dom/server'),
+   // bundling grafana-ui in plugins requires sharing react-inlinesvg for the icon cache
+   'react-inlinesvg': () => import('react-inlinesvg'),
+   'react-redux': () => import('react-redux'),
+diff --git a/yarn.lock b/yarn.lock
+index 5c81b019f445a..aa4622cdf7420 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -8080,142 +8080,177 @@ __metadata:
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-android-arm-eabi@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-android-arm-eabi@npm:4.46.1"
++"@rollup/rollup-android-arm-eabi@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-android-arm-eabi@npm:4.59.0"
+   conditions: os=android & cpu=arm
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-android-arm64@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-android-arm64@npm:4.46.1"
++"@rollup/rollup-android-arm64@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-android-arm64@npm:4.59.0"
+   conditions: os=android & cpu=arm64
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-darwin-arm64@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-darwin-arm64@npm:4.46.1"
++"@rollup/rollup-darwin-arm64@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-darwin-arm64@npm:4.59.0"
+   conditions: os=darwin & cpu=arm64
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-darwin-x64@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-darwin-x64@npm:4.46.1"
++"@rollup/rollup-darwin-x64@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-darwin-x64@npm:4.59.0"
+   conditions: os=darwin & cpu=x64
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-freebsd-arm64@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-freebsd-arm64@npm:4.46.1"
++"@rollup/rollup-freebsd-arm64@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-freebsd-arm64@npm:4.59.0"
+   conditions: os=freebsd & cpu=arm64
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-freebsd-x64@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-freebsd-x64@npm:4.46.1"
++"@rollup/rollup-freebsd-x64@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-freebsd-x64@npm:4.59.0"
+   conditions: os=freebsd & cpu=x64
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-arm-gnueabihf@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-arm-gnueabihf@npm:4.46.1"
++"@rollup/rollup-linux-arm-gnueabihf@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-arm-gnueabihf@npm:4.59.0"
+   conditions: os=linux & cpu=arm & libc=glibc
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-arm-musleabihf@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-arm-musleabihf@npm:4.46.1"
++"@rollup/rollup-linux-arm-musleabihf@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-arm-musleabihf@npm:4.59.0"
+   conditions: os=linux & cpu=arm & libc=musl
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-arm64-gnu@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-arm64-gnu@npm:4.46.1"
++"@rollup/rollup-linux-arm64-gnu@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-arm64-gnu@npm:4.59.0"
+   conditions: os=linux & cpu=arm64 & libc=glibc
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-arm64-musl@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-arm64-musl@npm:4.46.1"
++"@rollup/rollup-linux-arm64-musl@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-arm64-musl@npm:4.59.0"
+   conditions: os=linux & cpu=arm64 & libc=musl
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-loongarch64-gnu@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-loongarch64-gnu@npm:4.46.1"
++"@rollup/rollup-linux-loong64-gnu@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-loong64-gnu@npm:4.59.0"
+   conditions: os=linux & cpu=loong64 & libc=glibc
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-ppc64-gnu@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-ppc64-gnu@npm:4.46.1"
++"@rollup/rollup-linux-loong64-musl@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-loong64-musl@npm:4.59.0"
++  conditions: os=linux & cpu=loong64 & libc=musl
++  languageName: node
++  linkType: hard
++
++"@rollup/rollup-linux-ppc64-gnu@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-ppc64-gnu@npm:4.59.0"
+   conditions: os=linux & cpu=ppc64 & libc=glibc
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-riscv64-gnu@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-riscv64-gnu@npm:4.46.1"
++"@rollup/rollup-linux-ppc64-musl@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-ppc64-musl@npm:4.59.0"
++  conditions: os=linux & cpu=ppc64 & libc=musl
++  languageName: node
++  linkType: hard
++
++"@rollup/rollup-linux-riscv64-gnu@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-riscv64-gnu@npm:4.59.0"
+   conditions: os=linux & cpu=riscv64 & libc=glibc
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-riscv64-musl@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-riscv64-musl@npm:4.46.1"
++"@rollup/rollup-linux-riscv64-musl@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-riscv64-musl@npm:4.59.0"
+   conditions: os=linux & cpu=riscv64 & libc=musl
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-s390x-gnu@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-s390x-gnu@npm:4.46.1"
++"@rollup/rollup-linux-s390x-gnu@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-s390x-gnu@npm:4.59.0"
+   conditions: os=linux & cpu=s390x & libc=glibc
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-x64-gnu@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-x64-gnu@npm:4.46.1"
++"@rollup/rollup-linux-x64-gnu@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-x64-gnu@npm:4.59.0"
+   conditions: os=linux & cpu=x64 & libc=glibc
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-linux-x64-musl@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-linux-x64-musl@npm:4.46.1"
++"@rollup/rollup-linux-x64-musl@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-linux-x64-musl@npm:4.59.0"
+   conditions: os=linux & cpu=x64 & libc=musl
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-win32-arm64-msvc@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-win32-arm64-msvc@npm:4.46.1"
++"@rollup/rollup-openbsd-x64@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-openbsd-x64@npm:4.59.0"
++  conditions: os=openbsd & cpu=x64
++  languageName: node
++  linkType: hard
++
++"@rollup/rollup-openharmony-arm64@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-openharmony-arm64@npm:4.59.0"
++  conditions: os=openharmony & cpu=arm64
++  languageName: node
++  linkType: hard
++
++"@rollup/rollup-win32-arm64-msvc@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-win32-arm64-msvc@npm:4.59.0"
+   conditions: os=win32 & cpu=arm64
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-win32-ia32-msvc@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-win32-ia32-msvc@npm:4.46.1"
++"@rollup/rollup-win32-ia32-msvc@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-win32-ia32-msvc@npm:4.59.0"
+   conditions: os=win32 & cpu=ia32
+   languageName: node
+   linkType: hard
+ 
+-"@rollup/rollup-win32-x64-msvc@npm:4.46.1":
+-  version: 4.46.1
+-  resolution: "@rollup/rollup-win32-x64-msvc@npm:4.46.1"
++"@rollup/rollup-win32-x64-gnu@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-win32-x64-gnu@npm:4.59.0"
++  conditions: os=win32 & cpu=x64
++  languageName: node
++  linkType: hard
++
++"@rollup/rollup-win32-x64-msvc@npm:4.59.0":
++  version: 4.59.0
++  resolution: "@rollup/rollup-win32-x64-msvc@npm:4.59.0"
+   conditions: os=win32 & cpu=x64
+   languageName: node
+   linkType: hard
+@@ -30905,29 +30940,34 @@ __metadata:
+   linkType: hard
+ 
+ "rollup@npm:^4.22.4":
+-  version: 4.46.1
+-  resolution: "rollup@npm:4.46.1"
+-  dependencies:
+-    "@rollup/rollup-android-arm-eabi": "npm:4.46.1"
+-    "@rollup/rollup-android-arm64": "npm:4.46.1"
+-    "@rollup/rollup-darwin-arm64": "npm:4.46.1"
+-    "@rollup/rollup-darwin-x64": "npm:4.46.1"
+-    "@rollup/rollup-freebsd-arm64": "npm:4.46.1"
+-    "@rollup/rollup-freebsd-x64": "npm:4.46.1"
+-    "@rollup/rollup-linux-arm-gnueabihf": "npm:4.46.1"
+-    "@rollup/rollup-linux-arm-musleabihf": "npm:4.46.1"
+-    "@rollup/rollup-linux-arm64-gnu": "npm:4.46.1"
+-    "@rollup/rollup-linux-arm64-musl": "npm:4.46.1"
+-    "@rollup/rollup-linux-loongarch64-gnu": "npm:4.46.1"
+-    "@rollup/rollup-linux-ppc64-gnu": "npm:4.46.1"
+-    "@rollup/rollup-linux-riscv64-gnu": "npm:4.46.1"
+-    "@rollup/rollup-linux-riscv64-musl": "npm:4.46.1"
+-    "@rollup/rollup-linux-s390x-gnu": "npm:4.46.1"
+-    "@rollup/rollup-linux-x64-gnu": "npm:4.46.1"
+-    "@rollup/rollup-linux-x64-musl": "npm:4.46.1"
+-    "@rollup/rollup-win32-arm64-msvc": "npm:4.46.1"
+-    "@rollup/rollup-win32-ia32-msvc": "npm:4.46.1"
+-    "@rollup/rollup-win32-x64-msvc": "npm:4.46.1"
++  version: 4.59.0
++  resolution: "rollup@npm:4.59.0"
++  dependencies:
++    "@rollup/rollup-android-arm-eabi": "npm:4.59.0"
++    "@rollup/rollup-android-arm64": "npm:4.59.0"
++    "@rollup/rollup-darwin-arm64": "npm:4.59.0"
++    "@rollup/rollup-darwin-x64": "npm:4.59.0"
++    "@rollup/rollup-freebsd-arm64": "npm:4.59.0"
++    "@rollup/rollup-freebsd-x64": "npm:4.59.0"
++    "@rollup/rollup-linux-arm-gnueabihf": "npm:4.59.0"
++    "@rollup/rollup-linux-arm-musleabihf": "npm:4.59.0"
++    "@rollup/rollup-linux-arm64-gnu": "npm:4.59.0"
++    "@rollup/rollup-linux-arm64-musl": "npm:4.59.0"
++    "@rollup/rollup-linux-loong64-gnu": "npm:4.59.0"
++    "@rollup/rollup-linux-loong64-musl": "npm:4.59.0"
++    "@rollup/rollup-linux-ppc64-gnu": "npm:4.59.0"
++    "@rollup/rollup-linux-ppc64-musl": "npm:4.59.0"
++    "@rollup/rollup-linux-riscv64-gnu": "npm:4.59.0"
++    "@rollup/rollup-linux-riscv64-musl": "npm:4.59.0"
++    "@rollup/rollup-linux-s390x-gnu": "npm:4.59.0"
++    "@rollup/rollup-linux-x64-gnu": "npm:4.59.0"
++    "@rollup/rollup-linux-x64-musl": "npm:4.59.0"
++    "@rollup/rollup-openbsd-x64": "npm:4.59.0"
++    "@rollup/rollup-openharmony-arm64": "npm:4.59.0"
++    "@rollup/rollup-win32-arm64-msvc": "npm:4.59.0"
++    "@rollup/rollup-win32-ia32-msvc": "npm:4.59.0"
++    "@rollup/rollup-win32-x64-gnu": "npm:4.59.0"
++    "@rollup/rollup-win32-x64-msvc": "npm:4.59.0"
+     "@types/estree": "npm:1.0.8"
+     fsevents: "npm:~2.3.2"
+   dependenciesMeta:
+@@ -30951,10 +30991,14 @@ __metadata:
+       optional: true
+     "@rollup/rollup-linux-arm64-musl":
+       optional: true
+-    "@rollup/rollup-linux-loongarch64-gnu":
++    "@rollup/rollup-linux-loong64-gnu":
++      optional: true
++    "@rollup/rollup-linux-loong64-musl":
+       optional: true
+     "@rollup/rollup-linux-ppc64-gnu":
+       optional: true
++    "@rollup/rollup-linux-ppc64-musl":
++      optional: true
+     "@rollup/rollup-linux-riscv64-gnu":
+       optional: true
+     "@rollup/rollup-linux-riscv64-musl":
+@@ -30965,17 +31009,23 @@ __metadata:
+       optional: true
+     "@rollup/rollup-linux-x64-musl":
+       optional: true
++    "@rollup/rollup-openbsd-x64":
++      optional: true
++    "@rollup/rollup-openharmony-arm64":
++      optional: true
+     "@rollup/rollup-win32-arm64-msvc":
+       optional: true
+     "@rollup/rollup-win32-ia32-msvc":
+       optional: true
++    "@rollup/rollup-win32-x64-gnu":
++      optional: true
+     "@rollup/rollup-win32-x64-msvc":
+       optional: true
+     fsevents:
+       optional: true
+   bin:
+     rollup: dist/bin/rollup
+-  checksum: 10/dc79db54312e895acc8dc0f0b2ef7e507d9ee1f742944ed060f10c17010076f60df13a46baed66780cede9ccaa604dfc87edfbe0d0c47c63b32e66a647c0f5c8
++  checksum: 10/728237932aad7022c0640cd126b9fe5285f2578099f22a0542229a17785320a6553b74582fa5977877541c1faf27de65ed2750bc89dbb55b525405244a46d9f1
+   languageName: node
+   linkType: hard
+ 

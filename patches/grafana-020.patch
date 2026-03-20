@@ -1,156 +1,106 @@
-diff --git a/pkg/services/ngalert/api/api_ruler_validation_test.go b/pkg/services/ngalert/api/api_ruler_validation_test.go
-index 44aa20ad70c..57704085cb8 100644
---- a/pkg/services/ngalert/api/api_ruler_validation_test.go
-+++ b/pkg/services/ngalert/api/api_ruler_validation_test.go
-@@ -1122,3 +1122,14 @@ func TestValidateRuleNodeReservedLabels(t *testing.T) {
- 		})
- 	}
- }
-+
-+func TestValidateRuleNodeEmptyLabelKey(t *testing.T) {
-+	cfg := config(t)
-+	limits := makeLimits(cfg)
-+
-+	r := validRule()
-+	r.Labels = map[string]string{"": "true"}
-+	_, err := ValidateRuleNode(&r, util.GenerateShortUID(), cfg.BaseInterval*time.Duration(rand.Int63n(10)+1), rand.Int63(), randFolder().UID, limits)
-+	require.Error(t, err)
-+	require.ErrorContains(t, err, "label key cannot be empty")
-+}
-diff --git a/pkg/services/ngalert/api/validation/api_ruler_validation.go b/pkg/services/ngalert/api/validation/api_ruler_validation.go
-index aff545e362e..012624eaf9f 100644
---- a/pkg/services/ngalert/api/validation/api_ruler_validation.go
-+++ b/pkg/services/ngalert/api/validation/api_ruler_validation.go
-@@ -193,6 +193,9 @@ func validateRecordingRuleFields(in *apimodels.PostableExtendedRuleNode, newRule
+diff --git a/.air.toml b/.air.toml
+index 07cc2add5d3a2..edbeb3f35c145 100644
+--- a/.air.toml
++++ b/.air.toml
+@@ -1,7 +1,7 @@
+ [build]
+ bin = "./bin/grafana-air"
+ args_bin = ["server", "-profile", "-profile-addr=127.0.0.1", "-profile-port=6000", "-profile-block-rate=1", "-profile-mutex-rate=5", "-packaging=dev", "cfg:app_mode=development"]
+-cmd = "make CGO_ENABLED=0 GO_BUILD_GCFLAGS='all=-N -l' SOURCE_DATE_EPOCH=1767222000 GO_BUILD_DEV=1 build-air"
++cmd = "make CGO_ENABLED=0 SOURCE_DATE_EPOCH=1767222000 GO_BUILD_DEV=1 build-air"
+ exclude_regex = ["_test.go", "_gen.go"]
+ exclude_unchanged = true
+ follow_symlink = true
+diff --git a/Makefile b/Makefile
+index 8e965186ac576..f7b2676137355 100644
+--- a/Makefile
++++ b/Makefile
+@@ -287,7 +287,7 @@ update-workspace: gen-go
+ .PHONY: build-go
+ build-go: gen-themes ## Build all Go binaries (grafana, grafana-server, grafana-cli).
+ 	@echo "build go binaries"
+-	$(if $(CGO_ENABLED),CGO_ENABLED=$(CGO_ENABLED)) $(if $(GO_BUILD_OS),GOOS=$(GO_BUILD_OS)) $(if $(GO_BUILD_ARCH),GOARCH=$(GO_BUILD_ARCH)) $(GO) build -buildvcs=false -trimpath $(GO_RACE_FLAG) $(if $(GO_BUILD_TAGS),-tags $(GO_BUILD_TAGS)) $(if $(GO_BUILD_GCFLAGS),-gcflags "$(GO_BUILD_GCFLAGS)") -ldflags "$(GO_LDFLAGS)" -o ./bin/grafana ./pkg/cmd/grafana
++	$(if $(CGO_ENABLED),CGO_ENABLED=$(CGO_ENABLED)) $(if $(GO_BUILD_OS),GOOS=$(GO_BUILD_OS)) $(if $(GO_BUILD_ARCH),GOARCH=$(GO_BUILD_ARCH)) $(GO) build -buildvcs=false $(if $(GO_BUILD_DEV),-gcflags "all=-N -l",-trimpath) $(GO_RACE_FLAG) $(if $(GO_BUILD_TAGS),-tags $(GO_BUILD_TAGS)) $(if $(GO_BUILD_GCFLAGS),-gcflags "$(GO_BUILD_GCFLAGS)") -ldflags "$(GO_LDFLAGS)" -o ./bin/grafana ./pkg/cmd/grafana
  
- func validateLabels(l map[string]string) error {
- 	for key := range l {
-+		if key == "" {
-+			return fmt.Errorf("label key cannot be empty")
+ .PHONY: build-backend
+ build-backend: build-go
+diff --git a/pkg/plugins/envvars/envvars.go b/pkg/plugins/envvars/envvars.go
+index 442a350d51260..6a8f0aad21d7e 100644
+--- a/pkg/plugins/envvars/envvars.go
++++ b/pkg/plugins/envvars/envvars.go
+@@ -10,6 +10,10 @@ import (
+ // permittedHostEnvVarNames is the list of environment variables that can be passed from Grafana's process to the
+ // plugin's process
+ var permittedHostEnvVarNames = []string{
++	// PLUGIN_UNIX_SOCKET_DIR allows plugins to write Unix sockets in
++	// restricted environments (e.g. Kubernetes pods with read-only /tmp)
++	// See https://github.com/grafana/grafana/issues/119424
++	"PLUGIN_UNIX_SOCKET_DIR",
+ 	// Env vars used by net/http (Go stdlib) for http/https proxy
+ 	// https://github.com/golang/net/blob/fbaf41277f28102c36926d1368dafbe2b54b4c1d/http/httpproxy/proxy.go#L91-L93
+ 	"HTTP_PROXY",
+diff --git a/pkg/plugins/envvars/envvars_test.go b/pkg/plugins/envvars/envvars_test.go
+new file mode 100644
+index 0000000000000..7dd9c996fb084
+--- /dev/null
++++ b/pkg/plugins/envvars/envvars_test.go
+@@ -0,0 +1,46 @@
++package envvars
++
++import (
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestPermittedHostEnvVars_respectsPLUGIN_UNIX_SOCKET_DIR(t *testing.T) {
++	customTmp := t.TempDir()
++	t.Setenv("PLUGIN_UNIX_SOCKET_DIR", customTmp)
++
++	vars := PermittedHostEnvVars()
++
++	var count int
++	for _, v := range vars {
++		if strings.HasPrefix(v, "PLUGIN_UNIX_SOCKET_DIR=") {
++			require.Equal(t, "PLUGIN_UNIX_SOCKET_DIR="+customTmp, v, "PLUGIN_UNIX_SOCKET_DIR should be forwarded when set")
++			count++
 +		}
- 		if _, ok := ngmodels.LabelsUserCannotSpecify[key]; ok {
- 			return fmt.Errorf("system reserved labels cannot be defined in the rule. Label %s is the reserved", key)
- 		}
-diff --git a/pkg/services/ngalert/state/cache.go b/pkg/services/ngalert/state/cache.go
-index b3e1c44ce15..5fb87b4d960 100644
---- a/pkg/services/ngalert/state/cache.go
-+++ b/pkg/services/ngalert/state/cache.go
-@@ -18,6 +18,8 @@ import (
- 	"github.com/grafana/grafana/pkg/services/ngalert/state/template"
- )
- 
-+const emptyLabelKeyPrefix = "__empty_label_key__"
-+
- type ruleStates struct {
- 	states map[data.Fingerprint]*State
- }
-@@ -217,14 +219,19 @@ func expand(ctx context.Context, log log.Logger, name string, original map[strin
- 		expanded = make(map[string]string, len(original))
- 	)
- 	for k, v := range original {
-+		safeKey := k
-+		if safeKey == "" {
-+			safeKey = emptyLabelKeyPrefix
-+			log.Warn("Rule contains empty label key, using fallback key", "fallbackKey", safeKey)
-+		}
- 		result, err := template.Expand(ctx, name, v, data, externalURL, evaluatedAt)
- 		if err != nil {
- 			log.Error("Error in expanding template", "error", err)
- 			errs = errors.Join(errs, err)
- 			// keep the original template on error
--			expanded[k] = v
-+			expanded[safeKey] = v
- 		} else {
--			expanded[k] = result
-+			expanded[safeKey] = result
- 		}
- 	}
- 	return expanded, errs
-diff --git a/pkg/services/ngalert/state/cache_test.go b/pkg/services/ngalert/state/cache_test.go
-index 7892835830b..d9a059fbb6f 100644
---- a/pkg/services/ngalert/state/cache_test.go
-+++ b/pkg/services/ngalert/state/cache_test.go
-@@ -115,6 +115,24 @@ func Test_expand(t *testing.T) {
- 		require.True(t, errors.As(err, &expandErr))
- 		require.EqualError(t, expandErr, "failed to expand template '{{- $labels := .Labels -}}{{- $values := .Values -}}{{- $value := .Value -}}The instance has been down for {{ $value minutes, please check the instance is online': error parsing template __alert_test: template: __alert_test:1: function \"minutes\" not defined")
- 	})
-+
-+	t.Run("templated label key is not expanded", func(t *testing.T) {
-+		templatedKey := `{{ with (index $labels "instance") }}key-{{.}}{{ end }}`
-+		original := map[string]string{templatedKey: "{{ $labels.instance }}"}
-+		data := template.Data{Labels: map[string]string{"instance": "host1"}}
-+
-+		results, err := expand(ctx, logger, "test", original, data, nil, time.Now())
-+		require.NoError(t, err)
-+		require.Equal(t, map[string]string{templatedKey: "host1"}, results)
-+	})
-+
-+	t.Run("empty label key uses fallback key", func(t *testing.T) {
-+		original := map[string]string{"": "value"}
-+
-+		results, err := expand(ctx, logger, "test", original, template.Data{}, nil, time.Now())
-+		require.NoError(t, err)
-+		require.Equal(t, map[string]string{emptyLabelKeyPrefix: "value"}, results)
-+	})
- }
- 
- func Test_mergeLabels(t *testing.T) {
-diff --git a/pkg/services/ngalert/state/manager_test.go b/pkg/services/ngalert/state/manager_test.go
-index 59e33c116d7..7412e995154 100644
---- a/pkg/services/ngalert/state/manager_test.go
-+++ b/pkg/services/ngalert/state/manager_test.go
-@@ -370,6 +370,54 @@ func TestIntegrationDashboardAnnotations(t *testing.T) {
- 	}, time.Second, 100*time.Millisecond, "unexpected annotations")
- }
- 
-+func TestIntegrationProcessEvalResultsTemplatedLabelKeysAreNotExpanded(t *testing.T) {
-+	tutil.SkipIntegrationTestInShortMode(t)
-+
-+	evaluationTime, err := time.Parse("2006-01-02", "2022-02-02")
-+	require.NoError(t, err)
-+
-+	ctx := context.Background()
-+	ng, dbstore := tests.SetupTestEnv(t, 1)
-+
-+	cfg := state.ManagerCfg{
-+		Metrics:       metrics.NewNGAlert(prometheus.NewPedanticRegistry()).GetStateMetrics(),
-+		ExternalURL:   nil,
-+		InstanceStore: ng.InstanceStore,
-+		Images:        &state.NoopImageService{},
-+		Clock:         clock.New(),
-+		Historian:     &state.FakeHistorian{},
-+		Tracer:        tracing.InitializeTracerForTest(),
-+		Log:           log.New("ngalert.state.manager"),
 +	}
-+	st := state.NewManager(cfg, state.NewNoopPersister())
-+
-+	const mainOrgID int64 = 1
-+
-+	templatedKeyOne := `{{ with (index $labels "missing_key") }}{{.}}{{ end }}`
-+	templatedKeyTwo := `{{ $labels. }}`
-+
-+	rule := tests.CreateTestAlertRuleWithLabels(t, ctx, dbstore, 600, mainOrgID, map[string]string{
-+		templatedKeyOne: "empty-key-value",
-+		templatedKeyTwo: "error-key-value",
-+	})
-+
-+	st.Warm(ctx, dbstore, dbstore, ng.InstanceStore)
-+	_ = st.ProcessEvalResults(ctx, evaluationTime, rule, eval.Results{{
-+		Instance:    data.Labels{"instance_label": "test-value"},
-+		State:       eval.Alerting,
-+		EvaluatedAt: evaluationTime,
-+	}}, data.Labels{
-+		"alertname": rule.Title,
-+	}, nil)
-+
-+	states := st.GetStatesForRuleUID(ctx, mainOrgID, rule.UID)
-+	require.Len(t, states, 1)
-+
-+	labels := states[0].Labels
-+	require.Equal(t, "empty-key-value", labels[templatedKeyOne])
-+	require.Equal(t, "error-key-value", labels[templatedKeyTwo])
++	require.Equal(t, 1, count, "PLUGIN_UNIX_SOCKET_DIR should appear exactly once in PermittedHostEnvVars when set")
 +}
 +
- func TestProcessEvalResults(t *testing.T) {
- 	evaluationDuration := 10 * time.Millisecond
- 	evaluationInterval := 10 * time.Second
++func TestPermittedHostEnvVarNames_includesPLUGIN_UNIX_SOCKET_DIR(t *testing.T) {
++	names := PermittedHostEnvVarNames()
++	require.Contains(t, names, "PLUGIN_UNIX_SOCKET_DIR", "PLUGIN_UNIX_SOCKET_DIR must be in permitted host env var names for restricted environments")
++}
++
++func TestPermittedHostEnvVars_PLUGIN_UNIX_SOCKET_DIR_Unset(t *testing.T) {
++	prev, hadTMPDIR := os.LookupEnv("PLUGIN_UNIX_SOCKET_DIR")
++	if hadTMPDIR {
++		defer t.Setenv("PLUGIN_UNIX_SOCKET_DIR", prev)
++	}
++	_ = os.Unsetenv("PLUGIN_UNIX_SOCKET_DIR")
++
++	vars := PermittedHostEnvVars()
++
++	for _, v := range vars {
++		if strings.HasPrefix(v, "PLUGIN_UNIX_SOCKET_DIR=") {
++			t.Fatal("PLUGIN_UNIX_SOCKET_DIR should not be present when unset")
++		}
++	}
++}
+diff --git a/pkg/tsdb/grafana-pyroscope-datasource/query.go b/pkg/tsdb/grafana-pyroscope-datasource/query.go
+index ac1eefd429062..5f5a08ecac566 100644
+--- a/pkg/tsdb/grafana-pyroscope-datasource/query.go
++++ b/pkg/tsdb/grafana-pyroscope-datasource/query.go
+@@ -571,7 +571,7 @@ func seriesToDataFrames(resp *SeriesResponse, withAnnotations bool, stepDuration
+ 		frames = append(frames, frame)
+ 
+ 		if len(exemplars) > 0 {
+-			frame := exemplar.CreateExemplarFrame(labels, exemplars, resp.Units)
++			frame := exemplar.CreateExemplarFrame(labels, exemplars, displayUnit)
+ 			frames = append(frames, frame)
+ 		}
+ 	}

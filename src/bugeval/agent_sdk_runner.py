@@ -24,14 +24,16 @@ async def run_agent_sdk(
     max_turns: int = 10,
     model: str = "claude-sonnet-4-6",
     max_budget_usd: float = 1.0,
+    context_level: str = "diff+repo",
 ) -> AgentResult:
     """Run the Claude Agent SDK against repo_dir with the given prompt.
 
     Returns AgentResult. On error, sets AgentResult.error (never raises).
     """
+    allowed = ["Read", "Glob", "Grep"] if context_level != "diff-only" else []
     options = ClaudeAgentOptions(
         cwd=str(repo_dir),
-        allowed_tools=["Read", "Glob", "Grep"],
+        allowed_tools=allowed,
         system_prompt=system_prompt,
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,

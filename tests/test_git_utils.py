@@ -16,6 +16,7 @@ from bugeval.git_utils import (
     get_diff_stats,
     is_repo,
     run_git,
+    stats_from_patch,
 )
 
 
@@ -208,6 +209,32 @@ class TestIsRepo:
         not_repo = tmp_path / "not_a_repo"
         not_repo.mkdir()
         assert is_repo(not_repo) is False
+
+
+class TestStatsFromPatch:
+    def test_stats_from_patch(self) -> None:
+        patch = (
+            "diff --git a/foo.rs b/foo.rs\n"
+            "index abc..def 100644\n"
+            "--- a/foo.rs\n"
+            "+++ b/foo.rs\n"
+            "@@ -10,3 +10,4 @@\n"
+            " context\n"
+            "-old line\n"
+            "+new line\n"
+            "+added line\n"
+            "diff --git a/bar.rs b/bar.rs\n"
+            "--- a/bar.rs\n"
+            "+++ b/bar.rs\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-removed\n"
+            "+replaced\n"
+        )
+        stats = stats_from_patch(patch)
+        assert stats.lines_added == 3
+        assert stats.lines_deleted == 2
+        assert stats.files_changed == 2
+        assert stats.hunks == 2
 
 
 class TestTimeouts:

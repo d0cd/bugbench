@@ -14,7 +14,13 @@ from bugeval.models import (
     Severity,
     TestCase,
 )
-from bugeval.validate_cases import validate_cases
+from bugeval.validate_cases import (
+    AlignmentStatus,
+    check_finding_alignment,
+    parse_patch_files,
+    validate_case_alignment,
+    validate_cases,
+)
 
 
 def make_repo(path: Path) -> Path:
@@ -355,3 +361,143 @@ class TestValidateCasesBadCommit:
             ["--repo-dir", str(repo), "--cases-dir", str(cases_dir)],
         )
         assert result.exit_code == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Alignment checking (moved from test_validate_alignment.py)
+# ──────────────────────────────────────────────────────────────────────────────
+
+SIMPLE_PATCH = """\
+diff --git a/src/main.rs b/src/main.rs
+index abc1234..def5678 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,7 +10,7 @@ fn main() {
+-    let x = old_value;
++    let x = new_value;
+     println!("{}", x);
+ }
+"""
+
+MULTI_FILE_PATCH = """\
+diff --git a/src/lib.rs b/src/lib.rs
+index aaa0000..bbb1111 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,5 @@
+-fn old_fn() {}
++fn new_fn() {}
+ fn helper() {}
+ fn another() {}
+@@ -20,3 +20,4 @@ fn mid() {}
+ fn after_mid() {}
++fn extra() {}
+diff --git a/src/utils.rs b/src/utils.rs
+index ccc2222..ddd3333 100644
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -5,6 +5,7 @@ fn util() {
+     let a = 1;
++    let b = 2;
+     let c = 3;
+ }
+"""
+
+
+def _make_alignment_case(
+    case_id: str = "test-001",
+    findings: list[ExpectedFinding] | None = None,
+) -> TestCase:
+    return TestCase(
+        id=case_id,
+        repo="foo/bar",
+        base_commit="a" * 40,
+        head_commit="b" * 40,
+        fix_commit="b" * 40,
+        category=Category.logic,
+        difficulty=Difficulty.easy,
+        severity=Severity.low,
+        language="rust",
+        pr_size=PRSize.tiny,
+        description="Test",
+        expected_findings=findings or [],
+    )
+
+
+class TestParsePatchFiles:
+    def test_single_file_single_hunk(self) -> None:
+        result = parse_patch_files(SIMPLE_PATCH)
+        assert "src/main.rs" in result
+        ranges = result["src/main.rs"]
+        assert len(ranges) == 1
+        start, end = ranges[0]
+        assert start == 10
+        assert end == 16
+
+    def test_multi_file_multi_hunk(self) -> None:
+        result = parse_patch_files(MULTI_FILE_PATCH)
+        assert "src/lib.rs" in result
+        assert "src/utils.rs" in result
+        lib_ranges = result["src/lib.rs"]
+        assert len(lib_ranges) == 2
+        assert lib_ranges[0] == (1, 5)
+        assert lib_ranges[1] == (20, 22)
+
+    def test_empty_patch(self) -> None:
+        result = parse_patch_files("")
+        assert result == {}
+
+    def test_hunk_with_count_zero(self) -> None:
+        patch = (
+            "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -5,0 +6,1 @@\n+new line\n"
+        )
+        result = parse_patch_files(patch)
+        assert "foo.py" in result
+        assert result["foo.py"][0][0] == 5
+
+
+class TestCheckFindingAlignment:
+    def setup_method(self) -> None:
+        self.patch_files = parse_patch_files(SIMPLE_PATCH)
+
+    def test_aligned(self) -> None:
+        status = check_finding_alignment("src/main.rs", 10, self.patch_files)
+        assert status == AlignmentStatus.aligned
+
+    def test_file_only(self) -> None:
+        status = check_finding_alignment("src/main.rs", 50, self.patch_files)
+        assert status == AlignmentStatus.file_only
+
+    def test_misaligned(self) -> None:
+        status = check_finding_alignment("src/other.rs", 10, self.patch_files)
+        assert status == AlignmentStatus.misaligned
+
+
+class TestValidateCaseAlignment:
+    def test_single_aligned(self) -> None:
+        case = _make_alignment_case(
+            findings=[ExpectedFinding(file="src/main.rs", line=12, summary="bug")]
+        )
+        results = validate_case_alignment(case, SIMPLE_PATCH)
+        assert len(results) == 1
+        _, status = results[0]
+        assert status == AlignmentStatus.aligned
+
+    def test_mixed_findings(self) -> None:
+        case = _make_alignment_case(
+            findings=[
+                ExpectedFinding(file="src/main.rs", line=11, summary="in hunk"),
+                ExpectedFinding(file="src/main.rs", line=99, summary="file only"),
+                ExpectedFinding(file="ghost.rs", line=1, summary="misaligned"),
+            ]
+        )
+        results = validate_case_alignment(case, SIMPLE_PATCH)
+        statuses = [s for _, s in results]
+        assert AlignmentStatus.aligned in statuses
+        assert AlignmentStatus.file_only in statuses
+        assert AlignmentStatus.misaligned in statuses
+
+    def test_no_findings(self) -> None:
+        case = _make_alignment_case(findings=[])
+        results = validate_case_alignment(case, SIMPLE_PATCH)
+        assert results == []

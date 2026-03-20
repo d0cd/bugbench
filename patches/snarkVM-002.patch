@@ -1,95 +1,2033 @@
-diff --git a/ledger/block/src/header/metadata/serialize.rs b/ledger/block/src/header/metadata/serialize.rs
-index 1be1042d5..65ccd8b03 100644
---- a/ledger/block/src/header/metadata/serialize.rs
-+++ b/ledger/block/src/header/metadata/serialize.rs
-@@ -24,8 +24,8 @@ impl<N: Network> Serialize for Metadata<N> {
-                 metadata.serialize_field("network", &self.network)?;
-                 metadata.serialize_field("round", &self.round)?;
-                 metadata.serialize_field("height", &self.height)?;
--                metadata.serialize_field("cumulative_weight", &self.cumulative_weight)?;
--                metadata.serialize_field("cumulative_proof_target", &self.cumulative_proof_target)?;
-+                metadata.serialize_field("cumulative_weight", &self.cumulative_weight.to_string())?;
-+                metadata.serialize_field("cumulative_proof_target", &self.cumulative_proof_target.to_string())?;
-                 metadata.serialize_field("coinbase_target", &self.coinbase_target)?;
-                 metadata.serialize_field("proof_target", &self.proof_target)?;
-                 metadata.serialize_field("last_coinbase_target", &self.last_coinbase_target)?;
-@@ -44,12 +44,18 @@ impl<'de, N: Network> Deserialize<'de> for Metadata<N> {
-         match deserializer.is_human_readable() {
-             true => {
-                 let mut metadata = serde_json::Value::deserialize(deserializer)?;
-+                let cumulative_weight: String =
-+                    DeserializeExt::take_from_value::<D>(&mut metadata, "cumulative_weight")?;
-+                let cumulative_proof_target: String =
-+                    DeserializeExt::take_from_value::<D>(&mut metadata, "cumulative_proof_target")?;
-+                let cumulative_weight = cumulative_weight.parse::<u128>().map_err(de::Error::custom)?;
-+                let cumulative_proof_target = cumulative_proof_target.parse::<u128>().map_err(de::Error::custom)?;
-                 Ok(Self::new(
-                     DeserializeExt::take_from_value::<D>(&mut metadata, "network")?,
-                     DeserializeExt::take_from_value::<D>(&mut metadata, "round")?,
-                     DeserializeExt::take_from_value::<D>(&mut metadata, "height")?,
--                    DeserializeExt::take_from_value::<D>(&mut metadata, "cumulative_weight")?,
--                    DeserializeExt::take_from_value::<D>(&mut metadata, "cumulative_proof_target")?,
-+                    cumulative_weight,
-+                    cumulative_proof_target,
-                     DeserializeExt::take_from_value::<D>(&mut metadata, "coinbase_target")?,
-                     DeserializeExt::take_from_value::<D>(&mut metadata, "proof_target")?,
-                     DeserializeExt::take_from_value::<D>(&mut metadata, "last_coinbase_target")?,
-diff --git a/ledger/block/src/lib.rs b/ledger/block/src/lib.rs
-index af70f4ce1..8b35d163a 100644
---- a/ledger/block/src/lib.rs
-+++ b/ledger/block/src/lib.rs
-@@ -706,13 +706,41 @@ pub mod test_helpers {
-         // Return the block, transaction, and private key.
-         (block, transaction, private_key)
+diff --git a/circuit/program/src/request/mod.rs b/circuit/program/src/request/mod.rs
+index cd70d748e..b1c2c161c 100644
+--- a/circuit/program/src/request/mod.rs
++++ b/circuit/program/src/request/mod.rs
+@@ -136,6 +136,8 @@ pub struct Request<A: Aleo> {
+     tvk: Field<A>,
+     /// The transition commitment.
+     tcm: Field<A>,
++    /// The signer commitment.
++    scm: Field<A>,
+ }
+ 
+ #[cfg(console)]
+@@ -147,6 +149,9 @@ impl<A: Aleo> Inject for Request<A> {
+         // Inject the transition commitment `tcm` as `Mode::Public`.
+         let tcm = Field::new(Mode::Public, *request.tcm());
+ 
++        // Inject the signer commitment `scm` as `Mode::Public`.
++        let scm = Field::new(Mode::Public, *request.scm());
++
+         // Inject the inputs.
+         let inputs = match request
+             .input_ids()
+@@ -218,6 +223,7 @@ impl<A: Aleo> Inject for Request<A> {
+             sk_tag: Field::new(mode, *request.sk_tag()),
+             tvk: Field::new(mode, *request.tvk()),
+             tcm,
++            scm,
+         }
+     }
+ }
+@@ -272,6 +278,11 @@ impl<A: Aleo> Request<A> {
+     pub const fn tcm(&self) -> &Field<A> {
+         &self.tcm
      }
 +
-+    pub(crate) fn sample_metadata(rng: &mut TestRng) -> Metadata<CurrentNetwork> {
-+        let network = CurrentNetwork::ID;
-+        let round = u64::MAX;
-+        let height = u32::MAX;
-+        let cumulative_weight = u128::MAX - 1;
-+        let cumulative_proof_target = u128::MAX - 1;
-+        let coinbase_target = u64::MAX;
-+        let proof_target = u64::MAX - 1;
-+        let last_coinbase_target = u64::MAX;
-+        let timestamp = i64::MAX - 1;
-+        let last_coinbase_timestamp = timestamp - 1;
-+        Metadata::new(
-+            CurrentNetwork::ID,
-+            round,
-+            height,
-+            cumulative_weight,
-+            cumulative_proof_target,
-+            coinbase_target,
-+            proof_target,
-+            last_coinbase_target,
-+            last_coinbase_timestamp,
-+            timestamp,
-+        )
-+        .unwrap()
++    /// Returns the signer commitment.
++    pub const fn scm(&self) -> &Field<A> {
++        &self.scm
++    }
+ }
+ 
+ #[cfg(console)]
+@@ -290,6 +301,7 @@ impl<A: Aleo> Eject for Request<A> {
+             self.sk_tag.eject_mode(),
+             self.tvk.eject_mode(),
+             self.tcm.eject_mode(),
++            self.scm.eject_mode(),
+         ])
+     }
+ 
+@@ -306,6 +318,7 @@ impl<A: Aleo> Eject for Request<A> {
+             self.sk_tag.eject_value(),
+             self.tvk.eject_value(),
+             self.tcm.eject_value(),
++            self.scm.eject_value(),
+         ))
+     }
+ }
+diff --git a/circuit/program/src/request/verify.rs b/circuit/program/src/request/verify.rs
+index 8bff32e3c..30b3e3d5a 100644
+--- a/circuit/program/src/request/verify.rs
++++ b/circuit/program/src/request/verify.rs
+@@ -16,7 +16,7 @@ use super::*;
+ 
+ impl<A: Aleo> Request<A> {
+     /// Returns `true` if the input IDs are derived correctly, the input records all belong to the signer,
+-    /// and the signature is valid. tpk is passed separately so it can have a Mode different from Self.
++    /// and the signature is valid.
+     ///
+     /// Verifies (challenge == challenge') && (address == address') && (serial_numbers == serial_numbers') where:
+     ///     challenge' := HashToScalar(r * G, pk_sig, pr_sig, signer, \[tvk, tcm, function ID, input IDs\])
+@@ -24,6 +24,7 @@ impl<A: Aleo> Request<A> {
+         &self,
+         input_types: &[console::ValueType<A::Network>],
+         tpk: &Group<A>,
++        root_tvk: Option<Field<A>>,
+         is_root: Boolean<A>,
+     ) -> Boolean<A> {
+         // Compute the function ID.
+@@ -59,15 +60,21 @@ impl<A: Aleo> Request<A> {
+             None => A::halt("Missing input elements in request verification"),
+         }
+ 
+-        // Verify the transition public key and commitment are well-formed.
++        let root_tvk = root_tvk.unwrap_or(Field::<A>::new(Mode::Private, self.tvk.eject_value()));
++
++        // Verify the transition public key and commitments are well-formed.
+         let tpk_checks = {
+             // Compute the transition commitment as `Hash(tvk)`.
+             let tcm = A::hash_psd2(&[self.tvk.clone()]);
++            // Compute the signer commitment as `Hash(signer || root_tvk)`.
++            let scm = A::hash_psd2(&[self.signer.to_field(), root_tvk]);
+ 
+             // Ensure the transition public key matches with the saved one from the signature.
+             tpk.is_equal(&self.to_tpk())
+             // Ensure the computed transition commitment matches.
+             & tcm.is_equal(&self.tcm)
++            // Ensure the computed signer commitment matches.
++            & scm.is_equal(&self.scm)
+         };
+ 
+         // Verify the signature.
+@@ -356,6 +363,9 @@ mod tests {
+                 console::ValueType::from_str("token.aleo/token.record").unwrap(),
+             ];
+ 
++            // Sample 'root_tvk'.
++            let root_tvk = None;
++
+             // Sample 'is_root'.
+             let is_root = true;
+ 
+@@ -366,6 +376,7 @@ mod tests {
+                 function_name,
+                 inputs.iter(),
+                 &input_types,
++                root_tvk,
+                 is_root,
+                 rng,
+             )?;
+@@ -377,7 +388,8 @@ mod tests {
+             let is_root = Boolean::new(mode, is_root);
+ 
+             Circuit::scope(format!("Request {i}"), || {
+-                let candidate = request.verify(&input_types, &tpk, is_root);
++                let root_tvk = None;
++                let candidate = request.verify(&input_types, &tpk, root_tvk, is_root);
+                 assert!(candidate.eject_value());
+                 match mode.is_constant() {
+                     true => assert_scope!(<=num_constants, <=num_public, <=num_private, <=num_constraints),
+@@ -411,16 +423,16 @@ mod tests {
+         // Note: This is correct. At this (high) level of a program, we override the default mode in the `Record` case,
+         // based on the user-defined visibility in the record type. Thus, we have nonzero private and constraint values.
+         // These bounds are determined experimentally.
+-        check_verify(Mode::Constant, 42629, 0, 17494, 17518)
++        check_verify(Mode::Constant, 43000, 0, 18000, 18000)
+     }
+ 
+     #[test]
+     fn test_sign_and_verify_public() -> Result<()> {
+-        check_verify(Mode::Public, 40130, 0, 26401, 26429)
++        check_verify(Mode::Public, 40131, 0, 26675, 26702)
+     }
+ 
+     #[test]
+     fn test_sign_and_verify_private() -> Result<()> {
+-        check_verify(Mode::Private, 40130, 0, 26401, 26429)
++        check_verify(Mode::Private, 40131, 0, 26675, 26702)
+     }
+ }
+diff --git a/console/program/src/data/identifier/parse.rs b/console/program/src/data/identifier/parse.rs
+index 94de468b2..4d2673dd1 100644
+--- a/console/program/src/data/identifier/parse.rs
++++ b/console/program/src/data/identifier/parse.rs
+@@ -52,6 +52,12 @@ impl<N: Network> FromStr for Identifier<N> {
+             bail!("Identifier is too large. Identifiers must be <= {max_bytes} bytes long")
+         }
+ 
++        // Ensure that the identifier is not a literal.
++        ensure!(
++            crate::LiteralType::from_str(identifier).is_err(),
++            "Identifier '{identifier}' is a reserved literal type"
++        );
++
+         // Note: The string bytes themselves are **not** little-endian. Rather, they are order-preserving
+         // for reconstructing the string when recovering the field element back into bytes.
+         Ok(Self(
+diff --git a/console/program/src/data_types/plaintext_type/parse.rs b/console/program/src/data_types/plaintext_type/parse.rs
+index 21474fc5e..d1a063401 100644
+--- a/console/program/src/data_types/plaintext_type/parse.rs
++++ b/console/program/src/data_types/plaintext_type/parse.rs
+@@ -21,8 +21,8 @@ impl<N: Network> Parser for PlaintextType<N> {
+         // Parse to determine the plaintext type (order matters).
+         alt((
+             map(ArrayType::parse, |type_| Self::Array(type_)),
+-            map(LiteralType::parse, |type_| Self::Literal(type_)),
+             map(Identifier::parse, |identifier| Self::Struct(identifier)),
++            map(LiteralType::parse, |type_| Self::Literal(type_)),
+         ))(string)
+     }
+ }
+@@ -86,6 +86,10 @@ mod tests {
+             PlaintextType::parse("foo"),
+             Ok(("", PlaintextType::<CurrentNetwork>::Struct(Identifier::from_str("foo")?)))
+         );
++        assert_eq!(
++            PlaintextType::parse("u8jdsklaj"),
++            Ok(("", PlaintextType::<CurrentNetwork>::Struct(Identifier::from_str("u8jdsklaj")?)))
++        );
+         assert_eq!(
+             PlaintextType::parse("[field; 1u32]"),
+             Ok(("", PlaintextType::<CurrentNetwork>::Array(ArrayType::from_str("[field; 1u32]")?)))
+diff --git a/console/program/src/data_types/register_type/parse.rs b/console/program/src/data_types/register_type/parse.rs
+index ec4bbcef5..9b70a48ec 100644
+--- a/console/program/src/data_types/register_type/parse.rs
++++ b/console/program/src/data_types/register_type/parse.rs
+@@ -88,6 +88,10 @@ mod tests {
+             Ok(("", RegisterType::<CurrentNetwork>::Plaintext(PlaintextType::from_str("signature")?))),
+             RegisterType::<CurrentNetwork>::parse("signature")
+         );
++        assert_eq!(
++            Ok(("", RegisterType::<CurrentNetwork>::Plaintext(PlaintextType::from_str("u8kldsafj")?))),
++            RegisterType::<CurrentNetwork>::parse("u8kldsafj")
++        );
+ 
+         // Record type.
+         assert_eq!(
+diff --git a/console/program/src/data_types/value_type/parse.rs b/console/program/src/data_types/value_type/parse.rs
+index a9198179d..6b98fd2b4 100644
+--- a/console/program/src/data_types/value_type/parse.rs
++++ b/console/program/src/data_types/value_type/parse.rs
+@@ -105,6 +105,10 @@ mod tests {
+             Ok(("", ValueType::<CurrentNetwork>::from_str("signature.private")?)),
+             ValueType::<CurrentNetwork>::parse("signature.private")
+         );
++        assert_eq!(
++            Ok(("", ValueType::<CurrentNetwork>::from_str("i8abc.constant")?)),
++            ValueType::<CurrentNetwork>::parse("i8abc.constant")
++        );
+ 
+         // Record type.
+         assert_eq!(
+diff --git a/console/program/src/request/bytes.rs b/console/program/src/request/bytes.rs
+index ec664b9c4..84cb5ea1d 100644
+--- a/console/program/src/request/bytes.rs
++++ b/console/program/src/request/bytes.rs
+@@ -48,8 +48,22 @@ impl<N: Network> FromBytes for Request<N> {
+         let tvk = FromBytes::read_le(&mut reader)?;
+         // Read the transition commitment.
+         let tcm = FromBytes::read_le(&mut reader)?;
+-
+-        Ok(Self::from((signer, network_id, program_id, function_name, input_ids, inputs, signature, sk_tag, tvk, tcm)))
++        // Read the signer commitment.
++        let scm = FromBytes::read_le(&mut reader)?;
++
++        Ok(Self::from((
++            signer,
++            network_id,
++            program_id,
++            function_name,
++            input_ids,
++            inputs,
++            signature,
++            sk_tag,
++            tvk,
++            tcm,
++            scm,
++        )))
+     }
+ }
+ 
+@@ -93,7 +107,9 @@ impl<N: Network> ToBytes for Request<N> {
+         // Write the transition view key.
+         self.tvk.write_le(&mut writer)?;
+         // Write the transition commitment.
+-        self.tcm.write_le(&mut writer)
++        self.tcm.write_le(&mut writer)?;
++        // Write the signer commitment.
++        self.scm.write_le(&mut writer)
+     }
+ }
+ 
+diff --git a/console/program/src/request/mod.rs b/console/program/src/request/mod.rs
+index c45b4220a..41b2e8097 100644
+--- a/console/program/src/request/mod.rs
++++ b/console/program/src/request/mod.rs
+@@ -48,6 +48,8 @@ pub struct Request<N: Network> {
+     tvk: Field<N>,
+     /// The transition commitment.
+     tcm: Field<N>,
++    /// The signer commitment.
++    scm: Field<N>,
+ }
+ 
+ impl<N: Network>
+@@ -62,11 +64,12 @@ impl<N: Network>
+         Field<N>,
+         Field<N>,
+         Field<N>,
++        Field<N>,
+     )> for Request<N>
+ {
+     /// Note: See `Request::sign` to create the request. This method is used to eject from a circuit.
+     fn from(
+-        (signer, network_id, program_id, function_name, input_ids, inputs, signature, sk_tag, tvk, tcm): (
++        (signer, network_id, program_id, function_name, input_ids, inputs, signature, sk_tag, tvk, tcm, scm): (
+             Address<N>,
+             U16<N>,
+             ProgramID<N>,
+@@ -77,13 +80,14 @@ impl<N: Network>
+             Field<N>,
+             Field<N>,
+             Field<N>,
++            Field<N>,
+         ),
+     ) -> Self {
+         // Ensure the network ID is correct.
+         if *network_id != N::ID {
+             N::halt(format!("Invalid network ID. Expected {}, found {}", N::ID, *network_id))
+         } else {
+-            Self { signer, network_id, program_id, function_name, input_ids, inputs, signature, sk_tag, tvk, tcm }
++            Self { signer, network_id, program_id, function_name, input_ids, inputs, signature, sk_tag, tvk, tcm, scm }
+         }
+     }
+ }
+@@ -150,6 +154,11 @@ impl<N: Network> Request<N> {
+     pub const fn tcm(&self) -> &Field<N> {
+         &self.tcm
+     }
++
++    /// Returns the signer commitment `scm`.
++    pub const fn scm(&self) -> &Field<N> {
++        &self.scm
 +    }
  }
  
  #[cfg(test)]
- mod tests {
-     use super::*;
+@@ -196,9 +205,12 @@ mod test_helpers {
+                     ValueType::from_str("token.aleo/token.record").unwrap(),
+                 ];
  
-+    use console::network::MainnetV0;
-     use indexmap::IndexMap;
-+    type CurrentNetwork = MainnetV0;
++                // Sample root_tvk.
++                let root_tvk = None;
++
+                 // Compute the signed request.
+                 let request =
+-                    Request::sign(&private_key, program_id, function_name, inputs.into_iter(), &input_types, is_root, rng).unwrap();
++                    Request::sign(&private_key, program_id, function_name, inputs.into_iter(), &input_types, root_tvk, is_root, rng).unwrap();
+                 assert!(request.verify(&input_types, is_root));
+                 request
+             })
+diff --git a/console/program/src/request/serialize.rs b/console/program/src/request/serialize.rs
+index 905b67d99..34c8f73ac 100644
+--- a/console/program/src/request/serialize.rs
++++ b/console/program/src/request/serialize.rs
+@@ -21,7 +21,7 @@ impl<N: Network> Serialize for Request<N> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         match serializer.is_human_readable() {
+             true => {
+-                let mut transition = serializer.serialize_struct("Request", 10)?;
++                let mut transition = serializer.serialize_struct("Request", 11)?;
+                 transition.serialize_field("signer", &self.signer)?;
+                 transition.serialize_field("network", &self.network_id)?;
+                 transition.serialize_field("program", &self.program_id)?;
+@@ -32,6 +32,7 @@ impl<N: Network> Serialize for Request<N> {
+                 transition.serialize_field("sk_tag", &self.sk_tag)?;
+                 transition.serialize_field("tvk", &self.tvk)?;
+                 transition.serialize_field("tcm", &self.tcm)?;
++                transition.serialize_field("scm", &self.scm)?;
+                 transition.end()
+             }
+             false => ToBytesSerializer::serialize_with_size_encoding(self, serializer),
+@@ -68,6 +69,8 @@ impl<'de, N: Network> Deserialize<'de> for Request<N> {
+                     DeserializeExt::take_from_value::<D>(&mut request, "tvk")?,
+                     // Retrieve the `tcm`.
+                     DeserializeExt::take_from_value::<D>(&mut request, "tcm")?,
++                    // Retrieve the `scm`.
++                    DeserializeExt::take_from_value::<D>(&mut request, "scm")?,
+                 )))
+             }
+             false => FromBytesDeserializer::<Self>::deserialize_with_size_encoding(deserializer, "request"),
+diff --git a/console/program/src/request/sign.rs b/console/program/src/request/sign.rs
+index 362059fed..47751b8bf 100644
+--- a/console/program/src/request/sign.rs
++++ b/console/program/src/request/sign.rs
+@@ -24,6 +24,7 @@ impl<N: Network> Request<N> {
+         function_name: Identifier<N>,
+         inputs: impl ExactSizeIterator<Item = impl TryInto<Value<N>>>,
+         input_types: &[ValueType<N>],
++        root_tvk: Option<Field<N>>,
+         is_root: bool,
+         rng: &mut R,
+     ) -> Result<Self> {
+@@ -64,6 +65,9 @@ impl<N: Network> Request<N> {
+         let tvk = (*signer * r).to_x_coordinate();
+         // Compute the transition commitment `tcm` as `Hash(tvk)`.
+         let tcm = N::hash_psd2(&[tvk])?;
++        // Compute the signer commitment `scm` as `Hash(signer || root_tvk)`.
++        let root_tvk = root_tvk.unwrap_or(tvk);
++        let scm = N::hash_psd2(&[signer.deref().to_x_coordinate(), root_tvk])?;
+         // Compute 'is_root' as a field element.
+         let is_root = if is_root { Field::<N>::one() } else { Field::<N>::zero() };
  
-     #[test]
-     fn test_find_transaction_for_transition_id() {
-@@ -850,4 +878,12 @@ mod tests {
-             assert_eq!(transaction.find_record(commitment), None);
+@@ -234,6 +238,7 @@ impl<N: Network> Request<N> {
+             sk_tag,
+             tvk,
+             tcm,
++            scm,
+         })
+     }
+ }
+diff --git a/console/program/src/request/verify.rs b/console/program/src/request/verify.rs
+index 8b7bb5168..9b0d25f64 100644
+--- a/console/program/src/request/verify.rs
++++ b/console/program/src/request/verify.rs
+@@ -252,12 +252,23 @@ mod tests {
+                 ValueType::from_str("token.aleo/token.record").unwrap(),
+             ];
+ 
++            // Sample 'root_tvk'.
++            let root_tvk = None;
++            // Sample 'is_root'.
+             let is_root = Uniform::rand(rng);
+ 
+             // Compute the signed request.
+-            let request =
+-                Request::sign(&private_key, program_id, function_name, inputs.into_iter(), &input_types, is_root, rng)
+-                    .unwrap();
++            let request = Request::sign(
++                &private_key,
++                program_id,
++                function_name,
++                inputs.into_iter(),
++                &input_types,
++                root_tvk,
++                is_root,
++                rng,
++            )
++            .unwrap();
+             assert!(request.verify(&input_types, is_root));
          }
      }
+diff --git a/ledger/block/src/transition/bytes.rs b/ledger/block/src/transition/bytes.rs
+index dacc875df..3654b7de1 100644
+--- a/ledger/block/src/transition/bytes.rs
++++ b/ledger/block/src/transition/bytes.rs
+@@ -53,10 +53,12 @@ impl<N: Network> FromBytes for Transition<N> {
+         let tpk = FromBytes::read_le(&mut reader)?;
+         // Read the transition commitment.
+         let tcm = FromBytes::read_le(&mut reader)?;
++        // Read the signer commitment.
++        let scm = FromBytes::read_le(&mut reader)?;
+ 
+         // Construct the candidate transition.
+         let transition =
+-            Self::new(program_id, function_name, inputs, outputs, tpk, tcm).map_err(|e| error(e.to_string()))?;
++            Self::new(program_id, function_name, inputs, outputs, tpk, tcm, scm).map_err(|e| error(e.to_string()))?;
+         // Ensure the transition ID matches the expected ID.
+         match transition_id == *transition.id() {
+             true => Ok(transition),
+@@ -91,7 +93,9 @@ impl<N: Network> ToBytes for Transition<N> {
+         // Write the transition public key.
+         self.tpk.write_le(&mut writer)?;
+         // Write the transition commitment.
+-        self.tcm.write_le(&mut writer)
++        self.tcm.write_le(&mut writer)?;
++        // Write the signer commitment.
++        self.scm.write_le(&mut writer)
+     }
+ }
+ 
+diff --git a/ledger/block/src/transition/mod.rs b/ledger/block/src/transition/mod.rs
+index 508cf157f..6996952c0 100644
+--- a/ledger/block/src/transition/mod.rs
++++ b/ledger/block/src/transition/mod.rs
+@@ -62,6 +62,8 @@ pub struct Transition<N: Network> {
+     tpk: Group<N>,
+     /// The transition commitment.
+     tcm: Field<N>,
++    /// The transition signer commitment.
++    scm: Field<N>,
+ }
+ 
+ impl<N: Network> Transition<N> {
+@@ -74,12 +76,13 @@ impl<N: Network> Transition<N> {
+         outputs: Vec<Output<N>>,
+         tpk: Group<N>,
+         tcm: Field<N>,
++        scm: Field<N>,
+     ) -> Result<Self> {
+         // Compute the transition ID.
+         let function_tree = Self::function_tree(&inputs, &outputs)?;
+         let id = N::hash_bhp512(&(*function_tree.root(), tcm).to_bits_le())?;
+         // Return the transition.
+-        Ok(Self { id: id.into(), program_id, function_name, inputs, outputs, tpk, tcm })
++        Ok(Self { id: id.into(), program_id, function_name, inputs, outputs, tpk, tcm, scm })
+     }
+ 
+     /// Initializes a new transition from a request and response.
+@@ -255,8 +258,10 @@ impl<N: Network> Transition<N> {
+         let tpk = request.to_tpk();
+         // Retrieve the `tcm`.
+         let tcm = *request.tcm();
++        // Retrieve the `scm`.
++        let scm = *request.scm();
+         // Return the transition.
+-        Self::new(program_id, function_name, inputs, outputs, tpk, tcm)
++        Self::new(program_id, function_name, inputs, outputs, tpk, tcm, scm)
+     }
+ }
+ 
+@@ -295,6 +300,11 @@ impl<N: Network> Transition<N> {
+     pub const fn tcm(&self) -> &Field<N> {
+         &self.tcm
+     }
 +
-+    #[test]
-+    fn test_serde_metadata() {
-+        let rng = &mut TestRng::default();
-+        let metadata = crate::test_helpers::sample_metadata(rng);
-+        let json_metadata = serde_json::to_string(&metadata).unwrap();
-+        let deserialized_metadata: Metadata<CurrentNetwork> = serde_json::from_str(&json_metadata).unwrap();
++    /// Returns the signer commitment.
++    pub const fn scm(&self) -> &Field<N> {
++        &self.scm
 +    }
  }
+ 
+ impl<N: Network> Transition<N> {
+diff --git a/ledger/block/src/transition/serialize.rs b/ledger/block/src/transition/serialize.rs
+index 47e5e4b4f..a9c1c31da 100644
+--- a/ledger/block/src/transition/serialize.rs
++++ b/ledger/block/src/transition/serialize.rs
+@@ -27,6 +27,7 @@ impl<N: Network> Serialize for Transition<N> {
+                 transition.serialize_field("outputs", &self.outputs)?;
+                 transition.serialize_field("tpk", &self.tpk)?;
+                 transition.serialize_field("tcm", &self.tcm)?;
++                transition.serialize_field("scm", &self.scm)?;
+                 transition.end()
+             }
+             false => ToBytesSerializer::serialize_with_size_encoding(self, serializer),
+@@ -58,6 +59,8 @@ impl<'de, N: Network> Deserialize<'de> for Transition<N> {
+                     DeserializeExt::take_from_value::<D>(&mut transition, "tpk")?,
+                     // Retrieve the `tcm`.
+                     DeserializeExt::take_from_value::<D>(&mut transition, "tcm")?,
++                    // Retrieve the `scm`.
++                    DeserializeExt::take_from_value::<D>(&mut transition, "scm")?,
+                 )
+                 .map_err(de::Error::custom)?;
+ 
+diff --git a/ledger/narwhal/batch-certificate/src/lib.rs b/ledger/narwhal/batch-certificate/src/lib.rs
+index 6e916750f..c4c9c7194 100644
+--- a/ledger/narwhal/batch-certificate/src/lib.rs
++++ b/ledger/narwhal/batch-certificate/src/lib.rs
+@@ -305,7 +305,7 @@ pub mod test_helpers {
+         // Sample the leader certificate.
+         let certificate = sample_batch_certificate_for_round_with_previous_certificate_ids(
+             current_round,
+-            previous_certificate_ids.clone(),
++            previous_certificate_ids,
+             rng,
+         );
+ 
+diff --git a/ledger/store/src/helpers/memory/transition.rs b/ledger/store/src/helpers/memory/transition.rs
+index b72b6fa4b..ee5e90b1c 100644
+--- a/ledger/store/src/helpers/memory/transition.rs
++++ b/ledger/store/src/helpers/memory/transition.rs
+@@ -38,6 +38,8 @@ pub struct TransitionMemory<N: Network> {
+     tcm_map: MemoryMap<N::TransitionID, Field<N>>,
+     /// The reverse `tcm` map.
+     reverse_tcm_map: MemoryMap<Field<N>, N::TransitionID>,
++    /// The signer commitments.
++    scm_map: MemoryMap<N::TransitionID, Field<N>>,
+ }
+ 
+ #[rustfmt::skip]
+@@ -49,6 +51,7 @@ impl<N: Network> TransitionStorage<N> for TransitionMemory<N> {
+     type ReverseTPKMap = MemoryMap<Group<N>, N::TransitionID>;
+     type TCMMap = MemoryMap<N::TransitionID, Field<N>>;
+     type ReverseTCMMap = MemoryMap<Field<N>, N::TransitionID>;
++    type SCMMap = MemoryMap<N::TransitionID, Field<N>>;
+ 
+     /// Initializes the transition storage.
+     fn open<S: Clone + Into<StorageMode>>(storage: S) -> Result<Self> {
+@@ -60,6 +63,7 @@ impl<N: Network> TransitionStorage<N> for TransitionMemory<N> {
+             reverse_tpk_map: MemoryMap::default(),
+             tcm_map: MemoryMap::default(),
+             reverse_tcm_map: MemoryMap::default(),
++            scm_map: MemoryMap::default(),
+         })
+     }
+ 
+@@ -97,6 +101,11 @@ impl<N: Network> TransitionStorage<N> for TransitionMemory<N> {
+     fn reverse_tcm_map(&self) -> &Self::ReverseTCMMap {
+         &self.reverse_tcm_map
+     }
++
++    /// Returns the signer commitments.
++    fn scm_map(&self) -> &Self::SCMMap {
++        &self.scm_map
++    }
+ }
+ 
+ /// An in-memory transition input storage.
+diff --git a/ledger/store/src/helpers/rocksdb/internal/id.rs b/ledger/store/src/helpers/rocksdb/internal/id.rs
+index 5d42efc84..3fad6acee 100644
+--- a/ledger/store/src/helpers/rocksdb/internal/id.rs
++++ b/ledger/store/src/helpers/rocksdb/internal/id.rs
+@@ -186,6 +186,7 @@ pub enum TransitionMap {
+     ReverseTPK = DataID::TransitionReverseTPKMap as u16,
+     TCM = DataID::TransitionTCMMap as u16,
+     ReverseTCM = DataID::TransitionReverseTCMMap as u16,
++    SCM = DataID::TransitionSCMMap as u16,
+ }
+ 
+ /// The RocksDB map prefix for program-related entries.
+@@ -282,6 +283,7 @@ enum DataID {
+     TransitionReverseTPKMap,
+     TransitionTCMMap,
+     TransitionReverseTCMMap,
++    TransitionSCMMap,
+     // Program
+     ProgramIDMap,
+     KeyValueMap,
+diff --git a/ledger/store/src/helpers/rocksdb/program.rs b/ledger/store/src/helpers/rocksdb/program.rs
+index 9e11bda79..88b6481c1 100644
+--- a/ledger/store/src/helpers/rocksdb/program.rs
++++ b/ledger/store/src/helpers/rocksdb/program.rs
+@@ -70,7 +70,7 @@ impl<N: Network> FinalizeStorage<N> for FinalizeDB<N> {
+         Ok(Self {
+             committee_store,
+             program_id_map: rocksdb::RocksDB::open_map_testing(temp_dir.clone(), dev, MapID::Program(ProgramMap::ProgramID))?,
+-            key_value_map: rocksdb::RocksDB::open_nested_map_testing(temp_dir.clone(), dev, MapID::Program(ProgramMap::KeyValueID))?,
++            key_value_map: rocksdb::RocksDB::open_nested_map_testing(temp_dir, dev, MapID::Program(ProgramMap::KeyValueID))?,
+             storage_mode: dev.into(),
+         })
+     }
+diff --git a/ledger/store/src/helpers/rocksdb/transition.rs b/ledger/store/src/helpers/rocksdb/transition.rs
+index 8c636a10e..44ee06c33 100644
+--- a/ledger/store/src/helpers/rocksdb/transition.rs
++++ b/ledger/store/src/helpers/rocksdb/transition.rs
+@@ -45,6 +45,8 @@ pub struct TransitionDB<N: Network> {
+     tcm_map: DataMap<N::TransitionID, Field<N>>,
+     /// The reverse `tcm` map.
+     reverse_tcm_map: DataMap<Field<N>, N::TransitionID>,
++    /// The signer commitments.
++    scm_map: DataMap<N::TransitionID, Field<N>>,
+ }
+ 
+ #[rustfmt::skip]
+@@ -56,6 +58,7 @@ impl<N: Network> TransitionStorage<N> for TransitionDB<N> {
+     type ReverseTPKMap = DataMap<Group<N>, N::TransitionID>;
+     type TCMMap = DataMap<N::TransitionID, Field<N>>;
+     type ReverseTCMMap = DataMap<Field<N>, N::TransitionID>;
++    type SCMMap = DataMap<N::TransitionID, Field<N>>;
+ 
+     /// Initializes the transition storage.
+     fn open<S: Clone + Into<StorageMode>>(storage: S) -> Result<Self> {
+@@ -66,7 +69,8 @@ impl<N: Network> TransitionStorage<N> for TransitionDB<N> {
+             tpk_map: rocksdb::RocksDB::open_map(N::ID, storage.clone(), MapID::Transition(TransitionMap::TPK))?,
+             reverse_tpk_map: rocksdb::RocksDB::open_map(N::ID, storage.clone(), MapID::Transition(TransitionMap::ReverseTPK))?,
+             tcm_map: rocksdb::RocksDB::open_map(N::ID, storage.clone(), MapID::Transition(TransitionMap::TCM))?,
+-            reverse_tcm_map: rocksdb::RocksDB::open_map(N::ID, storage,  MapID::Transition(TransitionMap::ReverseTCM))?,
++            reverse_tcm_map: rocksdb::RocksDB::open_map(N::ID, storage.clone(),  MapID::Transition(TransitionMap::ReverseTCM))?,
++            scm_map: rocksdb::RocksDB::open_map(N::ID, storage.clone(), MapID::Transition(TransitionMap::SCM))?,
+         })
+     }
+ 
+@@ -104,6 +108,11 @@ impl<N: Network> TransitionStorage<N> for TransitionDB<N> {
+     fn reverse_tcm_map(&self) -> &Self::ReverseTCMMap {
+         &self.reverse_tcm_map
+     }
++
++    /// Returns the signer commitments.
++    fn scm_map(&self) -> &Self::SCMMap {
++        &self.scm_map
++    }
+ }
+ 
+ /// An database transition input storage.
+diff --git a/ledger/store/src/program/finalize.rs b/ledger/store/src/program/finalize.rs
+index 972ed5739..50179c738 100644
+--- a/ledger/store/src/program/finalize.rs
++++ b/ledger/store/src/program/finalize.rs
+@@ -1314,7 +1314,7 @@ mod tests {
+ 
+         // Insert the key and value.
+         let timer = std::time::Instant::now();
+-        finalize_store.insert_key_value(program_id, mapping_name, key.clone(), value.clone()).unwrap();
++        finalize_store.insert_key_value(program_id, mapping_name, key.clone(), value).unwrap();
+         println!("FinalizeStore::insert_key_value - {} μs", timer.elapsed().as_micros());
+ 
+         // Insert the list of keys and values.
+diff --git a/ledger/store/src/transition/mod.rs b/ledger/store/src/transition/mod.rs
+index 074c4756b..e813caa01 100644
+--- a/ledger/store/src/transition/mod.rs
++++ b/ledger/store/src/transition/mod.rs
+@@ -51,6 +51,8 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+     type TCMMap: for<'a> Map<'a, N::TransitionID, Field<N>>;
+     /// The mapping of `transition commitment` to `transition ID`.
+     type ReverseTCMMap: for<'a> Map<'a, Field<N>, N::TransitionID>;
++    /// The signer commitments.
++    type SCMMap: for<'a> Map<'a, N::TransitionID, Field<N>>;
+ 
+     /// Initializes the transition storage.
+     fn open<S: Clone + Into<StorageMode>>(storage: S) -> Result<Self>;
+@@ -69,6 +71,8 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+     fn tcm_map(&self) -> &Self::TCMMap;
+     /// Returns the reverse `tcm` map.
+     fn reverse_tcm_map(&self) -> &Self::ReverseTCMMap;
++    /// Returns the signer commitments map.
++    fn scm_map(&self) -> &Self::SCMMap;
+ 
+     /// Returns the storage mode.
+     fn storage_mode(&self) -> &StorageMode {
+@@ -85,6 +89,7 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+         self.reverse_tpk_map().start_atomic();
+         self.tcm_map().start_atomic();
+         self.reverse_tcm_map().start_atomic();
++        self.scm_map().start_atomic();
+     }
+ 
+     /// Checks if an atomic batch is in progress.
+@@ -96,6 +101,7 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+             || self.reverse_tpk_map().is_atomic_in_progress()
+             || self.tcm_map().is_atomic_in_progress()
+             || self.reverse_tcm_map().is_atomic_in_progress()
++            || self.scm_map().is_atomic_in_progress()
+     }
+ 
+     /// Checkpoints the atomic batch.
+@@ -107,6 +113,7 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+         self.reverse_tpk_map().atomic_checkpoint();
+         self.tcm_map().atomic_checkpoint();
+         self.reverse_tcm_map().atomic_checkpoint();
++        self.scm_map().atomic_checkpoint();
+     }
+ 
+     /// Clears the latest atomic batch checkpoint.
+@@ -118,6 +125,7 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+         self.reverse_tpk_map().clear_latest_checkpoint();
+         self.tcm_map().clear_latest_checkpoint();
+         self.reverse_tcm_map().clear_latest_checkpoint();
++        self.scm_map().clear_latest_checkpoint();
+     }
+ 
+     /// Rewinds the atomic batch to the previous checkpoint.
+@@ -129,6 +137,7 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+         self.reverse_tpk_map().atomic_rewind();
+         self.tcm_map().atomic_rewind();
+         self.reverse_tcm_map().atomic_rewind();
++        self.scm_map().atomic_rewind();
+     }
+ 
+     /// Aborts an atomic batch write operation.
+@@ -140,6 +149,7 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+         self.reverse_tpk_map().abort_atomic();
+         self.tcm_map().abort_atomic();
+         self.reverse_tcm_map().abort_atomic();
++        self.scm_map().abort_atomic();
+     }
+ 
+     /// Finishes an atomic batch write operation.
+@@ -150,7 +160,8 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+         self.tpk_map().finish_atomic()?;
+         self.reverse_tpk_map().finish_atomic()?;
+         self.tcm_map().finish_atomic()?;
+-        self.reverse_tcm_map().finish_atomic()
++        self.reverse_tcm_map().finish_atomic()?;
++        self.scm_map().finish_atomic()
+     }
+ 
+     /// Stores the given `transition` into storage.
+@@ -172,6 +183,8 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+             self.tcm_map().insert(transition_id, *transition.tcm())?;
+             // Store the reverse `tcm` entry.
+             self.reverse_tcm_map().insert(*transition.tcm(), transition_id)?;
++            // Store `scm`.
++            self.scm_map().insert(transition_id, *transition.scm())?;
+ 
+             Ok(())
+         })
+@@ -205,6 +218,8 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+             self.tcm_map().remove(transition_id)?;
+             // Remove the reverse `tcm` entry.
+             self.reverse_tcm_map().remove(&tcm)?;
++            // Remove `scm`.
++            self.scm_map().remove(transition_id)?;
+ 
+             Ok(())
+         })
+@@ -225,9 +240,11 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+         let tpk = self.tpk_map().get_confirmed(transition_id)?;
+         // Retrieve `tcm`.
+         let tcm = self.tcm_map().get_confirmed(transition_id)?;
++        // Retrieve `scm`.
++        let scm = self.scm_map().get_confirmed(transition_id)?;
+ 
+-        match (tpk, tcm) {
+-            (Some(tpk), Some(tcm)) => {
++        match (tpk, tcm, scm) {
++            (Some(tpk), Some(tcm), Some(scm)) => {
+                 // Construct the transition.
+                 let transition = Transition::new(
+                     program_id,
+@@ -236,6 +253,7 @@ pub trait TransitionStorage<N: Network>: Clone + Send + Sync {
+                     outputs,
+                     cow_to_cloned!(tpk),
+                     cow_to_cloned!(tcm),
++                    cow_to_cloned!(scm),
+                 )?;
+                 // Ensure the transition ID matches.
+                 match transition.id() == transition_id {
+@@ -265,6 +283,8 @@ pub struct TransitionStore<N: Network, T: TransitionStorage<N>> {
+     tcm: T::TCMMap,
+     /// The reverse `tcm` map.
+     reverse_tcm: T::ReverseTCMMap,
++    /// The map of signer commitments.
++    scm: T::SCMMap,
+     /// The transition storage.
+     storage: T,
+ }
+@@ -283,6 +303,7 @@ impl<N: Network, T: TransitionStorage<N>> TransitionStore<N, T> {
+             reverse_tpk: storage.reverse_tpk_map().clone(),
+             tcm: storage.tcm_map().clone(),
+             reverse_tcm: storage.reverse_tcm_map().clone(),
++            scm: storage.scm_map().clone(),
+             storage,
+         })
+     }
+@@ -297,6 +318,7 @@ impl<N: Network, T: TransitionStorage<N>> TransitionStore<N, T> {
+             reverse_tpk: storage.reverse_tpk_map().clone(),
+             tcm: storage.tcm_map().clone(),
+             reverse_tcm: storage.reverse_tcm_map().clone(),
++            scm: storage.scm_map().clone(),
+             storage,
+         }
+     }
+@@ -615,6 +637,11 @@ impl<N: Network, T: TransitionStorage<N>> TransitionStore<N, T> {
+     pub fn tcms(&self) -> impl '_ + Iterator<Item = Cow<'_, Field<N>>> {
+         self.tcm.values_confirmed()
+     }
++
++    /// Returns an iterator over the signer commitments, for all transitions.
++    pub fn scms(&self) -> impl '_ + Iterator<Item = Cow<'_, Field<N>>> {
++        self.scm.values_confirmed()
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/parameters/src/testnet3/genesis.rs b/parameters/src/testnet3/genesis.rs
+index 4e7c77511..45196d18d 100644
+--- a/parameters/src/testnet3/genesis.rs
++++ b/parameters/src/testnet3/genesis.rs
+@@ -27,6 +27,6 @@ mod tests {
+     #[test]
+     fn test_genesis_block() {
+         let bytes = GenesisBytes::load_bytes();
+-        assert_eq!(13733, bytes.len() as u64, "Update me if serialization has changed");
++        assert_eq!(13989, bytes.len() as u64, "Update me if serialization has changed");
+     }
+ }
+diff --git a/parameters/src/testnet3/resources/block.genesis b/parameters/src/testnet3/resources/block.genesis
+index 921aa57cd..fa73cde84 100644
+Binary files a/parameters/src/testnet3/resources/block.genesis and b/parameters/src/testnet3/resources/block.genesis differ
+diff --git a/parameters/src/testnet3/resources/bond_public.metadata b/parameters/src/testnet3/resources/bond_public.metadata
+index b54260a7c..66d68b259 100644
+--- a/parameters/src/testnet3/resources/bond_public.metadata
++++ b/parameters/src/testnet3/resources/bond_public.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "ad7d1557c71a301d6d49370b8bbcc402330c7759e68ee44d2be50addd3cf74ce",
+-  "prover_size": 28803098,
+-  "verifier_checksum": "ffe2bc8fd23fbc5d0d77c855f90847d9f592e1e3e0aba1064f893f6f4c017e93",
++  "prover_checksum": "65098917d1ab18982d0dd2eb1cc84d90e9a454d9e19a2b0997221303996b8e95",
++  "prover_size": 28928250,
++  "verifier_checksum": "7b2d0c51c6405e485335315f1290817b9d65a847b9262f303f8cb277328761c3",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/bond_public.verifier b/parameters/src/testnet3/resources/bond_public.verifier
+index 8549bb552..38ec52466 100644
+Binary files a/parameters/src/testnet3/resources/bond_public.verifier and b/parameters/src/testnet3/resources/bond_public.verifier differ
+diff --git a/parameters/src/testnet3/resources/claim_unbond_public.metadata b/parameters/src/testnet3/resources/claim_unbond_public.metadata
+index b630d86e2..bf2b40c35 100644
+--- a/parameters/src/testnet3/resources/claim_unbond_public.metadata
++++ b/parameters/src/testnet3/resources/claim_unbond_public.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "0b8e147fdab6e80d944c813771e8494cc2c489d503dfb8aaea7a12ca85e45181",
+-  "prover_size": 16736180,
+-  "verifier_checksum": "5709fecdad3de57cdf39870e52b3b02b5e21abc7bb0ffec873f2fa17c0cb4e46",
++  "prover_checksum": "4233e1a17025aa9335b3887bc6ef59a13d304e7af20409b2f71389c0c4444c7b",
++  "prover_size": 16861332,
++  "verifier_checksum": "217888235357c317e31b299e8bb84420361aea40c5ef6c5c029fda30855c7928",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/claim_unbond_public.verifier b/parameters/src/testnet3/resources/claim_unbond_public.verifier
+index 1497d4206..4fda456f1 100644
+Binary files a/parameters/src/testnet3/resources/claim_unbond_public.verifier and b/parameters/src/testnet3/resources/claim_unbond_public.verifier differ
+diff --git a/parameters/src/testnet3/resources/fee_private.metadata b/parameters/src/testnet3/resources/fee_private.metadata
+index f2e574276..a89e55dc6 100644
+--- a/parameters/src/testnet3/resources/fee_private.metadata
++++ b/parameters/src/testnet3/resources/fee_private.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "714ff002b32d9795bb5b5f6baddffd9c37ce0fffb4d85dd0aed72b07607b91d8",
+-  "prover_size": 66172820,
+-  "verifier_checksum": "59a6c8941333f41709a27ba831b5662973c21cc97ee544574c3d4c01b5ffc4fa",
++  "prover_checksum": "5c772cfef2162bab617896279a8501da1783c99707c727e5ed56c8d18f5d6402",
++  "prover_size": 66297972,
++  "verifier_checksum": "1075880f54492556fe8fc728dba26029a2888dd7672d15630c463a0bdc7e95c4",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/fee_private.verifier b/parameters/src/testnet3/resources/fee_private.verifier
+index 44fc090d9..7ba5fbe39 100644
+Binary files a/parameters/src/testnet3/resources/fee_private.verifier and b/parameters/src/testnet3/resources/fee_private.verifier differ
+diff --git a/parameters/src/testnet3/resources/fee_public.metadata b/parameters/src/testnet3/resources/fee_public.metadata
+index f065204c5..bf87ea0ca 100644
+--- a/parameters/src/testnet3/resources/fee_public.metadata
++++ b/parameters/src/testnet3/resources/fee_public.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "d7b309465c0871463a49d4fdfda5aed50be8ddbddd2c7dacc57f129697f62b93",
+-  "prover_size": 29049250,
+-  "verifier_checksum": "e6f6701c1635dfd11405a8e01a32380f3fa1abdddceed8459ecabae1d48d2ce9",
++  "prover_checksum": "71ad00a86a5af6b5948e11e9dbe6636d76bf4d3766b422f18e291af404fd66eb",
++  "prover_size": 29174402,
++  "verifier_checksum": "89631a2ec1b7cafa292164091d4d6b6055339337fe62d52f8d25b9e3b159eb07",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/fee_public.verifier b/parameters/src/testnet3/resources/fee_public.verifier
+index ee76bd058..3cded0e3d 100644
+Binary files a/parameters/src/testnet3/resources/fee_public.verifier and b/parameters/src/testnet3/resources/fee_public.verifier differ
+diff --git a/parameters/src/testnet3/resources/join.metadata b/parameters/src/testnet3/resources/join.metadata
+index 20ef363a5..7befb12d5 100644
+--- a/parameters/src/testnet3/resources/join.metadata
++++ b/parameters/src/testnet3/resources/join.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "ab0a98affcbeac1e8aa0ff208b9dd16f092ee37efaae9f7a1c9e14128f11e670",
+-  "prover_size": 74597012,
+-  "verifier_checksum": "a2cf95112b109855718a641a6f784b90fbd49e77296a161f19ff3c265e8598bc",
++  "prover_checksum": "defafd0c17ecb8fb181a6de1a3961ed1c491b34b59e4f92846633f08230b0149",
++  "prover_size": 74722164,
++  "verifier_checksum": "2e120fd6761a542e326655f8559838b9cf808625f722e9221e56f3bab58684b5",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/join.verifier b/parameters/src/testnet3/resources/join.verifier
+index a55f72a33..02d055f14 100644
+Binary files a/parameters/src/testnet3/resources/join.verifier and b/parameters/src/testnet3/resources/join.verifier differ
+diff --git a/parameters/src/testnet3/resources/set_validator_state.metadata b/parameters/src/testnet3/resources/set_validator_state.metadata
+index 09cfd0369..c3016081a 100644
+--- a/parameters/src/testnet3/resources/set_validator_state.metadata
++++ b/parameters/src/testnet3/resources/set_validator_state.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "502ca9fbae0c0fa45e754a133e31ae2416c130d70a6a76c7a94fd866c0b63c69",
+-  "prover_size": 17265036,
+-  "verifier_checksum": "dedb9b25c7a5cfcfb1b3ac584c40a8bb3c9a8e7518d4ae9387773cdc0ed59c81",
++  "prover_checksum": "80ff54fb9bffef4c6e91e79144bea0659b2d80c5681f08ab58b694cabd4b6a4e",
++  "prover_size": 17390188,
++  "verifier_checksum": "fd07770007aa5e0b7511e661081ade0abe2426d279aadd78b7dc0d3295278e10",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/set_validator_state.verifier b/parameters/src/testnet3/resources/set_validator_state.verifier
+index 3f9c72a2d..59a686a5e 100644
+Binary files a/parameters/src/testnet3/resources/set_validator_state.verifier and b/parameters/src/testnet3/resources/set_validator_state.verifier differ
+diff --git a/parameters/src/testnet3/resources/split.metadata b/parameters/src/testnet3/resources/split.metadata
+index a0318c3e9..7f07bc124 100644
+--- a/parameters/src/testnet3/resources/split.metadata
++++ b/parameters/src/testnet3/resources/split.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "0dee4c54612a0e6a78430c8cc58076858dba57b500ede33fcf80134ae571490d",
+-  "prover_size": 75036276,
+-  "verifier_checksum": "1614a11249671d1f8c0b7036d3eeff3e8fa5f42d7b6368b1fcd09a73ea200077",
++  "prover_checksum": "31e06388f556fd65974789d9a45f3e6de615011ac3891ce3c422a402de550f73",
++  "prover_size": 75161428,
++  "verifier_checksum": "0658262151b8fec6da628fe18fa369681c17291de2ad2aa5c492201e57e8f791",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/split.verifier b/parameters/src/testnet3/resources/split.verifier
+index 3865279aa..8e19a33c9 100644
+Binary files a/parameters/src/testnet3/resources/split.verifier and b/parameters/src/testnet3/resources/split.verifier differ
+diff --git a/parameters/src/testnet3/resources/transfer_private.metadata b/parameters/src/testnet3/resources/transfer_private.metadata
+index 47010da02..35302fa4d 100644
+--- a/parameters/src/testnet3/resources/transfer_private.metadata
++++ b/parameters/src/testnet3/resources/transfer_private.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "e34b8992d3023e30d76bd877a75d234f8ab6bbe41c5378017d35c81be62e45b9",
+-  "prover_size": 75824020,
+-  "verifier_checksum": "75d0acae871833bedd7ce978cfd97cb51a616358509bff975802c4875841053a",
++  "prover_checksum": "e7b63334512e99aceffb8c1e8f593002da98202b7bac71adc11a5bf029986ecb",
++  "prover_size": 75949172,
++  "verifier_checksum": "180940fc605e63bc275340c2a4116e3fcae449eac504e3628f3ea3152f1f2046",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/transfer_private.verifier b/parameters/src/testnet3/resources/transfer_private.verifier
+index 889d6eacd..4f0ea29bb 100644
+Binary files a/parameters/src/testnet3/resources/transfer_private.verifier and b/parameters/src/testnet3/resources/transfer_private.verifier differ
+diff --git a/parameters/src/testnet3/resources/transfer_private_to_public.metadata b/parameters/src/testnet3/resources/transfer_private_to_public.metadata
+index a39b63aa8..5b45c362e 100644
+--- a/parameters/src/testnet3/resources/transfer_private_to_public.metadata
++++ b/parameters/src/testnet3/resources/transfer_private_to_public.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "88c1e8c772ddf391bb0da11f29815f15f7540364ee1fc0c5b68fbf5803be773d",
+-  "prover_size": 66174324,
+-  "verifier_checksum": "b73f200123f8a9fb3f0cd9da71ac8e6a9d54f262a12eb871d4caa6384b47c30c",
++  "prover_checksum": "a7b14687479d6b7bd46de7787f622b94c3e8cf581750384ed88ec1afdf1be7f1",
++  "prover_size": 66299476,
++  "verifier_checksum": "17570750a8b64b839b77b07ed95a963f0d57b7a322945833e0b45b6593f2942a",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/transfer_private_to_public.verifier b/parameters/src/testnet3/resources/transfer_private_to_public.verifier
+index 67c60b2e8..607ec3cc1 100644
+Binary files a/parameters/src/testnet3/resources/transfer_private_to_public.verifier and b/parameters/src/testnet3/resources/transfer_private_to_public.verifier differ
+diff --git a/parameters/src/testnet3/resources/transfer_public.metadata b/parameters/src/testnet3/resources/transfer_public.metadata
+index d3bd87aa7..3aa747f94 100644
+--- a/parameters/src/testnet3/resources/transfer_public.metadata
++++ b/parameters/src/testnet3/resources/transfer_public.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "63a3f042e52763818a04a488281bba39c9c1d5a522fb3a568e41ef220dfb75f9",
+-  "prover_size": 28788330,
+-  "verifier_checksum": "9885663674dd5cb3c185edbbcb6a6dd19062fa025bc75abbf688571eb410ef63",
++  "prover_checksum": "f71fbfb10baa00a009b88bea8ca75106672dbf701ed65bf180dc538f832ae9a7",
++  "prover_size": 28913482,
++  "verifier_checksum": "0ac9e58c93e3f2cdf2fc652a412ca963a78c08f3d1e4abc1abbfd758e1a62940",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/transfer_public.verifier b/parameters/src/testnet3/resources/transfer_public.verifier
+index ed2098b34..774b18f54 100644
+Binary files a/parameters/src/testnet3/resources/transfer_public.verifier and b/parameters/src/testnet3/resources/transfer_public.verifier differ
+diff --git a/parameters/src/testnet3/resources/transfer_public_to_private.metadata b/parameters/src/testnet3/resources/transfer_public_to_private.metadata
+index ccd368748..1ab8c31a6 100644
+--- a/parameters/src/testnet3/resources/transfer_public_to_private.metadata
++++ b/parameters/src/testnet3/resources/transfer_public_to_private.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "11f9e0badedb04905623fd9b1d9041de69ad447ebf9a051cd2b8e6568725e88c",
+-  "prover_size": 38288164,
+-  "verifier_checksum": "2bf1723a81f61e6c5707eb953aeb703028ac43e6e5aaf796423903829e0d3fb7",
++  "prover_checksum": "9224bf6cec7261198597f514ca7e8a503773aa676ab098491114b6fd300a5b67",
++  "prover_size": 38413316,
++  "verifier_checksum": "4bf17b4827432e83bc1c7ed5a655e1733bcff2c642cea15799844490b6408f99",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/transfer_public_to_private.verifier b/parameters/src/testnet3/resources/transfer_public_to_private.verifier
+index 384169c31..fcb8b9677 100644
+Binary files a/parameters/src/testnet3/resources/transfer_public_to_private.verifier and b/parameters/src/testnet3/resources/transfer_public_to_private.verifier differ
+diff --git a/parameters/src/testnet3/resources/unbond_delegator_as_validator.metadata b/parameters/src/testnet3/resources/unbond_delegator_as_validator.metadata
+index ceb942fb5..54e91fdd4 100644
+--- a/parameters/src/testnet3/resources/unbond_delegator_as_validator.metadata
++++ b/parameters/src/testnet3/resources/unbond_delegator_as_validator.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "c60446568af061a5910204f6ff97066e0d7962b660c33ba5adbff75cbf083830",
+-  "prover_size": 17434172,
+-  "verifier_checksum": "949a46341c3d7f99ab3a508a31b1f25e6f8b40bc56b0a6f992e6170ec7c45d9d",
++  "prover_checksum": "17aeeb53b8d1eb53ce30662a83ae9889a86fbbc8af09015f0f0af972c9041720",
++  "prover_size": 27062250,
++  "verifier_checksum": "cdea9c3350d6f9059769782e3c3d41ca651633a9a0cd874195a298f4d20fa684",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/unbond_delegator_as_validator.verifier b/parameters/src/testnet3/resources/unbond_delegator_as_validator.verifier
+index 046c8ecba..4be3dc301 100644
+Binary files a/parameters/src/testnet3/resources/unbond_delegator_as_validator.verifier and b/parameters/src/testnet3/resources/unbond_delegator_as_validator.verifier differ
+diff --git a/parameters/src/testnet3/resources/unbond_public.metadata b/parameters/src/testnet3/resources/unbond_public.metadata
+index adb90f7db..1f1800bcd 100644
+--- a/parameters/src/testnet3/resources/unbond_public.metadata
++++ b/parameters/src/testnet3/resources/unbond_public.metadata
+@@ -1,6 +1,6 @@
+ {
+-  "prover_checksum": "77ffd6babbb31296a83d9948af241ef63bf1489d8907b49fecb7abea47070d94",
+-  "prover_size": 17289228,
+-  "verifier_checksum": "260f64e799a516665d2c47eb02dbb3b8edfe8fa1cfb0a0ced5c97bd8b7199fbd",
++  "prover_checksum": "b814018b94e6dfa2f0d84c01c14c1ba4769a5b3b1c0be37892c29108a283d47a",
++  "prover_size": 17414380,
++  "verifier_checksum": "10b1178f84756e3f76cafa126e787695544cbea5b45b1df8c3b5790424238043",
+   "verifier_size": 665
+ }
+\ No newline at end of file
+diff --git a/parameters/src/testnet3/resources/unbond_public.verifier b/parameters/src/testnet3/resources/unbond_public.verifier
+index 22292c87b..007750373 100644
+Binary files a/parameters/src/testnet3/resources/unbond_public.verifier and b/parameters/src/testnet3/resources/unbond_public.verifier differ
+diff --git a/synthesizer/benches/kary_merkle_tree.rs b/synthesizer/benches/kary_merkle_tree.rs
+index 17e7f8eeb..8a79e2720 100644
+--- a/synthesizer/benches/kary_merkle_tree.rs
++++ b/synthesizer/benches/kary_merkle_tree.rs
+@@ -74,14 +74,12 @@ fn batch_prove(c: &mut Criterion) {
+     CurrentAleo::reset();
+ 
+     // Initialize the Merkle path circuit.
+-    let path = KaryMerklePath::<CurrentAleo, circuit::Sha3_256<CurrentAleo>, DEPTH, ARITY>::new(
+-        Mode::Private,
+-        merkle_path.clone(),
+-    );
++    let path =
++        KaryMerklePath::<CurrentAleo, circuit::Sha3_256<CurrentAleo>, DEPTH, ARITY>::new(Mode::Private, merkle_path);
+     // Initialize the Merkle root.
+     let root = <CircuitPathHasher as PathHash<CurrentAleo>>::Hash::new(Mode::Private, *merkle_tree.root());
+     // Initialize the Merkle leaf.
+-    let leaf: Vec<_> = Inject::new(Mode::Private, merkle_leaf.clone());
++    let leaf: Vec<_> = Inject::new(Mode::Private, merkle_leaf);
+ 
+     // Verify the merkle path.
+     let candidate = path.verify(&circuit_leaf_hasher, &circuit_path_hasher, &root, &leaf);
+diff --git a/synthesizer/process/src/execute.rs b/synthesizer/process/src/execute.rs
+index 7311f018b..46b3db036 100644
+--- a/synthesizer/process/src/execute.rs
++++ b/synthesizer/process/src/execute.rs
+@@ -32,6 +32,10 @@ impl<N: Network> Process<N> {
+         #[cfg(feature = "aleo-cli")]
+         println!("{}", format!(" • Executing '{locator}'...",).dimmed());
+ 
++        // This is the root request and does not have a caller.
++        let caller = None;
++        // This is the root request and we do not have a root_tvk to pass on.
++        let root_tvk = None;
+         // Initialize the trace.
+         let trace = Arc::new(RwLock::new(Trace::new()));
+         // Initialize the call stack.
+@@ -41,7 +45,7 @@ impl<N: Network> Process<N> {
+         // Retrieve the stack.
+         let stack = self.get_stack(request.program_id())?;
+         // Execute the circuit.
+-        let response = stack.execute_function::<A, R>(call_stack, None, rng)?;
++        let response = stack.execute_function::<A, R>(call_stack, caller, root_tvk, rng)?;
+         lap!(timer, "Execute the function");
+ 
+         // Extract the trace.
+diff --git a/synthesizer/process/src/stack/authorization/mod.rs b/synthesizer/process/src/stack/authorization/mod.rs
+index ec1df28e2..6a510f381 100644
+--- a/synthesizer/process/src/stack/authorization/mod.rs
++++ b/synthesizer/process/src/stack/authorization/mod.rs
+@@ -238,6 +238,13 @@ fn ensure_request_and_transition_matches<N: Network>(
+         request.tcm(),
+         transition.tcm(),
+     );
++    // Ensure the request and transition have the same 'scm'.
++    ensure!(
++        request.scm() == transition.scm(),
++        "The request ({}) and transition ({}) at index {index} must have the same 'scm' in the authorization.",
++        request.scm(),
++        transition.scm(),
++    );
+     Ok(())
+ }
+ 
+diff --git a/synthesizer/process/src/stack/authorize.rs b/synthesizer/process/src/stack/authorize.rs
+index ffb835d42..6e740bd50 100644
+--- a/synthesizer/process/src/stack/authorize.rs
++++ b/synthesizer/process/src/stack/authorize.rs
+@@ -36,15 +36,20 @@ impl<N: Network> Stack<N> {
+         // Set is_root to true.
+         let is_root = true;
+ 
++        // This is the root request and does not have a caller.
++        let caller = None;
++        // This is the root request and we do not have a root_tvk to pass on.
++        let root_tvk = None;
+         // Compute the request.
+-        let request = Request::sign(private_key, program_id, function_name, inputs, &input_types, is_root, rng)?;
++        let request =
++            Request::sign(private_key, program_id, function_name, inputs, &input_types, root_tvk, is_root, rng)?;
+         lap!(timer, "Compute the request");
+         // Initialize the authorization.
+         let authorization = Authorization::new(request.clone());
+         // Construct the call stack.
+         let call_stack = CallStack::Authorize(vec![request], *private_key, authorization.clone());
+         // Construct the authorization from the function.
+-        let _response = self.execute_function::<A, R>(call_stack, None, rng)?;
++        let _response = self.execute_function::<A, R>(call_stack, caller, root_tvk, rng)?;
+         finish!(timer, "Construct the authorization from the function");
+ 
+         // Return the authorization.
+diff --git a/synthesizer/process/src/stack/call/mod.rs b/synthesizer/process/src/stack/call/mod.rs
+index da3910da9..c7301bbab 100644
+--- a/synthesizer/process/src/stack/call/mod.rs
++++ b/synthesizer/process/src/stack/call/mod.rs
+@@ -43,6 +43,7 @@ pub trait CallTrait<N: Network> {
+         stack: &(impl StackEvaluate<N> + StackExecute<N> + StackMatches<N> + StackProgram<N>),
+         registers: &mut (
+                  impl RegistersCall<N>
++                 + RegistersSigner<N>
+                  + RegistersSignerCircuit<N, A>
+                  + RegistersLoadCircuit<N, A>
+                  + RegistersStoreCircuit<N, A>
+@@ -136,6 +137,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
+         stack: &(impl StackEvaluate<N> + StackExecute<N> + StackMatches<N> + StackProgram<N>),
+         registers: &mut (
+                  impl RegistersCall<N>
++                 + RegistersSigner<N>
+                  + RegistersSignerCircuit<N, A>
+                  + RegistersLoadCircuit<N, A>
+                  + RegistersStoreCircuit<N, A>
+@@ -178,6 +180,9 @@ impl<N: Network> CallTrait<N> for Call<N> {
+         };
+         lap!(timer, "Retrieve the substack and resource");
+ 
++        // If we are not handling the root request, retrieve the root request's tvk
++        let root_tvk = registers.root_tvk().ok();
++
+         // If the operator is a closure, retrieve the closure and compute the output.
+         let outputs = if let Ok(closure) = substack.program().get_closure(resource) {
+             lap!(timer, "Execute the closure");
+@@ -228,6 +233,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
+                             *function.name(),
+                             inputs.iter(),
+                             &function.input_types(),
++                            root_tvk,
+                             is_root,
+                             rng,
+                         )?;
+@@ -241,7 +247,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
+                         authorization.push(request.clone());
+ 
+                         // Execute the request.
+-                        let response = substack.execute_function::<A, R>(call_stack, console_caller, rng)?;
++                        let response = substack.execute_function::<A, R>(call_stack, console_caller, root_tvk, rng)?;
+ 
+                         // Return the request and response.
+                         (request, response)
+@@ -254,6 +260,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
+                             *function.name(),
+                             inputs.iter(),
+                             &function.input_types(),
++                            root_tvk,
+                             is_root,
+                             rng,
+                         )?;
+@@ -264,7 +271,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
+                         call_stack.push(request.clone())?;
+ 
+                         // Evaluate the request.
+-                        let response = substack.execute_function::<A, _>(call_stack, console_caller, rng)?;
++                        let response = substack.execute_function::<A, _>(call_stack, console_caller, root_tvk, rng)?;
+ 
+                         // Return the request and response.
+                         (request, response)
+@@ -277,6 +284,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
+                             *function.name(),
+                             inputs.iter(),
+                             &function.input_types(),
++                            root_tvk,
+                             is_root,
+                             rng,
+                         )?;
+@@ -334,7 +342,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
+                             substack.evaluate_function::<A>(registers.call_stack().replicate(), console_caller)?;
+                         // Execute the request.
+                         let response =
+-                            substack.execute_function::<A, R>(registers.call_stack(), console_caller, rng)?;
++                            substack.execute_function::<A, R>(registers.call_stack(), console_caller, root_tvk, rng)?;
+                         // Ensure the values are equal.
+                         if console_response.outputs() != response.outputs() {
+                             #[cfg(debug_assertions)]
+diff --git a/synthesizer/process/src/stack/deploy.rs b/synthesizer/process/src/stack/deploy.rs
+index bb7339abd..79803d91b 100644
+--- a/synthesizer/process/src/stack/deploy.rs
++++ b/synthesizer/process/src/stack/deploy.rs
+@@ -76,6 +76,12 @@ impl<N: Network> Stack<N> {
+         // Construct the call stacks and assignments used to verify the certificates.
+         let mut call_stacks = Vec::with_capacity(deployment.verifying_keys().len());
+ 
++        // The `root_tvk` is `None` when verifying the deployment of an individual circuit.
++        let root_tvk = None;
++
++        // The `caller` is `None` when verifying the deployment of an individual circuit.
++        let caller = None;
++
+         // Iterate through the program functions and construct the callstacks and corresponding assignments.
+         for function in deployment.program().functions().values() {
+             // Initialize a burner private key.
+@@ -108,6 +114,7 @@ impl<N: Network> Stack<N> {
+                 *function.name(),
+                 inputs.into_iter(),
+                 &input_types,
++                root_tvk,
+                 is_root,
+                 rng,
+             )?;
+@@ -125,7 +132,7 @@ impl<N: Network> Stack<N> {
+         cfg_iter!(call_stacks).zip_eq(deployment.verifying_keys()).zip_eq(rngs).try_for_each(
+             |(((function_name, call_stack, assignments), (_, (verifying_key, certificate))), mut rng)| {
+                 // Synthesize the circuit.
+-                if let Err(err) = self.execute_function::<A, _>(call_stack.clone(), None, &mut rng) {
++                if let Err(err) = self.execute_function::<A, _>(call_stack.clone(), caller, root_tvk, &mut rng) {
+                     bail!("Failed to synthesize the circuit for '{function_name}': {err}")
+                 }
+                 // Check the certificate.
+diff --git a/synthesizer/process/src/stack/execute.rs b/synthesizer/process/src/stack/execute.rs
+index 9b3b5c73d..7e165a9fb 100644
+--- a/synthesizer/process/src/stack/execute.rs
++++ b/synthesizer/process/src/stack/execute.rs
+@@ -135,6 +135,7 @@ impl<N: Network> StackExecute<N> for Stack<N> {
+         &self,
+         mut call_stack: CallStack<N>,
+         console_caller: Option<ProgramID<N>>,
++        root_tvk: Option<Field<N>>,
+         rng: &mut R,
+     ) -> Result<Response<N>> {
+         let timer = timer!("Stack::execute_function");
+@@ -153,6 +154,8 @@ impl<N: Network> StackExecute<N> for Stack<N> {
+             console_request.network_id()
+         );
+ 
++        // We can only have a root_tvk if this request was called by another request
++        ensure!(console_caller.is_some() == root_tvk.is_some());
+         // Determine if this is the top-level caller.
+         let console_is_root = console_caller.is_none();
+ 
+@@ -194,6 +197,18 @@ impl<N: Network> StackExecute<N> for Stack<N> {
+         // Initialize the registers.
+         let mut registers = Registers::new(call_stack, self.get_register_types(function.name())?.clone());
+ 
++        // Set the root tvk, from a parent request or the current request.
++        // inject the `root_tvk` as `Mode::Private`.
++        if let Some(root_tvk) = root_tvk {
++            registers.set_root_tvk(root_tvk);
++            registers.set_root_tvk_circuit(circuit::Field::<A>::new(circuit::Mode::Private, root_tvk));
++        } else {
++            registers.set_root_tvk(*console_request.tvk());
++            registers.set_root_tvk_circuit(circuit::Field::<A>::new(circuit::Mode::Private, *console_request.tvk()));
++        }
++
++        let root_tvk = Some(registers.root_tvk_circuit()?);
++
+         use circuit::{Eject, Inject};
+ 
+         // Inject the transition public key `tpk` as `Mode::Public`.
+@@ -209,7 +224,7 @@ impl<N: Network> StackExecute<N> for Stack<N> {
+         let caller = Ternary::ternary(&is_root, request.signer(), &parent);
+ 
+         // Ensure the request has a valid signature, inputs, and transition view key.
+-        A::assert(request.verify(&input_types, &tpk, is_root));
++        A::assert(request.verify(&input_types, &tpk, root_tvk, is_root));
+         lap!(timer, "Verify the circuit request");
+ 
+         // Set the transition signer.
+diff --git a/synthesizer/process/src/stack/helpers/synthesize.rs b/synthesizer/process/src/stack/helpers/synthesize.rs
+index 212fc01cd..72d7d7bc2 100644
+--- a/synthesizer/process/src/stack/helpers/synthesize.rs
++++ b/synthesizer/process/src/stack/helpers/synthesize.rs
+@@ -52,6 +52,12 @@ impl<N: Network> Stack<N> {
+         // Sample 'is_root'.
+         let is_root = true;
+ 
++        // The `root_tvk` is `None` when deploying an individual circuit.
++        let root_tvk = None;
++
++        // The caller is `None` when deploying an individual circuit.
++        let caller = None;
++
+         // Compute the request, with a burner private key.
+         let request = Request::sign(
+             &burner_private_key,
+@@ -59,6 +65,7 @@ impl<N: Network> Stack<N> {
+             *function_name,
+             inputs.into_iter(),
+             &input_types,
++            root_tvk,
+             is_root,
+             rng,
+         )?;
+@@ -67,7 +74,7 @@ impl<N: Network> Stack<N> {
+         // Initialize the call stack.
+         let call_stack = CallStack::Synthesize(vec![request], burner_private_key, authorization);
+         // Synthesize the circuit.
+-        let _response = self.execute_function::<A, R>(call_stack, None, rng)?;
++        let _response = self.execute_function::<A, R>(call_stack, caller, root_tvk, rng)?;
+ 
+         // Ensure the proving key exists.
+         ensure!(self.contains_proving_key(function_name), "Function '{function_name}' is missing a proving key.");
+diff --git a/synthesizer/process/src/stack/registers/caller.rs b/synthesizer/process/src/stack/registers/caller.rs
+index ddea05cde..3839138af 100644
+--- a/synthesizer/process/src/stack/registers/caller.rs
++++ b/synthesizer/process/src/stack/registers/caller.rs
+@@ -27,6 +27,18 @@ impl<N: Network, A: circuit::Aleo<Network = N>> RegistersSigner<N> for Registers
+         self.signer = Some(signer);
+     }
+ 
++    /// Returns the root transition view key.
++    #[inline]
++    fn root_tvk(&self) -> Result<Field<N>> {
++        self.root_tvk.ok_or_else(|| anyhow!("Root tvk (console) is not set in the registers."))
++    }
++
++    /// Sets the root transition view key.
++    #[inline]
++    fn set_root_tvk(&mut self, root_tvk: Field<N>) {
++        self.root_tvk = Some(root_tvk);
++    }
++
+     /// Returns the transition caller.
+     #[inline]
+     fn caller(&self) -> Result<Address<N>> {
+@@ -65,6 +77,18 @@ impl<N: Network, A: circuit::Aleo<Network = N>> RegistersSignerCircuit<N, A> for
+         self.signer_circuit = Some(signer_circuit);
+     }
+ 
++    /// Returns the root transition view key, as a circuit.
++    #[inline]
++    fn root_tvk_circuit(&self) -> Result<circuit::Field<A>> {
++        self.root_tvk_circuit.clone().ok_or_else(|| anyhow!("Root tvk (circuit) is not set in the registers."))
++    }
++
++    /// Sets the root transition view key, as a circuit.
++    #[inline]
++    fn set_root_tvk_circuit(&mut self, root_tvk_circuit: circuit::Field<A>) {
++        self.root_tvk_circuit = Some(root_tvk_circuit);
++    }
++
+     /// Returns the transition caller, as a circuit.
+     #[inline]
+     fn caller_circuit(&self) -> Result<circuit::Address<A>> {
+diff --git a/synthesizer/process/src/stack/registers/mod.rs b/synthesizer/process/src/stack/registers/mod.rs
+index 3e6af26bb..225a194d3 100644
+--- a/synthesizer/process/src/stack/registers/mod.rs
++++ b/synthesizer/process/src/stack/registers/mod.rs
+@@ -51,6 +51,10 @@ pub struct Registers<N: Network, A: circuit::Aleo<Network = N>> {
+     signer: Option<Address<N>>,
+     /// The transition signer, as a circuit.
+     signer_circuit: Option<circuit::Address<A>>,
++    /// The root transition view key.
++    root_tvk: Option<Field<N>>,
++    /// The root transition view key, as a circuit.
++    root_tvk_circuit: Option<circuit::Field<A>>,
+     /// The transition caller.
+     caller: Option<Address<N>>,
+     /// The transition caller, as a circuit.
+@@ -72,6 +76,8 @@ impl<N: Network, A: circuit::Aleo<Network = N>> Registers<N, A> {
+             circuit_registers: IndexMap::new(),
+             signer: None,
+             signer_circuit: None,
++            root_tvk: None,
++            root_tvk_circuit: None,
+             caller: None,
+             caller_circuit: None,
+             tvk: None,
+diff --git a/synthesizer/process/src/tests/test_credits.rs b/synthesizer/process/src/tests/test_credits.rs
+index bf9a4672b..cfebf638d 100644
+--- a/synthesizer/process/src/tests/test_credits.rs
++++ b/synthesizer/process/src/tests/test_credits.rs
+@@ -1520,17 +1520,20 @@ mod sanity_checks {
+         let program_id = *program.id();
+         // Retrieve the input types.
+         let input_types = program.get_function(&function_name).unwrap().input_types();
++        // Sample 'root_tvk'.
++        let root_tvk = None;
+         // Sample 'is_root'.
+         let is_root = true;
+         // Compute the request.
+         let request =
+-            Request::sign(private_key, program_id, function_name, inputs.iter(), &input_types, is_root, rng).unwrap();
++            Request::sign(private_key, program_id, function_name, inputs.iter(), &input_types, root_tvk, is_root, rng)
++                .unwrap();
+         // Initialize the assignments.
+         let assignments = Assignments::<N>::default();
+         // Initialize the call stack.
+         let call_stack = CallStack::CheckDeployment(vec![request], *private_key, assignments.clone());
+         // Synthesize the circuit.
+-        let _response = stack.execute_function::<A, _>(call_stack, None, rng).unwrap();
++        let _response = stack.execute_function::<A, _>(call_stack, None, None, rng).unwrap();
+         // Retrieve the assignment.
+         let assignment = assignments.read().last().unwrap().0.clone();
+         assignment
+@@ -1563,10 +1566,10 @@ mod sanity_checks {
+ 
+         // Compute the assignment.
+         let assignment = get_assignment::<_, CurrentAleo>(stack, &private_key, function_name, &[r0, r1, r2], rng);
+-        assert_eq!(15, assignment.num_public());
+-        assert_eq!(50681, assignment.num_private());
+-        assert_eq!(50729, assignment.num_constraints());
+-        assert_eq!((98548, 109771, 77341), assignment.num_nonzeros());
++        assert_eq!(16, assignment.num_public());
++        assert_eq!(50956, assignment.num_private());
++        assert_eq!(51002, assignment.num_constraints());
++        assert_eq!((99540, 111472, 77613), assignment.num_nonzeros());
+     }
+ 
+     #[test]
+@@ -1591,10 +1594,10 @@ mod sanity_checks {
+ 
+         // Compute the assignment.
+         let assignment = get_assignment::<_, CurrentAleo>(stack, &private_key, function_name, &[r0, r1], rng);
+-        assert_eq!(10, assignment.num_public());
+-        assert_eq!(12043, assignment.num_private());
+-        assert_eq!(12052, assignment.num_constraints());
+-        assert_eq!((27251, 36305, 16407), assignment.num_nonzeros());
++        assert_eq!(11, assignment.num_public());
++        assert_eq!(12318, assignment.num_private());
++        assert_eq!(12325, assignment.num_constraints());
++        assert_eq!((28243, 38006, 16679), assignment.num_nonzeros());
+     }
+ 
+     #[test]
+@@ -1625,10 +1628,10 @@ mod sanity_checks {
+ 
+         // Compute the assignment.
+         let assignment = get_assignment::<_, CurrentAleo>(stack, &private_key, function_name, &[r0, r1, r2, r3], rng);
+-        assert_eq!(14, assignment.num_public());
+-        assert_eq!(37840, assignment.num_private());
+-        assert_eq!(37878, assignment.num_constraints());
+-        assert_eq!((72164, 80590, 56623), assignment.num_nonzeros());
++        assert_eq!(15, assignment.num_public());
++        assert_eq!(38115, assignment.num_private());
++        assert_eq!(38151, assignment.num_constraints());
++        assert_eq!((73156, 82291, 56895), assignment.num_nonzeros());
+     }
+ 
+     #[test]
+@@ -1653,9 +1656,9 @@ mod sanity_checks {
+ 
+         // Compute the assignment.
+         let assignment = get_assignment::<_, CurrentAleo>(stack, &private_key, function_name, &[r0, r1, r2], rng);
+-        assert_eq!(11, assignment.num_public());
+-        assert_eq!(12645, assignment.num_private());
+-        assert_eq!(12657, assignment.num_constraints());
+-        assert_eq!((29595, 39587, 16941), assignment.num_nonzeros());
++        assert_eq!(12, assignment.num_public());
++        assert_eq!(12920, assignment.num_private());
++        assert_eq!(12930, assignment.num_constraints());
++        assert_eq!((30587, 41288, 17213), assignment.num_nonzeros());
+     }
+ }
+diff --git a/synthesizer/process/src/tests/test_execute.rs b/synthesizer/process/src/tests/test_execute.rs
+index 1837b5496..1d182315e 100644
+--- a/synthesizer/process/src/tests/test_execute.rs
++++ b/synthesizer/process/src/tests/test_execute.rs
+@@ -395,7 +395,7 @@ output r4 as field.private;",
+     // Re-run to ensure state continues to work.
+     let trace = Arc::new(RwLock::new(Trace::new()));
+     let call_stack = CallStack::execute(authorization, trace).unwrap();
+-    let response = stack.execute_function::<CurrentAleo, _>(call_stack, None, rng).unwrap();
++    let response = stack.execute_function::<CurrentAleo, _>(call_stack, None, None, rng).unwrap();
+     let candidate = response.outputs();
+     assert_eq!(3, candidate.len());
+     assert_eq!(r2, candidate[0]);
+diff --git a/synthesizer/process/src/traits/mod.rs b/synthesizer/process/src/traits/mod.rs
+index c82b4ffd5..d0b6856a8 100644
+--- a/synthesizer/process/src/traits/mod.rs
++++ b/synthesizer/process/src/traits/mod.rs
+@@ -72,6 +72,7 @@ pub trait StackExecute<N: Network> {
+         &self,
+         call_stack: CallStack<N>,
+         console_caller: Option<ProgramID<N>>,
++        root_tvk: Option<Field<N>>,
+         rng: &mut R,
+     ) -> Result<Response<N>>;
+ }
+diff --git a/synthesizer/process/src/verify_execution.rs b/synthesizer/process/src/verify_execution.rs
+index 27c4a1caa..7684a5099 100644
+--- a/synthesizer/process/src/verify_execution.rs
++++ b/synthesizer/process/src/verify_execution.rs
+@@ -131,6 +131,16 @@ impl<N: Network> Process<N> {
+         let num_instances = verifier_inputs.values().map(|(_, inputs)| inputs.len()).sum::<usize>();
+         // Ensure the number of instances matches the number of transitions.
+         ensure!(num_instances == execution.transitions().len(), "The number of verifier instances is incorrect");
++        // Ensure the same signer is used for all transitions.
++        execution.transitions().try_fold(None, |signer, transition| {
++            Ok(match signer {
++                None => Some(transition.scm()),
++                Some(signer) => {
++                    ensure!(signer == transition.scm(), "The transitions did not use the same signer");
++                    Some(signer)
++                }
++            })
++        })?;
+ 
+         // Construct the list of verifier inputs.
+         let verifier_inputs: Vec<_> = verifier_inputs.values().cloned().collect();
+@@ -167,7 +177,7 @@ impl<N: Network> Process<N> {
+         let (parent_x, parent_y) = parent.to_address()?.to_xy_coordinates();
+ 
+         // [Inputs] Construct the verifier inputs to verify the proof.
+-        let mut inputs = vec![N::Field::one(), *tpk_x, *tpk_y, **transition.tcm()];
++        let mut inputs = vec![N::Field::one(), *tpk_x, *tpk_y, **transition.tcm(), **transition.scm()];
+         // [Inputs] Extend the verifier inputs with the input IDs.
+         inputs.extend(transition.inputs().iter().flat_map(|input| input.verifier_inputs()));
+         // [Inputs] Extend the verifier inputs with the public inputs for 'self.caller'.
+diff --git a/synthesizer/process/src/verify_fee.rs b/synthesizer/process/src/verify_fee.rs
+index 73460123b..dc3a18bf7 100644
+--- a/synthesizer/process/src/verify_fee.rs
++++ b/synthesizer/process/src/verify_fee.rs
+@@ -119,7 +119,7 @@ impl<N: Network> Process<N> {
+         let (parent_x, parent_y) = fee.program_id().to_address()?.to_xy_coordinates();
+ 
+         // Construct the public inputs to verify the proof.
+-        let mut inputs = vec![N::Field::one(), *tpk_x, *tpk_y, **fee.tcm()];
++        let mut inputs = vec![N::Field::one(), *tpk_x, *tpk_y, **fee.tcm(), **fee.scm()];
+         // Extend the inputs with the input IDs.
+         inputs.extend(fee.inputs().iter().flat_map(|input| input.verifier_inputs()));
+         // Extend the verifier inputs with the public inputs for 'self.caller'.
+@@ -188,7 +188,7 @@ impl<N: Network> Process<N> {
+         let (parent_x, parent_y) = fee.program_id().to_address()?.to_xy_coordinates();
+ 
+         // Construct the public inputs to verify the proof.
+-        let mut inputs = vec![N::Field::one(), *tpk_x, *tpk_y, **fee.tcm()];
++        let mut inputs = vec![N::Field::one(), *tpk_x, *tpk_y, **fee.tcm(), **fee.scm()];
+         // Extend the inputs with the input IDs.
+         inputs.extend(fee.inputs().iter().flat_map(|input| input.verifier_inputs()));
+         // Extend the verifier inputs with the public inputs for 'self.caller'
+diff --git a/synthesizer/program/src/closure/mod.rs b/synthesizer/program/src/closure/mod.rs
+index aad825d1e..0cd26c267 100644
+--- a/synthesizer/program/src/closure/mod.rs
++++ b/synthesizer/program/src/closure/mod.rs
+@@ -188,7 +188,7 @@ mod tests {
+ 
+         // Ensure that an instruction can be added.
+         let instruction = Instruction::<CurrentNetwork>::from_str("add r0 r1 into r2;").unwrap();
+-        assert!(closure.add_instruction(instruction.clone()).is_ok());
++        assert!(closure.add_instruction(instruction).is_ok());
+ 
+         // Ensure that adding more than the maximum number of instructions will fail.
+         for i in 3..CurrentNetwork::MAX_INSTRUCTIONS * 2 {
+@@ -209,7 +209,7 @@ mod tests {
+ 
+         // Ensure that an output can be added.
+         let output = Output::<CurrentNetwork>::from_str("output r0 as field;").unwrap();
+-        assert!(closure.add_output(output.clone()).is_ok());
++        assert!(closure.add_output(output).is_ok());
+ 
+         // Ensure that adding more than the maximum number of outputs will fail.
+         for i in 1..CurrentNetwork::MAX_OUTPUTS * 2 {
+diff --git a/synthesizer/program/src/finalize/mod.rs b/synthesizer/program/src/finalize/mod.rs
+index 2a6f57510..b5e5ec1d1 100644
+--- a/synthesizer/program/src/finalize/mod.rs
++++ b/synthesizer/program/src/finalize/mod.rs
+@@ -202,7 +202,7 @@ mod tests {
+ 
+         // Ensure that a command can be added.
+         let command = Command::<CurrentNetwork>::from_str("add r0 r1 into r2;").unwrap();
+-        assert!(finalize.add_command(command.clone()).is_ok());
++        assert!(finalize.add_command(command).is_ok());
+ 
+         // Ensure that adding more than the maximum number of commands will fail.
+         for i in 3..CurrentNetwork::MAX_COMMANDS * 2 {
+diff --git a/synthesizer/program/src/function/mod.rs b/synthesizer/program/src/function/mod.rs
+index 9f03a3c4a..28e5aa9cd 100644
+--- a/synthesizer/program/src/function/mod.rs
++++ b/synthesizer/program/src/function/mod.rs
+@@ -242,7 +242,7 @@ mod tests {
+ 
+         // Ensure that an instruction can be added.
+         let instruction = Instruction::<CurrentNetwork>::from_str("add r0 r1 into r2;").unwrap();
+-        assert!(function.add_instruction(instruction.clone()).is_ok());
++        assert!(function.add_instruction(instruction).is_ok());
+ 
+         // Ensure that adding more than the maximum number of instructions will fail.
+         for i in 3..CurrentNetwork::MAX_INSTRUCTIONS * 2 {
+@@ -263,7 +263,7 @@ mod tests {
+ 
+         // Ensure that an output can be added.
+         let output = Output::<CurrentNetwork>::from_str("output r0 as field.private;").unwrap();
+-        assert!(function.add_output(output.clone()).is_ok());
++        assert!(function.add_output(output).is_ok());
+ 
+         // Ensure that adding more than the maximum number of outputs will fail.
+         for i in 1..CurrentNetwork::MAX_OUTPUTS * 2 {
+diff --git a/synthesizer/program/src/traits/stack_and_registers.rs b/synthesizer/program/src/traits/stack_and_registers.rs
+index d3a596114..4c98b58b1 100644
+--- a/synthesizer/program/src/traits/stack_and_registers.rs
++++ b/synthesizer/program/src/traits/stack_and_registers.rs
+@@ -112,6 +112,12 @@ pub trait RegistersSigner<N: Network> {
+     /// Sets the transition signer.
+     fn set_signer(&mut self, signer: Address<N>);
+ 
++    /// Returns the root transition view key.
++    fn root_tvk(&self) -> Result<Field<N>>;
++
++    /// Sets the root transition view key.
++    fn set_root_tvk(&mut self, root_tvk: Field<N>);
++
+     /// Returns the transition caller.
+     fn caller(&self) -> Result<Address<N>>;
+ 
+@@ -132,6 +138,12 @@ pub trait RegistersSignerCircuit<N: Network, A: circuit::Aleo<Network = N>> {
+     /// Sets the transition signer, as a circuit.
+     fn set_signer_circuit(&mut self, signer_circuit: circuit::Address<A>);
+ 
++    /// Returns the root transition view key, as a circuit.
++    fn root_tvk_circuit(&self) -> Result<circuit::Field<A>>;
++
++    /// Sets the root transition view key, as a circuit.
++    fn set_root_tvk_circuit(&mut self, root_tvk_circuit: circuit::Field<A>);
++
+     /// Returns the transition caller, as a circuit.
+     fn caller_circuit(&self) -> Result<circuit::Address<A>>;
+ 
+diff --git a/synthesizer/src/vm/execute.rs b/synthesizer/src/vm/execute.rs
+index 31a211118..7d9231ade 100644
+--- a/synthesizer/src/vm/execute.rs
++++ b/synthesizer/src/vm/execute.rs
+@@ -271,13 +271,13 @@ mod tests {
+ 
+         // Assert the size of the transaction.
+         let transaction_size_in_bytes = transaction.to_bytes_le().unwrap().len();
+-        assert_eq!(3629, transaction_size_in_bytes, "Update me if serialization has changed");
++        assert_eq!(3693, transaction_size_in_bytes, "Update me if serialization has changed");
+ 
+         // Assert the size of the execution.
+         assert!(matches!(transaction, Transaction::Execute(_, _, _)));
+         if let Transaction::Execute(_, execution, _) = &transaction {
+             let execution_size_in_bytes = execution.to_bytes_le().unwrap().len();
+-            assert_eq!(2210, execution_size_in_bytes, "Update me if serialization has changed");
++            assert_eq!(2242, execution_size_in_bytes, "Update me if serialization has changed");
+         }
+     }
+ 
+@@ -305,13 +305,13 @@ mod tests {
+ 
+         // Assert the size of the transaction.
+         let transaction_size_in_bytes = transaction.to_bytes_le().unwrap().len();
+-        assert_eq!(2807, transaction_size_in_bytes, "Update me if serialization has changed");
++        assert_eq!(2871, transaction_size_in_bytes, "Update me if serialization has changed");
+ 
+         // Assert the size of the execution.
+         assert!(matches!(transaction, Transaction::Execute(_, _, _)));
+         if let Transaction::Execute(_, execution, _) = &transaction {
+             let execution_size_in_bytes = execution.to_bytes_le().unwrap().len();
+-            assert_eq!(1388, execution_size_in_bytes, "Update me if serialization has changed");
++            assert_eq!(1420, execution_size_in_bytes, "Update me if serialization has changed");
+         }
+     }
+ 
+@@ -340,13 +340,13 @@ mod tests {
+ 
+         // Assert the size of the transaction.
+         let transaction_size_in_bytes = transaction.to_bytes_le().unwrap().len();
+-        assert_eq!(3474, transaction_size_in_bytes, "Update me if serialization has changed");
++        assert_eq!(3538, transaction_size_in_bytes, "Update me if serialization has changed");
+ 
+         // Assert the size of the execution.
+         assert!(matches!(transaction, Transaction::Execute(_, _, _)));
+         if let Transaction::Execute(_, execution, _) = &transaction {
+             let execution_size_in_bytes = execution.to_bytes_le().unwrap().len();
+-            assert_eq!(2055, execution_size_in_bytes, "Update me if serialization has changed");
++            assert_eq!(2087, execution_size_in_bytes, "Update me if serialization has changed");
+         }
+     }
+ 
+@@ -374,13 +374,13 @@ mod tests {
+ 
+         // Assert the size of the transaction.
+         let transaction_size_in_bytes = transaction.to_bytes_le().unwrap().len();
+-        assert_eq!(2134, transaction_size_in_bytes, "Update me if serialization has changed");
++        assert_eq!(2166, transaction_size_in_bytes, "Update me if serialization has changed");
+ 
+         // Assert the size of the execution.
+         assert!(matches!(transaction, Transaction::Execute(_, _, _)));
+         if let Transaction::Execute(_, execution, _) = &transaction {
+             let execution_size_in_bytes = execution.to_bytes_le().unwrap().len();
+-            assert_eq!(2099, execution_size_in_bytes, "Update me if serialization has changed");
++            assert_eq!(2131, execution_size_in_bytes, "Update me if serialization has changed");
+         }
+     }
+ 
+@@ -397,7 +397,7 @@ mod tests {
+         };
+         // Assert the size of the transition.
+         let fee_size_in_bytes = fee.to_bytes_le().unwrap().len();
+-        assert_eq!(2011, fee_size_in_bytes, "Update me if serialization has changed");
++        assert_eq!(2043, fee_size_in_bytes, "Update me if serialization has changed");
+     }
+ 
+     #[test]
+@@ -413,6 +413,6 @@ mod tests {
+         };
+         // Assert the size of the transition.
+         let fee_size_in_bytes = fee.to_bytes_le().unwrap().len();
+-        assert_eq!(1384, fee_size_in_bytes, "Update me if serialization has changed");
++        assert_eq!(1416, fee_size_in_bytes, "Update me if serialization has changed");
+     }
+ }
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/arrays_in_finalize.out b/synthesizer/tests/expectations/vm/execute_and_finalize/arrays_in_finalize.out
+index c932e5367..3c8c0a5f7 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/arrays_in_finalize.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/arrays_in_finalize.out
+@@ -15,4 +15,4 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"2476798995127334960005895658235454048189044193444863602770662307552278795852field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1y9t0y4lvhm43qdzlfjmfzh8985vfnx9ms368p07x5lsemet5ey8qt0ssjn,\n    21758u64\n  ]\n}"}'
++      - '{"type":"future","id":"4142282429236500615355458184132048110685981096704230785688374794403057659904field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1y9t0y4lvhm43qdzlfjmfzh8985vfnx9ms368p07x5lsemet5ey8qt0ssjn,\n    21790u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/child_and_parent.out b/synthesizer/tests/expectations/vm/execute_and_finalize/child_and_parent.out
+index 4613f0078..476d6d637 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/child_and_parent.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/child_and_parent.out
+@@ -22,7 +22,7 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"8038303756319041464205585758890772107103094147833742185831015274112242397170field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    1244u64\n  ]\n}"}'
++      - '{"type":"future","id":"4193852777105201569735062214533514773129433748132976330865503683138607715780field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    1276u64\n  ]\n}"}'
+ - child_outputs:
+     child.aleo/foo:
+       outputs:
+@@ -30,4 +30,4 @@ additional:
+       - '{"type":"public","id":"3917485763512771512439229660054620197118945473924338831496641922296791545909field","value":"aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx"}'
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"7679903120497926643469426574546065855464063047315663279655785799119197818907field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    2123u64\n  ]\n}"}'
++      - '{"type":"future","id":"4709277201101508382627424837739523940171678083116221637642206810066192947343field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    2187u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/complex_finalization.out b/synthesizer/tests/expectations/vm/execute_and_finalize/complex_finalization.out
+index da90b48b7..3fe036677 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/complex_finalization.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/complex_finalization.out
+@@ -23,4 +23,4 @@ additional:
+       - '{"type":"future","id":"1924141467746445803895332427121150983883397442046587101238781615037989484141field","value":"{\n  program_id: three_program.aleo,\n  function_name: e,\n  arguments: [\n    {\n      program_id: two_program.aleo,\n      function_name: b,\n      arguments: [\n        {\n          program_id: zero_program.aleo,\n          function_name: c,\n          arguments: [\n            aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8\n          ]\n        },\n        {\n          program_id: one_program.aleo,\n          function_name: d,\n          arguments: [\n            aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8\n          ]\n        },\n        aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8\n      ]\n    },\n    {\n      program_id: one_program.aleo,\n      function_name: d,\n      arguments: [\n        aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8\n      ]\n    },\n    {\n      program_id: zero_program.aleo,\n      function_name: c,\n      arguments: [\n        aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8\n      ]\n    },\n    aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8\n  ]\n}"}'
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"4126822102724917981256079566828474499468063069398209683935093613913514021138field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8,\n    1312883u64\n  ]\n}"}'
++      - '{"type":"future","id":"3917070306191507021417247334289380256159485279427720000635170701460828577188field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8,\n    1313203u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/count_usages.out b/synthesizer/tests/expectations/vm/execute_and_finalize/count_usages.out
+index a3e6bfa43..462b19bc6 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/count_usages.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/count_usages.out
+@@ -20,4 +20,4 @@ additional:
+       - '{"type":"future","id":"8376420147018709384724335862198143063714524641135069419096866845262064600524field","value":"{\n  program_id: basic_math.aleo,\n  function_name: sub_and_count,\n  arguments: [\n    aleo1mrughg5ssadd9fc2uwve7l6u24xn76kyz24zsjtzta03vgkq4vpqggl6fg\n  ]\n}"}'
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"6260909541720264746621909645500014575705106994088979439219462960066635095228field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8,\n    263392u64\n  ]\n}"}'
++      - '{"type":"future","id":"8324153878106944143887476538634343411354922556646605767561376149695827127954field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1kw4knandael9qcpxs6g36rr6h7dwvjz6q25ueah6zz9v57zjlvxsx5llq8,\n    263488u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/hello.out b/synthesizer/tests/expectations/vm/execute_and_finalize/hello.out
+index daf8680d4..9d6f61125 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/hello.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/hello.out
+@@ -34,16 +34,16 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"7906474663973043796048283030690525601153234950413516032749407211316830590611field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    1285u64\n  ]\n}"}'
++      - '{"type":"future","id":"723398708416943965679286433509907489867610392336969928855182538567932233441field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    1317u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"4986645378558620768411028218075955547643001067189312101390486886806339263135field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    1285u64\n  ]\n}"}'
++      - '{"type":"future","id":"7500061893088709501926458874103429937756473156907366818228322418371799987083field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    1317u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"5042637910997219548198459244163194670599413522595257047810590515596700797862field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    5334u64\n  ]\n}"}'
++      - '{"type":"future","id":"767846553614807977239719420369516970523795400922031195070118946602953295894field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    5366u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"1608310067080883240382072451203651565784203539071743117295230341585705099606field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    5334u64\n  ]\n}"}'
++      - '{"type":"future","id":"3684392356443869477382230822477215940928201767871507287501762026606131450149field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo10knkelvnd55fsaarm25wch7p9suf2tqlgwy5k4nxwms6d262xyfqm2tccr,\n    5366u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/mapping_operations.out b/synthesizer/tests/expectations/vm/execute_and_finalize/mapping_operations.out
+index 8aa61ade0..2e7a5fd33 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/mapping_operations.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/mapping_operations.out
+@@ -32,16 +32,16 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"3650557045662795765128227441824141380803288967908940644428422428167011339441field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    11245u64\n  ]\n}"}'
++      - '{"type":"future","id":"4231981562230118887771148803779105717607845231959193592368421734187691782226field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    11277u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"3620478332538502782812242728702848880528883213602671188379828492788562304407field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    154810u64\n  ]\n}"}'
++      - '{"type":"future","id":"2092697046318791120140968816339851333886436511238705667711902517471851427507field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    154842u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"2964198291690383602020631875256968523060877520512567622589116733179614057067field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    154810u64\n  ]\n}"}'
++      - '{"type":"future","id":"5451185020177869968712311682344650503963494688356610676016967063974610448346field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    154842u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"3020010695955343053148471079248966957289673742622392677872488217076402723391field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    154810u64\n  ]\n}"}'
++      - '{"type":"future","id":"2284917219703505613501488644232038072426366368973461661148269133200617380349field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1eakarna6a70pg9r0l9qal20faejwctgur5xt7lnc2a42wj2yssfqc89rk8,\n    154842u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/mint_and_split.out b/synthesizer/tests/expectations/vm/execute_and_finalize/mint_and_split.out
+index 6a6fe1d76..f791a869a 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/mint_and_split.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/mint_and_split.out
+@@ -13,6 +13,6 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"8121404646185643523817169669755623614020572191631587303252879200167824265866field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo19e6k5ferx3k8a9k79xtj4uuaztt2jl4eza7k43pygsu977yazypqqwdmw6,\n    1414u64\n  ]\n}"}'
++      - '{"type":"future","id":"2158022471677595094455860012302752744522806829113696165327761361044312438720field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo19e6k5ferx3k8a9k79xtj4uuaztt2jl4eza7k43pygsu977yazypqqwdmw6,\n    1446u64\n  ]\n}"}'
+ - {}
+ - {}
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/program_callable.out b/synthesizer/tests/expectations/vm/execute_and_finalize/program_callable.out
+index f1d3608f5..2281c7042 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/program_callable.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/program_callable.out
+@@ -20,4 +20,4 @@ additional:
+       - '{"type":"public","id":"1098600096063596467886239395047240422541419832572815880494064602469155799505field","value":"aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx"}'
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"1893339967665850940775218212916106697902425076268110566466167393920804071573field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    2123u64\n  ]\n}"}'
++      - '{"type":"future","id":"501793283007282228322391938555677583342117982886938779668675863727551099142field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    2187u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/public_wallet.out b/synthesizer/tests/expectations/vm/execute_and_finalize/public_wallet.out
+index 86b208adf..8c14c6e65 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/public_wallet.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/public_wallet.out
+@@ -14,4 +14,4 @@ additional:
+       - '{"type":"future","id":"6870476253411913047431672168259118946802015453568356666196082705096404310887field","value":"{\n  program_id: token.aleo,\n  function_name: mint_public,\n  arguments: [\n    aleo1sry3pke49ykrf0aeshf889tr98r4c86p5f4ms766795ssdwfdyqq9jdg0j,\n    10u64\n  ]\n}"}'
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"546462310004815308785340027890541933050085460472488305954420334597248699563field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1d3e2je2m2hsxwdsvntvf4jnnlj459ywfry6ch2qwrpy6l6r6yvpq8e88h5,\n    131201u64\n  ]\n}"}'
++      - '{"type":"future","id":"5525308133544540763757385329943115018858161100889529786580724367369238892field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1d3e2je2m2hsxwdsvntvf4jnnlj459ywfry6ch2qwrpy6l6r6yvpq8e88h5,\n    131265u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/read_external_mapping.out b/synthesizer/tests/expectations/vm/execute_and_finalize/read_external_mapping.out
+index 1fdcaac0d..981eab75c 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/read_external_mapping.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/read_external_mapping.out
+@@ -50,24 +50,24 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"287714326547065147632386041381462772277143739683750779413781861533324542908field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28479u64\n  ]\n}"}'
++      - '{"type":"future","id":"1980579904176887149609836662057476775778939283569912608145754425251637674937field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28511u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"6649629637207372964857345430403866145654153614971187041628192785611251123180field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28507u64\n  ]\n}"}'
++      - '{"type":"future","id":"5447803391825137175441907904975044117223783214516201758332272734273947792008field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28539u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"6313149385997960507862814561552986754297687946640717773734483139258266930884field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1f6eg623knp66cwx0926w3plgdgzcmfpgyrzgnjz90mucgs3z7s9qls4upm,\n    101210u64\n  ]\n}"}'
++      - '{"type":"future","id":"3860882066519028066548084960516274925487614453365218041993564070381791439271field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1f6eg623knp66cwx0926w3plgdgzcmfpgyrzgnjz90mucgs3z7s9qls4upm,\n    101242u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"4275231109424124634535800322540895777297870484284382855497078926857012238518field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28479u64\n  ]\n}"}'
++      - '{"type":"future","id":"6950398885728475979865392048432051837738192098568760171018607474283886122052field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28511u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"4672593758915782759444776821290902637872156268641425969525459952369605821638field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1f6eg623knp66cwx0926w3plgdgzcmfpgyrzgnjz90mucgs3z7s9qls4upm,\n    101214u64\n  ]\n}"}'
++      - '{"type":"future","id":"1611419113948590934439813710994891232204055145464765197156009306482292108171field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1f6eg623knp66cwx0926w3plgdgzcmfpgyrzgnjz90mucgs3z7s9qls4upm,\n    101246u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"4563984273654878917898732677226757277037946841102836189913527591453113921149field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28479u64\n  ]\n}"}'
++      - '{"type":"future","id":"4567702067011150795800469439274536831772194733575217584709850797127644395715field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1xe2fps8f9xpdas2q0fqy22uraenk84tvvzetrsyxgnwy6445h59s6wv78x,\n    28511u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/test_branch.out b/synthesizer/tests/expectations/vm/execute_and_finalize/test_branch.out
+index 7c49e6744..7a740e732 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/test_branch.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/test_branch.out
+@@ -25,12 +25,12 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"6940404295839257166773786677864202896936117578403567412842677588206657634231field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1x3r205zqql5ywy0cqqt74k0r0htuusn0d037ycxe8ftt9ep8hyzsmqz4dh,\n    17268u64\n  ]\n}"}'
++      - '{"type":"future","id":"1171608727776431644975750070732912123034332726467525754602888924054094288537field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1x3r205zqql5ywy0cqqt74k0r0htuusn0d037ycxe8ftt9ep8hyzsmqz4dh,\n    17300u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"7204592238320861038815794761930169044297399772374442647756219229048743123164field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1x3r205zqql5ywy0cqqt74k0r0htuusn0d037ycxe8ftt9ep8hyzsmqz4dh,\n    17268u64\n  ]\n}"}'
++      - '{"type":"future","id":"7463420514229578917100663094481004916008770860159447604880946437006571567641field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1x3r205zqql5ywy0cqqt74k0r0htuusn0d037ycxe8ftt9ep8hyzsmqz4dh,\n    17300u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"6592199022535314305941469788916413763767223102452838589981136115277934350646field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1x3r205zqql5ywy0cqqt74k0r0htuusn0d037ycxe8ftt9ep8hyzsmqz4dh,\n    17268u64\n  ]\n}"}'
++      - '{"type":"future","id":"6487859374829903867805258250383686562413912996473658489745407025850659518586field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1x3r205zqql5ywy0cqqt74k0r0htuusn0d037ycxe8ftt9ep8hyzsmqz4dh,\n    17300u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out b/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
+index 0f83b86e5..532aef5b2 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/test_rand.out
+@@ -19,7 +19,7 @@ outputs:
+     test_rand.aleo/rand_chacha_check:
+       outputs:
+       - '{"type":"future","id":"488590592441422127997725386233571306457829570948543232762424611162021835080field","value":"{\n  program_id: test_rand.aleo,\n  function_name: rand_chacha_check,\n  arguments: [\n    0field,\n    false\n  ]\n}"}'
+-  speculate: the execution was rejected
++  speculate: the execution was accepted
+   add_next_block: succeeded.
+ - verified: true
+   execute:
+@@ -32,16 +32,16 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"5434435027697006436788114543338997352452472129161114538117990254445136075185field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    601806u64\n  ]\n}"}'
++      - '{"type":"future","id":"688232565550074479957237991079250189610291259825289272252652272917330731838field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    601838u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"1455465546409944304007956260384028107498636362872802223193183597053222860412field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    26679u64\n  ]\n}"}'
++      - '{"type":"future","id":"4312563321279759209886042118500602385599041356791262942076841476719411110110field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    26711u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"3897237322641678007226763707031207042005562444025847421658930358169707454055field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    28344u64\n  ]\n}"}'
++      - '{"type":"future","id":"4462067028953176194433456128612215180254915580822913622860423763786957990093field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    28376u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"3612589588414986325528303980793223423887868113647957048451367367231068740385field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    28344u64\n  ]\n}"}'
++      - '{"type":"future","id":"7019143888326425189688317194740968171760456342747217065687761270408913083348field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1uchf7kruskpp8thlnfeya9qeklcjss27j6rtu74zz7ch559neqystgslsp,\n    28376u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/timelock.out b/synthesizer/tests/expectations/vm/execute_and_finalize/timelock.out
+index e2f399d0c..fb8c6b56d 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/timelock.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/timelock.out
+@@ -18,8 +18,8 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"1981714784621045992744318877440212508684512329787653326579443667006655157948field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo12tksdptp7hvxly8tkm3um08fvf53qpehsgdgqfvy9pe3sewcq5ysjg5myy,\n    5164u64\n  ]\n}"}'
++      - '{"type":"future","id":"6311501351515915084600267933817246658800627224158118036734300141828790673821field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo12tksdptp7hvxly8tkm3um08fvf53qpehsgdgqfvy9pe3sewcq5ysjg5myy,\n    5196u64\n  ]\n}"}'
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"4220420961055570727047249271117595746967454704804978518496773456626487015950field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo12tksdptp7hvxly8tkm3um08fvf53qpehsgdgqfvy9pe3sewcq5ysjg5myy,\n    5164u64\n  ]\n}"}'
++      - '{"type":"future","id":"3727428454041721032579660663546168001221206494621052639644496834224868473189field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo12tksdptp7hvxly8tkm3um08fvf53qpehsgdgqfvy9pe3sewcq5ysjg5myy,\n    5196u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/unused_position.out b/synthesizer/tests/expectations/vm/execute_and_finalize/unused_position.out
+index f975c5d74..71a183aa9 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/unused_position.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/unused_position.out
+@@ -11,4 +11,4 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"845968501377643125837736950607122134527128597439414117623743716037006712304field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo12tksdptp7hvxly8tkm3um08fvf53qpehsgdgqfvy9pe3sewcq5ysjg5myy,\n    2176u64\n  ]\n}"}'
++      - '{"type":"future","id":"2621696734847465496099117263198227992906624839872816115893439464172566198419field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo12tksdptp7hvxly8tkm3um08fvf53qpehsgdgqfvy9pe3sewcq5ysjg5myy,\n    2208u64\n  ]\n}"}'
+diff --git a/synthesizer/tests/expectations/vm/execute_and_finalize/user_callable.out b/synthesizer/tests/expectations/vm/execute_and_finalize/user_callable.out
+index 41ce5f161..6bbde6d25 100644
+--- a/synthesizer/tests/expectations/vm/execute_and_finalize/user_callable.out
++++ b/synthesizer/tests/expectations/vm/execute_and_finalize/user_callable.out
+@@ -13,5 +13,5 @@ additional:
+ - child_outputs:
+     credits.aleo/fee_public:
+       outputs:
+-      - '{"type":"future","id":"8038303756319041464205585758890772107103094147833742185831015274112242397170field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    1244u64\n  ]\n}"}'
++      - '{"type":"future","id":"4193852777105201569735062214533514773129433748132976330865503683138607715780field","value":"{\n  program_id: credits.aleo,\n  function_name: fee_public,\n  arguments: [\n    aleo1qr2ha4pfs5l28aze88yn6fhleeythklkczrule2v838uwj65n5gqxt9djx,\n    1276u64\n  ]\n}"}'
+ - {}
+diff --git a/vm/package/run.rs b/vm/package/run.rs
+index 54b1520ea..59ace04ac 100644
+--- a/vm/package/run.rs
++++ b/vm/package/run.rs
+@@ -53,7 +53,7 @@ impl<N: Network> Package<N> {
+         // Initialize the call stack.
+         let call_stack = CallStack::PackageRun(vec![request], *private_key, assignments.clone());
+         // Synthesize the circuit.
+-        let response = stack.execute_function::<A, R>(call_stack, None, rng)?;
++        let response = stack.execute_function::<A, R>(call_stack, None, None, rng)?;
+         // Retrieve the call metrics.
+         let call_metrics = assignments.read().iter().map(|(_, metrics)| *metrics).collect::<Vec<_>>();
+         // Return the response and call metrics.

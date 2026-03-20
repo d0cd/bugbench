@@ -1,13 +1,288 @@
-diff --git a/packages/grafana-openapi/package.json b/packages/grafana-openapi/package.json
-index 7217d330722..dcda0e9c06d 100644
---- a/packages/grafana-openapi/package.json
-+++ b/packages/grafana-openapi/package.json
-@@ -13,7 +13,7 @@
-   "sideEffects": false,
-   "repository": {
-     "type": "git",
--    "url": "git+http://github.com/grafana/grafana.git",
-+    "url": "http://github.com/grafana/grafana.git",
-     "directory": "packages/grafana-openapi"
-   },
-   "exports": {
+diff --git a/.github/actions/change-detection/action.yml b/.github/actions/change-detection/action.yml
+index fa52fa9031a51..c485931b018a0 100644
+--- a/.github/actions/change-detection/action.yml
++++ b/.github/actions/change-detection/action.yml
+@@ -62,6 +62,7 @@ runs:
+             - '!docs/**'
+             - '!.github/**'
+             - '.github/actions/setup-enterprise/**'
++            - '.github/actions/setup-go/**'
+             - '.github/actions/checkout/**'
+             - '**/go.mod'
+             - '**/go.sum'
+diff --git a/packages/grafana-ui/src/components/Combobox/Combobox.tsx b/packages/grafana-ui/src/components/Combobox/Combobox.tsx
+index 1ea4b5ba05b7a..1eb0171b75a9d 100644
+--- a/packages/grafana-ui/src/components/Combobox/Combobox.tsx
++++ b/packages/grafana-ui/src/components/Combobox/Combobox.tsx
+@@ -164,6 +164,7 @@ export const Combobox = <T extends string | number>(props: ComboboxProps<T>) =>
+     updateOptions,
+     asyncLoading,
+     asyncError,
++    resetSearch,
+   } = useOptions(props.options, createCustomValue, customValueDescription);
+   const isAsync = typeof allOptions === 'function';
+ 
+@@ -293,6 +294,10 @@ export const Combobox = <T extends string | number>(props: ComboboxProps<T>) =>
+       if (isOpen && inputValue === '') {
+         updateOptions(inputValue);
+       }
++
++      if (!isOpen) {
++        resetSearch();
++      }
+     },
+ 
+     onHighlightedIndexChange: ({ highlightedIndex, type }) => {
+diff --git a/packages/grafana-ui/src/components/Combobox/useOptions.test.ts b/packages/grafana-ui/src/components/Combobox/useOptions.test.ts
+index ed5c58da61f41..24f8cc98f97c5 100644
+--- a/packages/grafana-ui/src/components/Combobox/useOptions.test.ts
++++ b/packages/grafana-ui/src/components/Combobox/useOptions.test.ts
+@@ -117,6 +117,27 @@ describe('useOptions', () => {
+     expect(result.current.asyncLoading).toBe(false);
+     expect(result.current.asyncError).toBe(true);
+   });
++
++  it('should be able to reset search', async () => {
++    jest.spyOn(console, 'error').mockImplementation();
++
++    const options = Array.from({ length: 100 }, (_, i) => ({ label: `Option ${i}`, value: i }));
++    const { result } = renderHook(() => useOptions(options, false));
++
++    expect(result.current.options).toEqual(options);
++
++    act(() => {
++      result.current.updateOptions('Option 50');
++    });
++
++    expect(result.current.options).toEqual([{ label: 'Option 50', value: 50 }]);
++
++    act(() => {
++      result.current.resetSearch();
++    });
++
++    expect(result.current.options).toEqual(options);
++  });
+ });
+ 
+ describe('sortByGroup', () => {
+diff --git a/packages/grafana-ui/src/components/Combobox/useOptions.ts b/packages/grafana-ui/src/components/Combobox/useOptions.ts
+index 7b0c5c77b6cf6..a46367b98adf6 100644
+--- a/packages/grafana-ui/src/components/Combobox/useOptions.ts
++++ b/packages/grafana-ui/src/components/Combobox/useOptions.ts
+@@ -120,7 +120,11 @@ export function useOptions<T extends string | number>(
+     return [addCustomValue(options), groupStartIndices];
+   }, [filteredOptions, addCustomValue]);
+ 
+-  return { options: finalOptions, groupStartIndices, updateOptions, asyncLoading, asyncError };
++  const resetSearch = useCallback(() => {
++    setUserTypedSearch('');
++  }, []);
++
++  return { options: finalOptions, groupStartIndices, updateOptions, asyncLoading, asyncError, resetSearch };
+ }
+ 
+ /**
+diff --git a/pkg/services/rendering/auth_test.go b/pkg/services/rendering/auth_test.go
+new file mode 100644
+index 0000000000000..f396d8f3abcaf
+--- /dev/null
++++ b/pkg/services/rendering/auth_test.go
+@@ -0,0 +1,177 @@
++package rendering
++
++import (
++	"encoding/base64"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/golang-jwt/jwt/v4"
++	"github.com/stretchr/testify/require"
++
++	"github.com/grafana/grafana/pkg/infra/log"
++	"github.com/grafana/grafana/pkg/setting"
++)
++
++func TestRenderingService_GetRenderUserFromJWT(t *testing.T) {
++	const authToken = "render-secret"
++
++	rs := &RenderingService{
++		Cfg: &setting.Cfg{
++			RendererAuthToken: authToken,
++		},
++		log: log.NewNopLogger(),
++	}
++
++	t.Run("returns render user from valid token", func(t *testing.T) {
++		key := mustSignRenderJWT(t, authToken, renderJWT{
++			RenderUser: &RenderUser{
++				OrgID:   1,
++				UserID:  2,
++				OrgRole: "Viewer",
++			},
++			RegisteredClaims: jwt.RegisteredClaims{
++				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
++			},
++		})
++
++		renderUser := rs.getRenderUserFromJWT(key)
++		require.NotNil(t, renderUser)
++		require.Equal(t, &RenderUser{OrgID: 1, UserID: 2, OrgRole: "Viewer"}, renderUser)
++	})
++
++	t.Run("returns nil when render user is null", func(t *testing.T) {
++		key := mustSignRenderJWT(t, authToken, renderJWT{
++			RenderUser: nil,
++			RegisteredClaims: jwt.RegisteredClaims{
++				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
++			},
++		})
++
++		renderUser := rs.getRenderUserFromJWT(key)
++		require.Nil(t, renderUser)
++	})
++
++	t.Run("returns nil for jwt signed with unexpected algorithm", func(t *testing.T) {
++		token := jwt.NewWithClaims(jwt.SigningMethodHS256, renderJWT{
++			RenderUser: &RenderUser{
++				OrgID:   7,
++				UserID:  9,
++				OrgRole: "Admin",
++			},
++			RegisteredClaims: jwt.RegisteredClaims{
++				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
++			},
++		})
++
++		key, err := token.SignedString([]byte(authToken))
++		require.NoError(t, err)
++
++		require.Nil(t, rs.getRenderUserFromJWT(key))
++	})
++
++	t.Run("returns nil for expired token", func(t *testing.T) {
++		key := mustSignRenderJWT(t, authToken, renderJWT{
++			RenderUser: &RenderUser{
++				OrgID:   1,
++				UserID:  2,
++				OrgRole: "Viewer",
++			},
++			RegisteredClaims: jwt.RegisteredClaims{
++				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(-time.Hour)),
++			},
++		})
++
++		require.Nil(t, rs.getRenderUserFromJWT(key))
++	})
++
++	t.Run("returns nil for token signed with wrong key", func(t *testing.T) {
++		key := mustSignRenderJWT(t, "wrong-secret", renderJWT{
++			RenderUser: &RenderUser{
++				OrgID:   1,
++				UserID:  2,
++				OrgRole: "Admin",
++			},
++			RegisteredClaims: jwt.RegisteredClaims{
++				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
++			},
++		})
++
++		require.Nil(t, rs.getRenderUserFromJWT(key))
++	})
++
++	t.Run("returns nil for invalid JWTs", func(t *testing.T) {
++		require.Nil(t, rs.getRenderUserFromJWT(""))
++
++		require.Nil(t, rs.getRenderUserFromJWT("not.a.jwt"))
++
++		key, err := jwt.SigningMethodHS512.Sign("null", []byte(authToken))
++		require.NoError(t, err)
++		require.Nil(t, rs.getRenderUserFromJWT(key))
++
++		key, err = jwt.SigningMethodHS512.Sign("", []byte(authToken))
++		require.NoError(t, err)
++		require.Nil(t, rs.getRenderUserFromJWT(key))
++
++		// missing parts, raw
++		key, err = jwt.SigningMethodHS512.Sign(base64.RawURLEncoding.EncodeToString([]byte(`{"exp":4102444800}`)), []byte(authToken))
++		require.NoError(t, err)
++		require.Nil(t, rs.getRenderUserFromJWT(key))
++
++		key, err = jwt.SigningMethodHS512.Sign(base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS512","typ":"JWT"}`)), []byte(authToken))
++		require.NoError(t, err)
++		require.Nil(t, rs.getRenderUserFromJWT(key))
++	})
++
++	t.Run("returns nil for weak auth cases", func(t *testing.T) {
++		claims := renderJWT{
++			RenderUser: &RenderUser{
++				OrgID:   1,
++				UserID:  2,
++				OrgRole: "Admin",
++			},
++			RegisteredClaims: jwt.RegisteredClaims{
++				ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
++			},
++		}
++
++		t.Run("alg:none", func(t *testing.T) {
++			token := jwt.NewWithClaims(jwt.SigningMethodNone, claims)
++			key, err := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
++			require.NoError(t, err)
++
++			require.Nil(t, rs.getRenderUserFromJWT(key))
++		})
++
++		t.Run("blank secret", func(t *testing.T) {
++			token := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
++			key, err := token.SignedString([]byte(""))
++			require.NoError(t, err)
++
++			require.Nil(t, rs.getRenderUserFromJWT(key))
++		})
++
++		t.Run("null signature", func(t *testing.T) {
++			token := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
++			key, err := token.SignedString([]byte(authToken))
++			require.NoError(t, err)
++
++			// Strip the signature: keep "header.payload." with a trailing dot.
++			parts := strings.SplitN(key, ".", 3)
++			require.Len(t, parts, 3)
++
++			nullSig := parts[0] + "." + parts[1] + "."
++			require.Nil(t, rs.getRenderUserFromJWT(nullSig))
++		})
++	})
++}
++
++func mustSignRenderJWT(t *testing.T, authToken string, claims renderJWT) string {
++	t.Helper()
++
++	token := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
++	key, err := token.SignedString([]byte(authToken))
++	require.NoError(t, err)
++
++	return key
++}
+diff --git a/public/app/features/alerting/unified/AGENTS.md b/public/app/features/alerting/unified/AGENTS.md
+index a9c77a2510d04..b6bdb411f9e5f 100644
+--- a/public/app/features/alerting/unified/AGENTS.md
++++ b/public/app/features/alerting/unified/AGENTS.md
+@@ -553,6 +553,16 @@ gh pr view 67890
+ gh pr diff 67890
+ ```
+ 
++## Learning from Corrections
++
++When the user corrects a mistake you made (wrong API, wrong pattern, wrong approach), assess whether the correction represents a recurring pattern worth documenting. If so, propose a concise addition to this AGENTS.md — but do **NOT** apply it without explicit approval.
++
++Skip proposing an update if the correction is:
++
++- A one-off or highly context-specific fix
++- Already documented in this file
++- A personal preference rather than a project convention
++
+ ## Getting Help
+ 
+ - Check patterns in existing `components/` code

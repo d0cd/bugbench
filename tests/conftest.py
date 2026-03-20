@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -17,6 +18,7 @@ from bugeval.models import (
     Severity,
     TestCase,
 )
+from bugeval.pr_eval_models import JudgingConfig
 
 
 def make_case(**kwargs: Any) -> TestCase:
@@ -38,6 +40,17 @@ def make_case(**kwargs: Any) -> TestCase:
     }
     defaults.update(kwargs)
     return TestCase(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_judging_config() -> Any:
+    """Prevent tests from reading config/config.yaml for judge ensemble models.
+
+    Tests that need specific ensemble configs patch default_judging themselves.
+    """
+    default = JudgingConfig()
+    with patch("bugeval.judge.default_judging", return_value=default):
+        yield
 
 
 def _init_repo(path: Path) -> Path:

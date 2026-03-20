@@ -1,0 +1,1238 @@
+diff --git a/adapters/saml/core/src/main/java/org/keycloak/adapters/saml/profile/AbstractSamlAuthenticationHandler.java b/adapters/saml/core/src/main/java/org/keycloak/adapters/saml/profile/AbstractSamlAuthenticationHandler.java
+index dd8bca3e0cef..7b55b04730eb 100644
+--- a/adapters/saml/core/src/main/java/org/keycloak/adapters/saml/profile/AbstractSamlAuthenticationHandler.java
++++ b/adapters/saml/core/src/main/java/org/keycloak/adapters/saml/profile/AbstractSamlAuthenticationHandler.java
+@@ -29,7 +29,6 @@
+ import java.util.Set;
+ import javax.xml.crypto.dsig.XMLSignature;
+ import javax.xml.datatype.XMLGregorianCalendar;
+-import javax.xml.namespace.QName;
+ 
+ import org.keycloak.adapters.saml.AbstractInitiateLogin;
+ import org.keycloak.adapters.saml.AdapterConstants;
+@@ -70,7 +69,6 @@
+ import org.keycloak.saml.SAMLRequestParser;
+ import org.keycloak.saml.SignatureAlgorithm;
+ import org.keycloak.saml.common.constants.GeneralConstants;
+-import org.keycloak.saml.common.constants.JBossSAMLConstants;
+ import org.keycloak.saml.common.constants.JBossSAMLURIConstants;
+ import org.keycloak.saml.common.exceptions.ConfigurationException;
+ import org.keycloak.saml.common.exceptions.ProcessingException;
+@@ -81,7 +79,6 @@
+ import org.keycloak.saml.processing.core.saml.v2.util.AssertionUtil;
+ import org.keycloak.saml.processing.core.util.KeycloakKeySamlExtensionGenerator;
+ import org.keycloak.saml.processing.core.util.RedirectBindingSignatureUtil;
+-import org.keycloak.saml.processing.core.util.XMLEncryptionUtil;
+ import org.keycloak.saml.processing.web.util.PostBindingUtil;
+ import org.keycloak.saml.validators.ConditionsValidator;
+ import org.keycloak.saml.validators.DestinationValidator;
+@@ -377,8 +374,15 @@ protected AuthOutcome handleLoginResponse(SAMLDocumentHolder responseHolder, boo
+         } else if (!isSuccessfulSamlResponse(responseType) || responseType.getAssertions() == null || responseType.getAssertions().isEmpty()) {
+             return failed(createAuthChallenge403(responseType));
+         }
++
++        Element assertionElement = null;
++        boolean isAssertionEncrypted = false;
+         try {
+-            assertion = AssertionUtil.getAssertion(responseHolder, responseType, deployment.getDecryptionKey());
++            isAssertionEncrypted = AssertionUtil.isAssertionEncrypted(responseType);
++            assertionElement = isAssertionEncrypted
++                    ? AssertionUtil.decryptAssertion(responseType, deployment.getDecryptionKey())
++                    : AssertionUtil.getAssertionElement(responseHolder);
++            assertion = responseType.getAssertions().get(0).getAssertion();
+             ConditionsValidator.Builder cvb = new ConditionsValidator.Builder(assertion.getID(), assertion.getConditions(), destinationValidator);
+             SubjectConfirmationDataValidator.Builder scdvb = new SubjectConfirmationDataValidator.Builder(assertion.getID(), getSubjectConfirmationData(assertion), destinationValidator)
+                     .clockSkewInMillis(deployment.getIDP().getAllowedClockSkew());
+@@ -403,10 +407,11 @@ protected AuthOutcome handleLoginResponse(SAMLDocumentHolder responseHolder, boo
+             return failed(CHALLENGE_EXTRACTION_FAILURE);
+         }
+ 
+-        Element assertionElement = null;
+-        if (deployment.getIDP().getSingleSignOnService().validateAssertionSignature()) {
++        if (deployment.getIDP().getSingleSignOnService().validateAssertionSignature()
++                || (deployment.getIDP().getSingleSignOnService().validateResponseSignature()
++                && postBinding && isAssertionEncrypted
++                && !AssertionUtil.isSignedElement(responseHolder.getSamlDocument().getDocumentElement()))) {
+             try {
+-                assertionElement = getAssertionFromResponse(responseHolder);
+                 if (!AssertionUtil.isSignatureValid(assertionElement, deployment.getIDP().getSignatureValidationKeyLocator())) {
+                     log.error("Failed to verify saml assertion signature");
+                     return failed(CHALLENGE_INVALID_SIGNATURE);
+@@ -492,10 +497,6 @@ protected AuthOutcome handleLoginResponse(SAMLDocumentHolder responseHolder, boo
+ 
+         URI nameFormat = subjectNameID == null ? null : subjectNameID.getFormat();
+         String nameFormatString = nameFormat == null ? JBossSAMLURIConstants.NAMEID_FORMAT_UNSPECIFIED.get() : nameFormat.toString();
+-        if (deployment.isKeepDOMAssertion() && assertionElement == null) {
+-            // obtain the assertion from the response to add the DOM document to the principal
+-            assertionElement = getAssertionFromResponseNoException(responseHolder);
+-        }
+         final SamlPrincipal principal = new SamlPrincipal(assertion,
+                 deployment.isKeepDOMAssertion()? getAssertionDocumentFromElement(assertionElement) : null,
+                 principalName, principalName, nameFormatString, attributes, friendlyAttributes);
+@@ -569,28 +570,6 @@ private boolean isRetrayableSamlResponse(ResponseType responseType) {
+           && Objects.equals(status.getStatusCode().getStatusCode().getValue().toString(), JBossSAMLURIConstants.STATUS_AUTHNFAILED.get());
+     }
+ 
+-    private Element getAssertionFromResponse(final SAMLDocumentHolder responseHolder) throws ConfigurationException, ProcessingException {
+-        Element encryptedAssertion = DocumentUtil.getElement(responseHolder.getSamlDocument(), new QName(JBossSAMLConstants.ENCRYPTED_ASSERTION.get()));
+-        if (encryptedAssertion != null) {
+-            // encrypted assertion.
+-            // We'll need to decrypt it first.
+-            Document encryptedAssertionDocument = DocumentUtil.createDocument();
+-            encryptedAssertionDocument.appendChild(encryptedAssertionDocument.importNode(encryptedAssertion, true));
+-
+-            return XMLEncryptionUtil.decryptElementInDocument(encryptedAssertionDocument, data -> Collections.singletonList(deployment.getDecryptionKey()));
+-        }
+-        return DocumentUtil.getElement(responseHolder.getSamlDocument(), new QName(JBossSAMLConstants.ASSERTION.get()));
+-    }
+-
+-    private Element getAssertionFromResponseNoException(final SAMLDocumentHolder responseHolder) {
+-        try {
+-            return getAssertionFromResponse(responseHolder);
+-        } catch (ConfigurationException|ProcessingException e) {
+-            log.warn("Cannot obtain DOM assertion element", e);
+-            return null;
+-        }
+-    }
+-
+     private Document getAssertionDocumentFromElement(final Element assertionElement) {
+         if (assertionElement == null) {
+             return null;
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmCacheSession.java b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmCacheSession.java
+index 1077b3d8898e..65532da6f460 100755
+--- a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmCacheSession.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RealmCacheSession.java
+@@ -484,6 +484,12 @@ public RealmModel getRealm(String id) {
+         return adapter;
+     }
+ 
++    /**
++     * Cache that we've triggered an admin role invalidation in this session already.
++     * This avoids loading the admin role again from the database
++     */
++    private boolean adminRoleInvalidated;
++
+     private RealmAdapter prepareCachedRealm(String id, KeycloakSession session) {
+         CachedRealm cached = cache.get(id, CachedRealm.class);
+         RealmAdapter adapter;
+@@ -494,17 +500,15 @@ private RealmAdapter prepareCachedRealm(String id, KeycloakSession session) {
+                 return null;
+             }
+ 
+-            // to accommodate imports of new realms, check to see if the master admin role is up-to-date
+-            if (!model.getName().equals(Config.getAdminRealm())) {
++            // To accommodate imports of new realms in a separate process, always evict the admin role.
++            // As an alternative, one could iterate through all composite roles of the Admin role, but that would
++            // load about 20 roles per realm to the cache which is also inefficient.
++            if (!adminRoleInvalidated && !model.getName().equals(Config.getAdminRealm())) {
+                 RealmModel adminRealm = session.realms().getRealmByName(Config.getAdminRealm());
+                 if (adminRealm != null) {
+-                    ClientModel clientModel = session.clients().getClientByClientId(adminRealm, model.getName() + "-realm");
+-                    if (clientModel != null) {
+-                        RoleModel adminRole = adminRealm.getRole(AdminRoles.ADMIN);
+-                        if (adminRole.getCompositesStream().noneMatch(r -> (r.isClientRole() && r.getContainerId().equals(clientModel.getId())))) {
+-                            registerRoleInvalidation(adminRole.getId(), adminRole.getName(), adminRole.getContainerId());
+-                        }
+-                    }
++                    RoleModel adminRole = adminRealm.getRole(AdminRoles.ADMIN);
++                    invalidateRole(adminRole.getId());
++                    adminRoleInvalidated = true;
+                 }
+             }
+ 
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RoleAdapter.java b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RoleAdapter.java
+index 5998a4752369..f92ab8e6ceab 100755
+--- a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RoleAdapter.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/RoleAdapter.java
+@@ -121,7 +121,7 @@ public void setName(String name) {
+     @Override
+     public boolean isComposite() {
+         if (isUpdated()) return updated.isComposite();
+-        return cached.isComposite();
++        return cached.isComposite(session, this::getRoleModel);
+     }
+ 
+     @Override
+diff --git a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRole.java b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRole.java
+index e912ee9e1245..affa9e69f117 100755
+--- a/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRole.java
++++ b/model/infinispan/src/main/java/org/keycloak/models/cache/infinispan/entities/CachedRole.java
+@@ -38,7 +38,6 @@ public class CachedRole extends AbstractRevisioned implements InRealm {
+     final protected String name;
+     final protected String realm;
+     final protected String description;
+-    protected boolean composite;
+     final protected LazyLoader<RoleModel, Set<String>> composites;
+     /**
+      * Use this so the cache invalidation can retrieve any previously cached role mappings to determine if this
+@@ -49,15 +48,10 @@ public class CachedRole extends AbstractRevisioned implements InRealm {
+ 
+     public CachedRole(Long revision, RoleModel model, RealmModel realm) {
+         super(revision, model.getId());
+-        composite = model.isComposite();
+         description = model.getDescription();
+         name = model.getName();
+         this.realm = realm.getId();
+-        if (composite) {
+-            composites = new DefaultLazyLoader<>(roleModel -> roleModel.getCompositesStream().map(RoleModel::getId).collect(Collectors.toSet()), HashSet::new);
+-        } else {
+-            composites = new DefaultLazyLoader<>(roleModel -> new HashSet<>(), HashSet::new);
+-        }
++        composites = new DefaultLazyLoader<>(roleModel -> roleModel.getCompositesStream().map(RoleModel::getId).collect(Collectors.toSet()), HashSet::new);
+         attributes = new DefaultLazyLoader<>(roleModel -> new MultivaluedHashMap<>(roleModel.getAttributes()), MultivaluedHashMap::new);
+     }
+ 
+@@ -73,13 +67,12 @@ public String getDescription() {
+         return description;
+     }
+ 
+-    public boolean isComposite() {
+-        return composite;
++    public boolean isComposite(KeycloakSession session, Supplier<RoleModel> roleModel) {
++        return !getComposites(session, roleModel).isEmpty();
+     }
+ 
+     public Set<String> getComposites(KeycloakSession session, Supplier<RoleModel> roleModel) {
+         cachedComposites = composites.get(session, roleModel);
+-        composite = !cachedComposites.isEmpty();
+         return cachedComposites;
+     }
+ 
+diff --git a/model/jpa/src/main/java/org/keycloak/models/jpa/RoleAdapter.java b/model/jpa/src/main/java/org/keycloak/models/jpa/RoleAdapter.java
+index baa1123a5701..b5f2843e941e 100755
+--- a/model/jpa/src/main/java/org/keycloak/models/jpa/RoleAdapter.java
++++ b/model/jpa/src/main/java/org/keycloak/models/jpa/RoleAdapter.java
+@@ -92,7 +92,9 @@ public void setName(String name) {
+ 
+     @Override
+     public boolean isComposite() {
+-        return getChildRoles().findAny().isPresent();
++        return StreamsUtil.closing(em.createNamedQuery("getChildRoles", RoleEntity.class)
++                .setMaxResults(1)
++                .setParameter("parentRoleId", getId()).getResultStream()).findAny().isPresent();
+     }
+ 
+     @Override
+diff --git a/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java b/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
+index 40df81b003a7..a0ce080bfecd 100644
+--- a/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
++++ b/quarkus/config-api/src/main/java/org/keycloak/config/DatabaseOptions.java
+@@ -117,6 +117,7 @@ public class DatabaseOptions {
+ 
+     public static final Option<String> DB_POSTGRESQL_TARGET_SERVER_TYPE = new OptionBuilder<>("db-postgres-target-server-type", String.class)
+             .category(OptionCategory.DATABASE)
++            .defaultValue("primary") // cause the propertymapping logic to always advertise this property
+             .hidden()
+             .build();
+ 
+diff --git a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
+index b5f0df6476a7..6b7ba9cda46e 100644
+--- a/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
++++ b/quarkus/runtime/src/main/java/org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers.java
+@@ -29,7 +29,8 @@
+ import static org.keycloak.quarkus.runtime.configuration.mappers.DatabasePropertyMappers.Datasources.appendDatasourceMappers;
+ import static org.keycloak.quarkus.runtime.configuration.mappers.PropertyMapper.fromOption;
+ 
+-final class DatabasePropertyMappers implements PropertyMapperGrouping {
++public final class DatabasePropertyMappers implements PropertyMapperGrouping {
++    public static final String PG_TARGET_SERVER_TYPE = "quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType";
+     private static final Logger log = Logger.getLogger(DatabasePropertyMappers.class);
+ 
+     @Override
+@@ -54,9 +55,8 @@ public List<PropertyMapper<?>> getPropertyMappers() {
+                         .paramLabel("jdbc-url")
+                         .build(),
+                 fromOption(DatabaseOptions.DB_POSTGRESQL_TARGET_SERVER_TYPE)
+-                        .to("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType")
+-                        .mapFrom(DatabaseOptions.DB, DatabasePropertyMappers::getPostgresqlTargetServerType)
+-                        .isEnabled(() -> getPostgresqlTargetServerType(Configuration.getConfigValue(DB).getValue(), null) != null)
++                        .to(PG_TARGET_SERVER_TYPE)
++                        .isEnabled(() -> isPostgresqlTargetServerTypeEnabled())
+                         .build(),
+                 fromOption(DatabaseOptions.DB_URL_HOST)
+                         .paramLabel("hostname")
+@@ -125,10 +125,11 @@ public List<PropertyMapper<?>> getPropertyMappers() {
+             .description("Used for internal purposes of H2 database.")
+             .build();
+ 
+-    private static String getPostgresqlTargetServerType(String db, ConfigSourceInterceptorContext context) {
++    public static boolean isPostgresqlTargetServerTypeEnabled() {
++        String db = Configuration.getConfigValue(DB).getValue();
+         Database.Vendor vendor = Database.getVendor(db).orElse(null);
+         if (vendor != Database.Vendor.POSTGRES) {
+-            return null;
++            return false;
+         }
+ 
+         String dbDriver = Configuration.getConfigValue(DatabaseOptions.DB_DRIVER).getValue();
+@@ -137,14 +138,10 @@ private static String getPostgresqlTargetServerType(String db, ConfigSourceInter
+         if (!Objects.equals(Database.getDriver(db, true).orElse(null), dbDriver) &&
+                 !Objects.equals(Database.getDriver(db, false).orElse(null), dbDriver)) {
+             // Custom JDBC-Driver, for example, AWS JDBC Wrapper.
+-            return null;
++            return false;
+         }
+-        if (dbUrl != null && dbUrl.contains("targetServerType")) {
+-            // targetServerType already set to same or different value in db-url, ignore
+-            return null;
+-        }
+-        log.debug("setting targetServerType for PostgreSQL to 'primary'");
+-        return "primary";
++        // targetServerType already set to same or different value in db-url, ignore
++        return dbUrl == null || !dbUrl.contains("targetServerType");
+     }
+ 
+     /**
+diff --git a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java
+index 5da11af8dd6f..56b243da87a1 100644
+--- a/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java
++++ b/quarkus/runtime/src/test/java/org/keycloak/quarkus/runtime/configuration/ConfigurationTest.java
+@@ -30,6 +30,7 @@
+ import org.keycloak.Config;
+ import org.keycloak.config.CachingOptions;
+ import org.keycloak.quarkus.runtime.Environment;
++import org.keycloak.quarkus.runtime.configuration.mappers.DatabasePropertyMappers;
+ import org.keycloak.quarkus.runtime.configuration.mappers.HttpPropertyMappers;
+ import org.keycloak.quarkus.runtime.vault.FilesKeystoreVaultProviderFactory;
+ import org.keycloak.quarkus.runtime.vault.FilesPlainTextVaultProviderFactory;
+@@ -390,21 +391,21 @@ public void testDatabaseProperties() {
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres");
+         config = createConfig();
+-        assertEquals("primary", config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
+-
++        assertTrue(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
++        assertTrue(StreamSupport.stream(config.getPropertyNames().spliterator(), false).anyMatch(DatabasePropertyMappers.PG_TARGET_SERVER_TYPE::equals));
++        assertEquals("primary", config.getConfigValue(DatabasePropertyMappers.PG_TARGET_SERVER_TYPE).getValue());
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres", "--db-url-properties=?targetServerType=any");
+         config = createConfig();
+-        assertNull(config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
+-        assertEquals("jdbc:postgresql://localhost:5432/keycloak?targetServerType=any", config.getConfigValue("quarkus.datasource.jdbc.url").getValue());
++        assertFalse(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres", "--db-driver=software.amazon.jdbc.Driver");
+         config = createConfig();
+-        assertNull(config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
++        assertFalse(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
+ 
+         ConfigArgsConfigSource.setCliArgs("--db=postgres", "--db-url=jdbc:postgresql://localhost:5432/keycloak?targetServerType=any");
+         config = createConfig();
+-        assertNull(config.getConfigValue("quarkus.datasource.jdbc.additional-jdbc-properties.targetServerType").getValue());
++        assertFalse(DatabasePropertyMappers.isPostgresqlTargetServerTypeEnabled());
+     }
+ 
+     // KEYCLOAK-15632
+diff --git a/saml-core/src/main/java/org/keycloak/saml/processing/core/saml/v2/util/AssertionUtil.java b/saml-core/src/main/java/org/keycloak/saml/processing/core/saml/v2/util/AssertionUtil.java
+index 671089ab8c11..0b95ba42f365 100755
+--- a/saml-core/src/main/java/org/keycloak/saml/processing/core/saml/v2/util/AssertionUtil.java
++++ b/saml-core/src/main/java/org/keycloak/saml/processing/core/saml/v2/util/AssertionUtil.java
+@@ -23,7 +23,6 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+-import java.util.Objects;
+ import java.util.Set;
+ import javax.xml.datatype.XMLGregorianCalendar;
+ import javax.xml.stream.XMLEventReader;
+@@ -71,6 +70,7 @@
+ import org.w3c.dom.Document;
+ import org.w3c.dom.Element;
+ import org.w3c.dom.Node;
++import org.w3c.dom.NodeList;
+ 
+ /**
+  * Utility to deal with assertions
+@@ -572,6 +572,30 @@ public static AssertionType getAssertion(SAMLDocumentHolder holder, ResponseType
+         return responseType.getAssertions().get(0).getAssertion();
+     }
+ 
++    public static Element getAssertionElement(SAMLDocumentHolder holder) throws ProcessingException {
++        Document doc = holder.getSamlDocument();
++        Element response = doc.getDocumentElement();
++        if (!JBossSAMLConstants.RESPONSE__PROTOCOL.getNsUri().get().equals(response.getNamespaceURI())
++             || !JBossSAMLConstants.RESPONSE__PROTOCOL.get().equals(response.getLocalName())) {
++            throw new ProcessingException("No response type.");
++        }
++
++        // get the first assertion in the response
++        NodeList children = response.getChildNodes();
++        for(int i = 0; i < children.getLength(); i++) {
++            Node childNode = children.item(i);
++            if (childNode instanceof Element) {
++                Element childElement = (Element) childNode;
++                if (JBossSAMLConstants.ASSERTION.getNsUri().get().equals(childElement.getNamespaceURI())
++                        && JBossSAMLConstants.ASSERTION.get().equals(childElement.getLocalName())) {
++                    return childElement;
++                }
++            }
++        }
++
++        throw new ProcessingException("No assertion from response.");
++    }
++
+     public static boolean isAssertionEncrypted(ResponseType responseType) throws ProcessingException {
+         List<ResponseType.RTChoiceType> assertions = responseType.getAssertions();
+ 
+@@ -596,13 +620,17 @@ public static Element decryptAssertion(ResponseType responseType, PrivateKey pri
+      * @return the assertion element as it was decrypted. This can be used in signature verification.
+      */
+     public static Element decryptAssertion(ResponseType responseType, XMLEncryptionUtil.DecryptionKeyLocator decryptionKeyLocator) throws ParsingException, ProcessingException, ConfigurationException {
+-        Element enc = responseType.getAssertions().stream()
+-                .map(ResponseType.RTChoiceType::getEncryptedAssertion)
+-                .filter(Objects::nonNull)
+-                .findFirst()
+-                .map(EncryptedElementType::getEncryptedElement)
+-                .orElseThrow(() -> new ProcessingException("No encrypted assertion found."));
++        List<ResponseType.RTChoiceType> assertions = responseType.getAssertions();
++        if (assertions.isEmpty()) {
++            throw new ProcessingException("No encrypted assertion found.");
++        }
++
++        ResponseType.RTChoiceType rtChoiceType = assertions.get(0);
++        if (rtChoiceType.getEncryptedAssertion() == null || rtChoiceType.getEncryptedAssertion().getEncryptedElement() == null) {
++            throw new ProcessingException("No encrypted assertion found.");
++        }
+ 
++        Element enc = rtChoiceType.getEncryptedAssertion().getEncryptedElement();
+         String oldID = enc.getAttribute(JBossSAMLConstants.ID.get());
+         Document newDoc = DocumentUtil.createDocument();
+         Node importedNode = newDoc.importNode(enc, true);
+diff --git a/server-spi-private/src/main/java/org/keycloak/broker/provider/BrokeredIdentityContext.java b/server-spi-private/src/main/java/org/keycloak/broker/provider/BrokeredIdentityContext.java
+index 4d268d71cf11..49f2d97aa8c0 100755
+--- a/server-spi-private/src/main/java/org/keycloak/broker/provider/BrokeredIdentityContext.java
++++ b/server-spi-private/src/main/java/org/keycloak/broker/provider/BrokeredIdentityContext.java
+@@ -22,6 +22,7 @@
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.Set;
+ 
+ import org.keycloak.models.Constants;
+@@ -53,8 +54,11 @@ public class BrokeredIdentityContext {
+     private AuthenticationSessionModel authenticationSession;
+ 
+     public BrokeredIdentityContext(String id, IdentityProviderModel idpConfig) {
+-        if (id == null) {
+-            throw new RuntimeException("No identifier provider for identity.");
++        Objects.requireNonNull(id, "id must not be null");
++        Objects.requireNonNull(idpConfig, "Identity provider config must not be null");
++
++        if (!idpConfig.isEnabled()) {
++            throw new IdentityBrokerException("Identity provider is disabled");
+         }
+ 
+         this.id = id;
+@@ -62,6 +66,12 @@ public BrokeredIdentityContext(String id, IdentityProviderModel idpConfig) {
+     }
+ 
+     public BrokeredIdentityContext(IdentityProviderModel idpConfig) {
++        Objects.requireNonNull(idpConfig, "Identity provider config must not be null");
++
++        if (!idpConfig.isEnabled()) {
++            throw new IdentityBrokerException("Identity provider is disabled");
++        }
++
+         this.idpConfig = idpConfig;
+     }
+ 
+diff --git a/services/src/main/java/org/keycloak/authentication/authenticators/broker/util/SerializedBrokeredIdentityContext.java b/services/src/main/java/org/keycloak/authentication/authenticators/broker/util/SerializedBrokeredIdentityContext.java
+index d923bbc6f099..a9c8069554f0 100755
+--- a/services/src/main/java/org/keycloak/authentication/authenticators/broker/util/SerializedBrokeredIdentityContext.java
++++ b/services/src/main/java/org/keycloak/authentication/authenticators/broker/util/SerializedBrokeredIdentityContext.java
+@@ -268,7 +268,7 @@ public BrokeredIdentityContext deserialize(KeycloakSession session, Authenticati
+         RealmModel realm = authSession.getRealm();
+         IdentityProviderModel idpConfig = session.identityProviders().getByAlias(getIdentityProviderId());
+ 
+-        if (idpConfig == null) {
++        if (idpConfig == null || !idpConfig.isEnabled()) {
+             throw new ModelException("Can't find identity provider with ID " + getIdentityProviderId() + " in realm " + realm.getName());
+         }
+ 
+diff --git a/services/src/main/java/org/keycloak/broker/saml/SAMLEndpoint.java b/services/src/main/java/org/keycloak/broker/saml/SAMLEndpoint.java
+index 4755ea8f5be8..5b7b8b20a6df 100755
+--- a/services/src/main/java/org/keycloak/broker/saml/SAMLEndpoint.java
++++ b/services/src/main/java/org/keycloak/broker/saml/SAMLEndpoint.java
+@@ -34,7 +34,6 @@
+ import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+ import javax.xml.crypto.dsig.XMLSignature;
+-import javax.xml.namespace.QName;
+ 
+ import jakarta.ws.rs.Consumes;
+ import jakarta.ws.rs.FormParam;
+@@ -101,11 +100,9 @@
+ import org.keycloak.saml.SAML2LogoutResponseBuilder;
+ import org.keycloak.saml.SAMLRequestParser;
+ import org.keycloak.saml.common.constants.GeneralConstants;
+-import org.keycloak.saml.common.constants.JBossSAMLConstants;
+ import org.keycloak.saml.common.constants.JBossSAMLURIConstants;
+ import org.keycloak.saml.common.exceptions.ConfigurationException;
+ import org.keycloak.saml.common.exceptions.ProcessingException;
+-import org.keycloak.saml.common.util.DocumentUtil;
+ import org.keycloak.saml.processing.core.saml.v2.common.SAMLDocumentHolder;
+ import org.keycloak.saml.processing.core.saml.v2.constants.X500SAMLProfileConstants;
+ import org.keycloak.saml.processing.core.saml.v2.util.ArtifactResponseUtil;
+@@ -259,6 +256,7 @@ protected Response basicChecks(String samlRequest, String samlResponse, String s
+ 
+         protected abstract String getBindingType();
+         protected abstract boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder);
++        protected abstract boolean isMessageFullySigned(SAMLDocumentHolder documentHolder);
+         protected abstract void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException;
+         protected abstract SAMLDocumentHolder extractRequestDocument(String samlRequest);
+         protected abstract SAMLDocumentHolder extractResponseDocument(String response);
+@@ -579,7 +577,7 @@ protected Response handleLoginResponse(String samlResponse, SAMLDocumentHolder h
+                 } else {
+                     /* We verify the assertion using original document to handle cases where the IdP
+                     includes whitespace and/or newlines inside tags. */
+-                    assertionElement = DocumentUtil.getElement(holder.getSamlDocument(), new QName(JBossSAMLConstants.ASSERTION.get()));
++                    assertionElement = AssertionUtil.getAssertionElement(holder);
+                 }
+ 
+                 // Validate the response Issuer
+@@ -605,7 +603,7 @@ protected Response handleLoginResponse(String samlResponse, SAMLDocumentHolder h
+                 boolean signed = AssertionUtil.isSignedElement(assertionElement);
+                 final boolean assertionSignatureNotExistsWhenRequired = config.isWantAssertionsSigned() && !signed;
+                 final boolean signatureNotValid = signed && config.isValidateSignature() && !AssertionUtil.isSignatureValid(assertionElement, getIDPKeyLocator());
+-                final boolean hasNoSignatureWhenRequired = ! signed && config.isValidateSignature() && ! containsUnencryptedSignature(holder);
++                final boolean hasNoSignatureWhenRequired = !signed && config.isValidateSignature() && !isMessageFullySigned(holder);
+ 
+                 if (assertionSignatureNotExistsWhenRequired || signatureNotValid || hasNoSignatureWhenRequired) {
+                     logger.error("validation failed");
+@@ -728,6 +726,7 @@ private AuthenticationSessionModel samlIdpInitiatedSSO(final String clientUrlNam
+             CacheControlUtil.noBackButtonCacheControlHeader(session);
+             Optional<ClientModel> oClient = SAMLEndpoint.this.session.clients()
+               .searchClientsByAttributes(realm, Collections.singletonMap(SamlProtocol.SAML_IDP_INITIATED_SSO_URL_NAME, clientUrlName), 0, 1)
++              .filter(ClientModel::isEnabled)
+               .findFirst();
+ 
+             if (! oClient.isPresent()) {
+@@ -840,6 +839,11 @@ protected boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder
+             return (nl != null && nl.getLength() > 0);
+         }
+ 
++        @Override
++        protected boolean isMessageFullySigned(SAMLDocumentHolder documentHolder) {
++            return AssertionUtil.isSignedElement(documentHolder.getSamlDocument().getDocumentElement());
++        }
++
+         @Override
+         protected void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException {
+             if ((! containsUnencryptedSignature(documentHolder)) && (documentHolder.getSamlObject() instanceof ResponseType)) {
+@@ -879,14 +883,17 @@ protected boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder
+             return algorithm != null && signature != null;
+         }
+ 
++        @Override
++        protected boolean isMessageFullySigned(SAMLDocumentHolder documentHolder) {
++            return containsUnencryptedSignature(documentHolder);
++        }
++
+         @Override
+         protected void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException {
+             KeyLocator locator = getIDPKeyLocator();
+             SamlProtocolUtils.verifyRedirectSignature(documentHolder, locator, session.getContext().getUri(), key);
+         }
+ 
+-
+-
+         @Override
+         protected SAMLDocumentHolder extractRequestDocument(String samlRequest) {
+             return SAMLRequestParser.parseRequestRedirectBinding(samlRequest, maxInflatingSize);
+@@ -906,20 +913,31 @@ protected String getBindingType() {
+ 
+     protected class ArtifactBinding extends Binding {
+ 
+-        private boolean unencryptedSignaturesVerified = false;
++        // artifact binding is processed twice, first with the art and then with the response, vars to store the first pass
++        private Boolean containsUnencryptedSignature = null;
++        private Boolean messageFullySigned = null;
++        private Boolean verified = null;
+ 
+         @Override
+         protected boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder) {
+-            if (unencryptedSignaturesVerified) {
+-                return true;
++            if (containsUnencryptedSignature != null) {
++                return containsUnencryptedSignature;
+             }
+             NodeList nl = documentHolder.getSamlDocument().getElementsByTagNameNS(XMLSignature.XMLNS, "Signature");
+-            return (nl != null && nl.getLength() > 0);
++            containsUnencryptedSignature = (nl != null && nl.getLength() > 0);
++            messageFullySigned = AssertionUtil.isSignedElement(documentHolder.getSamlDocument().getDocumentElement());
++            return containsUnencryptedSignature;
++        }
++
++        @Override
++        protected boolean isMessageFullySigned(SAMLDocumentHolder documentHolder) {
++            containsUnencryptedSignature(documentHolder);
++            return messageFullySigned;
+         }
+ 
+         @Override
+         protected void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException {
+-            if (unencryptedSignaturesVerified) {
++            if (verified != null) {
+                 // this is the second pass and signatures were already verified in the artifact response time
+                 return;
+             }
+@@ -938,13 +956,14 @@ protected void verifySignature(String key, SAMLDocumentHolder documentHolder) th
+                 }
+             }
+             SamlProtocolUtils.verifyDocumentSignature(documentHolder.getSamlDocument(), getIDPKeyLocator());
+-            unencryptedSignaturesVerified = true; // mark signatures as verified
++            verified = true;
+         }
+ 
+         @Override
+         protected SAMLDocumentHolder extractRequestDocument(String samlRequest) {
+             throw new UnsupportedOperationException("SAML request is not compliant with Artifact binding");
+         }
++
+         @Override
+         protected SAMLDocumentHolder extractResponseDocument(String response) {
+             byte[] samlBytes = PostBindingUtil.base64Decode(response);
+diff --git a/services/src/main/java/org/keycloak/protocol/oidc/TokenManager.java b/services/src/main/java/org/keycloak/protocol/oidc/TokenManager.java
+index 0bc8a4182a5f..d92d240869fc 100755
+--- a/services/src/main/java/org/keycloak/protocol/oidc/TokenManager.java
++++ b/services/src/main/java/org/keycloak/protocol/oidc/TokenManager.java
+@@ -17,6 +17,8 @@
+ 
+ package org.keycloak.protocol.oidc;
+ 
++import java.time.Duration;
++import java.time.temporal.ChronoUnit;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+@@ -53,6 +55,7 @@
+ import org.keycloak.common.Profile;
+ import org.keycloak.common.Profile.Feature;
+ import org.keycloak.common.VerificationException;
++import org.keycloak.common.util.Retry;
+ import org.keycloak.common.util.SecretGenerator;
+ import org.keycloak.common.util.Time;
+ import org.keycloak.crypto.HashProvider;
+@@ -65,6 +68,7 @@
+ import org.keycloak.jose.jws.JWSInputException;
+ import org.keycloak.jose.jws.crypto.HashUtils;
+ import org.keycloak.migration.migrators.MigrationUtils;
++import org.keycloak.models.AbstractKeycloakTransaction;
+ import org.keycloak.models.AuthenticatedClientSessionModel;
+ import org.keycloak.models.ClientModel;
+ import org.keycloak.models.ClientScopeModel;
+@@ -72,6 +76,7 @@
+ import org.keycloak.models.Constants;
+ import org.keycloak.models.IdentityProviderQuery;
+ import org.keycloak.models.KeycloakSession;
++import org.keycloak.models.KeycloakSessionFactory;
+ import org.keycloak.models.ProtocolMapperModel;
+ import org.keycloak.models.RealmModel;
+ import org.keycloak.models.RoleModel;
+@@ -298,6 +303,12 @@ public AccessTokenResponseBuilder refreshAccessToken(KeycloakSession session, Ur
+                                             String encodedRefreshToken, EventBuilder event, HttpHeaders headers, HttpRequest request, String scopeParameter) throws OAuthErrorException {
+         RefreshToken refreshToken = verifyRefreshToken(session, realm, authorizedClient, request, encodedRefreshToken, true);
+ 
++        if (realm.isRevokeRefreshToken()) {
++            // If refresh tokens are revoked, we need to serialize all requests to avoid wrong conclusions.
++            // This needs to be called before we load the user session from the database or the cache
++            createTemporaryExclusiveLockForTokenRefreshOperation(session, refreshToken);
++        }
++
+         event.session(refreshToken.getSessionState())
+                 .detail(Details.REFRESH_TOKEN_ID, refreshToken.getId())
+                 .detail(Details.REFRESH_TOKEN_TYPE, refreshToken.getType());
+@@ -368,6 +379,32 @@ public AccessTokenResponseBuilder refreshAccessToken(KeycloakSession session, Ur
+         return responseBuilder;
+     }
+ 
++    private void createTemporaryExclusiveLockForTokenRefreshOperation(KeycloakSession session, RefreshToken refreshToken) {
++        String lockId = "refreshLock:" + refreshToken.getSessionId() + ":" + getReuseIdKey(refreshToken);
++        Retry.executeWithBackoff((int iteration) -> {
++            // This assumes that 60 seconds is the maximum time this operation will take
++            if (!session.singleUseObjects().putIfAbsent(lockId, 60)) {
++                throw new RuntimeException("Unable to acquire serialization lock for token refresh");
++            }
++
++            // Trigger the session provider, to ensure that it enlists first for enlistAfterCompletion
++            session.sessions();
++
++            KeycloakSessionFactory factory = session.getKeycloakSessionFactory();
++            session.getTransactionManager().enlistAfterCompletion(new AbstractKeycloakTransaction() {
++                @Override
++                protected void commitImpl() {
++                    KeycloakModelUtils.runJobInTransaction(factory, s -> s.singleUseObjects().remove(lockId));
++                }
++
++                @Override
++                protected void rollbackImpl() {
++                    KeycloakModelUtils.runJobInTransaction(factory, s -> s.singleUseObjects().remove(lockId));
++                }
++            });
++        }, Duration.of(10, ChronoUnit.SECONDS), 10);
++    }
++
+     private Function<String, String> transformScopes(KeycloakSession session, Set<String> requestedScopes) {
+         return scope -> {
+             if (requestedScopes.contains(scope)) {
+diff --git a/services/src/main/java/org/keycloak/services/resources/IdentityBrokerService.java b/services/src/main/java/org/keycloak/services/resources/IdentityBrokerService.java
+index 67920fd6b10c..17dd201b952b 100755
+--- a/services/src/main/java/org/keycloak/services/resources/IdentityBrokerService.java
++++ b/services/src/main/java/org/keycloak/services/resources/IdentityBrokerService.java
+@@ -130,11 +130,6 @@
+ 
+ import static org.keycloak.broker.provider.AbstractIdentityProvider.BROKER_REGISTERED_NEW_USER;
+ 
+-/**
+- * <p></p>
+- *
+- * @author Pedro Igor
+- */
+ public class IdentityBrokerService implements UserAuthenticationIdentityProvider.AuthenticationCallback {
+ 
+     // Authentication session note, which references identity provider that is currently linked
+@@ -301,7 +296,7 @@ public Response clientInitiatedAccountLinking(@PathParam("provider_alias") Strin
+         }
+ 
+ 
+-        IdentityProviderModel identityProviderModel = session.identityProviders().getByAlias(providerAlias);
++        IdentityProviderModel identityProviderModel = getIdentityProviderModel(session, providerAlias);
+         if (identityProviderModel == null) {
+             event.error(Errors.UNKNOWN_IDENTITY_PROVIDER);
+             UriBuilder builder = UriBuilder.fromUri(redirectUri)
+@@ -341,6 +336,16 @@ public Response clientInitiatedAccountLinking(@PathParam("provider_alias") Strin
+         return performClientInitiatedAccountLogin(providerAlias, clientSessionCode);
+     }
+ 
++    private static IdentityProviderModel getIdentityProviderModel(KeycloakSession session, String providerAlias) {
++        IdentityProviderModel model = session.identityProviders().getByAlias(providerAlias);
++
++        if (model == null || !model.isEnabled()) {
++            throw new IdentityBrokerException("Identity Provider [" + providerAlias + "] not found.");
++        }
++
++        return model;
++    }
++
+     public Response performClientInitiatedAccountLogin(String providerAlias, ClientSessionCode<AuthenticationSessionModel> clientSessionCode) {
+         try {
+             UserAuthenticationIdentityProvider<?> identityProvider = getIdentityProvider(session, providerAlias);
+@@ -394,7 +399,7 @@ public Response performLogin(@PathParam("provider_alias") String providerAlias,
+ 
+             ClientSessionCode<AuthenticationSessionModel> clientSessionCode = new ClientSessionCode<>(session, realmModel, authSession);
+             clientSessionCode.setAction(AuthenticationSessionModel.Action.AUTHENTICATE.name());
+-            IdentityProviderModel identityProviderModel = session.identityProviders().getByAlias(providerAlias);
++            IdentityProviderModel identityProviderModel = getIdentityProviderModel(session, providerAlias);
+             if (identityProviderModel == null) {
+                 throw new IdentityBrokerException("Identity Provider [" + providerAlias + "] not found.");
+             }
+@@ -563,6 +568,12 @@ public Response authenticated(BrokeredIdentityContext context) {
+             context.setToken(null);
+         }
+ 
++        ClientModel client = authenticationSession.getClient();
++
++        if (!client.isEnabled()) {
++            return redirectToErrorPage(Status.BAD_REQUEST, Messages.CLIENT_NOT_FOUND, null, providerAlias);
++        }
++
+         StatusResponseType loginResponse = (StatusResponseType) context.getContextData().get(SAMLEndpoint.SAML_LOGIN_RESPONSE);
+         if (loginResponse != null) {
+             for(Iterator<SamlAuthenticationPreprocessor> it = SamlSessionUtils.getSamlAuthenticationPreprocessorIterator(session); it.hasNext();) {
+@@ -570,7 +581,7 @@ public Response authenticated(BrokeredIdentityContext context) {
+             }
+         }
+ 
+-        session.getContext().setClient(authenticationSession.getClient());
++        session.getContext().setClient(client);
+ 
+         context.getIdp().preprocessFederatedIdentity(session, realmModel, context);
+         KeycloakSessionFactory sessionFactory = session.getKeycloakSessionFactory();
+@@ -652,7 +663,7 @@ public Response authenticated(BrokeredIdentityContext context) {
+             ctx.saveToAuthenticationSession(authenticationSession, AbstractIdpAuthenticator.BROKERED_CONTEXT_NOTE);
+ 
+             URI redirect = LoginActionsService.firstBrokerLoginProcessor(session.getContext().getUri())
+-                    .queryParam(Constants.CLIENT_ID, authenticationSession.getClient().getClientId())
++                    .queryParam(Constants.CLIENT_ID, client.getClientId())
+                     .queryParam(Constants.TAB_ID, authenticationSession.getTabId())
+                     .queryParam(Constants.CLIENT_DATA, AuthenticationProcessor.getClientData(session, authenticationSession))
+                     .build(realmModel.getName());
+@@ -1346,7 +1357,7 @@ private Response notFound(String message) {
+     }
+ 
+     public static UserAuthenticationIdentityProvider<?> getIdentityProvider(KeycloakSession session, String alias) {
+-        IdentityProviderModel identityProviderModel = session.identityProviders().getByAlias(alias);
++        IdentityProviderModel identityProviderModel = getIdentityProviderModel(session, alias);
+         UserAuthenticationIdentityProvider<?> identityProvider = getIdentityProvider(session, identityProviderModel, UserAuthenticationIdentityProvider.class);
+         if (identityProvider == null) {
+             throw new IdentityBrokerException("Identity Provider [" + alias + "] not found.");
+@@ -1377,7 +1388,7 @@ private static IdentityProviderFactory<?> getIdentityProviderFactory(KeycloakSes
+     }
+ 
+     private IdentityProviderModel getIdentityProviderConfig(String providerAlias) {
+-        IdentityProviderModel model = session.identityProviders().getByAlias(providerAlias);
++        IdentityProviderModel model = getIdentityProviderModel(session, providerAlias);
+         if (model == null) {
+             throw new IdentityBrokerException("Configuration for identity provider [" + providerAlias + "] not found.");
+         }
+diff --git a/services/src/test/java/org/keycloak/test/broker/oidc/AbstractOAuth2IdentityProviderTest.java b/services/src/test/java/org/keycloak/test/broker/oidc/AbstractOAuth2IdentityProviderTest.java
+index 02b5966bc631..eb24865c4936 100755
+--- a/services/src/test/java/org/keycloak/test/broker/oidc/AbstractOAuth2IdentityProviderTest.java
++++ b/services/src/test/java/org/keycloak/test/broker/oidc/AbstractOAuth2IdentityProviderTest.java
+@@ -175,6 +175,7 @@ private static class TestProvider extends AbstractOAuth2IdentityProvider<OAuth2I
+ 
+ 		public TestProvider(OAuth2IdentityProviderConfig config) {
+ 			super(null, config);
++            config.setEnabled(true);
+ 		}
+ 
+ 		@Override
+diff --git a/services/src/test/java/org/keycloak/test/broker/saml/XPathAttributeMapperTest.java b/services/src/test/java/org/keycloak/test/broker/saml/XPathAttributeMapperTest.java
+index 7f317d97147d..f6b52e0de887 100644
+--- a/services/src/test/java/org/keycloak/test/broker/saml/XPathAttributeMapperTest.java
++++ b/services/src/test/java/org/keycloak/test/broker/saml/XPathAttributeMapperTest.java
+@@ -115,7 +115,7 @@ private String testMapping(String attributeValue, String xpath, String attribute
+         config.put(XPathAttributeMapper.ATTRIBUTE_NAME, attributeNameToSearch);
+         config.put(XPathAttributeMapper.USER_ATTRIBUTE, attribute);
+         config.put(XPathAttributeMapper.ATTRIBUTE_XPATH, xpath);
+-        BrokeredIdentityContext context = new BrokeredIdentityContext("brokeredIdentityContext", new IdentityProviderModel());
++        BrokeredIdentityContext context = new BrokeredIdentityContext("brokeredIdentityContext", createIdentityProviderModel());
+         AssertionType assertion = AssertionUtil.createAssertion("assertionId", NameIDType.deserializeFromString("nameIDType"));
+         AttributeStatementType statement = new AttributeStatementType();
+         assertion.addStatement(statement);
+@@ -137,4 +137,12 @@ private String testMapping(String attributeValue, String xpath, String attribute
+         Object userAttributes = context.getContextData().get("user.attributes." + attribute);
+         return userAttributes == null ? null : ((List<?>) userAttributes).get(0).toString();
+     }
++
++    private IdentityProviderModel createIdentityProviderModel() {
++        IdentityProviderModel model = new IdentityProviderModel();
++
++        model.setEnabled(true);
++
++        return model;
++    }
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/adapter/servlet/SamlSignatureTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/adapter/servlet/SamlSignatureTest.java
+index fb0e2c4b615e..857d3b559c7e 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/adapter/servlet/SamlSignatureTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/adapter/servlet/SamlSignatureTest.java
+@@ -17,25 +17,39 @@
+ package org.keycloak.testsuite.adapter.servlet;
+ 
+ import java.net.URI;
++import java.security.PublicKey;
+ import java.util.List;
+ import java.util.UUID;
+ import java.util.function.Consumer;
+ import java.util.stream.Collectors;
++import javax.crypto.spec.SecretKeySpec;
++import javax.xml.XMLConstants;
+ import javax.xml.crypto.dsig.XMLSignature;
++import javax.xml.namespace.QName;
+ 
+ import jakarta.ws.rs.core.Response.Status;
+ 
+ import org.keycloak.admin.client.resource.UserResource;
+ import org.keycloak.broker.saml.SAMLIdentityProviderConfig;
+ import org.keycloak.broker.saml.SAMLIdentityProviderFactory;
++import org.keycloak.models.utils.KeycloakModelUtils;
+ import org.keycloak.protocol.saml.SamlConfigAttributes;
+ import org.keycloak.protocol.saml.SamlProtocol;
++import org.keycloak.representations.idm.KeysMetadataRepresentation;
++import org.keycloak.representations.idm.KeysMetadataRepresentation.KeyMetadataRepresentation;
+ import org.keycloak.representations.idm.RealmRepresentation;
+ import org.keycloak.representations.idm.RoleRepresentation;
+ import org.keycloak.representations.idm.UserRepresentation;
++import org.keycloak.saml.RandomSecret;
++import org.keycloak.saml.common.constants.JBossSAMLConstants;
++import org.keycloak.saml.common.constants.JBossSAMLURIConstants;
++import org.keycloak.saml.processing.core.util.XMLEncryptionUtil;
+ import org.keycloak.testsuite.adapter.AbstractAdapterTest;
++import org.keycloak.testsuite.adapter.page.SAMLServlet;
+ import org.keycloak.testsuite.adapter.page.SalesPostAssertionAndResponseSig;
++import org.keycloak.testsuite.adapter.page.SalesPostEncServlet;
+ import org.keycloak.testsuite.arquillian.annotation.AppServerContainer;
++import org.keycloak.testsuite.saml.AbstractSamlTest;
+ import org.keycloak.testsuite.updaters.Creator;
+ import org.keycloak.testsuite.util.ClientBuilder;
+ import org.keycloak.testsuite.util.IdentityProviderBuilder;
+@@ -49,6 +63,7 @@
+ import org.keycloak.testsuite.utils.arquillian.ContainerConstants;
+ 
+ import org.apache.http.client.methods.CloseableHttpResponse;
++import org.apache.xml.security.encryption.XMLCipher;
+ import org.jboss.arquillian.container.test.api.Deployment;
+ import org.jboss.arquillian.graphene.page.Page;
+ import org.jboss.shrinkwrap.api.spec.WebArchive;
+@@ -201,10 +216,37 @@ public static void noDocumentSignatureOnlyOneAssertionSignedBelowResponse(Docume
+             evilAssertion.setAttribute("ID", "_evil_assertion_ID");
+             document.getDocumentElement().insertBefore(evilAssertion, assertion);
+         }
++
++        public static void encryptedAssertionWithoutSignature(Document document, PublicKey publicKey) {
++            // remove the signature for the whole response
++            removeDocumentSignature(document);
++            // get the assertion signed
++            Element assertion = (Element) document.getElementsByTagNameNS(ASSERTION_NSURI.get(), "Assertion").item(0);
++            // create a second assertion and encrypt it, put it first
++            Element evilAssertion = (Element) assertion.cloneNode(true);
++            evilAssertion.setAttributeNS(XMLConstants.XMLNS_ATTRIBUTE_NS_URI, "xmlns:" + assertion.getPrefix(), JBossSAMLURIConstants.ASSERTION_NSURI.get());
++            Element signature = (Element) evilAssertion.getElementsByTagNameNS(XMLSignature.XMLNS, "Signature").item(0);
++            evilAssertion.removeChild(signature);
++            document.getDocumentElement().insertBefore(evilAssertion, assertion);
++            final int keySize = XMLEncryptionUtil.getKeyLengthFromURI(XMLCipher.AES_256_GCM);
++            try {
++                XMLEncryptionUtil.encryptElement(
++                        new QName(JBossSAMLURIConstants.ASSERTION_NSURI.get(), JBossSAMLConstants.ASSERTION.get(), assertion.getPrefix()),
++                        document, publicKey,
++                        new SecretKeySpec(RandomSecret.createRandomSecret(keySize/8), XMLEncryptionUtil.getJCEKeyAlgorithmFromURI(XMLCipher.AES_256_GCM)),
++                        keySize,
++                        new QName(JBossSAMLURIConstants.ASSERTION_NSURI.get(), JBossSAMLConstants.ENCRYPTED_ASSERTION.get(), assertion.getPrefix()),
++                        true);
++            } catch (Exception e) {
++                throw new RuntimeException(e);
++            }
++        }
+     }
+ 
+     @Page
+     private SalesPostAssertionAndResponseSig salesPostAssertionAndResponseSigPage;
++    @Page
++    private SalesPostEncServlet salesPostEncPage;
+ 
+     private UserRepresentation user;
+ 
+@@ -213,6 +255,11 @@ protected static WebArchive salesPostAssertionAndResponseSig() {
+         return samlServletDeployment(SalesPostAssertionAndResponseSig.DEPLOYMENT_NAME, SendUsernameServlet.class);
+     }
+ 
++    @Deployment(name = SalesPostEncServlet.DEPLOYMENT_NAME)
++    protected static WebArchive salesPostEnc() {
++        return samlServletDeployment(SalesPostEncServlet.DEPLOYMENT_NAME, SendUsernameServlet.class);
++    }
++
+     @Override
+     protected boolean isImportAfterEachMethod() {
+         return false;
+@@ -235,6 +282,9 @@ public void addAdapterTestRealms(List<RealmRepresentation> testRealms) {
+         final ClientBuilder salesPostClient = signingSamlClient(APP_CLIENT_ID)
+           .baseUrl("http://localhost:8080/sales-post-assertion-and-response-sig")
+           .redirectUris("http://localhost:8080/sales-post-assertion-and-response-sig/*");
++        final ClientBuilder salesPostEncClient = signingSamlClient(AbstractSamlTest.SAML_CLIENT_ID_SALES_POST_ENC)
++          .baseUrl("http://localhost:8080/sales-post-enc")
++          .redirectUris("http://localhost:8080/sales-post-enc/*");
+         final String brokerBaseUrl = getAuthServerRoot() + "realms/" + BROKER;
+         final ClientBuilder brokerRealmIdPClient = signingSamlClient(brokerBaseUrl)
+           .baseUrl(brokerBaseUrl + "/broker/" + REALM_NAME + "/endpoint")
+@@ -245,6 +295,7 @@ public void addAdapterTestRealms(List<RealmRepresentation> testRealms) {
+           .publicKey(REALM_PUBLIC_KEY)
+           .privateKey(REALM_PRIVATE_KEY)
+           .client(salesPostClient)
++          .client(salesPostEncClient)
+           .client(brokerRealmIdPClient)
+           .roles(RolesBuilder.create().realmRole(REQUIRED_ROLE))
+           .build()
+@@ -300,8 +351,12 @@ private void testSamlResponseModificationsBroker(Consumer<Document> samlResponse
+     }
+ 
+     private void testSamlResponseModificationsClient(Consumer<Document> samlResponseModifier, Consumer<CloseableHttpResponse> assertions) {
++        testSamlResponseModificationsClient(salesPostAssertionAndResponseSigPage, samlResponseModifier, assertions);
++    }
++
++    private void testSamlResponseModificationsClient(SAMLServlet page, Consumer<Document> samlResponseModifier, Consumer<CloseableHttpResponse> assertions) {
+         new SamlClientBuilder()
+-          .navigateTo(salesPostAssertionAndResponseSigPage)
++          .navigateTo(page)
+           .processSamlResponse(Binding.POST).build()
+           .login().user(user).build()
+           .processSamlResponse(Binding.POST).transformDocument(d -> { samlResponseModifier.accept(d); return d; }).build()
+@@ -405,4 +460,20 @@ public void testXSW8() throws Exception {
+     public void testNoDocumentSignatureOnlyOneAssertionSignedBelowResponse() throws Exception {
+         testSamlResponseModifications(XSWHelpers::noDocumentSignatureOnlyOneAssertionSignedBelowResponse, false);
+     }
++
++    @Test
++    public void testEncryptedAssertionWithoutSignature() throws Exception {
++        KeysMetadataRepresentation keysMetadata = adminClient.realm(REALM_NAME).keys().getKeyMetadata();
++        String kid = keysMetadata.getActive().get("RSA-OAEP");
++        KeyMetadataRepresentation keyMetadata = keysMetadata.getKeys().stream()
++                .filter(k -> kid.equals(k.getKid())).findAny().orElse(null);
++        PublicKey realmPubKey = KeycloakModelUtils.getPublicKey(keyMetadata.getPublicKey());
++        PublicKey clientPubKey = KeycloakModelUtils.getPublicKey(AbstractSamlTest.SAML_CLIENT_SALES_POST_ENC_PUBLIC_KEY);
++
++        testSamlResponseModificationsClient(salesPostEncPage,
++                d -> XSWHelpers.encryptedAssertionWithoutSignature(d, clientPubKey),
++                SamlSignatureTest::assertUserAccessDenied);
++        testSamlResponseModificationsBroker(d -> XSWHelpers.encryptedAssertionWithoutSignature(d, realmPubKey),
++                SamlSignatureTest::assertNotUpdateProfilePage);
++    }
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java
+index d2d130f1aca7..f03c1be1c1fe 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/AbstractAdvancedBrokerTest.java
+@@ -56,6 +56,7 @@
+ 
+ import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.hamcrest.Matchers.hasItems;
++import static org.hamcrest.Matchers.is;
+ import static org.hamcrest.Matchers.not;
+ import static org.hamcrest.Matchers.notNullValue;
+ import static org.junit.Assert.assertEquals;
+@@ -614,4 +615,36 @@ public void testWithLinkedFederationProvider() {
+             removeUserByUsername(adminClient.realm(bc.consumerRealmName()), "test-user-noemail");
+         }
+     }
++
++    @Test
++    public void testDisabledBroker() {
++        loginUser();
++        logoutFromConsumerRealm();
++        AccountHelper.logout(adminClient.realm(bc.providerRealmName()), bc.getUserLogin());
++
++        oauth.clientId("broker-app");
++        loginPage.open(bc.consumerRealmName());
++
++        RealmResource realm = adminClient.realm(bc.consumerRealmName());
++        identityProviderResource = realm.identityProviders().get(bc.getIDPAlias());
++        IdentityProviderRepresentation idpRep = identityProviderResource.toRepresentation();
++        idpRep.setEnabled(false);
++        identityProviderResource.update(idpRep);
++        waitForPage(driver, "sign in to", true);
++        loginPage.clickSocial(bc.getIDPAlias());
++        errorPage.assertCurrent();
++        assertThat(errorPage.getError(), is("Could not send authentication request to identity provider."));
++
++        idpRep.setEnabled(true);
++        identityProviderResource.update(idpRep);
++        oauth.openLoginForm();
++        loginPage.clickSocial(bc.getIDPAlias());
++        waitForPage(driver, "sign in to", true);
++        Assert.assertTrue("Driver should be on the provider realm page right now", driver.getCurrentUrl().contains("/auth/realms/" + bc.providerRealmName() + "/"));
++        idpRep.setEnabled(false);
++        identityProviderResource.update(idpRep);
++        loginPage.login(bc.getUserLogin(), bc.getUserPassword());
++        errorPage.assertCurrent();
++        assertThat(errorPage.getError(), is("Page not found"));
++    }
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcSamlIdPInitiatedSsoTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcSamlIdPInitiatedSsoTest.java
+index 4cd0ed191ca7..884cc47df5bb 100644
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcSamlIdPInitiatedSsoTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/broker/KcSamlIdPInitiatedSsoTest.java
+@@ -29,6 +29,7 @@
+ import org.keycloak.dom.saml.v2.assertion.StatementAbstractType;
+ import org.keycloak.dom.saml.v2.protocol.ResponseType;
+ import org.keycloak.protocol.saml.SamlPrincipalType;
++import org.keycloak.protocol.saml.SamlProtocol;
+ import org.keycloak.representations.idm.ClientRepresentation;
+ import org.keycloak.representations.idm.FederatedIdentityRepresentation;
+ import org.keycloak.representations.idm.IdentityProviderRepresentation;
+@@ -41,6 +42,7 @@
+ import org.keycloak.saml.processing.core.saml.v2.util.AssertionUtil;
+ import org.keycloak.testsuite.AbstractKeycloakTest;
+ import org.keycloak.testsuite.Assert;
++import org.keycloak.testsuite.pages.ErrorPage;
+ import org.keycloak.testsuite.pages.LoginPage;
+ import org.keycloak.testsuite.pages.PageUtils;
+ import org.keycloak.testsuite.pages.UpdateAccountInformationPage;
+@@ -70,6 +72,7 @@
+ import static org.hamcrest.Matchers.is;
+ import static org.hamcrest.Matchers.notNullValue;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
+ /**
+@@ -89,6 +92,9 @@ public class KcSamlIdPInitiatedSsoTest extends AbstractKeycloakTest {
+     @Page
+     protected UpdateAccountInformationPage updateAccountInformationPage;
+ 
++    @Page
++    protected ErrorPage errorPage;
++
+     private String urlRealmConsumer2;
+     private String urlRealmConsumer;
+     private String urlRealmProvider;
+@@ -130,6 +136,7 @@ public void resetPrincipalType() {
+         IdentityProviderRepresentation rep = idp.toRepresentation();
+         rep.getConfig().put(SAMLIdentityProviderConfig.NAME_ID_POLICY_FORMAT, JBossSAMLURIConstants.NAMEID_FORMAT_PERSISTENT.get());
+         rep.getConfig().put(SAMLIdentityProviderConfig.PRINCIPAL_TYPE, SamlPrincipalType.SUBJECT.name());
++        rep.setEnabled(true);
+         idp.update(rep);
+     }
+ 
+@@ -182,6 +189,36 @@ public void testProviderIdpInitiatedLogin() throws Exception {
+         assertThat(driver.findElement(By.tagName("a")).getAttribute("id"), containsString("account"));
+     }
+ 
++    @Test
++    public void testDisabledBroker() throws Exception {
++        driver.navigate().to(getSamlIdpInitiatedUrl(REALM_PROV_NAME, "samlbroker"));
++
++        waitForPage("sign in to", true);
++
++        assertThat("Driver should be on the provider realm page right now",
++                driver.getCurrentUrl(), containsString("/auth/realms/" + REALM_PROV_NAME + "/"));
++
++        log.debug("Logging in");
++        accountLoginPage.login(PROVIDER_REALM_USER_NAME, PROVIDER_REALM_USER_PASSWORD);
++
++        waitForPage("update account information", false);
++
++        Assert.assertTrue(updateAccountInformationPage.isCurrent());
++        assertThat("We must be on consumer realm right now",
++                driver.getCurrentUrl(), containsString("/auth/realms/" + REALM_CONS_NAME + "/"));
++
++        log.debug("Updating info on updateAccount page");
++        updateAccountInformationPage.updateAccountInformation(CONSUMER_CHOSEN_USERNAME, "test@localhost", "Firstname", "Lastname");
++
++        IdentityProviderResource idp = adminClient.realm(REALM_CONS_NAME).identityProviders().get("saml-leaf");
++        IdentityProviderRepresentation rep = idp.toRepresentation();
++        rep.setEnabled(false);
++        idp.update(rep);
++        driver.navigate().to(getSamlIdpInitiatedUrl(REALM_PROV_NAME, "samlbroker"));
++        errorPage.assertCurrent();
++        assertThat(errorPage.getError(), is("Page not found"));
++    }
++
+     private String getSamlIdpInitiatedUrl(String realmName, String samlIdpInitiatedSsoUrlName) {
+         return getAuthRoot() + "/auth/realms/" + realmName + "/protocol/saml/clients/" + samlIdpInitiatedSsoUrlName;
+     }
+@@ -526,4 +563,41 @@ private void assertSingleUserSession(String realmName, String userName, String..
+ 
+         assertThat(clientIds, containsInAnyOrder(expectedClientIds));
+     }
++
++    @Test
++    public void testDisabledClient() {
++        driver.navigate().to(getSamlIdpInitiatedUrl(REALM_PROV_NAME, "samlbroker"));
++
++        waitForPage("sign in to", true);
++
++        assertThat("Driver should be on the provider realm page right now",
++                driver.getCurrentUrl(), containsString("/auth/realms/" + REALM_PROV_NAME + "/"));
++
++        log.debug("Logging in");
++        accountLoginPage.login(PROVIDER_REALM_USER_NAME, PROVIDER_REALM_USER_PASSWORD);
++
++        waitForPage("update account information", false);
++
++        Assert.assertTrue(updateAccountInformationPage.isCurrent());
++        assertThat("We must be on consumer realm right now",
++                driver.getCurrentUrl(), containsString("/auth/realms/" + REALM_CONS_NAME + "/"));
++
++        log.debug("Updating info on updateAccount page");
++        updateAccountInformationPage.updateAccountInformation(CONSUMER_CHOSEN_USERNAME, "test@localhost", "Firstname", "Lastname");
++
++        ClientRepresentation client = adminClient.realm(REALM_CONS_NAME).clients().findAll().stream()
++                .filter(c -> c.getAttributes().getOrDefault(SamlProtocol.SAML_IDP_INITIATED_SSO_URL_NAME, "").equals("sales"))
++                .findAny()
++                .orElse(null);
++        assertNotNull(client);
++        client.setEnabled(false);
++        getCleanup(REALM_CONS_NAME).addCleanup(() -> {
++            client.setEnabled(true);
++            adminClient.realm(REALM_CONS_NAME).clients().get(client.getId()).update(client);
++        });
++        adminClient.realm(REALM_CONS_NAME).clients().get(client.getId()).update(client);
++        driver.navigate().to(getSamlIdpInitiatedUrl(REALM_PROV_NAME, "samlbroker"));
++        errorPage.assertCurrent();
++        assertThat(errorPage.getError(), is("Client not found."));
++    }
+ }
+diff --git a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RefreshTokenTest.java b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RefreshTokenTest.java
+index ac336330bba0..7789416031b8 100755
+--- a/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RefreshTokenTest.java
++++ b/testsuite/integration-arquillian/tests/base/src/test/java/org/keycloak/testsuite/oauth/RefreshTokenTest.java
+@@ -18,9 +18,11 @@
+ 
+ import java.io.Closeable;
+ import java.net.URI;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.UUID;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import jakarta.ws.rs.client.Client;
+ import jakarta.ws.rs.client.Entity;
+@@ -719,6 +721,76 @@ public void refreshTokenReuseTokenWithRefreshTokensRevoked() {
+         }
+     }
+ 
++    // GH issue 45647
++    @Test
++    public void refreshTokenRevokeWithConcurrentRefreshTokenRequests() {
++        try {
++            RealmManager.realm(adminClient.realm("test"))
++                    .revokeRefreshToken(true);
++
++            testRefreshTokenConcurrentReuse(1);
++        } finally {
++            RealmManager.realm(adminClient.realm("test"))
++                    .revokeRefreshToken(false);
++        }
++    }
++
++    // GH issue 45647
++    @Test
++    public void refreshTokenRevokeAndReuseWithConcurrentRefreshTokenRequests() {
++        try {
++            RealmManager.realm(adminClient.realm("test"))
++                    .refreshTokenMaxReuse(2)
++                    .revokeRefreshToken(true);
++
++            testRefreshTokenConcurrentReuse(3);
++        } finally {
++            RealmManager.realm(adminClient.realm("test"))
++                    .refreshTokenMaxReuse(0)
++                    .revokeRefreshToken(false);
++        }
++    }
++
++    private void testRefreshTokenConcurrentReuse(int expectedSuccessfulRefreshes) {
++        int THREADS_COUNT = 5;
++
++        oauth.doLogin("test-user@localhost", "password");
++        String code = oauth.parseLoginResponse().getCode();
++        AccessTokenResponse response1 = oauth.doAccessTokenRequest(code);
++
++        // Try concurrent requests for refresh-token requests
++        AtomicInteger successCounts = new AtomicInteger(0);
++        AtomicInteger errorCounts = new AtomicInteger(0);
++        Runnable runnable = () -> {
++            AccessTokenResponse response2 = oauth.doRefreshTokenRequest(response1.getRefreshToken());
++            if (response2.getStatusCode() == 200) {
++                successCounts.incrementAndGet();
++            } else {
++                assertEquals(400, response2.getStatusCode());
++                errorCounts.incrementAndGet();
++            }
++        };
++
++        List<Thread> threads = new ArrayList<>();
++        for (int i = 0 ; i < THREADS_COUNT ; i++) {
++            threads.add(new Thread(runnable));
++        }
++        for (Thread t : threads) {
++            t.start();
++        }
++        for (Thread t : threads) {
++            try {
++                t.join();
++            } catch(InterruptedException ie) {
++                Assert.fail("Interrupted exception thrown in one of the threads during token refresh");
++            }
++        }
++
++        // Check expected successful count of refreshes
++        assertEquals("Expected only " + expectedSuccessfulRefreshes + " successful refreshes, but was successfully refreshed " + successCounts.get() + " times", expectedSuccessfulRefreshes, successCounts.get());
++        assertEquals(THREADS_COUNT - expectedSuccessfulRefreshes, errorCounts.get());
++    }
++
+     @Test
+     public void refreshTokenReuseOnDifferentTab() {
+         try {

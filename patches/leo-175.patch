@@ -1,77 +1,443 @@
-diff --git a/leo/cli/cli.rs b/leo/cli/cli.rs
-index ada4024fa1..d176e2b8a5 100644
---- a/leo/cli/cli.rs
-+++ b/leo/cli/cli.rs
-@@ -65,7 +65,7 @@ enum Commands {
-     #[clap(about = "Deploy a program")]
-     Deploy {
-         #[clap(flatten)]
--        command: Deploy,
-+        command: LeoDeploy,
-     },
-     #[clap(about = "Query live data from the Aleo network")]
-     Query {
-diff --git a/leo/cli/commands/deploy.rs b/leo/cli/commands/deploy.rs
-index 4a7704182d..917ff84794 100644
---- a/leo/cli/commands/deploy.rs
-+++ b/leo/cli/commands/deploy.rs
-@@ -41,7 +41,7 @@ use text_tables;
+diff --git a/Cargo.lock b/Cargo.lock
+index 7d8eae5221..3f03c2658d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1262,6 +1262,7 @@ version = "1.5.3"
+ dependencies = [
+  "ansi_term",
+  "assert_cmd",
++ "backtrace",
+  "clap 3.1.9",
+  "color-backtrace",
+  "colored",
+@@ -1282,6 +1283,7 @@ dependencies = [
+  "serde_json",
+  "snarkvm-utilities 0.7.5 (git+https://github.com/AleoHQ/snarkVM.git?rev=51633e2)",
+  "structopt",
++ "sys-info",
+  "test_dir",
+  "toml",
+  "tracing",
+@@ -2589,6 +2591,16 @@ dependencies = [
+  "unicode-xid 0.2.2",
+ ]
  
- /// Deploys an Aleo program.
- #[derive(Parser, Debug)]
--pub struct Deploy {
-+pub struct LeoDeploy {
-     #[clap(flatten)]
-     pub(crate) fee_options: FeeOptions,
-     #[clap(long, help = "Disables building of the project before deployment.", default_value = "false")]
-@@ -58,7 +58,7 @@ pub struct Deploy {
-     pub(crate) options: BuildOptions,
++[[package]]
++name = "sys-info"
++version = "0.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b3a0d0aba8bf96a0e1ddfdc352fc53b3df7f39318c71854910c3c4b024ae52c"
++dependencies = [
++ "cc",
++ "libc",
++]
++
+ [[package]]
+ name = "tempfile"
+ version = "3.3.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 1807713169..1cdbce37f1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -59,6 +59,12 @@ version = "0.5.1"
+ [dependencies.colored]
+ version = "2.0"
+ 
++[dependencies.backtrace]
++version = "0.3.65"
++
++[dependencies.sys-info]
++version = "0.9.1"
++
+ [dependencies.dirs]
+ version = "4.0.0"
+ 
+diff --git a/compiler/parser/src/tokenizer/lexer.rs b/compiler/parser/src/tokenizer/lexer.rs
+index c9281e8610..45ced2d423 100644
+--- a/compiler/parser/src/tokenizer/lexer.rs
++++ b/compiler/parser/src/tokenizer/lexer.rs
+@@ -41,6 +41,14 @@ fn eat_identifier(input: &mut Peekable<impl Iterator<Item = char>>) -> Option<St
+     Some(ident)
  }
  
--impl Command for Deploy {
-+impl Command for LeoDeploy {
-     type Input = ();
-     type Output = ();
++///
++/// Checks if a char is a Unicode Bidirectional Override code point
++///
++fn is_bidi_override(c: char) -> bool {
++    let i = c as u32;
++    return (0x202A <= i && i <= 0x202E) || (0x2066 <= i && i <= 0x2069);
++}
++
+ impl Token {
+     // Eats the parts of the unicode character after \u.
+     fn eat_unicode_char(input: &mut Peekable<impl Iterator<Item = char>>) -> Result<(usize, Char)> {
+@@ -198,6 +206,9 @@ impl Token {
  
-@@ -97,11 +97,11 @@ impl Command for Deploy {
+                 let mut len = 0;
+                 while let Some(c) = input.peek() {
++                    if is_bidi_override(*c) {
++                        return Err(ParserError::lexer_bidi_override().into());
++                    }
+                     if c == &'"' {
+                         break;
+                     }
+@@ -215,8 +226,14 @@ impl Token {
+             Some('\'') => {
+                 input.next();
  
- // A helper function to handle deployment logic.
- fn handle_deploy<A: Aleo<Network = N, BaseField = N::Field>, N: Network>(
--    command: &Deploy,
-+    command: &LeoDeploy,
-     context: Context,
-     network: NetworkName,
-     endpoint: &str,
--) -> Result<<Deploy as Command>::Output> {
-+) -> Result<<LeoDeploy as Command>::Output> {
-     // Get the program name.
-     let project_name = context.open_manifest::<N>()?.program_id().to_string();
+-                let (len, character) = Self::eat_char(&mut input)?;
++                match input.peek() {
++                    Some(c) if is_bidi_override(*c) => {
++                        return Err(ParserError::lexer_bidi_override().into());
++                    }
++                    _ => {}
++                }
  
-diff --git a/leo/cli/commands/mod.rs b/leo/cli/commands/mod.rs
-index ce2a4d3e78..0c2c14bf5b 100644
---- a/leo/cli/commands/mod.rs
-+++ b/leo/cli/commands/mod.rs
-@@ -30,7 +30,7 @@ pub mod debug;
- pub use debug::LeoDebug;
++                let (len, character) = Self::eat_char(&mut input)?;
+                 if input.next_if_eq(&'\'').is_some() {
+                     input.next();
+                     return Ok((len + 2, Token::CharLit(character)));
+@@ -294,6 +311,9 @@ impl Token {
+                     let mut comment = String::from("//");
  
- pub mod deploy;
--pub use deploy::Deploy;
-+pub use deploy::LeoDeploy;
+                     while let Some(c) = input.next_if(|c| c != &'\n') {
++                        if is_bidi_override(c) {
++                            return Err(ParserError::lexer_bidi_override().into());
++                        }
+                         comment.push(c);
+                     }
  
- pub mod execute;
- pub use execute::LeoExecute;
-diff --git a/leo/cli/commands/run.rs b/leo/cli/commands/run.rs
-index 552fc3531d..339d89cc5b 100644
---- a/leo/cli/commands/run.rs
-+++ b/leo/cli/commands/run.rs
-@@ -66,7 +66,9 @@ fn handle_run<N: Network>(command: LeoRun, context: Context) -> Result<<LeoRun a
-     let mut inputs = command.inputs;
+@@ -312,6 +332,9 @@ impl Token {
  
-     // Compose the `run` command.
--    let mut arguments = vec![SNARKVM_COMMAND.to_string(), command.name];
-+    // The argument "--" is the separator, used to make sure snarkvm doesn't try to parse negative
-+    // values as CLI flags.
-+    let mut arguments = vec![SNARKVM_COMMAND.to_string(), command.name, "--".to_string()];
+                     let mut ended = false;
+                     while let Some(c) = input.next() {
++                        if is_bidi_override(c) {
++                            return Err(ParserError::lexer_bidi_override().into());
++                        }
+                         comment.push(c);
+                         if c == '*' && input.next_if_eq(&'/').is_some() {
+                             comment.push('/');
+diff --git a/docs/grammar/README.md b/docs/grammar/README.md
+index 95eb46c8cc..5f9786f9be 100644
+--- a/docs/grammar/README.md
++++ b/docs/grammar/README.md
+@@ -21,11 +21,26 @@ along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
+ Lexical Grammar
+ ---------------
  
-     // Add the inputs to the arguments.
-     match command.file {
++<a name="ascii"></a>
++```abnf
++ascii = %x0-7F
++```
++
++<a name="safe-nonascii"></a>
++```abnf
++safe-nonascii = %x80-2029 / %x202F-2065 / %x2070-D7FF / %xE000-10FFFF
++                ; excludes bidi overrides and high/low surrogates
++```
++
+ <a name="character"></a>
+ ```abnf
+-character = %x0-D7FF / %xE000-10FFFF   ; Unicode code points decoded from UTF-8
++character = ascii / safe-nonascii
++            ; Unicode code points decoded from UTF-8
+ ```
+ 
++Go to: _[ascii](#user-content-ascii), [safe-nonascii](#user-content-safe-nonascii)_;
++
++
+ <a name="horizontal-tab"></a>
+ ```abnf
+ horizontal-tab = %x9   ; <HT>
+@@ -58,33 +73,48 @@ single-quote = %x27   ; '
+ 
+ <a name="not-star"></a>
+ ```abnf
+-not-star = %x0-29 / %x2B-D7FF / %xE000-10FFFF   ; anything but *
++not-star = %x0-29 / %x2B-7F / safe-nonascii  ; anything but *
+ ```
+ 
++Go to: _[safe-nonascii](#user-content-safe-nonascii)_;
++
++
+ <a name="not-star-or-slash"></a>
+ ```abnf
+-not-star-or-slash = %x0-29 / %x2B-2E / %x30-D7FF / %xE000-10FFFF
++not-star-or-slash = %x0-29 / %x2B-2E / %x30-7F / safe-nonascii
+                     ; anything but * or /
+ ```
+ 
++Go to: _[safe-nonascii](#user-content-safe-nonascii)_;
++
++
+ <a name="not-line-feed-or-carriage-return"></a>
+ ```abnf
+-not-line-feed-or-carriage-return = %x0-9 / %xB-C / %xE-D7FF / %xE000-10FFFF
++not-line-feed-or-carriage-return = %x0-9 / %xB-C / %xE-7F / safe-nonascii
+                                    ; anything but <LF> or <CR>
+ ```
+ 
++Go to: _[safe-nonascii](#user-content-safe-nonascii)_;
++
++
+ <a name="not-double-quote-or-backslash"></a>
+ ```abnf
+-not-double-quote-or-backslash = %x0-21 / %x23-5B / %x5D-D7FF / %xE000-10FFFF
++not-double-quote-or-backslash = %x0-21 / %x23-5B / %x5D-7F / safe-nonascii
+                                 ; anything but " or \
+ ```
+ 
++Go to: _[safe-nonascii](#user-content-safe-nonascii)_;
++
++
+ <a name="not-single-quote-or-backslash"></a>
+ ```abnf
+-not-single-quote-or-backslash = %x0-26 / %x28-5B / %x5D-D7FF / %xE000-10FFFF
++not-single-quote-or-backslash = %x0-26 / %x28-5B / %x5D-7F / safe-nonascii
+                                 ; anything but ' or \
+ ```
+ 
++Go to: _[safe-nonascii](#user-content-safe-nonascii)_;
++
++
+ <a name="line-terminator"></a>
+ ```abnf
+ line-terminator = line-feed / carriage-return / carriage-return line-feed
+diff --git a/docs/grammar/abnf-grammar.txt b/docs/grammar/abnf-grammar.txt
+index 40773688e8..d1b7a5c14b 100644
+--- a/docs/grammar/abnf-grammar.txt
++++ b/docs/grammar/abnf-grammar.txt
+@@ -19,7 +19,13 @@
+ ; Lexical Grammar
+ ; ---------------
+ 
+-character = %x0-D7FF / %xE000-10FFFF   ; Unicode code points decoded from UTF-8
++ascii = %x0-7F
++
++safe-nonascii = %x80-2029 / %x202F-2065 / %x2070-D7FF / %xE000-10FFFF
++                ; excludes bidi overrides and high/low surrogates
++
++character = ascii / safe-nonascii
++            ; Unicode code points decoded from UTF-8
+ 
+ horizontal-tab = %x9   ; <HT>
+ 
+@@ -33,18 +39,18 @@ double-quote = %x22   ; "
+ 
+ single-quote = %x27   ; '
+ 
+-not-star = %x0-29 / %x2B-D7FF / %xE000-10FFFF   ; anything but *
++not-star = %x0-29 / %x2B-7F / safe-nonascii  ; anything but *
+ 
+-not-star-or-slash = %x0-29 / %x2B-2E / %x30-D7FF / %xE000-10FFFF
++not-star-or-slash = %x0-29 / %x2B-2E / %x30-7F / safe-nonascii
+                     ; anything but * or /
+ 
+-not-line-feed-or-carriage-return = %x0-9 / %xB-C / %xE-D7FF / %xE000-10FFFF
++not-line-feed-or-carriage-return = %x0-9 / %xB-C / %xE-7F / safe-nonascii
+                                    ; anything but <LF> or <CR>
+ 
+-not-double-quote-or-backslash = %x0-21 / %x23-5B / %x5D-D7FF / %xE000-10FFFF
++not-double-quote-or-backslash = %x0-21 / %x23-5B / %x5D-7F / safe-nonascii
+                                 ; anything but " or \
+ 
+-not-single-quote-or-backslash = %x0-26 / %x28-5B / %x5D-D7FF / %xE000-10FFFF
++not-single-quote-or-backslash = %x0-26 / %x28-5B / %x5D-7F / safe-nonascii
+                                 ; anything but ' or \
+ 
+ line-terminator = line-feed / carriage-return / carriage-return line-feed
+diff --git a/leo/errors/src/parser/parser_errors.rs b/leo/errors/src/parser/parser_errors.rs
+index 741f7ccd9b..15f7ebe3fd 100644
+--- a/leo/errors/src/parser/parser_errors.rs
++++ b/leo/errors/src/parser/parser_errors.rs
+@@ -374,4 +374,13 @@ create_errors!(
+          msg: "`constant` is preferred over `const` for function parameters to indicate a R1CS constant.",
+          help: None,
+      }
++
++    /// For when the lexer encountered a bidi override character
++    @backtraced
++    lexer_bidi_override {
++        args: (),
++        msg: "Unicode bidi override code point encountered.",
++        help: None,
++    }
++
+ );
+diff --git a/leo/main.rs b/leo/main.rs
+index baf29ad926..34a3d66a71 100644
+--- a/leo/main.rs
++++ b/leo/main.rs
+@@ -175,8 +175,38 @@ enum CommandOpts {
+     // },
+ }
+ 
++fn set_panic_hook() {
++    #[cfg(not(debug_assertions))]
++    std::panic::set_hook({
++        Box::new(move |e| {
++            println!(
++                "thread `{}` {}",
++                std::thread::current().name().unwrap_or("<unnamed>"),
++                e
++            );
++            println!("stack backtrace: \n{:?}", backtrace::Backtrace::new());
++            println!("error: internal compiler error: unexpected panic\n");
++            println!("note: the compiler unexpectedly panicked. this is a bug.\n");
++            println!("note: we would appreciate a bug report: https://github.com/AleoHQ/leo/issues/new?labels=bug,panic&template=bug.md&title=[Bug]\n");
++            println!(
++                "note: {} {} running on {} {}\n",
++                env!("CARGO_PKG_NAME"),
++                env!("CARGO_PKG_VERSION"),
++                sys_info::os_type().unwrap_or_else(|e| e.to_string()),
++                sys_info::os_release().unwrap_or_else(|e| e.to_string()),
++            );
++            println!(
++                "note: compiler args: {}\n",
++                std::env::args().collect::<Vec<_>>().join(" ")
++            );
++            println!("note: compiler flags: {:?}\n", Opt::from_args());
++        })
++    });
++}
++
+ fn main() {
+-    handle_error(run_with_args(Opt::from_args()))
++    set_panic_hook();
++    handle_error(run_with_args(Opt::from_args()));
+ }
+ 
+ /// Run command with custom build arguments.
+diff --git a/tests/expectations/parser/parser/expression/literal/char_fail.leo.out b/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
+index f429609540..eefa9cf0ea 100644
+--- a/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
++++ b/tests/expectations/parser/parser/expression/literal/char_fail.leo.out
+@@ -48,3 +48,4 @@ outputs:
+   - "Error [EPAR0370033]: The escaped unicode char `1234567890` is not within valid length of [1, 6]."
+   - "Error [EPAR0370026]: Expected a closed char but found `򻮻`."
+   - "Error [EPAR0370026]: Expected a closed char but found `😭`."
++  - "Error [EPAR0370043]: Unicode bidi override code point encountered."
+diff --git a/tests/expectations/parser/parser/expression/literal/string_fail.leo.out b/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
+index 331ee1f2d9..0e4d924ff3 100644
+--- a/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
++++ b/tests/expectations/parser/parser/expression/literal/string_fail.leo.out
+@@ -15,3 +15,4 @@ outputs:
+   - "Error [EPAR0370032]: There was no closing `}` after a escaped unicode `af🦀\"`."
+   - "Error [EPAR0370025]: Expected a closed string but found `\"`."
+   - "Error [EPAR0370025]: Expected a closed string but found `⭇😍;`."
++  - "Error [EPAR0370043]: Unicode bidi override code point encountered."
+diff --git a/tests/expectations/parser/parser/program/bidi_comment.leo.out b/tests/expectations/parser/parser/program/bidi_comment.leo.out
+new file mode 100644
+index 0000000000..61ceb26700
+--- /dev/null
++++ b/tests/expectations/parser/parser/program/bidi_comment.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Parse
++expectation: Fail
++outputs:
++  - "Error [EPAR0370043]: Unicode bidi override code point encountered."
+diff --git a/tests/expectations/parser/parser/program/bidi_comment_2.leo.out b/tests/expectations/parser/parser/program/bidi_comment_2.leo.out
+new file mode 100644
+index 0000000000..61ceb26700
+--- /dev/null
++++ b/tests/expectations/parser/parser/program/bidi_comment_2.leo.out
+@@ -0,0 +1,5 @@
++---
++namespace: Parse
++expectation: Fail
++outputs:
++  - "Error [EPAR0370043]: Unicode bidi override code point encountered."
+diff --git a/tests/expectations/parser/parser/statement/console_fail.leo.out b/tests/expectations/parser/parser/statement/console_fail.leo.out
+index b06712cbf1..759aa5bd62 100644
+--- a/tests/expectations/parser/parser/statement/console_fail.leo.out
++++ b/tests/expectations/parser/parser/statement/console_fail.leo.out
+@@ -2,5 +2,6 @@
+ namespace: ParseStatement
+ expectation: Fail
+ outputs:
++  - "Error [EPAR0370043]: Unicode bidi override code point encountered."
+   - "Error [EPAR0370009]: unexpected string: expected 'formatted string', got '1'\n    --> test:1:13\n     |\n   1 | console.log(1);\n     |             ^"
+   - "Error [EPAR0370007]: unexpected identifier: expected 'assert', 'error', 'log' -- got 'test'\n    --> test:1:9\n     |\n   1 | console.test();\n     |         ^^^^"
+diff --git a/tests/parser/expression/literal/char_fail.leo b/tests/parser/expression/literal/char_fail.leo
+index fbd343b4e5..166423f739 100644
+--- a/tests/parser/expression/literal/char_fail.leo
++++ b/tests/parser/expression/literal/char_fail.leo
+@@ -56,3 +56,4 @@ expectation: Fail
+ '\u{bbbbb}\u{aaaa}'
+ 
+ '😭😂😘'
++'⁩'
+diff --git a/tests/parser/expression/literal/string_fail.leo b/tests/parser/expression/literal/string_fail.leo
+index dad1c2448c..4aa792b90a 100644
+--- a/tests/parser/expression/literal/string_fail.leo
++++ b/tests/parser/expression/literal/string_fail.leo
+@@ -27,4 +27,6 @@ expectation: Fail
+ 
+ "\"
+ 
+-"⭇😍;
+\ No newline at end of file
++"⭇😍;
++
++"2066:⁦"
+diff --git a/tests/parser/program/bidi_comment.leo b/tests/parser/program/bidi_comment.leo
+new file mode 100644
+index 0000000000..cdeb79d904
+--- /dev/null
++++ b/tests/parser/program/bidi_comment.leo
+@@ -0,0 +1,9 @@
++/*
++namespace: Parse
++expectation: Fail
++*/
++
++function main() {
++    // 202E‮<-here
++    let x = 1u8;
++}
+diff --git a/tests/parser/program/bidi_comment_2 b/tests/parser/program/bidi_comment_2
+new file mode 100644
+index 0000000000..49cd565a87
+--- /dev/null
++++ b/tests/parser/program/bidi_comment_2
+@@ -0,0 +1,9 @@
++/*
++namespace: Parse
++expectation: Fail
++*/
++
++function main() {
++    /* next line starts with 2069
++⁩*/
++}
+diff --git a/tests/parser/program/bidi_comment_2.leo b/tests/parser/program/bidi_comment_2.leo
+new file mode 100644
+index 0000000000..49cd565a87
+--- /dev/null
++++ b/tests/parser/program/bidi_comment_2.leo
+@@ -0,0 +1,9 @@
++/*
++namespace: Parse
++expectation: Fail
++*/
++
++function main() {
++    /* next line starts with 2069
++⁩*/
++}
+diff --git a/tests/parser/statement/console_fail.leo b/tests/parser/statement/console_fail.leo
+index bb9fff5836..6bf4371c67 100644
+--- a/tests/parser/statement/console_fail.leo
++++ b/tests/parser/statement/console_fail.leo
+@@ -3,6 +3,8 @@ namespace: ParseStatement
+ expectation: Fail
+ */
+ 
++console.error("‪"); // bidi override
++
+ console.log(1);
+ 
+-console.test();
+\ No newline at end of file
++console.test();

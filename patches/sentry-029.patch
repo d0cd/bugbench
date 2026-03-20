@@ -1,188 +1,229 @@
-diff --git a/src/sentry/processing_errors/eap/producer.py b/src/sentry/processing_errors/eap/producer.py
-index 80f876dfdbd..adc56b9d6db 100644
---- a/src/sentry/processing_errors/eap/producer.py
-+++ b/src/sentry/processing_errors/eap/producer.py
-@@ -67,6 +67,11 @@ def produce_processing_errors_to_eap(
-         sdk = event_data.get("sdk") or {}
-         sdk_name = sdk.get("name")
-         sdk_version = sdk.get("version")
-+        received = (
-+            Timestamp(seconds=int(event_data["received"]))
-+            if "received" in event_data
-+            else timestamp
-+        )
+diff --git a/src/sentry/models/group.py b/src/sentry/models/group.py
+index 415ac847d57962..78d3bd1cdf571c 100644
+--- a/src/sentry/models/group.py
++++ b/src/sentry/models/group.py
+@@ -34,6 +34,7 @@
+ )
+ from sentry.db.models.fields.jsonfield import LegacyTextJSONField
+ from sentry.db.models.manager.base import BaseManager
++from sentry.db.models.manager.base_query_set import BaseQuerySet
+ from sentry.issues.grouptype import GroupCategory, get_group_type_by_type_id
+ from sentry.issues.priority import (
+     PRIORITY_TO_GROUP_HISTORY_STATUS,
+@@ -95,23 +96,30 @@ def looks_like_short_id(value):
+     return _short_id_re.match((value or "").strip()) is not None
  
-         count = 0
-         for index, error in enumerate(processing_errors):
-@@ -103,6 +108,7 @@ def produce_processing_errors_to_eap(
-                 item_id=item_id,
-                 item_type=TraceItemType.TRACE_ITEM_TYPE_PROCESSING_ERROR,
-                 timestamp=timestamp,
-+                received=received,
-                 trace_id=trace_id,
-                 retention_days=retention_days,
-                 attributes={k: anyvalue(v) for k, v in attributes.items()},
-diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
-index d99877ec090..704e5e62d21 100644
---- a/src/sentry/testutils/cases.py
-+++ b/src/sentry/testutils/cases.py
-@@ -6,7 +6,7 @@ import random
- import re
- import time
- import uuid
--from collections.abc import Generator, Mapping, Sequence
-+from collections.abc import Callable, Generator, Mapping, Sequence
- from contextlib import contextmanager
- from datetime import UTC, datetime, timedelta
- from enum import Enum
-@@ -1172,6 +1172,36 @@ class SnubaTestCase(BaseTestCase):
-         )
-         assert response.status_code == 200
  
-+    def produce_and_store_eap_items(
-+        self, producer_mock_path: str, produce_fn: Callable[..., Any], *args: Any, **kwargs: Any
-+    ) -> list[TraceItem]:
-+        """
-+        Calls produce_fn while intercepting the Kafka produce call at
-+        producer_mock_path, then inserts the captured TraceItems into Snuba
-+        via the synchronous HTTP endpoint so they're immediately queryable.
-+
-+        Use this instead of calling EAP producers directly in tests, since
-+        SingletonProducer only flushes on process exit.
-+        """
-+        codec = get_topic_codec(Topic.SNUBA_ITEMS)
-+
-+        payloads: list[bytes] = []
-+
-+        def capture(topic: Any, payload: Any) -> None:
-+            payloads.append(payload.value)
-+
-+        with mock.patch(producer_mock_path, side_effect=capture):
-+            produce_fn(*args, **kwargs)
-+
-+        trace_items = []
-+        for raw in payloads:
-+            item = TraceItem()
-+            item.CopyFrom(codec.decode(raw))
-+            trace_items.append(item)
-+
-+        self.store_eap_items(trace_items)
-+        return trace_items
-+
-     def store_occurrences(self, occurrences: Sequence[TraceItem]):
-         files = {
-             f"occurrence_{i}": occurrence.SerializeToString()
-diff --git a/tests/snuba/processing_errors/__init__.py b/tests/snuba/processing_errors/__init__.py
-new file mode 100644
-index 00000000000..e69de29bb2d
-diff --git a/tests/snuba/processing_errors/eap/__init__.py b/tests/snuba/processing_errors/eap/__init__.py
-new file mode 100644
-index 00000000000..e69de29bb2d
-diff --git a/tests/snuba/processing_errors/eap/test_producer.py b/tests/snuba/processing_errors/eap/test_producer.py
-new file mode 100644
-index 00000000000..1e4bec2d9fb
---- /dev/null
-+++ b/tests/snuba/processing_errors/eap/test_producer.py
-@@ -0,0 +1,102 @@
-+from __future__ import annotations
-+
-+from datetime import datetime, timedelta
-+from datetime import timezone as dt_timezone
-+
-+from google.protobuf.timestamp_pb2 import Timestamp
-+from sentry_protos.snuba.v1.endpoint_trace_item_table_pb2 import (
-+    Column,
-+    TraceItemTableRequest,
-+)
-+from sentry_protos.snuba.v1.request_common_pb2 import PageToken, RequestMeta, TraceItemType
-+from sentry_protos.snuba.v1.trace_item_attribute_pb2 import AttributeKey, AttributeValue
-+from sentry_protos.snuba.v1.trace_item_filter_pb2 import ComparisonFilter, TraceItemFilter
-+
-+from sentry.processing_errors.eap.producer import produce_processing_errors_to_eap
-+from sentry.testutils.cases import SnubaTestCase, TestCase
-+from sentry.utils import snuba_rpc
-+
-+
-+class ProcessingErrorEAPIntegrationTest(TestCase, SnubaTestCase):
-+    """
-+    Integration test that produces processing errors through the real
-+    producer logic, captures the serialized TraceItem, inserts it into
-+    Snuba via the synchronous HTTP endpoint, and queries it back to
-+    verify the full round-trip.
-+    """
-+
-+    def test_write_and_read_round_trip(self) -> None:
-+        event_id = "a" * 32
-+        event_data = {
-+            "event_id": event_id,
-+            "timestamp": int(datetime.now(dt_timezone.utc).timestamp()),
-+            "received": int(datetime.now(dt_timezone.utc).timestamp()),
-+            "contexts": {"trace": {"trace_id": "b" * 32}},
-+            "platform": "javascript",
-+            "release": "1.0.0",
-+            "sdk": {"name": "sentry.javascript.browser", "version": "7.0.0"},
-+        }
-+        errors = [
-+            {"type": "js_no_source", "symbolicator_type": "missing_sourcemap"},
-+        ]
-+
-+        self.produce_and_store_eap_items(
-+            "sentry.processing_errors.eap.producer._eap_producer.produce",
-+            produce_processing_errors_to_eap,
-+            self.project,
-+            event_data,
-+            errors,
-+        )
-+
-+        now = datetime.now(dt_timezone.utc)
-+
-+        start_proto = Timestamp()
-+        start_proto.FromDatetime(now - timedelta(hours=1))
-+        end_proto = Timestamp()
-+        end_proto.FromDatetime(now + timedelta(hours=1))
-+
-+        rpc_request = TraceItemTableRequest(
-+            meta=RequestMeta(
-+                referrer="test.processing_errors.integration",
-+                organization_id=self.organization.id,
-+                project_ids=[self.project.id],
-+                trace_item_type=TraceItemType.TRACE_ITEM_TYPE_PROCESSING_ERROR,
-+                start_timestamp=start_proto,
-+                end_timestamp=end_proto,
-+            ),
-+            columns=[
-+                Column(
-+                    label="event_id",
-+                    key=AttributeKey(name="event_id", type=AttributeKey.Type.TYPE_STRING),
-+                ),
-+                Column(
-+                    label="error_type",
-+                    key=AttributeKey(name="error_type", type=AttributeKey.Type.TYPE_STRING),
-+                ),
-+                Column(
-+                    label="platform",
-+                    key=AttributeKey(name="platform", type=AttributeKey.Type.TYPE_STRING),
-+                ),
-+            ],
-+            filter=TraceItemFilter(
-+                comparison_filter=ComparisonFilter(
-+                    key=AttributeKey(name="event_id", type=AttributeKey.Type.TYPE_STRING),
-+                    op=ComparisonFilter.OP_EQUALS,
-+                    value=AttributeValue(val_str=event_id),
-+                )
-+            ),
-+            limit=10,
-+            page_token=PageToken(offset=0),
-+        )
-+
-+        responses = snuba_rpc.table_rpc([rpc_request])
-+        response = responses[0]
-+
-+        assert response.column_values and response.column_values[0].results, (
-+            "Processing error not found in Snuba"
-+        )
-+
-+        columns = {cv.attribute_name: idx for idx, cv in enumerate(response.column_values)}
-+        assert response.column_values[columns["event_id"]].results[0].val_str == event_id
-+        assert response.column_values[columns["error_type"]].results[0].val_str == "js_no_source"
-+        assert response.column_values[columns["platform"]].results[0].val_str == "javascript"
+-def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organization=None):
++def get_group_with_redirect(
++    id_or_qualified_short_id: int | str,
++    queryset: BaseQuerySet[Group, Group] | None = None,
++    organization: Organization | None = None,
++) -> tuple[Group, bool]:
+     """
+     Retrieve a group by ID, checking the redirect table if the requested group
+     does not exist. Returns a two-tuple of ``(object, redirected)``.
+     """
+     if queryset is None:
+         if organization:
+-            queryset = Group.objects.filter(project__organization=organization)
+-            getter = queryset.get
++            updated_qs = Group.objects.filter(project__organization=organization)
++            getter = updated_qs.get
+         else:
+-            queryset = Group.objects.all()
++            updated_qs = Group.objects.all()
+             # When not passing a queryset, we want to read from cache
+             getter = Group.objects.get_from_cache
+     else:
+         if organization:
+-            queryset = queryset.filter(project__organization=organization)
+-        getter = queryset.get
++            updated_qs = queryset.filter(project__organization=organization)
++        else:
++            # No updates!
++            updated_qs = queryset
++        getter = updated_qs.get
+ 
+     if not (isinstance(id_or_qualified_short_id, int) or id_or_qualified_short_id.isdigit()):
+         short_id = parse_short_id(id_or_qualified_short_id)
+@@ -137,6 +145,8 @@ def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organizatio
+         from sentry.models.groupredirect import GroupRedirect
+ 
+         if short_id:
++            # Known because we only set short_id in a path that raises if org is None
++            assert organization is not None
+             params = {
+                 "id__in": GroupRedirect.objects.filter(
+                     organization_id=organization.id,
+@@ -152,7 +162,7 @@ def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organizatio
+             }
+ 
+         try:
+-            return queryset.get(**params), True
++            return updated_qs.get(**params), True
+         except Group.DoesNotExist:
+             raise error  # raise original `DoesNotExist`
+ 
+diff --git a/src/sentry/seer/code_review/models.py b/src/sentry/seer/code_review/models.py
+index 4c092123203d96..8d36e4a83ed742 100644
+--- a/src/sentry/seer/code_review/models.py
++++ b/src/sentry/seer/code_review/models.py
+@@ -86,6 +86,7 @@ class SeerCodeReviewRepoDefinition(BaseModel):
+     # Optional in base, overridden in subclasses based on request type
+     organization_id: int | None = None
+     integration_id: str | None = None
++    is_private: bool | None = None
+ 
+ 
+ class SeerCodeReviewRepoForPrReview(SeerCodeReviewRepoDefinition):
+diff --git a/src/sentry/seer/code_review/utils.py b/src/sentry/seer/code_review/utils.py
+index d57d58a599864a..e097f70bca5940 100644
+--- a/src/sentry/seer/code_review/utils.py
++++ b/src/sentry/seer/code_review/utils.py
+@@ -246,9 +246,10 @@ def _common_codegen_request_payload(
+     repo: Repository,
+     target_commit_sha: str,
+     organization: Organization,
++    event_payload: Mapping[str, Any],
+ ) -> dict[str, Any]:
+     data: dict[str, Any] = {
+-        "repo": _build_repo_definition(repo, target_commit_sha),
++        "repo": _build_repo_definition(repo, target_commit_sha, event_payload),
+         "bug_prediction_specific_information": {
+             "organization_id": organization.id,
+             "organization_slug": organization.slug,
+@@ -287,6 +288,7 @@ def transform_issue_comment_to_codegen_request(
+         repo=repo,
+         target_commit_sha=target_commit_sha,
+         organization=organization,
++        event_payload=event_payload,
+     )
+     payload["data"]["pr_id"] = event_payload["issue"]["number"]
+     config = payload["data"]["config"]
+@@ -325,6 +327,7 @@ def transform_pull_request_to_codegen_request(
+         repo=repo,
+         target_commit_sha=target_commit_sha,
+         organization=organization,
++        event_payload=event_payload,
+     )
+     pull_request = event_payload.get("pull_request", {})
+     payload["data"]["pr_id"] = pull_request.get("number")
+@@ -343,7 +346,11 @@ def transform_pull_request_to_codegen_request(
+     return payload
+ 
+ 
+-def _build_repo_definition(repo: Repository, target_commit_sha: str) -> dict[str, Any]:
++def _build_repo_definition(
++    repo: Repository,
++    target_commit_sha: str,
++    event_payload: Mapping[str, Any],
++) -> dict[str, Any]:
+     """
+     Build the repository definition for code review requests.
+     """
+@@ -359,6 +366,7 @@ def _build_repo_definition(repo: Repository, target_commit_sha: str) -> dict[str
+         "external_id": repo.external_id,
+         "base_commit_sha": target_commit_sha,
+         "organization_id": repo.organization_id,
++        "is_private": event_payload.get("repository", {}).get("private"),
+     }
+ 
+     # add integration_id which is used in pr_closed_step for product metrics dashboarding only
+@@ -425,6 +433,7 @@ def get_tags(
+             - scm_owner: The repository owner/organization name
+             - scm_provider: Always "github"
+             - scm_repo_full_name: The repository full name (owner/repo)
++            - scm_repo_is_private: Whether the repo is private (if available)
+             - scm_repo_name: The repository name
+             - sentry_integration_id: The Sentry integration ID
+             - sentry_organization_id: Sentry organization ID (if available)
+@@ -448,6 +457,8 @@ def get_tags(
+             result["scm_repo_name"] = repo_name
+         if owner_repo_name := repository.get("full_name"):
+             result["scm_repo_full_name"] = owner_repo_name
++        if (repo_private := repository.get("private")) is not None:
++            result["scm_repo_is_private"] = str(repo_private)
+ 
+     github_event_action = event.get("action")
+     if github_event_action:
+diff --git a/src/sentry/seer/models/seer_api_models.py b/src/sentry/seer/models/seer_api_models.py
+index 1e53fd3d952ac1..734dbec63684c5 100644
+--- a/src/sentry/seer/models/seer_api_models.py
++++ b/src/sentry/seer/models/seer_api_models.py
+@@ -36,6 +36,7 @@ class SeerRepoDefinition(BaseModel):
+     owner: str
+     name: str
+     external_id: str
++    is_private: bool | None = None
+     branch_name: str | None = Field(
+         default=None,
+         description="The branch that will be used, otherwise the default branch will be used.",
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+index 371a5dcca08600..9f90e1f4728e28 100644
+--- a/src/sentry/tasks/merge.py
++++ b/src/sentry/tasks/merge.py
+@@ -7,6 +7,7 @@
+ from django.db.models import F
+ 
+ from sentry import eventstream, similarity, tsdb
++from sentry.models.group import Group
+ from sentry.silo.base import SiloMode
+ from sentry.tasks.base import instrumented_task, track_group_async_operation
+ from sentry.tasks.post_process import fetch_buffered_group_stats
+@@ -27,17 +28,16 @@
+ @track_group_async_operation
+ def merge_groups(
+     from_object_ids: list[int] | None = None,
+-    to_object_id: list[int] | None = None,
++    to_object_id: int | str | None = None,
+     transaction_id: int | None = None,
+     recursed: bool = False,
+     eventstream_state: Mapping[str, Any] | None = None,
+-    **kwargs,
+ ):
+     # TODO(mattrobenolt): Write tests for all of this
+     from sentry.models.activity import Activity
+     from sentry.models.environment import Environment
+     from sentry.models.eventattachment import EventAttachment
+-    from sentry.models.group import Group, get_group_with_redirect
++    from sentry.models.group import get_group_with_redirect
+     from sentry.models.groupassignee import GroupAssignee
+     from sentry.models.groupenvironment import GroupEnvironment
+     from sentry.models.grouphash import GroupHash
+@@ -207,7 +207,14 @@ def merge_groups(
+         eventstream.backend.end_merge(eventstream_state)
+ 
+ 
+-def merge_objects(models, group, new_group, limit=1000, logger=None, transaction_id=None):
++def merge_objects(
++    models,
++    group: Group,
++    new_group: Group,
++    limit: int = 1000,
++    logger: logging.Logger | None = None,
++    transaction_id: int | None = None,
++):
+     has_more = False
+     for model in models:
+         all_fields = [f.name for f in model._meta.get_fields()]
+diff --git a/src/sentry/web/frontend/group_event_json.py b/src/sentry/web/frontend/group_event_json.py
+index 88f7f58a8cb111..c1d0b4b9c0a728 100644
+--- a/src/sentry/web/frontend/group_event_json.py
++++ b/src/sentry/web/frontend/group_event_json.py
+@@ -3,6 +3,7 @@
+ from sentry.models.group import Group, get_group_with_redirect
+ from sentry.models.groupmeta import GroupMeta
+ from sentry.services import eventstore
++from sentry.services.eventstore.models import Event, GroupEvent
+ from sentry.utils import json
+ from sentry.web.frontend.base import OrganizationView, region_silo_view
+ 
+@@ -19,6 +20,7 @@ def get(self, request: HttpRequest, organization, group_id, event_id_or_latest)
+         except Group.DoesNotExist:
+             raise Http404
+ 
++        event: Event | GroupEvent | None
+         if event_id_or_latest == "latest":
+             event = group.get_latest_event()
+         else:
