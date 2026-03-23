@@ -6,21 +6,21 @@ Full pipeline from dataset construction through analysis:
 
 ```bash
 # 1. Dataset construction
-bugeval mine --repo ProvableHQ/leo --output-dir cases/leo
-bugeval blame --cases-dir cases/leo --repo-dir ./repos/leo
-bugeval ground-truth --cases-dir cases/leo --repo-dir ./repos/leo
-bugeval validate --cases-dir cases/leo --repo-dir ./repos/leo
-bugeval clean-cases --repo ProvableHQ/leo --cases-dir cases/leo
+bugbench mine --repo ProvableHQ/leo --output-dir cases/leo
+bugbench blame --cases-dir cases/leo --repo-dir ./repos/leo
+bugbench ground-truth --cases-dir cases/leo --repo-dir ./repos/leo
+bugbench validate --cases-dir cases/leo --repo-dir ./repos/leo
+bugbench clean-cases --repo ProvableHQ/leo --cases-dir cases/leo
 
 # 2. Evaluation (PR tools need --org for forks)
-bugeval evaluate --tool copilot --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --org bug-tools-eval
-bugeval evaluate --tool greptile --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --org bug-tools-eval
-bugeval evaluate --tool coderabbit --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --org bug-tools-eval
-bugeval evaluate --tool agent --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --context diff+repo
+bugbench evaluate --tool copilot --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --org bug-tools-eval
+bugbench evaluate --tool greptile --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --org bug-tools-eval
+bugbench evaluate --tool coderabbit --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --org bug-tools-eval
+bugbench evaluate --tool agent --cases-dir cases/leo --run-dir results/run-001 --repo-dir ./repos/leo --context diff+repo
 
 # 3. Scoring and analysis
-bugeval score --run-dir results/run-001 --cases-dir cases/leo
-bugeval analyze --run-dir results/run-001 --cases-dir cases/leo
+bugbench score --run-dir results/run-001 --cases-dir cases/leo
+bugbench analyze --run-dir results/run-001 --cases-dir cases/leo
 ```
 
 ## GitHub Org Setup
@@ -30,7 +30,7 @@ The evaluation org is `bug-tools-eval`. Each tool gets its own isolated repo per
 - `ensure_tool_repo()` creates per-tool repos lazily (e.g., `leo-copilot`, `leo-greptile`, `leo-coderabbit`)
 - Repos must be **public** for free-tier tool access
 - Each PR tool needs its GitHub App installed on the org
-- `--org bug-tools-eval` must be passed to `bugeval evaluate` for all PR-based tools
+- `--org bug-tools-eval` must be passed to `bugbench evaluate` for all PR-based tools
 
 ### App installation
 
@@ -68,7 +68,7 @@ done
 
 # Run all tools in parallel (each uses its own clone)
 for tool in copilot greptile coderabbit; do
-  uv run bugeval evaluate \
+  uv run bugbench evaluate \
     --tool $tool \
     --cases-dir cases/leo \
     --run-dir results/run-pr-tools \
@@ -82,7 +82,7 @@ wait
 
 ## Dashboard
 
-`bugeval dashboard` launches a local Flask web UI for experiment management and dataset review.
+`bugbench dashboard` launches a local Flask web UI for experiment management and dataset review.
 
 | Page | URL | Purpose |
 |------|-----|---------|
@@ -105,13 +105,13 @@ The Agent SDK runner can execute inside Docker, giving the agent access to Bash,
 
 ```bash
 # Build the Docker image (Rust toolchain + Claude Code CLI + Agent SDK)
-docker build -t bugeval-agent-v2 .
+docker build -t bugbench-agent-v2 .
 
 # Authenticate Claude Code inside Docker (interactive, one-time)
 docker run -it \
-  -v bugeval-claude-auth:/home/agent/.claude \
+  -v bugbench-claude-auth:/home/agent/.claude \
   -e CLAUDE_CONFIG_DIR=/home/agent/.claude \
-  bugeval-agent-v2 claude /login
+  bugbench-agent-v2 claude /login
 ```
 
 **Requirements:** Docker (Orbstack recommended on macOS). The image needs ~2.8GB. Each container uses ~300-500MB RAM at runtime.
@@ -120,7 +120,7 @@ docker run -it \
 
 ```bash
 # Sonnet with Docker (Bash/rg access)
-uv run bugeval evaluate \
+uv run bugbench evaluate \
   --tool agent-sdk \
   --cases-dir cases/leo \
   --run-dir results/run-docker-sonnet \
@@ -130,10 +130,10 @@ uv run bugeval evaluate \
   --timeout 300 \
   --max-turns 20 \
   --docker \
-  --docker-image bugeval-agent-v2
+  --docker-image bugbench-agent-v2
 
 # Opus with Docker
-uv run bugeval evaluate \
+uv run bugbench evaluate \
   --tool agent-sdk \
   --cases-dir cases/leo \
   --run-dir results/run-docker-opus \
@@ -144,12 +144,12 @@ uv run bugeval evaluate \
   --max-turns 20 \
   --model claude-opus-4-6 \
   --docker \
-  --docker-image bugeval-agent-v2
+  --docker-image bugbench-agent-v2
 ```
 
 ### Architecture
 
-- **`--docker` flag** on `bugeval evaluate` routes SDK tools through Docker at the orchestrator level (`evaluate.py`). Runners are Docker-unaware.
+- **`--docker` flag** on `bugbench evaluate` routes SDK tools through Docker at the orchestrator level (`evaluate.py`). Runners are Docker-unaware.
 - Inside Docker, `_docker_runner.py` runs the Agent SDK with `ClaudeSDKClient`, capturing turn-by-turn transcripts (tool calls, text, cost).
 - **Synthesis continuation:** If the agent exhausts its turns without producing JSON findings, a synthesis prompt is automatically sent in the same session (90s reserved budget). This recovered 7/9 failures in testing.
 - **Prompt:** Docker agents get an enhanced prompt (`bash_enabled=True`) describing Bash, `rg`, `cargo` tools. Non-Docker agents get read-only tools (Read, Glob, Grep, WebSearch).
@@ -169,7 +169,7 @@ uv run bugeval evaluate \
 results/run-*/
 ├── results/*.yaml         # ToolResult: comments, cost, time
 ├── transcripts/*.json     # Turn-by-turn SDK messages (tool_use, text, cost)
-├── scores/*.yaml          # LLM judge scores (after `bugeval score`)
+├── scores/*.yaml          # LLM judge scores (after `bugbench score`)
 └── workspaces/            # Repo clones (can be cleaned up after run)
 ```
 
@@ -179,8 +179,8 @@ results/run-*/
 |-------|-------|-----|
 | Exit code -9 (SIGKILL) | OOM — too many concurrent containers | Reduce `--concurrency` or increase Orbstack memory |
 | Empty workspace inside container | Mount from `/tmp` fails on some Docker runtimes | Workspaces must be under project dir (evaluate does this automatically) |
-| `docker: Error response from daemon: pull access denied` | Image not built on current Docker runtime | Rebuild: `docker build -t bugeval-agent-v2 .` |
-| Auth failure inside container | Claude Code not logged in | Re-run: `docker run -it -v bugeval-claude-auth:/home/agent/.claude ... claude /login` |
+| `docker: Error response from daemon: pull access denied` | Image not built on current Docker runtime | Rebuild: `docker build -t bugbench-agent-v2 .` |
+| Auth failure inside container | Claude Code not logged in | Re-run: `docker run -it -v bugbench-claude-auth:/home/agent/.claude ... claude /login` |
 | Agent explores forever (100+ messages) | Large PR, agent doesn't self-terminate | Synthesis continuation handles this; also consider `--max-turns 15` |
 | Docker + diff-only produces empty results | `workspace=None` mounts `/dev/null` as `/work` | Not yet supported. Use `--context diff+repo` with Docker, or SDK without `--docker` for diff-only |
 
@@ -192,7 +192,7 @@ open all PRs first, let tools review asynchronously, then scrape.
 ```bash
 # Phase 1: Open PRs (fast, ~2 min for 58 cases × 3 tools)
 for tool in copilot greptile coderabbit; do
-  uv run bugeval open-prs \
+  uv run bugbench open-prs \
     --tool $tool \
     --cases-dir cases/leo \
     --run-dir results/run-pr-tools \
@@ -205,22 +205,22 @@ wait
 # Wait for tools to review (5-30 min depending on tool)
 
 # Phase 2: Scrape reviews (re-run until all reviewed)
-uv run bugeval scrape-prs \
+uv run bugbench scrape-prs \
   --run-dir results/run-pr-tools \
   --cases-dir cases/leo \
   --org bug-tools-eval \
   --no-close    # keep PRs open until all tools have reviewed
 
 # When all reviewed, close PRs
-uv run bugeval scrape-prs \
+uv run bugbench scrape-prs \
   --run-dir results/run-pr-tools \
   --cases-dir cases/leo \
   --org bug-tools-eval \
   --close
 
 # Clean up orphaned PRs/branches from failed runs
-uv run bugeval cleanup-prs --org bug-tools-eval --dry-run
-uv run bugeval cleanup-prs --org bug-tools-eval
+uv run bugbench cleanup-prs --org bug-tools-eval --dry-run
+uv run bugbench cleanup-prs --org bug-tools-eval
 ```
 
 **Preflight checks:** `open-prs` validates cases exist, repo is valid, GitHub
@@ -236,17 +236,17 @@ errors (timeouts, 500s, rate limits).
 
 | Command | Purpose |
 |---------|---------|
-| `bugeval mine` | Scrape fix PRs from GitHub, build initial TestCase YAMLs |
-| `bugeval blame` | Find introducing commits via git blame |
-| `bugeval ground-truth` | Build ground truth via diff intersection |
-| `bugeval curate` | Auto-exclude bad cases (bumps, CI fixes, features, etc.) |
-| `bugeval validate` | Cross-model validation (Claude + Gemini) |
-| `bugeval clean-cases` | Generate negative control cases (clean PRs) |
-| `bugeval evaluate` | Run a tool against test cases (agents + single-phase PR) |
-| `bugeval open-prs` | Phase 1: Open PRs for PR tools (no waiting) |
-| `bugeval scrape-prs` | Phase 2: Scrape reviews from open PRs |
-| `bugeval cleanup-prs` | Close orphaned PRs and delete stale branches |
-| `bugeval score` | Mechanical catch rate + LLM quality judge |
-| `bugeval analyze` | Statistics, comparison tables, charts |
-| `bugeval dashboard` | Local Flask web UI for experiment management |
-| `bugeval add-case` | Manually add a case from a fix PR URL |
+| `bugbench mine` | Scrape fix PRs from GitHub, build initial TestCase YAMLs |
+| `bugbench blame` | Find introducing commits via git blame |
+| `bugbench ground-truth` | Build ground truth via diff intersection |
+| `bugbench curate` | Auto-exclude bad cases (bumps, CI fixes, features, etc.) |
+| `bugbench validate` | Cross-model validation (Claude + Gemini) |
+| `bugbench clean-cases` | Generate negative control cases (clean PRs) |
+| `bugbench evaluate` | Run a tool against test cases (agents + single-phase PR) |
+| `bugbench open-prs` | Phase 1: Open PRs for PR tools (no waiting) |
+| `bugbench scrape-prs` | Phase 2: Scrape reviews from open PRs |
+| `bugbench cleanup-prs` | Close orphaned PRs and delete stale branches |
+| `bugbench score` | Mechanical catch rate + LLM quality judge |
+| `bugbench analyze` | Statistics, comparison tables, charts |
+| `bugbench dashboard` | Local Flask web UI for experiment management |
+| `bugbench add-case` | Manually add a case from a fix PR URL |

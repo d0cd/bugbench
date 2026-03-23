@@ -30,10 +30,10 @@ One-time GitHub org setup (needed for Step 3):
 Mine fix PRs, build ground truth, auto-curate.
 
 ```bash
-uv run bugeval mine --repo ProvableHQ/leo --limit 500 --output-dir cases --since 2023-01-01
-uv run bugeval blame --cases-dir cases/leo --repo-dir repos/leo
-uv run bugeval ground-truth --cases-dir cases/leo --repo-dir repos/leo
-uv run bugeval curate --cases-dir cases/leo
+uv run bugbench mine --repo ProvableHQ/leo --limit 500 --output-dir cases --since 2023-01-01
+uv run bugbench blame --cases-dir cases/leo --repo-dir repos/leo
+uv run bugbench ground-truth --cases-dir cases/leo --repo-dir repos/leo
+uv run bugbench curate --cases-dir cases/leo
 ```
 
 **Results:** 232 mined -> 58 active cases after curation.
@@ -53,7 +53,7 @@ bug descriptions, classification metadata, language=rust.
 Validate evaluate -> score -> analyze on the curated dataset.
 
 ```bash
-uv run bugeval evaluate \
+uv run bugbench evaluate \
   --tool agent-sdk \
   --cases-dir cases/leo \
   --run-dir results/run-01-sdk-diffonly \
@@ -62,8 +62,8 @@ uv run bugeval evaluate \
   --concurrency 3
 
 # Mechanical scoring only (no LLM, no API key)
-uv run bugeval score --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo --dry-run
-uv run bugeval analyze --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo
+uv run bugbench score --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo --dry-run
+uv run bugbench analyze --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo
 ```
 
 **Check:**
@@ -83,7 +83,7 @@ uv run bugeval analyze --run-dir results/run-01-sdk-diffonly --cases-dir cases/l
 Validate workspace-as-fixture pattern and tool use.
 
 ```bash
-uv run bugeval evaluate \
+uv run bugbench evaluate \
   --tool agent-sdk \
   --cases-dir cases/leo \
   --run-dir results/run-02-sdk-repo \
@@ -91,8 +91,8 @@ uv run bugeval evaluate \
   --context diff+repo \
   --concurrency 3
 
-uv run bugeval score --run-dir results/run-02-sdk-repo --cases-dir cases/leo --dry-run
-uv run bugeval analyze --run-dir results/run-02-sdk-repo --cases-dir cases/leo
+uv run bugbench score --run-dir results/run-02-sdk-repo --cases-dir cases/leo --dry-run
+uv run bugbench analyze --run-dir results/run-02-sdk-repo --cases-dir cases/leo
 ```
 
 **Check:**
@@ -116,7 +116,7 @@ cp cases/leo/leo-002.yaml cases/leo/leo-020.yaml cases/leo/leo-022.yaml cases/le
 
 # Phase 1: Open PRs (fast)
 for tool in copilot greptile coderabbit; do
-  uv run bugeval open-prs \
+  uv run bugbench open-prs \
     --tool $tool \
     --cases-dir cases/leo-pilot \
     --run-dir results/run-03-pr-pilot \
@@ -126,14 +126,14 @@ done
 wait
 
 # Wait 10-15 min for tools to review, then scrape
-uv run bugeval scrape-prs \
+uv run bugbench scrape-prs \
   --run-dir results/run-03-pr-pilot \
   --cases-dir cases/leo-pilot \
   --org bug-tools-eval \
   --no-close
 
 # Re-run scrape until all reviewed, then close
-uv run bugeval scrape-prs \
+uv run bugbench scrape-prs \
   --run-dir results/run-03-pr-pilot \
   --cases-dir cases/leo-pilot \
   --org bug-tools-eval \
@@ -158,13 +158,13 @@ uv run bugeval scrape-prs \
 export ANTHROPIC_API_KEY=...
 
 # Cross-validate ground truth
-uv run bugeval validate --cases-dir cases/leo --repo-dir repos/leo
+uv run bugbench validate --cases-dir cases/leo --repo-dir repos/leo
 
 # Score Step 1+2 results WITH LLM judge
-uv run bugeval score --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo
-uv run bugeval score --run-dir results/run-02-sdk-repo --cases-dir cases/leo
-uv run bugeval analyze --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo
-uv run bugeval analyze --run-dir results/run-02-sdk-repo --cases-dir cases/leo
+uv run bugbench score --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo
+uv run bugbench score --run-dir results/run-02-sdk-repo --cases-dir cases/leo
+uv run bugbench analyze --run-dir results/run-01-sdk-diffonly --cases-dir cases/leo
+uv run bugbench analyze --run-dir results/run-02-sdk-repo --cases-dir cases/leo
 ```
 
 **Check:**
@@ -183,10 +183,10 @@ uv run bugeval analyze --run-dir results/run-02-sdk-repo --cases-dir cases/leo
 Add negative controls for false alarm testing.
 
 ```bash
-uv run bugeval clean-cases --repo ProvableHQ/leo --count 10 --cases-dir cases --since 2023-01-01
+uv run bugbench clean-cases --repo ProvableHQ/leo --count 10 --cases-dir cases --since 2023-01-01
 
 # Run SDK on all cases (bug + clean)
-uv run bugeval evaluate \
+uv run bugbench evaluate \
   --tool agent-sdk \
   --cases-dir cases/leo \
   --run-dir results/run-05-sdk-full \
@@ -194,13 +194,13 @@ uv run bugeval evaluate \
   --context diff+repo \
   --concurrency 3
 
-uv run bugeval score --run-dir results/run-05-sdk-full --cases-dir cases/leo
-uv run bugeval analyze --run-dir results/run-05-sdk-full --cases-dir cases/leo
+uv run bugbench score --run-dir results/run-05-sdk-full --cases-dir cases/leo
+uv run bugbench analyze --run-dir results/run-05-sdk-full --cases-dir cases/leo
 ```
 
 **Check via dashboard:**
 ```bash
-uv run bugeval dashboard --cases-dir cases --results-dir results --debug
+uv run bugbench dashboard --cases-dir cases --results-dir results --debug
 # Visit http://localhost:5000
 # Check: blame confidence distribution, clean cases present, catch rate >10%
 ```
@@ -216,7 +216,7 @@ Run all 3 PR tools on the full leo dataset using two-phase approach.
 ```bash
 # Phase 1: Open all PRs (~2 min)
 for tool in copilot greptile coderabbit; do
-  uv run bugeval open-prs \
+  uv run bugbench open-prs \
     --tool $tool \
     --cases-dir cases/leo \
     --run-dir results/run-06-pr-tools \
@@ -228,21 +228,21 @@ wait
 
 # Wait for tools to review (Copilot ~10 min, Greptile ~15 min, CodeRabbit ~30 min)
 # Scrape periodically until all reviewed
-uv run bugeval scrape-prs \
+uv run bugbench scrape-prs \
   --run-dir results/run-06-pr-tools \
   --cases-dir cases/leo \
   --org bug-tools-eval \
   --no-close
 
 # When all reviewed, close and score
-uv run bugeval scrape-prs \
+uv run bugbench scrape-prs \
   --run-dir results/run-06-pr-tools \
   --cases-dir cases/leo \
   --org bug-tools-eval \
   --close
 
-uv run bugeval score --run-dir results/run-06-pr-tools --cases-dir cases/leo
-uv run bugeval analyze --run-dir results/run-06-pr-tools --cases-dir cases/leo
+uv run bugbench score --run-dir results/run-06-pr-tools --cases-dir cases/leo
+uv run bugbench analyze --run-dir results/run-06-pr-tools --cases-dir cases/leo
 ```
 
 **Check:** Comparison table shows copilot vs greptile vs coderabbit catch rates.
@@ -259,11 +259,11 @@ Mine additional repos and curate.
 for repo in ProvableHQ/snarkOS AleoNet/sdk; do
   slug=$(echo $repo | cut -d/ -f2)
   git clone https://github.com/$repo.git repos/$slug
-  uv run bugeval mine --repo $repo --limit 500 --output-dir cases --since 2023-01-01
-  uv run bugeval blame --cases-dir cases/$slug --repo-dir repos/$slug
-  uv run bugeval ground-truth --cases-dir cases/$slug --repo-dir repos/$slug
-  uv run bugeval curate --cases-dir cases/$slug
-  uv run bugeval clean-cases --repo $repo --count 10 --cases-dir cases --since 2023-01-01
+  uv run bugbench mine --repo $repo --limit 500 --output-dir cases --since 2023-01-01
+  uv run bugbench blame --cases-dir cases/$slug --repo-dir repos/$slug
+  uv run bugbench ground-truth --cases-dir cases/$slug --repo-dir repos/$slug
+  uv run bugbench curate --cases-dir cases/$slug
+  uv run bugbench clean-cases --repo $repo --count 10 --cases-dir cases --since 2023-01-01
 done
 ```
 
@@ -284,7 +284,7 @@ for slug in leo snarkOS sdk; do
   for tool_model in "agent claude-sonnet-4-6" "agent-gemini gemini-2.5-flash" "agent-openai o4-mini"; do
     tool=$(echo $tool_model | cut -d' ' -f1)
     model=$(echo $tool_model | cut -d' ' -f2)
-    uv run bugeval evaluate \
+    uv run bugbench evaluate \
       --tool $tool --model $model \
       --cases-dir cases/$slug \
       --run-dir results/run-08-models \
@@ -294,8 +294,8 @@ for slug in leo snarkOS sdk; do
   done
 done
 
-uv run bugeval score --run-dir results/run-08-models --cases-dir cases
-uv run bugeval analyze --run-dir results/run-08-models --cases-dir cases
+uv run bugbench score --run-dir results/run-08-models --cases-dir cases
+uv run bugbench analyze --run-dir results/run-08-models --cases-dir cases
 ```
 
 **Check:** Model quality ladder visible. Compare in dashboard.

@@ -76,6 +76,11 @@ def _invalidate_cache(prefix: str = "") -> None:
 
 
 def _find_case_yaml(cases_dir: Path, case_id: str) -> Path | None:
+    # Check directly in cases_dir (when --cases-dir points to repo subdir)
+    direct = cases_dir / f"{case_id}.yaml"
+    if direct.exists():
+        return direct
+    # Check subdirectories (when --cases-dir points to parent)
     for repo_dir in cases_dir.iterdir():
         if not repo_dir.is_dir():
             continue
@@ -113,6 +118,7 @@ def _run_summary(run_dir: Path) -> dict[str, Any]:
     tool = ""
     context = ""
     model = ""
+    created = ""
     if meta_path.exists():
         import json
 
@@ -121,7 +127,13 @@ def _run_summary(run_dir: Path) -> dict[str, Any]:
             tool = meta.get("tool", "")
             context = meta.get("context_level", "")
             model = meta.get("model", "")
-        except (json.JSONDecodeError, OSError):
+            raw_created = meta.get("created_at", "")
+            if raw_created:
+                from datetime import UTC, datetime
+
+                dt = datetime.fromisoformat(raw_created)
+                created = dt.astimezone(UTC).strftime("%Y-%m-%d")
+        except (json.JSONDecodeError, OSError, ValueError):
             pass
     return {
         "name": run_dir.name,
@@ -131,6 +143,7 @@ def _run_summary(run_dir: Path) -> dict[str, Any]:
         "tool": tool,
         "context": context,
         "model": model,
+        "created": created,
     }
 
 
@@ -514,29 +527,31 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
         prev_id = ids[idx - 1] if idx > 0 else None
         next_id = ids[idx + 1] if idx + 1 < len(ids) else None
 
-        # Golden status
+        # Golden status + notes
         golden = load_golden_set(c_dir)
         golden_entry = golden.get(case_id)
         golden_status = golden_entry.status if golden_entry else "unreviewed"
+        golden_notes = golden_entry.notes if golden_entry else ""
 
         # Run links — find scores for this case across all runs
+        # Use glob for specific case files instead of loading all scores
         r_dir: Path = app.config["RESULTS_DIR"]
         run_links: list[dict[str, Any]] = []
         for rd in _run_dirs(r_dir):
             scores_dir = rd / "scores"
             if not scores_dir.exists():
                 continue
-            scores: list[CaseScore] = _cached(
-                f"scores:{rd.name}",
-                lambda sd=scores_dir: load_scores(sd),
-            )
-            for s in scores:
-                if s.case_id == case_id:
-                    run_links.append({
-                        "run": rd.name,
-                        "tool": s.tool,
-                        "caught": s.caught,
-                    })
+            for p in scores_dir.glob(f"{case_id}--*.yaml"):
+                try:
+                    score_data = yaml.safe_load(p.read_text())
+                    if score_data:
+                        run_links.append({
+                            "run": rd.name,
+                            "tool": score_data.get("tool", ""),
+                            "caught": score_data.get("caught", False),
+                        })
+                except (yaml.YAMLError, OSError):
+                    pass
 
         return render_template(
             "case_detail.html",
@@ -544,8 +559,25 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
             prev_id=prev_id,
             next_id=next_id,
             golden_status=golden_status,
+            golden_notes=golden_notes,
             run_links=run_links,
         )
+
+    @app.route("/cases/<case_id>/review", methods=["POST"])
+    def case_review(case_id: str) -> Any:
+        c_dir: Path = app.config["CASES_DIR"]
+        status = request.form.get("status", "")
+        notes = request.form.get("notes", "").strip()
+        if status and status not in ("confirmed", "disputed", "unreviewed"):
+            return "Invalid status", 400
+        golden = load_golden_set(c_dir)
+        entry = golden.get(case_id)
+        current_status = entry.status if entry else "unreviewed"
+        new_status = status if status else current_status
+        set_golden_status(
+            c_dir, case_id, new_status, reviewer="dashboard", notes=notes
+        )
+        return redirect(url_for("case_detail", case_id=case_id))
 
     # ------------------------------------------------------------------
     # Golden set
@@ -663,7 +695,7 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
 
     @app.route("/presentation")
     def presentation() -> Any:
-        pres_path = Path.cwd() / "presentation.html"
+        pres_path = Path.cwd() / "docs" / "presentation.html"
         if not pres_path.exists():
             return "presentation.html not found", 404
         return send_file(str(pres_path), mimetype="text/html")

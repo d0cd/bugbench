@@ -412,6 +412,27 @@ class TestRuns:
         )
         assert resp.status_code == 404
 
+    def test_runs_page_shows_created(self, results_dir: Path, cases_dir: Path) -> None:
+        import json
+
+        run_dir = results_dir / "run-2026-03-22"
+        run_dir.mkdir()
+        meta = {
+            "tool": "agent",
+            "context_level": "diff-only",
+            "model": "claude",
+            "created_at": "2026-03-22T19:41:39.098658+00:00",
+        }
+        (run_dir / "run_metadata.json").write_text(json.dumps(meta))
+
+        app = create_app(cases_dir, results_dir)
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            resp = c.get("/runs")
+            html = resp.data.decode()
+            assert "Created" in html
+            assert "2026-03-22" in html
+
 
 class TestAddCase:
     def test_add_case_missing_url(self, client) -> None:
@@ -497,6 +518,42 @@ class TestCaseDetailRunLinks:
         assert "Scored In" in html
 
 
+class TestCaseReview:
+    def test_review_sets_status_and_notes(self, client) -> None:
+        resp = client.post(
+            "/cases/leo-001/review",
+            data={"status": "confirmed", "notes": "Looks legit"},
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        html = resp.data.decode()
+        assert "confirmed" in html
+        assert "Looks legit" in html
+
+    def test_review_saves_notes_only(self, client) -> None:
+        client.post(
+            "/cases/leo-001/review",
+            data={"notes": "Just a note"},
+            follow_redirects=True,
+        )
+        resp = client.get("/cases/leo-001")
+        html = resp.data.decode()
+        assert "Just a note" in html
+        assert "unreviewed" in html
+
+    def test_review_toggle_off(self, client) -> None:
+        client.post("/cases/leo-001/review", data={"status": "confirmed"})
+        client.post("/cases/leo-001/review", data={"status": "unreviewed"})
+        resp = client.get("/cases/leo-001")
+        assert b"unreviewed" in resp.data
+
+    def test_review_has_form(self, client) -> None:
+        resp = client.get("/cases/leo-001")
+        html = resp.data.decode()
+        assert "/cases/leo-001/review" in html
+        assert "Review" in html
+
+
 class TestCaseDetailGolden:
     def test_case_detail_shows_golden_status(self, client) -> None:
         client.post("/golden/leo-001", data={"status": "confirmed"})
@@ -533,6 +590,40 @@ class TestCompareRemoved:
     def test_compare_returns_404(self, client) -> None:
         resp = client.get("/compare")
         assert resp.status_code == 404
+
+
+class TestCaseClickThrough:
+    """Verify that case links from list pages lead to working detail pages."""
+
+    def test_api_case_ids_resolve_to_detail(self, client) -> None:
+        """Every case ID returned by /api/cases should load at /cases/<id>."""
+        data = client.get("/api/cases").get_json()
+        assert data["total"] > 0
+        for case in data["cases"]:
+            resp = client.get(f"/cases/{case['id']}")
+            assert resp.status_code == 200, f"/cases/{case['id']} returned {resp.status_code}"
+
+    def test_golden_page_links_resolve(self, client) -> None:
+        """Every case link on the golden page should load at /cases/<id>."""
+        import re
+
+        resp = client.get("/golden")
+        assert resp.status_code == 200
+        html = resp.data.decode()
+        # Only match Jinja2-rendered links (case IDs like leo-001), not JS code
+        links = re.findall(r'href="/cases/([\w-]+)"', html)
+        assert len(links) > 0, "Golden page has no case links"
+        for case_id in links:
+            resp = client.get(f"/cases/{case_id}")
+            assert resp.status_code == 200, f"/cases/{case_id} returned {resp.status_code}"
+
+    def test_case_list_html_has_case_links(self, client) -> None:
+        """The cases page should render an API endpoint that returns linkable IDs."""
+        resp = client.get("/cases")
+        assert resp.status_code == 200
+        html = resp.data.decode()
+        # The JS fetches /api/cases and builds links like /cases/${c.id}
+        assert "/api/cases" in html
 
 
 class TestDashboardCli:
