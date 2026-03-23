@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from bugeval.models import (
+    BlameConfidence,
+    BugCategory,
     BuggyLine,
     CaseKind,
     CaseStats,
+    CaseStatus,
+    Difficulty,
     GroundTruth,
     PRRelation,
+    PRSize,
+    Severity,
     TestCase,
     Validation,
 )
@@ -57,7 +63,7 @@ class TestGroundTruth:
     def test_defaults(self) -> None:
         gt = GroundTruth()
         assert gt.introducing_commit is None
-        assert gt.blame_confidence == ""
+        assert gt.blame_confidence is None
         assert gt.buggy_lines == []
         assert gt.fix_pr_numbers == []
 
@@ -115,3 +121,64 @@ class TestTestCase:
     def test_clean_case(self, clean_case: TestCase) -> None:
         assert clean_case.kind == CaseKind.clean
         assert clean_case.truth is None
+
+
+class TestNewEnums:
+    def test_bug_category_values(self) -> None:
+        assert BugCategory.parser == "parser"
+        assert BugCategory.compiler_pass == "compiler-pass"
+
+    def test_difficulty_values(self) -> None:
+        assert Difficulty.easy == "easy"
+
+    def test_severity_values(self) -> None:
+        assert Severity.critical == "critical"
+
+    def test_case_status_values(self) -> None:
+        assert CaseStatus.draft == "draft"
+        assert CaseStatus.ground_truth == "ground-truth"
+        assert CaseStatus.ready == "ready"
+
+    def test_pr_size_values(self) -> None:
+        assert PRSize.xl == "xl"
+
+    def test_blame_confidence_values(self) -> None:
+        assert BlameConfidence.A == "A"
+        assert BlameConfidence.excluded == "excluded"
+
+
+class TestNewFields:
+    def test_testcase_new_fields_default(self) -> None:
+        case = TestCase(
+            id="t-001",
+            repo="foo/bar",
+            kind=CaseKind.bug,
+            base_commit="abc",
+        )
+        assert case.source == ""
+        assert case.status == "draft"
+        assert case.bug_summary == ""
+        assert case.fix_pr_files == []
+
+    def test_buggy_line_line_type(self) -> None:
+        bl = BuggyLine(file="src/lib.rs", line=1, content="// comment")
+        assert bl.line_type == ""
+        bl2 = BuggyLine(file="src/lib.rs", line=1, content="code", line_type="code")
+        assert bl2.line_type == "code"
+
+    def test_ground_truth_introduction_summary(self) -> None:
+        gt = GroundTruth(introduction_summary="The refactor broke X")
+        assert gt.introduction_summary == "The refactor broke X"
+
+    def test_backward_compat_existing_case(self) -> None:
+        """Existing cases without new fields should load fine."""
+        case = TestCase(
+            id="t-001",
+            repo="foo/bar",
+            kind=CaseKind.bug,
+            base_commit="abc",
+            category="other",
+            difficulty="medium",
+        )
+        assert case.category == "other"
+        assert case.status == "draft"

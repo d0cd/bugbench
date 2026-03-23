@@ -11,10 +11,13 @@ from bugeval.models import BuggyLine, CaseKind, GroundTruth, TestCase
 from bugeval.result_models import Comment, ToolResult
 from bugeval.score import (
     _files_match,
+    _get_precise_buggy_lines,
     build_judge_prompt,
     classify_comments,
     detect_contamination,
+    majority_vote,
     mechanical_catch,
+    mechanical_catch_details,
     score_case,
     score_run,
 )
@@ -77,23 +80,17 @@ def result_miss() -> ToolResult:
 
 
 class TestMechanicalCatch:
-    def test_exact_match(
-        self, result_exact: ToolResult, truth_one_line: GroundTruth
-    ) -> None:
+    def test_exact_match(self, result_exact: ToolResult, truth_one_line: GroundTruth) -> None:
         caught, dist = mechanical_catch(result_exact, truth_one_line)
         assert caught is True
         assert dist == 0
 
-    def test_within_tolerance(
-        self, result_near: ToolResult, truth_one_line: GroundTruth
-    ) -> None:
+    def test_within_tolerance(self, result_near: ToolResult, truth_one_line: GroundTruth) -> None:
         caught, dist = mechanical_catch(result_near, truth_one_line)
         assert caught is True
         assert dist == 5
 
-    def test_miss(
-        self, result_miss: ToolResult, truth_one_line: GroundTruth
-    ) -> None:
+    def test_miss(self, result_miss: ToolResult, truth_one_line: GroundTruth) -> None:
         caught, dist = mechanical_catch(result_miss, truth_one_line)
         assert caught is False
         assert dist is None
@@ -103,9 +100,7 @@ class TestMechanicalCatch:
         assert caught is False
         assert dist is None
 
-    def test_outside_tolerance(
-        self, truth_one_line: GroundTruth
-    ) -> None:
+    def test_outside_tolerance(self, truth_one_line: GroundTruth) -> None:
         result = ToolResult(
             case_id="test-001",
             tool="copilot",
@@ -139,7 +134,7 @@ class TestClassifyComments:
         scores = classify_comments(result, truth_one_line)
         assert len(scores) == 1
         assert scores[0].verdict == CommentVerdict.tp
-        assert scores[0].matched_buggy_line == 0
+        assert scores[0].matched_buggy_line_idx == 0
 
     def test_fp(self, truth_one_line: GroundTruth) -> None:
         result = ToolResult(
@@ -188,9 +183,7 @@ class TestClassifyComments:
 
 
 class TestScoreCase:
-    def test_mechanical(
-        self, sample_case: TestCase, sample_result: ToolResult
-    ) -> None:
+    def test_mechanical(self, sample_case: TestCase, sample_result: ToolResult) -> None:
         cs = score_case(sample_case, sample_result, use_llm=False)
         assert cs.case_id == "snarkVM-001"
         assert cs.tool == "copilot"
@@ -216,7 +209,8 @@ class TestScoreCase:
         assert cs.false_alarm is True
 
     def test_clean_case_fp_count_excludes_low_value(
-        self, clean_case: TestCase,
+        self,
+        clean_case: TestCase,
     ) -> None:
         """Clean case with some line=0 comments: fp_count < total comments."""
         result = ToolResult(
@@ -225,7 +219,8 @@ class TestScoreCase:
             comments=[
                 Comment(file="lib.rs", line=0, body="General comment"),
                 Comment(
-                    file="lib.rs", line=10,
+                    file="lib.rs",
+                    line=10,
                     body="This looks like a bug to me",
                 ),
                 Comment(file="lib.rs", line=0, body="Another file-level note"),
@@ -308,9 +303,7 @@ class TestDetectContamination:
 
 
 class TestBuildJudgePrompt:
-    def test_includes_key_parts(
-        self, sample_case: TestCase, sample_result: ToolResult
-    ) -> None:
+    def test_includes_key_parts(self, sample_case: TestCase, sample_result: ToolResult) -> None:
         prompt = build_judge_prompt(sample_case, sample_result)
         assert "detection_score" in prompt
         assert "review_quality" in prompt
@@ -382,9 +375,7 @@ class TestScoreRun:
 
 
 class TestContaminationWiredInScoreRun:
-    def test_contamination_flag_set(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_contamination_flag_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Verify score_run calls detect_contamination before scoring."""
         cases_dir = tmp_path / "cases" / "repo"
         cases_dir.mkdir(parents=True)
@@ -427,11 +418,10 @@ class TestContaminationWiredInScoreRun:
         # Track whether detect_contamination was called
         contamination_calls: list[bool] = []
         import bugeval.score as score_mod
+
         orig_detect = score_mod.detect_contamination
 
-        def tracking_detect(
-            r: ToolResult, c: TestCase
-        ) -> bool:
+        def tracking_detect(r: ToolResult, c: TestCase) -> bool:
             val = orig_detect(r, c)
             contamination_calls.append(val)
             return val
@@ -701,15 +691,17 @@ class TestJudgeFailedFlag:
         cs = CaseScore(case_id="x", tool="t")
         assert cs.judge_failed is False
 
-    def test_call_judge_sets_flag_on_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_call_judge_sets_flag_on_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When call_judge raises internally, the returned dict has judge_failed."""
         import bugeval.score as score_mod
 
         # Simulate an API failure by monkeypatching anthropic import
         def _failing_judge(
-            prompt: str, model: str = "", case_id: str = ""
+            prompt: str,
+            model: str = "",
+            case_id: str = "",
+            judge_models: list[str] | None = None,
+            backend: str = "api",
         ) -> dict:
             # Simulate the except branch directly
             return {
@@ -747,14 +739,16 @@ class TestJudgeFailedFlag:
         assert cs.detection_score == 0
         assert cs.review_quality == 0
 
-    def test_successful_judge_not_failed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_successful_judge_not_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When call_judge succeeds, judge_failed is False."""
         import bugeval.score as score_mod
 
         def _ok_judge(
-            prompt: str, model: str = "", case_id: str = ""
+            prompt: str,
+            model: str = "",
+            case_id: str = "",
+            judge_models: list[str] | None = None,
+            backend: str = "api",
         ) -> dict:
             return {
                 "detection_score": 2,
@@ -795,9 +789,7 @@ class TestJudgeFailedFlag:
 
 
 class TestLlmOverrideChangesCounts:
-    def test_llm_override_changes_counts(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_llm_override_changes_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When LLM overrides mechanical verdicts, tp/fp/novel counts change."""
         import bugeval.score as score_mod
 
@@ -836,7 +828,11 @@ class TestLlmOverrideChangesCounts:
 
         # Mock LLM to disagree: [FP, TP-novel, FP]
         def _override_judge(
-            prompt: str, model: str = "", case_id: str = ""
+            prompt: str,
+            model: str = "",
+            case_id: str = "",
+            judge_models: list[str] | None = None,
+            backend: str = "api",
         ) -> dict:
             return {
                 "detection_score": 1,
@@ -1010,7 +1006,8 @@ class TestResultFilenameRoundtrip:
 
 class TestJudgeModelThreading:
     def test_score_case_passes_judge_model(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Verify score_case passes judge_model to call_judge."""
         import bugeval.score as score_mod
@@ -1018,7 +1015,11 @@ class TestJudgeModelThreading:
         captured_models: list[str] = []
 
         def _tracking_judge(
-            prompt: str, model: str = "", case_id: str = "",
+            prompt: str,
+            model: str = "",
+            case_id: str = "",
+            judge_models: list[str] | None = None,
+            backend: str = "api",
         ) -> dict:
             captured_models.append(model)
             return {
@@ -1051,14 +1052,18 @@ class TestJudgeModelThreading:
             ],
         )
         score_case(
-            case, result, use_llm=True,
+            case,
+            result,
+            use_llm=True,
             judge_model="claude-sonnet-4-20250514",
         )
         assert len(captured_models) == 1
         assert captured_models[0] == "claude-sonnet-4-20250514"
 
     def test_score_run_passes_judge_model(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Verify score_run passes judge_model through to score_case."""
         import bugeval.score as score_mod
@@ -1072,6 +1077,8 @@ class TestJudgeModelThreading:
             result: ToolResult,
             use_llm: bool = True,
             judge_model: str = "claude-haiku-4-5-20251001",
+            judge_models: list[str] | None = None,
+            backend: str = "api",
         ) -> CaseScore:
             captured_models.append(judge_model)
             return orig_score_case(case, result, use_llm=False)
@@ -1110,7 +1117,9 @@ class TestJudgeModelThreading:
         save_result(result, results_dir / "jm-002__agent.yaml")
 
         score_run(
-            run_dir, tmp_path / "cases", dry_run=True,
+            run_dir,
+            tmp_path / "cases",
+            dry_run=True,
             judge_model="claude-sonnet-4-20250514",
         )
         assert len(captured_models) == 1
@@ -1134,3 +1143,826 @@ class TestContaminationShortFixText:
             comments=[Comment(body="Fix the bug")],
         )
         assert detect_contamination(result, case) is False
+
+
+# ---------------------------------------------------------------------------
+# majority_vote
+# ---------------------------------------------------------------------------
+
+
+class TestMajorityVote:
+    def test_all_agree(self) -> None:
+        """All judges agree: result is their unanimous answer."""
+        verdicts = [
+            {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP", "FP"],
+                "reasoning": "Good",
+            },
+            {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP", "FP"],
+                "reasoning": "Also good",
+            },
+            {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP", "FP"],
+                "reasoning": "Same",
+            },
+        ]
+        result = majority_vote(verdicts)
+        assert result["detection_score"] == 2
+        assert result["review_quality"] == 3
+        assert result["comment_verdicts"] == ["TP", "FP"]
+        assert result["judge_agreement"] == 1.0
+
+    def test_majority_wins(self) -> None:
+        """2 of 3 judges agree: majority wins."""
+        verdicts = [
+            {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP", "FP"],
+                "reasoning": "A",
+            },
+            {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP", "FP"],
+                "reasoning": "B",
+            },
+            {
+                "detection_score": 0,
+                "review_quality": 1,
+                "comment_verdicts": ["FP", "FP"],
+                "reasoning": "C",
+            },
+        ]
+        result = majority_vote(verdicts)
+        assert result["detection_score"] == 2
+        assert result["review_quality"] == 3
+        assert result["comment_verdicts"] == ["TP", "FP"]
+        # 2/3 agreement
+        assert abs(result["judge_agreement"] - 2 / 3) < 0.01
+
+    def test_tie_conservative(self) -> None:
+        """2 judges disagree: conservative (lower) wins."""
+        verdicts = [
+            {
+                "detection_score": 3,
+                "review_quality": 4,
+                "comment_verdicts": ["TP"],
+                "reasoning": "High",
+            },
+            {
+                "detection_score": 1,
+                "review_quality": 2,
+                "comment_verdicts": ["FP"],
+                "reasoning": "Low",
+            },
+        ]
+        result = majority_vote(verdicts)
+        assert result["detection_score"] == 1
+        assert result["review_quality"] == 2
+        assert result["comment_verdicts"] == ["FP"]
+        assert result["judge_agreement"] == 0.5
+
+    def test_single_verdict(self) -> None:
+        """Single verdict passes through unchanged."""
+        verdicts = [
+            {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP"],
+                "reasoning": "Only one",
+            },
+        ]
+        result = majority_vote(verdicts)
+        assert result["detection_score"] == 2
+        assert result["review_quality"] == 3
+        assert result["judge_agreement"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Ensemble scoring (call_judge with judge_models)
+# ---------------------------------------------------------------------------
+
+
+class TestEnsembleScoring:
+    def test_ensemble_three_models_agree(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ensemble with 3 models all agreeing."""
+        import bugeval.score as score_mod
+
+        call_count = 0
+
+        def _mock_single_judge(
+            prompt: str,
+            model: str = "",
+            case_id: str = "",
+        ) -> dict:
+            nonlocal call_count
+            call_count += 1
+            return {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP"],
+                "reasoning": "Good",
+            }
+
+        monkeypatch.setattr(
+            score_mod,
+            "_call_single_judge",
+            _mock_single_judge,
+        )
+
+        from bugeval.score import call_judge
+
+        result = call_judge(
+            "test prompt",
+            judge_models=["model-a", "model-b", "model-c"],
+            case_id="test",
+        )
+        assert call_count == 3
+        assert result["detection_score"] == 2
+        assert result["review_quality"] == 3
+        assert result["judge_agreement"] == 1.0
+
+    def test_ensemble_backward_compat(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Single model (no judge_models) works as before."""
+        import bugeval.score as score_mod
+
+        captured_models: list[str] = []
+
+        def _mock_single_judge(
+            prompt: str,
+            model: str = "",
+            case_id: str = "",
+        ) -> dict:
+            captured_models.append(model)
+            return {
+                "detection_score": 1,
+                "review_quality": 2,
+                "comment_verdicts": [],
+                "reasoning": "OK",
+            }
+
+        monkeypatch.setattr(
+            score_mod,
+            "_call_single_judge",
+            _mock_single_judge,
+        )
+
+        from bugeval.score import call_judge
+
+        result = call_judge(
+            "test prompt",
+            model="claude-haiku-4-5",
+            case_id="test",
+        )
+        assert len(captured_models) == 1
+        assert captured_models[0] == "claude-haiku-4-5"
+        assert result["detection_score"] == 1
+        assert "judge_agreement" not in result
+
+    def test_score_case_ensemble_fields(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """score_case with judge_models populates ensemble fields."""
+        import bugeval.score as score_mod
+
+        def _mock_judge(
+            prompt: str,
+            model: str = "claude-haiku-4-5",
+            case_id: str = "",
+            judge_models: list[str] | None = None,
+            backend: str = "api",
+        ) -> dict:
+            return {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP"],
+                "reasoning": "Ensemble",
+                "judge_agreement": 0.67,
+            }
+
+        monkeypatch.setattr(score_mod, "call_judge", _mock_judge)
+
+        case = TestCase(
+            id="ens-001",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="aaa",
+            bug_description="A bug",
+            truth=GroundTruth(
+                buggy_lines=[
+                    BuggyLine(file="f.rs", line=10, content="x"),
+                ],
+                fix_summary="Fixed",
+            ),
+        )
+        result = ToolResult(
+            case_id="ens-001",
+            tool="agent",
+            comments=[
+                Comment(
+                    file="f.rs",
+                    line=10,
+                    body="Bug here on this line",
+                ),
+            ],
+        )
+        cs = score_case(
+            case,
+            result,
+            use_llm=True,
+            judge_models=["model-a", "model-b", "model-c"],
+        )
+        assert cs.judge_models == ["model-a", "model-b", "model-c"]
+        assert abs(cs.judge_agreement - 0.67) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# CaseScore ensemble fields
+# ---------------------------------------------------------------------------
+
+
+class TestCaseScoreEnsembleFields:
+    def test_defaults(self) -> None:
+        cs = CaseScore(case_id="x", tool="t")
+        assert cs.judge_models == []
+        assert cs.judge_agreement is None
+
+    def test_populated(self) -> None:
+        cs = CaseScore(
+            case_id="x",
+            tool="t",
+            judge_models=["a", "b"],
+            judge_agreement=0.75,
+        )
+        assert cs.judge_models == ["a", "b"]
+        assert cs.judge_agreement == 0.75
+
+
+# ---------------------------------------------------------------------------
+# judge_cost_usd field
+# ---------------------------------------------------------------------------
+
+
+class TestJudgeCostUsd:
+    def test_default_zero(self) -> None:
+        cs = CaseScore(case_id="x", tool="t")
+        assert cs.judge_cost_usd == 0.0
+
+    def test_populated_from_judge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """score_case propagates judge_cost_usd from call_judge."""
+        import bugeval.score as score_mod
+
+        def _mock_judge(
+            prompt: str,
+            model: str = "",
+            case_id: str = "",
+            judge_models: list[str] | None = None,
+            backend: str = "api",
+        ) -> dict:
+            return {
+                "detection_score": 2,
+                "review_quality": 3,
+                "comment_verdicts": ["TP"],
+                "reasoning": "Good",
+                "judge_cost_usd": 0.00123,
+            }
+
+        monkeypatch.setattr(score_mod, "call_judge", _mock_judge)
+
+        case = TestCase(
+            id="jc-001",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="aaa",
+            bug_description="A bug",
+            truth=GroundTruth(
+                buggy_lines=[
+                    BuggyLine(file="f.rs", line=10, content="x"),
+                ],
+                fix_summary="Fixed",
+            ),
+        )
+        result = ToolResult(
+            case_id="jc-001",
+            tool="agent",
+            comments=[
+                Comment(
+                    file="f.rs",
+                    line=10,
+                    body="Bug on this line here",
+                ),
+            ],
+        )
+        cs = score_case(case, result, use_llm=True)
+        assert cs.judge_cost_usd == 0.00123
+
+    def test_zero_when_no_llm(self) -> None:
+        """judge_cost_usd stays 0 when use_llm=False."""
+        case = TestCase(
+            id="jc-002",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="aaa",
+            truth=GroundTruth(
+                buggy_lines=[
+                    BuggyLine(file="f.rs", line=10, content="x"),
+                ],
+                fix_summary="Fixed",
+            ),
+        )
+        result = ToolResult(
+            case_id="jc-002",
+            tool="agent",
+            comments=[
+                Comment(
+                    file="f.rs",
+                    line=10,
+                    body="Bug on this line here",
+                ),
+            ],
+        )
+        cs = score_case(case, result, use_llm=False)
+        assert cs.judge_cost_usd == 0.0
+
+
+# -------------------------------------------------------------------
+# _files_match: basename-only matching
+# -------------------------------------------------------------------
+
+
+class TestFilesMatchBasename:
+    def test_exact_match(self) -> None:
+        assert _files_match("src/main.rs", "src/main.rs") is True
+
+    def test_suffix_match_comment_longer(self) -> None:
+        assert _files_match("repo/src/main.rs", "src/main.rs") is True
+
+    def test_suffix_match_truth_longer(self) -> None:
+        assert _files_match("src/main.rs", "repo/src/main.rs") is True
+
+    def test_basename_vs_full_path(self) -> None:
+        """parser.rs should NOT match src/compiler/parser.rs (too loose)."""
+        assert _files_match("parser.rs", "src/compiler/parser.rs") is False
+
+    def test_full_path_vs_basename(self) -> None:
+        """src/compiler/parser.rs should NOT match parser.rs (too loose)."""
+        assert _files_match("src/compiler/parser.rs", "parser.rs") is False
+
+    def test_no_match_different_basename(self) -> None:
+        assert _files_match("parser.rs", "src/compiler/lexer.rs") is False
+
+    def test_no_match_different_dirs(self) -> None:
+        assert _files_match("other/main.rs", "src/main.rs") is False
+
+    def test_both_bare_same(self) -> None:
+        assert _files_match("main.rs", "main.rs") is True
+
+    def test_both_bare_different(self) -> None:
+        assert _files_match("main.rs", "lib.rs") is False
+
+    def test_suffix_without_separator(self) -> None:
+        """xsrc/main.rs should NOT match src/main.rs."""
+        assert _files_match("xsrc/main.rs", "src/main.rs") is False
+
+
+# -------------------------------------------------------------------
+# mechanical_catch_details
+# -------------------------------------------------------------------
+
+
+class TestMechanicalCatchDetails:
+    def test_details_shows_match(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/main.rs", line=100, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="d-001",
+            tool="t",
+            comments=[
+                Comment(
+                    file="src/main.rs",
+                    line=105,
+                    body="Potential issue here on this line",
+                ),
+            ],
+        )
+        details = mechanical_catch_details(result, truth)
+        assert len(details) == 1
+        d = details[0]
+        assert d["comment_index"] == 0
+        assert d["comment_file"] == "src/main.rs"
+        assert d["comment_line"] == 105
+        assert len(d["comparisons"]) == 1
+        cmp = d["comparisons"][0]
+        assert cmp["buggy_file"] == "src/main.rs"
+        assert cmp["buggy_line"] == 100
+        assert cmp["distance"] == 5
+        assert cmp["file_matched"] is True
+        assert cmp["within_tolerance"] is True
+
+    def test_details_shows_no_file_match(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/main.rs", line=100, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="d-002",
+            tool="t",
+            comments=[
+                Comment(
+                    file="other.rs",
+                    line=100,
+                    body="Potential issue here on this line",
+                ),
+            ],
+        )
+        details = mechanical_catch_details(result, truth)
+        assert len(details) == 1
+        cmp = details[0]["comparisons"][0]
+        assert cmp["file_matched"] is False
+        assert cmp["within_tolerance"] is False
+
+    def test_details_skips_line_zero(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/main.rs", line=100, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="d-003",
+            tool="t",
+            comments=[
+                Comment(
+                    file="src/main.rs",
+                    line=0,
+                    body="General comment about file",
+                ),
+            ],
+        )
+        details = mechanical_catch_details(result, truth)
+        assert len(details) == 1
+        assert details[0]["skipped"] == "line=0"
+
+    def test_details_no_truth(self) -> None:
+        result = ToolResult(
+            case_id="d-004",
+            tool="t",
+            comments=[
+                Comment(
+                    file="src/main.rs",
+                    line=10,
+                    body="Something wrong here definitely",
+                ),
+            ],
+        )
+        details = mechanical_catch_details(result, None)
+        assert details == []
+
+    def test_details_basename_no_longer_matches(self) -> None:
+        """Basename-only comment no longer matches full-path truth."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(
+                    file="src/compiler/parser.rs",
+                    line=50,
+                    content="bad",
+                ),
+            ],
+        )
+        result = ToolResult(
+            case_id="d-005",
+            tool="t",
+            comments=[
+                Comment(
+                    file="parser.rs",
+                    line=50,
+                    body="Potential issue here on this line",
+                ),
+            ],
+        )
+        details = mechanical_catch_details(result, truth)
+        cmp = details[0]["comparisons"][0]
+        assert cmp["file_matched"] is False
+
+
+# ---------------------------------------------------------------------------
+# mechanical_catch skips test expectation buggy lines
+# ---------------------------------------------------------------------------
+
+
+class TestMechanicalCatchSkipsTestExpectation:
+    def test_skips_expectation_only_lines(self) -> None:
+        """When all buggy lines are test expectations, catch is False."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(
+                    file="tests/expectations/foo.out",
+                    line=10,
+                    content="expected output",
+                    is_test_expectation=True,
+                ),
+            ],
+        )
+        result = ToolResult(
+            case_id="te-001",
+            tool="t",
+            comments=[
+                Comment(
+                    file="tests/expectations/foo.out",
+                    line=10,
+                    body="This output line looks wrong to me",
+                ),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth)
+        assert caught is False
+        assert dist is None
+
+    def test_matches_source_lines_alongside_expectations(self) -> None:
+        """Source buggy lines still match even with expectation lines."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(
+                    file="tests/expectations/foo.out",
+                    line=10,
+                    content="expected output",
+                    is_test_expectation=True,
+                ),
+                BuggyLine(
+                    file="src/lib.rs",
+                    line=50,
+                    content="bad source line",
+                    is_test_expectation=False,
+                ),
+            ],
+        )
+        result = ToolResult(
+            case_id="te-002",
+            tool="t",
+            comments=[
+                Comment(
+                    file="src/lib.rs",
+                    line=50,
+                    body="Bug found in this source code line",
+                ),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth)
+        assert caught is True
+        assert dist == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue 1: _files_match tightened (no basename-only fallback)
+# ---------------------------------------------------------------------------
+
+
+class TestFilesMatchTightened:
+    def test_exact_match(self) -> None:
+        assert _files_match("src/lib.rs", "src/lib.rs") is True
+
+    def test_suffix_match(self) -> None:
+        assert _files_match("src/lib.rs", "crates/foo/src/lib.rs") is True
+        assert _files_match("crates/foo/src/lib.rs", "src/lib.rs") is True
+
+    def test_basename_only_no_longer_matches(self) -> None:
+        """lib.rs should NOT match src/lib.rs (too loose)."""
+        assert _files_match("lib.rs", "src/lib.rs") is False
+
+    def test_empty_paths(self) -> None:
+        assert _files_match("", "src/lib.rs") is False
+        assert _files_match("src/lib.rs", "") is False
+
+
+# ---------------------------------------------------------------------------
+# Issue 2: Diffuse ground truth skips mechanical matching
+# ---------------------------------------------------------------------------
+
+
+class TestDiffuseGroundTruth:
+    def test_precise_case_catches(self) -> None:
+        """Case with few buggy lines uses mechanical matching."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/foo.rs", line=10, content="bug"),
+            ]
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="copilot",
+            comments=[
+                Comment(file="src/foo.rs", line=10, body="This is wrong"),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth)
+        assert caught is True
+        assert dist == 0
+
+    def test_diffuse_case_skips_mechanical(self) -> None:
+        """Case with 100+ buggy lines defers to LLM judge."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/foo.rs", line=i, content=f"line {i}") for i in range(100)
+            ]
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="copilot",
+            comments=[
+                Comment(file="src/foo.rs", line=50, body="This is wrong"),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth)
+        assert caught is False  # Skipped, defer to LLM
+
+    def test_get_precise_buggy_lines_filters_test_expectations(self) -> None:
+        """_get_precise_buggy_lines excludes test expectation lines."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(
+                    file="src/foo.rs",
+                    line=10,
+                    content="bug",
+                    is_test_expectation=False,
+                ),
+                BuggyLine(
+                    file="tests/foo.out",
+                    line=5,
+                    content="expected",
+                    is_test_expectation=True,
+                ),
+            ]
+        )
+        precise = _get_precise_buggy_lines(truth)
+        assert len(precise) == 1
+        assert precise[0].file == "src/foo.rs"
+
+    def test_get_precise_buggy_lines_empty_for_diffuse(self) -> None:
+        """_get_precise_buggy_lines returns [] if > 50 non-test lines."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/foo.rs", line=i, content=f"line {i}") for i in range(51)
+            ]
+        )
+        assert _get_precise_buggy_lines(truth) == []
+
+    def test_classify_comments_diffuse_marks_fp(self) -> None:
+        """Diffuse case: comments that would be TP are FP instead."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/foo.rs", line=i, content=f"line {i}") for i in range(100)
+            ]
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="copilot",
+            comments=[
+                Comment(
+                    file="src/foo.rs",
+                    line=50,
+                    body="This line has a bug in the logic",
+                ),
+            ],
+        )
+        scores = classify_comments(result, truth)
+        assert len(scores) == 1
+        assert scores[0].verdict == CommentVerdict.fp
+
+
+# ---------------------------------------------------------------------------
+# Issue 3: Per-finding-group catch rate
+# ---------------------------------------------------------------------------
+
+
+class TestFindingsPerGroup:
+    def test_multiple_finding_groups(self) -> None:
+        case = TestCase(
+            id="t",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="abc",
+            truth=GroundTruth(
+                buggy_lines=[
+                    BuggyLine(
+                        file="src/a.rs",
+                        line=10,
+                        content="bug1",
+                        fix_pr_number=100,
+                    ),
+                    BuggyLine(
+                        file="src/b.rs",
+                        line=20,
+                        content="bug2",
+                        fix_pr_number=200,
+                    ),
+                ]
+            ),
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="copilot",
+            comments=[
+                Comment(
+                    file="src/a.rs",
+                    line=10,
+                    body="Found a real bug in this file a.rs",
+                ),
+            ],
+        )
+        score = score_case(case, result, use_llm=False)
+        assert score.findings_total == 2
+        assert score.findings_caught == 1  # Only caught bug from PR 100
+        assert score.diffuse_ground_truth is False
+
+    def test_single_finding_group(self) -> None:
+        case = TestCase(
+            id="t",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="abc",
+            truth=GroundTruth(
+                buggy_lines=[
+                    BuggyLine(file="src/a.rs", line=10, content="bug1"),
+                    BuggyLine(file="src/a.rs", line=20, content="bug2"),
+                ]
+            ),
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="copilot",
+            comments=[
+                Comment(
+                    file="src/a.rs",
+                    line=10,
+                    body="Found a real bug in this file a.rs",
+                ),
+            ],
+        )
+        score = score_case(case, result, use_llm=False)
+        assert score.findings_total == 1
+        assert score.findings_caught == 1
+
+    def test_diffuse_sets_flag(self) -> None:
+        case = TestCase(
+            id="t",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="abc",
+            truth=GroundTruth(
+                buggy_lines=[
+                    BuggyLine(file="src/foo.rs", line=i, content=f"line {i}") for i in range(100)
+                ]
+            ),
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="copilot",
+            comments=[
+                Comment(
+                    file="src/foo.rs",
+                    line=50,
+                    body="Found bug in this code here",
+                ),
+            ],
+        )
+        score = score_case(case, result, use_llm=False)
+        assert score.diffuse_ground_truth is True
+        assert score.findings_caught == 0
+
+    def test_no_truth(self) -> None:
+        case = TestCase(
+            id="t",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="abc",
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="copilot",
+            comments=[],
+        )
+        score = score_case(case, result, use_llm=False)
+        assert score.findings_total == 0
+        assert score.findings_caught == 0
+        assert score.diffuse_ground_truth is False

@@ -21,7 +21,9 @@ log = logging.getLogger(__name__)
 
 
 def fetch_clean_prs(
-    repo: str, count: int, since: str,
+    repo: str,
+    count: int,
+    since: str,
 ) -> list[dict[str, Any]]:
     """Fetch merged PRs that lack fix/bug signals."""
     fields = (
@@ -29,8 +31,16 @@ def fetch_clean_prs(
         "changedFiles,files,mergedAt,author"
     )
     args = [
-        "pr", "list", "--repo", repo, "--state", "merged",
-        "--json", fields, "--limit", str(count * 3),
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "merged",
+        "--json",
+        fields,
+        "--limit",
+        str(count * 3),
     ]
     if since:
         args.extend(["--search", f"merged:>{since}"])
@@ -41,10 +51,7 @@ def fetch_clean_prs(
     for pr in all_prs:
         title = str(pr.get("title") or "")
         body = str(pr.get("body") or "")
-        labels = [
-            str(lbl.get("name", ""))
-            for lbl in (pr.get("labels") or [])
-        ]
+        labels = [str(lbl.get("name", "")) for lbl in (pr.get("labels") or [])]
         additions = int(pr.get("additions") or 0)
         deletions = int(pr.get("deletions") or 0)
         total_lines = additions + deletions
@@ -68,15 +75,25 @@ def fetch_clean_prs(
 
 
 def check_not_subsequently_fixed(
-    repo: str, pr: dict[str, Any], window_months: int = 6,
+    repo: str,
+    pr: dict[str, Any],
+    window_months: int = 6,
 ) -> bool:
     """Check that no later fix PR references this PR number."""
     pr_number = int(pr["number"])
     output = run_gh(
-        "pr", "list", "--repo", repo, "--state", "merged",
-        "--search", f"#{pr_number}",
-        "--json", "number,title,body,labels",
-        "--limit", "20",
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "merged",
+        "--search",
+        f"#{pr_number}",
+        "--json",
+        "number,title,body,labels",
+        "--limit",
+        "20",
     )
     candidates: list[dict[str, Any]] = json.loads(output)
     for cand in candidates:
@@ -84,24 +101,21 @@ def check_not_subsequently_fixed(
             continue
         title = str(cand.get("title") or "")
         body = str(cand.get("body") or "")
-        labels = [
-            str(lbl.get("name", ""))
-            for lbl in (cand.get("labels") or [])
-        ]
+        labels = [str(lbl.get("name", "")) for lbl in (cand.get("labels") or [])]
         if has_fix_signal(title, body, labels):
             return False
     return True
 
 
 def build_clean_case(
-    repo: str, pr: dict[str, Any], case_id: str,
+    repo: str,
+    pr: dict[str, Any],
+    case_id: str,
 ) -> TestCase:
     """Build a TestCase with kind=clean from a non-buggy PR."""
     title = str(pr.get("title") or "")
     body = str(pr.get("body") or "")
-    merge_commit = str(
-        (pr.get("mergeCommit") or {}).get("oid", "")
-    )
+    merge_commit = str((pr.get("mergeCommit") or {}).get("oid", ""))
     additions = int(pr.get("additions") or 0)
     deletions = int(pr.get("deletions") or 0)
     files_count = int(pr.get("changedFiles") or 0)
@@ -148,17 +162,18 @@ def mine_clean_cases(
 
     log.info(
         "Fetching clean PRs from %s (count=%d, since=%s)",
-        repo, count, since,
+        repo,
+        count,
+        since,
     )
     prs = fetch_clean_prs(repo, count * 2, since)
     log.info("Found %d candidate clean PRs", len(prs))
 
-    pending = [
-        pr for pr in prs if str(pr["number"]) not in done
-    ]
+    pending = [pr for pr in prs if str(pr["number"]) not in done]
     log.info(
         "Processing %d pending PRs (%d already done)",
-        len(pending), len(done),
+        len(pending),
+        len(done),
     )
 
     existing = sorted(repo_dir.glob(f"{repo_slug}-clean-*.yaml"))

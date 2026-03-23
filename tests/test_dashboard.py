@@ -48,9 +48,7 @@ def cases_dir(tmp_path: Path) -> Path:
             "agreement": True,
         },
     }
-    (repo_dir / "leo-001.yaml").write_text(
-        yaml.safe_dump(bug_case, sort_keys=False)
-    )
+    (repo_dir / "leo-001.yaml").write_text(yaml.safe_dump(bug_case, sort_keys=False))
 
     clean_case = {
         "id": "leo-002",
@@ -59,9 +57,7 @@ def cases_dir(tmp_path: Path) -> Path:
         "language": "rust",
         "base_commit": "ccc333",
     }
-    (repo_dir / "leo-002.yaml").write_text(
-        yaml.safe_dump(clean_case, sort_keys=False)
-    )
+    (repo_dir / "leo-002.yaml").write_text(yaml.safe_dump(clean_case, sort_keys=False))
 
     return tmp_path / "cases"
 
@@ -93,9 +89,7 @@ def run_dir_with_scores(results_dir: Path) -> Path:
         "false_alarm": False,
         "potentially_contaminated": False,
     }
-    (scores_dir / "leo-001--agent.yaml").write_text(
-        yaml.safe_dump(score, sort_keys=False)
-    )
+    (scores_dir / "leo-001--agent.yaml").write_text(yaml.safe_dump(score, sort_keys=False))
 
     clean_score = {
         "case_id": "leo-002",
@@ -105,9 +99,7 @@ def run_dir_with_scores(results_dir: Path) -> Path:
         "review_quality": 2,
         "false_alarm": False,
     }
-    (scores_dir / "leo-002--agent.yaml").write_text(
-        yaml.safe_dump(clean_score, sort_keys=False)
-    )
+    (scores_dir / "leo-002--agent.yaml").write_text(yaml.safe_dump(clean_score, sort_keys=False))
 
     results_sub = run_dir / "results"
     results_sub.mkdir()
@@ -118,9 +110,7 @@ def run_dir_with_scores(results_dir: Path) -> Path:
         "time_seconds": 12.5,
         "cost_usd": 0.03,
     }
-    (results_sub / "leo-001--agent.yaml").write_text(
-        yaml.safe_dump(result, sort_keys=False)
-    )
+    (results_sub / "leo-001--agent.yaml").write_text(yaml.safe_dump(result, sort_keys=False))
 
     return run_dir
 
@@ -153,8 +143,38 @@ class TestHome:
     def test_home_shows_counts(self, client) -> None:
         resp = client.get("/")
         html = resp.data.decode()
-        assert "2" in html  # total cases
-        assert "ProvableHQ/leo" in html
+        assert "Dashboard" in html
+
+    def test_home_shows_dataset_stats(self, client) -> None:
+        resp = client.get("/")
+        html = resp.data.decode()
+        assert "Total Cases" in html
+        assert "dataset-stats" in html
+        assert "Bug Cases" in html
+
+
+class TestDatasetStatsAPI:
+    def test_dataset_stats_returns_json(self, client) -> None:
+        resp = client.get("/api/dataset-stats")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["total_cases"] == 2
+        assert data["bug_cases"] == 1
+        assert data["clean_cases"] == 1
+        assert "ProvableHQ/leo" in data["repos"]
+
+    def test_dataset_stats_empty(self, tmp_path: Path) -> None:
+        empty_cases = tmp_path / "empty_cases"
+        empty_cases.mkdir()
+        results = tmp_path / "results"
+        results.mkdir()
+        app = create_app(empty_cases, results)
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            data = c.get("/api/dataset-stats").get_json()
+            assert data["total_cases"] == 0
+            assert data["bug_cases"] == 0
+            assert data["repos"] == []
 
 
 class TestCasesAPI:
@@ -345,20 +365,15 @@ class TestGoldenSet:
 
 
 class TestMetrics:
-    def test_metrics_list_200(self, client) -> None:
+    def test_metrics_list_redirects_to_runs(self, client) -> None:
         resp = client.get("/metrics")
-        assert resp.status_code == 200
+        assert resp.status_code == 302
+        assert "/runs" in resp.headers["Location"]
 
-    def test_metrics_with_scores(self, client_with_scores) -> None:
+    def test_metrics_detail_redirects_to_run(self, client_with_scores) -> None:
         resp = client_with_scores.get("/metrics/run-2026-03-20")
-        assert resp.status_code == 200
-        html = resp.data.decode()
-        assert "agent" in html
-        assert "Catch Rate" in html
-
-    def test_metrics_404(self, client) -> None:
-        resp = client.get("/metrics/nonexistent")
-        assert resp.status_code == 404
+        assert resp.status_code == 302
+        assert "/runs/run-2026-03-20" in resp.headers["Location"]
 
 
 class TestRuns:
@@ -373,6 +388,13 @@ class TestRuns:
     def test_run_detail_with_scores(self, client_with_scores) -> None:
         resp = client_with_scores.get("/runs/run-2026-03-20")
         assert resp.status_code == 200
+        html = resp.data.decode()
+        assert "Catch Rate" in html
+        assert "agent" in html
+
+    def test_run_detail_has_back_link(self, client_with_scores) -> None:
+        resp = client_with_scores.get("/runs/run-2026-03-20")
+        assert b'href="/runs"' in resp.data
 
     def test_run_notes(self, client_with_scores) -> None:
         resp = client_with_scores.post(
@@ -424,9 +446,7 @@ class TestAddCase:
             assert pr_url == "https://github.com/ProvableHQ/leo/pull/99"
             return fake_case
 
-        monkeypatch.setattr(
-            "bugeval.dashboard.add_case_from_pr", mock_add
-        )
+        monkeypatch.setattr("bugeval.dashboard.add_case_from_pr", mock_add)
         resp = client.post(
             "/api/add-case",
             json={"pr_url": "https://github.com/ProvableHQ/leo/pull/99"},
@@ -441,9 +461,7 @@ class TestAddCase:
         def mock_add(pr_url: str, cases_dir, repo_dir):
             return None
 
-        monkeypatch.setattr(
-            "bugeval.dashboard.add_case_from_pr", mock_add
-        )
+        monkeypatch.setattr("bugeval.dashboard.add_case_from_pr", mock_add)
         resp = client.post(
             "/api/add-case",
             json={"pr_url": "https://github.com/ProvableHQ/leo/pull/1"},
@@ -457,9 +475,7 @@ class TestAddCase:
         def mock_add(pr_url: str, cases_dir, repo_dir):
             raise RuntimeError("gh CLI failed")
 
-        monkeypatch.setattr(
-            "bugeval.dashboard.add_case_from_pr", mock_add
-        )
+        monkeypatch.setattr("bugeval.dashboard.add_case_from_pr", mock_add)
         resp = client.post(
             "/api/add-case",
             json={"pr_url": "https://github.com/ProvableHQ/leo/pull/1"},
@@ -468,6 +484,55 @@ class TestAddCase:
         assert resp.status_code == 500
         data = resp.get_json()
         assert "gh CLI failed" in data["error"]
+
+
+class TestCaseDetailRunLinks:
+    def test_case_detail_shows_run_links(self, client_with_scores) -> None:
+        resp = client_with_scores.get("/cases/leo-001")
+        assert resp.status_code == 200
+        html = resp.data.decode()
+        assert "run-2026-03-20" in html
+        assert 'href="/runs/run-2026-03-20"' in html
+        assert "agent" in html
+        assert "Scored In" in html
+
+
+class TestCaseDetailGolden:
+    def test_case_detail_shows_golden_status(self, client) -> None:
+        client.post("/golden/leo-001", data={"status": "confirmed"})
+        resp = client.get("/cases/leo-001")
+        html = resp.data.decode()
+        assert "confirmed" in html
+
+    def test_case_detail_default_unreviewed(self, client) -> None:
+        resp = client.get("/cases/leo-001")
+        html = resp.data.decode()
+        assert "unreviewed" in html
+
+    def test_case_detail_has_back_link(self, client) -> None:
+        resp = client.get("/cases/leo-001")
+        assert b'href="/cases"' in resp.data
+
+
+class TestCasesAPIGolden:
+    def test_cases_api_includes_golden_status(self, client) -> None:
+        client.post("/golden/leo-001", data={"status": "confirmed"})
+        resp = client.get("/api/cases")
+        data = resp.get_json()
+        case = next(c for c in data["cases"] if c["id"] == "leo-001")
+        assert case["golden_status"] == "confirmed"
+
+    def test_cases_api_default_golden_unreviewed(self, client) -> None:
+        resp = client.get("/api/cases")
+        data = resp.get_json()
+        case = next(c for c in data["cases"] if c["id"] == "leo-002")
+        assert case["golden_status"] == "unreviewed"
+
+
+class TestCompareRemoved:
+    def test_compare_returns_404(self, client) -> None:
+        resp = client.get("/compare")
+        assert resp.status_code == 404
 
 
 class TestDashboardCli:

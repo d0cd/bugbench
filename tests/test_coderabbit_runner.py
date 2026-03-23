@@ -36,18 +36,23 @@ def _make_case(**overrides: object) -> TestCase:
 
 class TestPollForCodeRabbitReview:
     def test_found(self) -> None:
-        reviews_data = json.dumps({
-            "reviews": [
-                {"author": {"login": "coderabbitai[bot]"}, "body": "review"},
-            ],
-        })
+        reviews_data = json.dumps(
+            {
+                "reviews": [
+                    {"author": {"login": "coderabbitai[bot]"}, "body": "review"},
+                ],
+            }
+        )
 
         with patch(
             "bugeval.copilot_runner.run_gh",
             return_value=reviews_data,
         ):
             result = poll_for_coderabbit_review(
-                "org/repo", 42, timeout=10, poll_interval=1,
+                "org/repo",
+                42,
+                timeout=10,
+                poll_interval=1,
             )
 
         assert result is True
@@ -55,34 +60,48 @@ class TestPollForCodeRabbitReview:
     def test_timeout(self) -> None:
         no_reviews = json.dumps({"reviews": []})
 
-        with patch(
-            "bugeval.copilot_runner.run_gh",
-            return_value=no_reviews,
-        ), patch("bugeval.copilot_runner.time") as mock_time:
+        with (
+            patch(
+                "bugeval.copilot_runner.run_gh",
+                return_value=no_reviews,
+            ),
+            patch("bugeval.copilot_runner.time") as mock_time,
+        ):
             # First call: 0, second check: over timeout
             mock_time.monotonic.side_effect = [0.0, 0.0, 11.0]
             mock_time.sleep = lambda _: None
             result = poll_for_coderabbit_review(
-                "org/repo", 42, timeout=10, poll_interval=1,
+                "org/repo",
+                42,
+                timeout=10,
+                poll_interval=1,
             )
 
         assert result is False
 
     def test_ignores_non_coderabbit_reviews(self) -> None:
-        reviews_data = json.dumps({
-            "reviews": [
-                {"author": {"login": "some-user"}, "body": "lgtm"},
-            ],
-        })
+        reviews_data = json.dumps(
+            {
+                "reviews": [
+                    {"author": {"login": "some-user"}, "body": "lgtm"},
+                ],
+            }
+        )
 
-        with patch(
-            "bugeval.copilot_runner.run_gh",
-            return_value=reviews_data,
-        ), patch("bugeval.copilot_runner.time") as mock_time:
+        with (
+            patch(
+                "bugeval.copilot_runner.run_gh",
+                return_value=reviews_data,
+            ),
+            patch("bugeval.copilot_runner.time") as mock_time,
+        ):
             mock_time.monotonic.side_effect = [0.0, 0.0, 11.0]
             mock_time.sleep = lambda _: None
             result = poll_for_coderabbit_review(
-                "org/repo", 42, timeout=10, poll_interval=1,
+                "org/repo",
+                42,
+                timeout=10,
+                poll_interval=1,
             )
 
         assert result is False
@@ -90,26 +109,28 @@ class TestPollForCodeRabbitReview:
 
 class TestScrapeCodeRabbitComments:
     def test_filters_to_coderabbit(self) -> None:
-        raw = json.dumps([
-            {
-                "user": {"login": "coderabbitai[bot]"},
-                "path": "src/lib.rs",
-                "line": 42,
-                "body": "Potential null deref",
-            },
-            {
-                "user": {"login": "human-reviewer"},
-                "path": "src/lib.rs",
-                "line": 10,
-                "body": "Looks good",
-            },
-            {
-                "user": {"login": "coderabbitai[bot]"},
-                "path": "src/main.rs",
-                "line": 99,
-                "body": "Off-by-one error",
-            },
-        ])
+        raw = json.dumps(
+            [
+                {
+                    "user": {"login": "coderabbitai[bot]"},
+                    "path": "src/lib.rs",
+                    "line": 42,
+                    "body": "Potential null deref",
+                },
+                {
+                    "user": {"login": "human-reviewer"},
+                    "path": "src/lib.rs",
+                    "line": 10,
+                    "body": "Looks good",
+                },
+                {
+                    "user": {"login": "coderabbitai[bot]"},
+                    "path": "src/main.rs",
+                    "line": 99,
+                    "body": "Off-by-one error",
+                },
+            ]
+        )
 
         with patch("bugeval.copilot_runner.run_gh", return_value=raw):
             comments = scrape_coderabbit_comments("org/repo", 1)
@@ -120,14 +141,16 @@ class TestScrapeCodeRabbitComments:
         assert comments[1].file == "src/main.rs"
 
     def test_empty_when_no_coderabbit(self) -> None:
-        raw = json.dumps([
-            {
-                "user": {"login": "human"},
-                "path": "f.rs",
-                "line": 1,
-                "body": "ok",
-            },
-        ])
+        raw = json.dumps(
+            [
+                {
+                    "user": {"login": "human"},
+                    "path": "f.rs",
+                    "line": 1,
+                    "body": "ok",
+                },
+            ]
+        )
 
         with patch("bugeval.copilot_runner.run_gh", return_value=raw):
             comments = scrape_coderabbit_comments("org/repo", 1)
@@ -138,7 +161,8 @@ class TestScrapeCodeRabbitComments:
 class TestSaveCodeRabbitTranscript:
     def test_saves_transcript(self, tmp_path: Path) -> None:
         result = _save_coderabbit_transcript(
-            tmp_path, "leo-001",
+            tmp_path,
+            "leo-001",
             fork="org/leo",
             branch="eval/leo-001",
             pr_number=42,
@@ -212,8 +236,11 @@ class TestRunCodeRabbit:
             ) as mock_close,
         ):
             result = run_coderabbit(
-                case, repo_dir, timeout=300,
-                org="org", transcript_dir=transcript_dir,
+                case,
+                repo_dir,
+                timeout=300,
+                org="org",
+                transcript_dir=transcript_dir,
             )
 
         assert result.tool == "coderabbit"
@@ -222,7 +249,10 @@ class TestRunCodeRabbit:
         assert result.comments[0].file == "src/lib.rs"
         assert result.error == ""
         mock_close.assert_called_once_with(
-            "org/leo-coderabbit", 42, "review-abc", "base-abc",
+            "org/leo-coderabbit",
+            42,
+            "review-abc",
+            "base-abc",
         )
 
     def test_timeout_returns_error(self, tmp_path: Path) -> None:

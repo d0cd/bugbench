@@ -46,9 +46,7 @@ class TestCaseIO:
         assert loaded.kind == CaseKind.clean
         assert loaded.truth is None
 
-    def test_load_cases(
-        self, tmp_path: Path, sample_case: TestCase, clean_case: TestCase
-    ) -> None:
+    def test_load_cases(self, tmp_path: Path, sample_case: TestCase, clean_case: TestCase) -> None:
         d = tmp_path / "cases" / "repo"
         d.mkdir(parents=True)
         save_case(sample_case, d / "case-001.yaml")
@@ -116,8 +114,13 @@ class TestWriteRunMetadata:
         cases_dir = tmp_path / "cases"
         cases_dir.mkdir()
         write_run_metadata(
-            run_dir, "greptile", "diff+repo", cases_dir,
-            model="claude-opus-4-6", thinking_budget=1024, timeout=600,
+            run_dir,
+            "greptile",
+            "diff+repo",
+            cases_dir,
+            model="claude-opus-4-6",
+            thinking_budget=1024,
+            timeout=600,
         )
         meta = json.loads((run_dir / "run_metadata.json").read_text())
         assert meta["tool"] == "greptile"
@@ -129,7 +132,9 @@ class TestWriteRunMetadata:
         assert "python_version" in meta
 
     def test_handles_missing_config(
-        self, tmp_path: Path, monkeypatch: object,
+        self,
+        tmp_path: Path,
+        monkeypatch: object,
     ) -> None:
         run_dir = tmp_path / "run"
         run_dir.mkdir()

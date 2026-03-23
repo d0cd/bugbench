@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -16,6 +17,8 @@ from bugeval.mine import fetch_pr_details_graphql, run_gh
 from bugeval.models import CaseKind, GroundTruth, TestCase
 
 log = logging.getLogger(__name__)
+
+_checkpoint_lock = threading.Lock()
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -79,7 +82,10 @@ def parse_diff_added_lines(diff: str) -> dict[str, list[int]]:
 
 
 def run_blame(
-    file: str, lines: list[int], cwd: Path, at_rev: str = "HEAD",
+    file: str,
+    lines: list[int],
+    cwd: Path,
+    at_rev: str = "HEAD",
 ) -> dict[int, str]:
     """Run git blame at a specific revision for specific lines."""
     if not lines:
@@ -90,9 +96,15 @@ def run_blame(
     max_line = max(lines)
     try:
         output = run_git(
-            "blame", "-C", "-C", "-C",
+            "blame",
+            "-C",
+            "-C",
+            "-C",
             f"-L{min_line},{max_line}",
-            "--porcelain", at_rev, "--", file,
+            "--porcelain",
+            at_rev,
+            "--",
+            file,
             cwd=cwd,
         )
     except GitError:
@@ -119,29 +131,27 @@ def run_blame(
 def walk_merge_commit(sha: str, cwd: Path) -> str:
     """If SHA is a merge commit, resolve to the feature (second parent)."""
     try:
-        parents_out = run_git(
-            "log", "--format=%P", "-1", sha, cwd=cwd
-        )
+        parents_out = run_git("log", "--format=%P", "-1", sha, cwd=cwd)
         parents = parents_out.strip().split()
         if len(parents) >= 2:
             # Merge commit — get second parent
-            child = run_git(
-                "log", "--format=%H", f"{sha}^2", "-1", cwd=cwd
-            )
+            child = run_git("log", "--format=%H", f"{sha}^2", "-1", cwd=cwd)
             return child.strip()
     except GitError:
         pass
     return sha
 
 
-def file_level_fallback(
-    files: list[str], before_sha: str, cwd: Path
-) -> str | None:
+def file_level_fallback(files: list[str], before_sha: str, cwd: Path) -> str | None:
     """Find most recent commit touching any of the given files before a SHA."""
     try:
         output = run_git(
-            "log", "--format=%H", "-1", before_sha,
-            "--", *files,
+            "log",
+            "--format=%H",
+            "-1",
+            before_sha,
+            "--",
+            *files,
             cwd=cwd,
         )
         sha = output.strip()
@@ -150,43 +160,43 @@ def file_level_fallback(
         return None
 
 
-def blame_enclosing_function(
-    file: str, line: int, cwd: Path, at_sha: str
-) -> str | None:
+def blame_enclosing_function(file: str, line: int, cwd: Path, at_sha: str) -> str | None:
     """For omission bugs: blame the function signature containing the line."""
     try:
         output = run_git(
-            "log", "-1", "--format=%H",
+            "log",
+            "-1",
+            "--format=%H",
             f"-L{line},{line}:{file}",
             at_sha,
             cwd=cwd,
         )
-        sha = output.strip()
-        return sha if sha else None
+        # -L implies --patch, so output contains diff after the SHA line
+        lines = output.strip().splitlines()
+        if not lines:
+            return None
+        sha = lines[0].strip()
+        if not (len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)):
+            return None
+        return sha
     except GitError:
         return None
 
 
 def _is_initial_commit(sha: str, cwd: Path) -> bool:
     try:
-        output = run_git(
-            "rev-list", "--count", sha, cwd=cwd
-        )
+        output = run_git("rev-list", "--count", sha, cwd=cwd)
         return output.strip() == "1"
     except GitError:
         # If rev-list fails entirely, check if there are parents
         try:
-            parents = run_git(
-                "log", "--format=%P", "-1", sha, cwd=cwd
-            )
+            parents = run_git("log", "--format=%P", "-1", sha, cwd=cwd)
             return not parents.strip()
         except GitError:
             return False
 
 
-def find_introducing_commit(
-    case: TestCase, repo_dir: Path
-) -> tuple[str | None, str]:
+def find_introducing_commit(case: TestCase, repo_dir: Path) -> tuple[str | None, str]:
     """Find the commit that introduced the bug via git blame analysis."""
     fix_sha = case.fix_commit
     if not fix_sha:
@@ -194,9 +204,7 @@ def find_introducing_commit(
 
     # Get diff of the fix commit against its parent
     try:
-        diff = run_git(
-            "diff", f"{fix_sha}~1", fix_sha, cwd=repo_dir
-        )
+        diff = run_git("diff", f"{fix_sha}~1", fix_sha, cwd=repo_dir)
     except GitError:
         return None, "excluded"
 
@@ -207,9 +215,7 @@ def find_introducing_commit(
         added = parse_diff_added_lines(diff)
         for file, lines in added.items():
             if lines:
-                result = blame_enclosing_function(
-                    file, lines[0], repo_dir, f"{fix_sha}~1"
-                )
+                result = blame_enclosing_function(file, lines[0], repo_dir, f"{fix_sha}~1")
                 if result:
                     resolved = walk_merge_commit(result, repo_dir)
                     if not _is_initial_commit(resolved, repo_dir):
@@ -220,20 +226,18 @@ def find_introducing_commit(
         if not files:
             try:
                 diff_names = run_git(
-                    "diff", "--name-only",
-                    f"{fix_sha}~1", fix_sha,
+                    "diff",
+                    "--name-only",
+                    f"{fix_sha}~1",
+                    fix_sha,
                     cwd=repo_dir,
                 )
-                files = [
-                    f for f in diff_names.strip().splitlines() if f
-                ]
+                files = [f for f in diff_names.strip().splitlines() if f]
             except GitError:
                 return None, "excluded"
 
         if files:
-            sha = file_level_fallback(
-                files, f"{fix_sha}~1", repo_dir
-            )
+            sha = file_level_fallback(files, f"{fix_sha}~1", repo_dir)
             if sha:
                 resolved = walk_merge_commit(sha, repo_dir)
                 if _is_initial_commit(resolved, repo_dir):
@@ -249,7 +253,10 @@ def find_introducing_commit(
 
     for file_path, line_nums in deleted.items():
         blame_result = run_blame(
-            file_path, line_nums, cwd=repo_dir, at_rev=f"{fix_sha}~1",
+            file_path,
+            line_nums,
+            cwd=repo_dir,
+            at_rev=f"{fix_sha}~1",
         )
         for _ln, sha in blame_result.items():
             all_shas.append(sha)
@@ -306,8 +313,10 @@ def resolve_introducing_pr(case: TestCase, repo: str) -> TestCase:
 
     try:
         output = run_gh(
-            "api", f"repos/{owner}/{name}/commits/{sha}/pulls",
-            "--header", "Accept: application/vnd.github.v3+json",
+            "api",
+            f"repos/{owner}/{name}/commits/{sha}/pulls",
+            "--header",
+            "Accept: application/vnd.github.v3+json",
         )
         prs = json.loads(output)
     except Exception:
@@ -352,31 +361,29 @@ def resolve_introducing_pr(case: TestCase, repo: str) -> TestCase:
     status = gql.get("statusCheckRollup") or {}
     ci_status = str(status.get("state") or "")
 
-    author = str(
-        (gql.get("author") or pr.get("user") or {}).get("login", "")
-    )
+    author = str((gql.get("author") or pr.get("user") or {}).get("login", ""))
 
-    intro_merge_date = str(
-        pr.get("merged_at") or gql.get("mergedAt") or ""
-    )
+    intro_merge_date = str(pr.get("merged_at") or gql.get("mergedAt") or "")
 
     # Compute bug latency: days between introducing PR merge and fix PR merge
     latency: int | None = None
     if intro_merge_date and case.fix_pr_merge_date:
         latency = _compute_latency_days(intro_merge_date, case.fix_pr_merge_date)
 
-    return case.model_copy(update={
-        "introducing_pr_number": pr_number,
-        "introducing_pr_title": str(pr.get("title", "")),
-        "introducing_pr_body": str(pr.get("body") or ""),
-        "introducing_pr_commit_messages": commit_messages,
-        "introducing_pr_commit_shas": commit_shas,
-        "introducing_pr_author": author,
-        "introducing_pr_merge_date": intro_merge_date,
-        "introducing_pr_review_comments": review_comments,
-        "introducing_pr_ci_status": ci_status,
-        "bug_latency_days": latency,
-    })
+    return case.model_copy(
+        update={
+            "introducing_pr_number": pr_number,
+            "introducing_pr_title": str(pr.get("title", "")),
+            "introducing_pr_body": str(pr.get("body") or ""),
+            "introducing_pr_commit_messages": commit_messages,
+            "introducing_pr_commit_shas": commit_shas,
+            "introducing_pr_author": author,
+            "introducing_pr_merge_date": intro_merge_date,
+            "introducing_pr_review_comments": review_comments,
+            "introducing_pr_ci_status": ci_status,
+            "bug_latency_days": latency,
+        }
+    )
 
 
 def populate_blame(case: TestCase, repo_dir: Path) -> TestCase:
@@ -395,9 +402,7 @@ def populate_blame(case: TestCase, repo_dir: Path) -> TestCase:
     # Set base_commit to parent of introducing commit
     if sha:
         try:
-            parent = run_git(
-                "rev-parse", f"{sha}~1", cwd=repo_dir
-            )
+            parent = run_git("rev-parse", f"{sha}~1", cwd=repo_dir)
             case.base_commit = parent.strip()
         except GitError:
             pass
@@ -408,16 +413,15 @@ def populate_blame(case: TestCase, repo_dir: Path) -> TestCase:
     return case
 
 
-def blame_cases(
-    cases_dir: Path, repo_dir: Path, concurrency: int
-) -> None:
+def blame_cases(cases_dir: Path, repo_dir: Path, concurrency: int) -> None:
     """Load cases and populate blame for those missing introducing_commit."""
     cases = load_cases(cases_dir)
     checkpoint_path = cases_dir / ".blame_checkpoint.json"
     done = load_checkpoint(checkpoint_path)
 
     pending = [
-        c for c in cases
+        c
+        for c in cases
         if c.id not in done
         and c.kind != CaseKind.clean
         and (c.truth is None or not c.truth.introducing_commit)
@@ -425,11 +429,16 @@ def blame_cases(
 
     log.info(
         "Blame: %d pending, %d already done, %d total",
-        len(pending), len(done), len(cases),
+        len(pending),
+        len(done),
+        len(cases),
     )
 
     def process(case: TestCase) -> TestCase:
         return populate_blame(case, repo_dir)
+
+    total = len(pending)
+    completed = 0
 
     if concurrency <= 1:
         for case in pending:
@@ -437,28 +446,34 @@ def blame_cases(
             case_path = _find_case_path(cases_dir, case.id)
             if case_path:
                 save_case(updated, case_path)
-            done.add(case.id)
-            save_checkpoint(done, checkpoint_path)
+            with _checkpoint_lock:
+                done.add(case.id)
+                save_checkpoint(done, checkpoint_path)
+            completed += 1
+            log.info("Blamed %d/%d: %s", completed, total, case.id)
     else:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {
-                pool.submit(process, c): c for c in pending
-            }
+            futures = {pool.submit(process, c): c for c in pending}
             for future in futures:
                 case = futures[future]
                 try:
                     updated = future.result()
-                    case_path = _find_case_path(
-                        cases_dir, case.id
-                    )
+                    case_path = _find_case_path(cases_dir, case.id)
                     if case_path:
                         save_case(updated, case_path)
-                    done.add(case.id)
-                    save_checkpoint(done, checkpoint_path)
+                    with _checkpoint_lock:
+                        done.add(case.id)
+                        save_checkpoint(done, checkpoint_path)
+                    completed += 1
+                    log.info("Blamed %d/%d: %s", completed, total, case.id)
                 except Exception as exc:
                     log.warning(
-                        "Blame failed for %s: %s", case.id, exc,
+                        "Blame failed for %s: %s",
+                        case.id,
+                        exc,
                     )
+
+    log.info("Blame complete: %d/%d cases processed", completed, total)
 
 
 def _find_case_path(cases_dir: Path, case_id: str) -> Path | None:

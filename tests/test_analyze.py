@@ -57,13 +57,9 @@ def _score(
     for i in range(tp):
         scores.append(CommentScore(comment_index=i, verdict=CommentVerdict.tp))
     for i in range(novel):
-        scores.append(
-            CommentScore(comment_index=tp + i, verdict=CommentVerdict.tp_novel)
-        )
+        scores.append(CommentScore(comment_index=tp + i, verdict=CommentVerdict.tp_novel))
     for i in range(fp):
-        scores.append(
-            CommentScore(comment_index=tp + novel + i, verdict=CommentVerdict.fp)
-        )
+        scores.append(CommentScore(comment_index=tp + novel + i, verdict=CommentVerdict.fp))
     return CaseScore(
         case_id=case_id,
         tool=tool,
@@ -165,7 +161,7 @@ class TestUsefulnessRate:
     def test_ratio(self) -> None:
         scores = [
             _score("a", tp=2, novel=1, fp=2),  # 3 useful / 5 total
-            _score("b", tp=1, fp=1),            # 1 useful / 2 total
+            _score("b", tp=1, fp=1),  # 1 useful / 2 total
         ]
         # 4 useful / 7 total (usefulness_rate was removed; use signal_to_noise)
         assert abs(signal_to_noise(scores) - 4 / 7) < 1e-9
@@ -196,7 +192,7 @@ class TestSignalToNoise:
     def test_ratio(self) -> None:
         scores = [
             _score("a", tp=3, novel=1, fp=2),  # 4 useful / 6
-            _score("b", tp=0, fp=2),            # 0 useful / 2
+            _score("b", tp=0, fp=2),  # 0 useful / 2
         ]
         # 4 / 8
         assert abs(signal_to_noise(scores) - 0.5) < 1e-9
@@ -258,6 +254,42 @@ class TestBuildComparisonTable:
         assert "precision" in row
         assert "snr" in row
         assert "cost_per_bug" in row
+        assert "judge_cost_per_case" in row
+        assert "total_cost_per_bug" in row
+
+    def test_judge_cost_aggregation(self) -> None:
+        """judge_cost_per_case and total_cost_per_bug are computed."""
+        cases = [_bug_case("a"), _bug_case("b")]
+        s1 = _score("a", tool="copilot", caught=True, tp=1)
+        s1.judge_cost_usd = 0.002
+        s2 = _score("b", tool="copilot", caught=True, tp=1)
+        s2.judge_cost_usd = 0.004
+        all_scores = {"copilot": [s1, s2]}
+        all_results = {
+            "copilot": [
+                ToolResult(case_id="a", tool="copilot", cost_usd=1.0),
+                ToolResult(case_id="b", tool="copilot", cost_usd=1.0),
+            ],
+        }
+        table = build_comparison_table(all_scores, all_results, cases)
+        row = table[0]
+        # judge_cost_per_case = (0.002 + 0.004) / 2 = 0.003
+        assert abs(row["judge_cost_per_case"] - 0.003) < 1e-6
+        # total_cost_per_bug = (2.0 tool + 0.006 judge) / 2 catches
+        assert abs(row["total_cost_per_bug"] - 1.003) < 1e-4
+
+    def test_total_cost_per_bug_none_when_no_catches(self) -> None:
+        cases = [_bug_case("a")]
+        s = _score("a", tool="copilot", caught=False)
+        s.judge_cost_usd = 0.001
+        all_scores = {"copilot": [s]}
+        all_results = {
+            "copilot": [
+                ToolResult(case_id="a", tool="copilot", cost_usd=1.0),
+            ],
+        }
+        table = build_comparison_table(all_scores, all_results, cases)
+        assert table[0]["total_cost_per_bug"] is None
 
 
 class TestJudgeFailedExcludedFromQualityMetrics:
@@ -399,10 +431,16 @@ class TestContextLevelSlice:
     def test_slice_by_context_level(self) -> None:
         cases = [_bug_case("a"), _bug_case("b")]
         s1 = CaseScore(
-            case_id="a", tool="t", caught=True, context_level="diff-only",
+            case_id="a",
+            tool="t",
+            caught=True,
+            context_level="diff-only",
         )
         s2 = CaseScore(
-            case_id="b", tool="t", caught=False, context_level="diff+repo",
+            case_id="b",
+            tool="t",
+            caught=False,
+            context_level="diff+repo",
         )
         sliced = slice_scores([s1, s2], cases, "context_level", "diff-only")
         assert len(sliced) == 1

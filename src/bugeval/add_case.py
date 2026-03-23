@@ -16,9 +16,7 @@ from bugeval.models import TestCase
 
 log = logging.getLogger(__name__)
 
-_PR_URL_RE = re.compile(
-    r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$"
-)
+_PR_URL_RE = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$")
 
 
 def parse_pr_url(url: str) -> tuple[str, str, int]:
@@ -69,15 +67,26 @@ def add_case_from_pr(
         "reviewDecision,statusCheckRollup"
     )
     output = run_gh(
-        "pr", "view", str(pr_number), "--repo", full_repo,
-        "--json", fields,
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        full_repo,
+        "--json",
+        fields,
     )
-    pr_data = json.loads(output)
+    try:
+        pr_data = json.loads(output)
+    except json.JSONDecodeError:
+        log.error(
+            "Failed to parse gh CLI output for PR #%d in %s",
+            pr_number,
+            full_repo,
+        )
+        return None
 
     # GraphQL enrichment
-    graphql_details = fetch_pr_details_graphql(
-        owner, repo_name, [pr_number]
-    )
+    graphql_details = fetch_pr_details_graphql(owner, repo_name, [pr_number])
     gql = graphql_details.get(pr_number)
 
     # Build case
@@ -89,30 +98,29 @@ def add_case_from_pr(
         graphql_data=gql,
     )
 
+    case.source = "manual"
+
     # Blame + ground truth if repo_dir is available
     if repo_dir and repo_dir != Path("") and repo_dir.is_dir():
         case = populate_blame(case, repo_dir)
-        if (
-            case.truth
-            and case.truth.introducing_commit
-            and case.fix_commit
-        ):
+        if case.truth and case.truth.introducing_commit and case.fix_commit:
             from bugeval.git_utils import run_git
 
             try:
                 intro_sha = case.truth.introducing_commit
                 intro_diff = run_git(
-                    "diff", f"{intro_sha}~1", intro_sha,
+                    "diff",
+                    f"{intro_sha}~1",
+                    intro_sha,
                     cwd=repo_dir,
                 )
                 fix_diff = run_git(
-                    "diff", f"{case.fix_commit}~1",
+                    "diff",
+                    f"{case.fix_commit}~1",
                     case.fix_commit,
                     cwd=repo_dir,
                 )
-                case.truth.buggy_lines = compute_buggy_lines(
-                    intro_diff, [fix_diff]
-                )
+                case.truth.buggy_lines = compute_buggy_lines(intro_diff, [fix_diff])
             except Exception:
                 log.debug(
                     "Ground truth computation failed for %s",

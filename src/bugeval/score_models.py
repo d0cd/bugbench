@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CommentVerdict(StrEnum):
@@ -17,10 +17,12 @@ class CommentVerdict(StrEnum):
 class CommentScore(BaseModel):
     comment_index: int
     verdict: CommentVerdict
-    matched_buggy_line: int | None = None
+    matched_buggy_line_idx: int | None = None
 
 
 class CaseScore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     case_id: str
     tool: str
     caught: bool = False
@@ -36,3 +38,9 @@ class CaseScore(BaseModel):
     potentially_contaminated: bool = False
     context_level: str = ""
     judge_failed: bool = False
+    judge_models: list[str] = []
+    judge_agreement: float | None = None
+    judge_cost_usd: float = 0.0
+    findings_caught: int = 0
+    findings_total: int = 0
+    diffuse_ground_truth: bool = False

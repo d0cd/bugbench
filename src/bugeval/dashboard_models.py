@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class RunNote(BaseModel):
@@ -47,7 +50,11 @@ def load_run_notes(run_dir: Path) -> list[RunNote]:
     path = _notes_path(run_dir)
     if not path.exists():
         return []
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logger.warning("Corrupt notes file %s, returning empty", path)
+        return []
     return [RunNote(**n) for n in data]
 
 
@@ -80,13 +87,15 @@ def load_golden_set(cases_dir: Path) -> dict[str, GoldenEntry]:
     path = _golden_path(cases_dir)
     if not path.exists():
         return {}
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logger.warning("Corrupt golden set %s, returning empty", path)
+        return {}
     return {k: GoldenEntry(**v) for k, v in data.items()}
 
 
-def save_golden_set(
-    cases_dir: Path, entries: dict[str, GoldenEntry]
-) -> None:
+def save_golden_set(cases_dir: Path, entries: dict[str, GoldenEntry]) -> None:
     """Persist golden set entries to JSON sidecar."""
     path = _golden_path(cases_dir)
     path.write_text(
@@ -125,9 +134,7 @@ def _human_scores_dir(run_dir: Path) -> Path:
     return run_dir / "human_scores"
 
 
-def load_human_score(
-    run_dir: Path, case_id: str, tool: str
-) -> HumanScore | None:
+def load_human_score(run_dir: Path, case_id: str, tool: str) -> HumanScore | None:
     """Load a single human score."""
     safe_case = case_id.replace("/", "_")
     safe_tool = tool.replace("/", "_")
@@ -147,9 +154,7 @@ def save_human_score(run_dir: Path, score: HumanScore) -> None:
     safe_case = score.case_id.replace("/", "_")
     safe_tool = score.tool.replace("/", "_")
     path = hs_dir / f"{safe_case}__{safe_tool}.yaml"
-    path.write_text(
-        yaml.safe_dump(score.model_dump(mode="json"), sort_keys=False)
-    )
+    path.write_text(yaml.safe_dump(score.model_dump(mode="json"), sort_keys=False))
 
 
 # ---------------------------------------------------------------------------
@@ -190,15 +195,11 @@ def load_experiments(results_dir: Path) -> ExperimentStore:
     return ExperimentStore(**data)
 
 
-def save_experiments(
-    results_dir: Path, store: ExperimentStore
-) -> None:
+def save_experiments(results_dir: Path, store: ExperimentStore) -> None:
     """Write experiments to results/experiments.yaml."""
     results_dir.mkdir(parents=True, exist_ok=True)
     path = results_dir / "experiments.yaml"
-    path.write_text(
-        yaml.safe_dump(store.model_dump(mode="json"), sort_keys=False)
-    )
+    path.write_text(yaml.safe_dump(store.model_dump(mode="json"), sort_keys=False))
 
 
 def current_date_iso() -> str:

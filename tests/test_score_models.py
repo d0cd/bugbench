@@ -15,12 +15,12 @@ class TestCommentVerdict:
 
 class TestCommentScore:
     def test_tp(self) -> None:
-        cs = CommentScore(comment_index=0, verdict=CommentVerdict.tp, matched_buggy_line=0)
-        assert cs.matched_buggy_line == 0
+        cs = CommentScore(comment_index=0, verdict=CommentVerdict.tp, matched_buggy_line_idx=0)
+        assert cs.matched_buggy_line_idx == 0
 
     def test_fp(self) -> None:
         cs = CommentScore(comment_index=1, verdict=CommentVerdict.fp)
-        assert cs.matched_buggy_line is None
+        assert cs.matched_buggy_line_idx is None
 
 
 class TestCaseScore:

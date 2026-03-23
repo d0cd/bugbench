@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -44,9 +45,12 @@ def ensure_tool_repo(repo: str, tool: str, org: str) -> str:
     # Create it
     try:
         run_gh(
-            "repo", "create", full_name,
+            "repo",
+            "create",
+            full_name,
             "--private",
-            "--description", f"bugeval: {tool} evaluation repo for {repo}",
+            "--description",
+            f"bugeval: {tool} evaluation repo for {repo}",
         )
     except GhError:
         # May already exist (race condition) — verify
@@ -68,7 +72,10 @@ def ensure_fork(repo: str, org: str = "") -> str:
     if org:
         return f"{org}/{name}"
     username = run_gh(
-        "api", "user", "--jq", ".login",
+        "api",
+        "user",
+        "--jq",
+        ".login",
     ).strip()
     return f"{username}/{name}"
 
@@ -78,6 +85,19 @@ def _opaque_id() -> str:
     import hashlib
 
     return hashlib.sha256(str(time.monotonic()).encode()).hexdigest()[:10]
+
+
+def _delete_remote_branch(fork: str, branch: str) -> None:
+    """Delete a remote branch via GitHub API. Ignores 404 (already gone)."""
+    try:
+        run_gh(
+            "api",
+            "--method",
+            "DELETE",
+            f"repos/{fork}/git/refs/heads/{branch}",
+        )
+    except GhError:
+        pass  # 404 or other — branch may already be gone
 
 
 def create_eval_branches(
@@ -96,85 +116,172 @@ def create_eval_branches(
     opaque = _opaque_id()
     base_branch = f"base-{opaque}"
     head_branch = f"review-{opaque}"
-    introducing = (
-        (case.truth.introducing_commit if case.truth else None) or case.base_commit
-    )
+    introducing = (case.truth.introducing_commit if case.truth else None) or case.base_commit
+
+    _eval_env = {
+        **os.environ.copy(),
+        "GIT_COMMITTER_NAME": "bugeval",
+        "GIT_COMMITTER_EMAIL": "bugeval@users.noreply.github.com",
+        "GIT_AUTHOR_NAME": "bugeval",
+        "GIT_AUTHOR_EMAIL": "bugeval@users.noreply.github.com",
+    }
 
     def _git(*args: str) -> None:
         cmd = ["git", "-C", str(repo_dir), *args]
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_eval_env,
         )
         if result.returncode != 0:
             raise GhError(cmd, result.stderr)
 
-    # Push base branch (introducing~1)
-    _git("checkout", "-B", base_branch, f"{introducing}~1")
-    _git(
-        "push", "--force", f"https://github.com/{fork}.git",
-        f"{base_branch}:{base_branch}",
-    )
+    base_pushed = False
+    try:
+        # Push base branch (introducing~1)
+        # Amend with generic identity to avoid GH007 email privacy rejections
+        _git("checkout", "-B", base_branch, f"{introducing}~1")
+        _git(
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--allow-empty",
+            "--reset-author",
+        )
+        _git(
+            "push",
+            "--force",
+            f"https://github.com/{fork}.git",
+            f"{base_branch}:{base_branch}",
+        )
+        base_pushed = True
 
-    # Push head branch (introducing changes applied on top of base)
-    _git("checkout", "-B", head_branch, f"{introducing}~1")
+        # Push head branch (introducing changes applied on top of base)
+        _git("checkout", "-B", head_branch, f"{introducing}~1")
+        _git(
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--allow-empty",
+            "--reset-author",
+        )
 
-    cmd = [
-        "git", "-C", str(repo_dir), "apply", "--allow-empty",
-    ]
-    proc = subprocess.run(
-        cmd, input=patch_diff, capture_output=True, text=True, timeout=120,
-    )
-    if proc.returncode != 0:
-        raise GhError(cmd, proc.stderr)
+        # Apply the introducing diff. Try git apply first; fall back to
+        # cherry-pick for binary patches that git apply can't handle.
+        apply_cmd = [
+            "git",
+            "-C",
+            str(repo_dir),
+            "apply",
+            "--allow-empty",
+        ]
+        proc = subprocess.run(
+            apply_cmd,
+            input=patch_diff,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_eval_env,
+        )
+        if proc.returncode != 0:
+            # Fallback: cherry-pick the introducing commit directly
+            log.info(
+                "git apply failed for %s, trying cherry-pick of %s",
+                case.id,
+                introducing,
+            )
+            try:
+                _git("cherry-pick", "--no-commit", introducing)
+            except GhError as cp_err:
+                # Abort the failed cherry-pick before raising
+                try:
+                    _git("cherry-pick", "--abort")
+                except GhError:
+                    pass
+                raise cp_err
 
-    _git("add", "-A")
-    _git("commit", "-m", "code changes", "--allow-empty")
-    _git(
-        "push", "--force", f"https://github.com/{fork}.git",
-        f"{head_branch}:{head_branch}",
-    )
-    return base_branch, head_branch
+        _git("add", "-A")
+        _git("commit", "-m", "code changes", "--allow-empty")
+        _git(
+            "push",
+            "--force",
+            f"https://github.com/{fork}.git",
+            f"{head_branch}:{head_branch}",
+        )
+        return base_branch, head_branch
+    except Exception:
+        # Clean up orphaned base branch if head was never pushed
+        if base_pushed:
+            _delete_remote_branch(fork, base_branch)
+        raise
+    finally:
+        # Always reset local working tree
+        try:
+            _git("cherry-pick", "--abort")
+        except GhError:
+            pass
+        try:
+            _git("checkout", "-f", "HEAD")
+        except GhError:
+            pass
+        try:
+            _git("clean", "-fd")
+        except GhError:
+            pass
 
 
 def _default_branch(fork: str) -> str:
     output = run_gh(
-        "repo", "view", fork,
-        "--json", "defaultBranchRef",
-        "-q", ".defaultBranchRef.name",
+        "repo",
+        "view",
+        fork,
+        "--json",
+        "defaultBranchRef",
+        "-q",
+        ".defaultBranchRef.name",
     )
     return output.strip() or "main"
 
 
 def open_eval_pr(
-    fork: str, head_branch: str, base_branch: str, case: TestCase,
+    fork: str,
+    head_branch: str,
+    base_branch: str,
+    case: TestCase,
 ) -> int:
     """Open a PR on the tool repo: head_branch → base_branch."""
     scrubbed_title = (
-        _scrub_fix_references(case.introducing_pr_title)
-        if case.introducing_pr_title else ""
+        _scrub_fix_references(case.introducing_pr_title) if case.introducing_pr_title else ""
     )
     title = scrubbed_title or "code changes"
-    body = (
-        _scrub_fix_references(case.introducing_pr_body)
-        if case.introducing_pr_body else ""
-    )
+    body = _scrub_fix_references(case.introducing_pr_body) if case.introducing_pr_body else ""
     # Write body to temp file to avoid shell escaping issues with special chars
     import tempfile
 
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False,
+        mode="w",
+        suffix=".md",
+        delete=False,
     ) as f:
         f.write(body)
         body_file = f.name
 
     try:
         output = run_gh(
-            "pr", "create",
-            "--repo", fork,
-            "--head", head_branch,
-            "--base", base_branch,
-            "--title", title,
-            "--body-file", body_file,
+            "pr",
+            "create",
+            "--repo",
+            fork,
+            "--head",
+            head_branch,
+            "--base",
+            base_branch,
+            "--title",
+            title,
+            "--body-file",
+            body_file,
         )
     finally:
         Path(body_file).unlink(missing_ok=True)
@@ -198,9 +305,13 @@ def poll_for_review(
         # Check reviews (e.g., copilot-pull-request-reviewer[bot])
         try:
             output = run_gh(
-                "pr", "view", str(pr_number),
-                "--repo", fork,
-                "--json", "reviews",
+                "pr",
+                "view",
+                str(pr_number),
+                "--repo",
+                fork,
+                "--json",
+                "reviews",
             )
             data = json.loads(output)
             reviews = data.get("reviews") or []
@@ -208,81 +319,133 @@ def poll_for_review(
                 author = (review.get("author") or {}).get("login", "")
                 if bot_name.lower() in author.lower():
                     log.info(
-                        "%s review found on PR #%d", bot_name, pr_number,
+                        "%s review found on PR #%d",
+                        bot_name,
+                        pr_number,
                     )
                     return True
         except (GhError, json.JSONDecodeError):
             pass  # gh pr view may fail on fresh repos; fall through to comment check
 
-        # Also check inline PR comments (some bots post as comments, not reviews)
-        try:
-            output = run_gh(
-                "api",
-                f"repos/{fork}/pulls/{pr_number}/comments",
-            )
-            comments = json.loads(output)
-            if isinstance(comments, list):
-                for comment in comments:
-                    if not isinstance(comment, dict):
-                        continue
-                    user = comment.get("user") or {}
-                    login = str(user.get("login", ""))
-                    if bot_name.lower() in login.lower():
-                        log.info(
-                            "%s comment found on PR #%d", bot_name, pr_number,
-                        )
-                        return True
-        except (GhError, json.JSONDecodeError):
-            pass
+        # Check inline PR review comments AND issue comments.
+        # Some bots (Copilot) post as PR review comments,
+        # others (CodeRabbit, Greptile) post as issue comments.
+        for endpoint in (
+            f"repos/{fork}/pulls/{pr_number}/comments",
+            f"repos/{fork}/issues/{pr_number}/comments",
+        ):
+            try:
+                output = run_gh("api", endpoint)
+                comments = json.loads(output)
+                if isinstance(comments, list):
+                    for comment in comments:
+                        if not isinstance(comment, dict):
+                            continue
+                        user = comment.get("user") or {}
+                        login = str(user.get("login", ""))
+                        if bot_name.lower() in login.lower():
+                            log.info(
+                                "%s comment found on PR #%d (%s)",
+                                bot_name,
+                                pr_number,
+                                endpoint.split("/")[-1],
+                            )
+                            return True
+            except (GhError, json.JSONDecodeError):
+                pass
 
         elapsed = time.monotonic() - start
         if elapsed >= timeout:
             log.warning(
                 "Timed out waiting for %s review on PR #%d",
-                bot_name, pr_number,
+                bot_name,
+                pr_number,
             )
             return False
         time.sleep(poll_interval)
 
 
 def scrape_pr_comments(
-    fork: str, pr_number: int, bot_name: str = "copilot",
+    fork: str,
+    pr_number: int,
+    bot_name: str = "copilot",
 ) -> list[Comment]:
-    """Scrape review comments from a PR, filtering to the named bot."""
-    output = run_gh(
-        "api",
-        f"repos/{fork}/pulls/{pr_number}/comments",
-    )
-    raw_comments: list[dict[str, object]] = json.loads(output)
+    """Scrape review comments from a PR, filtering to the named bot.
 
+    Checks both PR review comments (inline) and issue comments (general).
+    PR review comments have file/line; issue comments have body only.
+    """
     comments: list[Comment] = []
-    for rc in raw_comments:
-        user = rc.get("user") or {}
-        login = str(
-            user.get("login", "") if isinstance(user, dict) else ""
+
+    # 1. PR review comments (inline, have file + line)
+    try:
+        output = run_gh(
+            "api",
+            f"repos/{fork}/pulls/{pr_number}/comments",
         )
-        if bot_name.lower() not in login.lower():
-            continue
-        comments.append(Comment(
-            file=str(rc.get("path", "")),
-            line=int(rc.get("line") or 0),  # type: ignore[arg-type]
-            body=str(rc.get("body", "")),
-        ))
+        for rc in json.loads(output):
+            if not isinstance(rc, dict):
+                continue
+            user = rc.get("user") or {}
+            login = str(user.get("login", "") if isinstance(user, dict) else "")
+            if bot_name.lower() not in login.lower():
+                continue
+            comments.append(
+                Comment(
+                    file=str(rc.get("path", "")),
+                    line=int(rc.get("line") or 0),  # type: ignore[arg-type]
+                    body=str(rc.get("body", "")),
+                )
+            )
+    except (GhError, json.JSONDecodeError):
+        pass
+
+    # 2. Issue comments (general, no file/line — used by CodeRabbit, Greptile)
+    try:
+        output = run_gh(
+            "api",
+            f"repos/{fork}/issues/{pr_number}/comments",
+        )
+        for rc in json.loads(output):
+            if not isinstance(rc, dict):
+                continue
+            user = rc.get("user") or {}
+            login = str(user.get("login", "") if isinstance(user, dict) else "")
+            if bot_name.lower() not in login.lower():
+                continue
+            body = str(rc.get("body", ""))
+            # Skip trigger comments (e.g. "@greptile", "@coderabbitai review")
+            if body.strip().startswith("@"):
+                continue
+            comments.append(
+                Comment(file="", line=0, body=body),
+            )
+    except (GhError, json.JSONDecodeError):
+        pass
+
     return comments
 
 
 def close_eval_pr(
-    fork: str, pr_number: int,
-    head_branch: str, base_branch: str = "",
+    fork: str,
+    pr_number: int,
+    head_branch: str,
+    base_branch: str = "",
 ) -> None:
     """Close the eval PR and delete remote branches."""
     run_gh(
-        "pr", "close", str(pr_number), "--repo", fork,
+        "pr",
+        "close",
+        str(pr_number),
+        "--repo",
+        fork,
     )
     # Delete head branch
     try:
         run_gh(
-            "api", "--method", "DELETE",
+            "api",
+            "--method",
+            "DELETE",
             f"repos/{fork}/git/refs/heads/{head_branch}",
         )
     except GhError:
@@ -291,7 +454,9 @@ def close_eval_pr(
     if base_branch:
         try:
             run_gh(
-                "api", "--method", "DELETE",
+                "api",
+                "--method",
+                "DELETE",
                 f"repos/{fork}/git/refs/heads/{base_branch}",
             )
         except GhError:
@@ -301,28 +466,10 @@ def close_eval_pr(
 
 def _get_patch_diff(case: TestCase, repo_dir: Path) -> str:
     """Get the diff for the introducing commit."""
-    introducing = (
-        (case.truth.introducing_commit if case.truth else None) or case.base_commit
-    )
+    introducing = (case.truth.introducing_commit if case.truth else None) or case.base_commit
     if not introducing:
         return ""
     return run_git("diff", f"{introducing}~1", introducing, cwd=repo_dir)
-
-
-def _isolate_fork(
-    fork: str, introducing: str, default_branch: str, repo_dir: Path,
-) -> None:
-    """Force-push the fork's default branch to introducing~1 for isolation."""
-    cmd = [
-        "git", "-C", str(repo_dir), "push", "--force",
-        f"https://github.com/{fork}.git",
-        f"{introducing}~1:refs/heads/{default_branch}",
-    ]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        raise GhError(cmd, result.stderr)
 
 
 def _save_copilot_transcript(
@@ -367,6 +514,124 @@ def _scrape_raw_comments(fork: str, pr_number: int) -> list[dict[str, Any]]:
     return raw
 
 
+_BOT_NAMES: dict[str, str] = {
+    "copilot": "copilot",
+    "greptile": "greptile",
+    "coderabbit": "coderabbitai",
+}
+
+
+def scrape_pr_for_case(
+    pending: ToolResult,
+    fork: str,
+    *,
+    close: bool = True,
+) -> ToolResult:
+    """Check once for a review on a pending PR, scrape if found.
+
+    Does a quick check (not a long poll): timeout=5, poll_interval=5.
+    If no review yet, returns the pending result unchanged.
+    If review found, scrapes comments and optionally closes the PR.
+    """
+    bot_name = _BOT_NAMES.get(pending.tool, pending.tool)
+    found = poll_for_review(
+        fork,
+        pending.pr_number,
+        bot_name,
+        timeout=5,
+        poll_interval=5,
+    )
+    if not found:
+        # Re-trigger for tools that need explicit triggers
+        if pending.tool == "greptile":
+            from bugeval.greptile_runner import _trigger_greptile
+
+            _trigger_greptile(fork, pending.pr_number)
+        elif pending.tool == "coderabbit":
+            from bugeval.coderabbit_runner import _trigger_coderabbit
+
+            _trigger_coderabbit(fork, pending.pr_number)
+        return pending
+
+    comments = scrape_pr_comments(fork, pending.pr_number, bot_name)
+
+    new_state = "reviewed"
+    if close:
+        close_eval_pr(
+            fork,
+            pending.pr_number,
+            pending.pr_head_branch,
+            pending.pr_base_branch,
+        )
+        new_state = "closed"
+
+    return pending.model_copy(
+        update={"comments": comments, "pr_state": new_state},
+    )
+
+
+def open_pr_for_case(
+    case: TestCase,
+    repo_dir: Path,
+    tool: str,
+    org: str = "",
+) -> ToolResult:
+    """Open a PR for a test case and trigger tool-specific review.
+
+    Returns a ToolResult with pr_state="pending-review" and no comments.
+    The caller is expected to poll/scrape later in a separate phase.
+    """
+    pr_number = 0
+    try:
+        patch_diff = _get_patch_diff(case, repo_dir)
+        if org:
+            fork = ensure_tool_repo(case.repo, tool, org)
+        else:
+            fork = ensure_fork(case.repo)
+
+        base_branch, head_branch = create_eval_branches(
+            fork=fork,
+            case=case,
+            patch_diff=patch_diff,
+            repo_dir=repo_dir,
+        )
+
+        pr_number = open_eval_pr(fork, head_branch, base_branch, case)
+
+        # Trigger tool-specific review
+        if tool == "greptile":
+            from bugeval.greptile_runner import _trigger_greptile
+
+            _trigger_greptile(fork, pr_number)
+        elif tool == "coderabbit":
+            from bugeval.coderabbit_runner import (
+                _trigger_coderabbit,
+            )
+
+            _trigger_coderabbit(fork, pr_number)
+        # copilot: automatic, no trigger needed
+
+        return ToolResult(
+            case_id=case.id,
+            tool=tool,
+            context_level="diff+repo",
+            comments=[],
+            pr_number=pr_number,
+            pr_state="pending-review",
+            pr_head_branch=head_branch,
+            pr_base_branch=base_branch,
+        )
+    except Exception as exc:
+        return ToolResult(
+            case_id=case.id,
+            tool=tool,
+            context_level="diff+repo",
+            comments=[],
+            pr_number=pr_number,
+            error=str(exc),
+        )
+
+
 def run_copilot(
     case: TestCase,
     repo_dir: Path,
@@ -400,15 +665,19 @@ def run_copilot(
             elapsed = time.monotonic() - start
             if transcript_dir:
                 _save_copilot_transcript(
-                    transcript_dir, case.id,
-                    fork=fork, branch=head_branch, pr_number=pr_number,
+                    transcript_dir,
+                    case.id,
+                    fork=fork,
+                    branch=head_branch,
+                    pr_number=pr_number,
                     scrubbed_title=_scrub_fix_references(
                         case.introducing_pr_title or "",
                     ),
                     scrubbed_body=_scrub_fix_references(
                         case.introducing_pr_body or "",
                     ),
-                    raw_comments=[], patch_diff=patch_diff,
+                    raw_comments=[],
+                    patch_diff=patch_diff,
                     time_seconds=elapsed,
                 )
             return ToolResult(
@@ -417,6 +686,7 @@ def run_copilot(
                 context_level="diff+repo",
                 comments=[],
                 time_seconds=elapsed,
+                pr_number=pr_number,
                 error=f"Timeout waiting for Copilot review ({timeout}s)",
             )
 
@@ -433,11 +703,15 @@ def run_copilot(
         transcript_path = ""
         if transcript_dir:
             transcript_path = _save_copilot_transcript(
-                transcript_dir, case.id,
-                fork=fork, branch=head_branch, pr_number=pr_number,
+                transcript_dir,
+                case.id,
+                fork=fork,
+                branch=head_branch,
+                pr_number=pr_number,
                 scrubbed_title=scrubbed_title,
                 scrubbed_body=scrubbed_body,
-                raw_comments=raw_comments, patch_diff=patch_diff,
+                raw_comments=raw_comments,
+                patch_diff=patch_diff,
                 time_seconds=elapsed,
             )
         return ToolResult(
@@ -447,6 +721,7 @@ def run_copilot(
             comments=comments,
             time_seconds=elapsed,
             transcript_path=transcript_path,
+            pr_number=pr_number,
         )
     except Exception as exc:
         elapsed = time.monotonic() - start
@@ -456,6 +731,7 @@ def run_copilot(
             context_level="diff+repo",
             comments=[],
             time_seconds=elapsed,
+            pr_number=pr_number,
             error=str(exc),
         )
     finally:
@@ -465,5 +741,6 @@ def run_copilot(
             except Exception:
                 log.warning(
                     "Failed to clean up PR #%d on %s",
-                    pr_number, fork,
+                    pr_number,
+                    fork,
                 )

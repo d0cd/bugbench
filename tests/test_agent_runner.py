@@ -2,28 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as json_mod
 import sys
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from bugeval.agent_runner import (
     _execute_tool,
+    _run_single_pass_sdk,
     _save_transcript,
     _scrub_fix_references,
+    annotate_diff,
     build_system_prompt,
     build_user_prompt,
-    is_docker_available,
     materialize_workspace,
     parse_agent_findings,
     run_agent_cli,
     run_agent_sdk,
+    run_agent_sdk_2pass,
     run_anthropic_api,
-    run_docker,
     run_google_api,
     run_openai_api,
     sanitize_diff,
+    setup_workspace,
 )
 from bugeval.models import CaseKind, TestCase
 
@@ -43,9 +48,7 @@ def _make_case(**overrides: object) -> TestCase:
     return TestCase(**defaults)  # type: ignore[arg-type]
 
 
-SAMPLE_DIFF = (
-    "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,3 +1,3 @@\n-old\n+new\n"
-)
+SAMPLE_DIFF = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,3 +1,3 @@\n-old\n+new\n"
 
 
 class TestBuildSystemPrompt:
@@ -57,10 +60,10 @@ class TestBuildSystemPrompt:
         # diff-only should NOT mention repo tools
         assert "full repository" not in prompt
 
-    def test_diff_repo_mentions_tools(self) -> None:
+    def test_diff_repo_mentions_methodology(self) -> None:
         prompt = build_system_prompt("diff+repo")
         assert "full repository" in prompt
-        assert "tools" in prompt.lower()
+        assert "callers" in prompt.lower()
         assert "diff.patch" in prompt
 
     def test_diff_repo_domain_has_zk_context(self) -> None:
@@ -68,6 +71,44 @@ class TestBuildSystemPrompt:
         assert "zero-knowledge" in prompt.lower()
         assert ".pr/domain.md" in prompt
         assert "full repository" in prompt
+
+    def test_docker_v3_has_cargo_check(self) -> None:
+        prompt = build_system_prompt("diff+repo", bash_enabled=True)
+        assert "cargo check" in prompt
+        assert "cargo clippy" in prompt
+        assert "rg " in prompt  # ripgrep
+        assert "Bash" in prompt
+
+    def test_docker_v3_has_workflow(self) -> None:
+        prompt = build_system_prompt("diff+repo", bash_enabled=True)
+        assert "Read the diff" in prompt
+        assert "Check callers" in prompt
+        assert "Report findings" in prompt
+
+    def test_docker_v3_has_tool_guidance(self) -> None:
+        prompt = build_system_prompt("diff+repo", bash_enabled=True)
+        assert "rg" in prompt.lower() or "bash" in prompt.lower()
+
+    def test_docker_v3_has_anti_cheat(self) -> None:
+        prompt = build_system_prompt("diff+repo", bash_enabled=True)
+        assert "Do NOT search for" in prompt
+        assert "github.com" in prompt
+
+    def test_docker_v3_has_output_format(self) -> None:
+        prompt = build_system_prompt("diff+repo", bash_enabled=True)
+        assert '"file"' in prompt
+        assert '"line"' in prompt
+        assert "JSON" in prompt
+
+    def test_docker_false_uses_standard_prompt(self) -> None:
+        docker_prompt = build_system_prompt("diff+repo", bash_enabled=True)
+        standard_prompt = build_system_prompt("diff+repo", bash_enabled=False)
+        assert "cargo check" in docker_prompt
+        assert "cargo check" not in standard_prompt
+
+    def test_docker_v3_mentions_already_merged(self) -> None:
+        prompt = build_system_prompt("diff+repo", bash_enabled=True)
+        assert "already been merged" in prompt.lower() or "already applied" in prompt.lower()
 
 
 class TestBuildUserPrompt:
@@ -82,7 +123,10 @@ class TestBuildUserPrompt:
     def test_inline_diff_when_requested(self) -> None:
         case = _make_case()
         prompt = build_user_prompt(
-            case, SAMPLE_DIFF, "diff-only", inline_diff=True,
+            case,
+            SAMPLE_DIFF,
+            "diff-only",
+            inline_diff=True,
         )
         assert "```diff" in prompt
         assert "foo.rs" in prompt
@@ -128,10 +172,7 @@ class TestSanitizeDiff:
         assert "--- a/f.rs" in result
 
     def test_strips_from_sha_line(self) -> None:
-        diff = (
-            "From abc1234def5678901234567890abcdef12345678 Mon Sep 17\n"
-            "--- a/f.rs\n+++ b/f.rs\n"
-        )
+        diff = "From abc1234def5678901234567890abcdef12345678 Mon Sep 17\n--- a/f.rs\n+++ b/f.rs\n"
         result = sanitize_diff(diff)
         assert "From abc1234" not in result
         assert "--- a/f.rs" in result
@@ -148,9 +189,7 @@ class TestParseAgentFindings:
 
     def test_json_with_surrounding_text(self) -> None:
         response = (
-            'Here are my findings:\n'
-            '[{"file":"a.rs","line":5,"description":"issue"}]\n'
-            'That is all.'
+            'Here are my findings:\n[{"file":"a.rs","line":5,"description":"issue"}]\nThat is all.'
         )
         comments = parse_agent_findings(response)
         assert len(comments) == 1
@@ -165,9 +204,7 @@ class TestParseAgentFindings:
         assert parse_agent_findings("[]") == []
 
     def test_with_suggested_fix(self) -> None:
-        response = (
-            '[{"file":"x.rs","line":1,"description":"d","suggested_fix":"f"}]'
-        )
+        response = '[{"file":"x.rs","line":1,"description":"d","suggested_fix":"f"}]'
         comments = parse_agent_findings(response)
         assert comments[0].suggested_fix == "f"
 
@@ -184,17 +221,19 @@ class TestRunAgentApiDiffOnly:
         mock_response = MagicMock()
         mock_response.stop_reason = "end_turn"
         mock_response.content = [text_block]
-        mock_response.usage = MagicMock(
-            input_tokens=100, output_tokens=50
-        )
+        mock_response.usage = MagicMock(input_tokens=100, output_tokens=50)
 
         mock_client = MagicMock()
         mock_client.messages.create.return_value = mock_response
 
         with patch("bugeval.agent_runner.anthropic.Anthropic", return_value=mock_client):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         assert result.case_id == "leo-001"
@@ -213,8 +252,12 @@ class TestRunAgentApiDiffOnly:
 
         with patch("bugeval.agent_runner.anthropic.Anthropic", return_value=mock_client):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         assert result.case_id == "leo-001"
@@ -271,7 +314,8 @@ class TestMaterializeWorkspaceScrubsTitle:
 
 class TestMaterializeWorkspaceScrubsCommitMessages:
     def test_commit_messages_with_fix_keyword_scrubbed(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         case = _make_case(
             introducing_pr_commit_messages=[
@@ -287,7 +331,8 @@ class TestMaterializeWorkspaceScrubsCommitMessages:
         assert "feat: add parser" in commits
 
     def test_all_messages_scrubbed_uses_placeholder(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         case = _make_case(
             introducing_pr_commit_messages=["fix: patch bug #42"],
@@ -312,7 +357,8 @@ class TestMaterializeWorkspaceAntiContamination:
         assert "Add parser" in desc
 
     def test_body_entirely_fix_references_omitted(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         case = _make_case(
             introducing_pr_title="",
@@ -364,6 +410,80 @@ class TestMaterializeWorkspace:
         assert not (ws / ".pr" / "domain.md").exists()
 
 
+class TestSetupWorkspace:
+    def test_diff_only_returns_none(self) -> None:
+        case = _make_case()
+        result = setup_workspace(case, Path("/repo"), "diff-only", Path("/work"))
+        assert result is None
+
+    def test_passes_local_path_to_clone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        case = _make_case()
+        local_repo = tmp_path / "repo"
+        local_repo.mkdir()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        calls: list[str] = []
+
+        def mock_clone(source: str, dest: Path, sha: str, **kw: object) -> Path:
+            calls.append(source)
+            dest.mkdir(parents=True, exist_ok=True)
+            return dest
+
+        monkeypatch.setattr("bugeval.git_utils.clone_at_sha", mock_clone)
+        result = setup_workspace(case, local_repo, "diff+repo", work_dir)
+        assert result == work_dir / case.id
+        # Should receive local path, not a URL
+        assert calls[0] == str(local_repo)
+
+    def test_passes_url_string_to_clone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        case = _make_case()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        calls: list[str] = []
+
+        def mock_clone(source: str, dest: Path, sha: str, **kw: object) -> Path:
+            calls.append(source)
+            dest.mkdir(parents=True, exist_ok=True)
+            return dest
+
+        monkeypatch.setattr("bugeval.git_utils.clone_at_sha", mock_clone)
+        url = "https://github.com/ProvableHQ/leo.git"
+        setup_workspace(case, url, "diff+repo", work_dir)
+        assert calls[0] == url
+
+    def test_workspace_per_case_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        def mock_clone(source: str, dest: Path, sha: str, **kw: object) -> Path:
+            dest.mkdir(parents=True, exist_ok=True)
+            return dest
+
+        monkeypatch.setattr("bugeval.git_utils.clone_at_sha", mock_clone)
+
+        case1 = _make_case(id="leo-001")
+        case2 = _make_case(id="leo-002")
+        r1 = setup_workspace(case1, Path("/repo"), "diff+repo", work_dir)
+        r2 = setup_workspace(case2, Path("/repo"), "diff+repo", work_dir)
+        assert r1 != r2
+        assert r1.name == "leo-001"
+        assert r2.name == "leo-002"
+
+
 class TestExecuteToolReadFile:
     def test_read_file_success(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
@@ -377,9 +497,7 @@ class TestExecuteToolReadFile:
         repo.mkdir()
         # Create a file outside repo
         (tmp_path / "secret.txt").write_text("secret")
-        result = _execute_tool(
-            "read_file", {"path": "../../etc/passwd"}, repo
-        )
+        result = _execute_tool("read_file", {"path": "../../etc/passwd"}, repo)
         assert "path outside workspace" in result.lower()
 
     def test_read_file_path_traversal_prefix_trick(self, tmp_path: Path) -> None:
@@ -391,9 +509,7 @@ class TestExecuteToolReadFile:
         evil.mkdir()
         (evil / "data.txt").write_text("evil")
         # ../repo-evil/data.txt resolves outside repo
-        result = _execute_tool(
-            "read_file", {"path": "../repo-evil/data.txt"}, repo
-        )
+        result = _execute_tool("read_file", {"path": "../repo-evil/data.txt"}, repo)
         assert "path outside workspace" in result.lower()
 
     def test_read_file_not_found(self, tmp_path: Path) -> None:
@@ -446,20 +562,14 @@ class TestExecuteToolSearchText:
         repo = tmp_path / "repo"
         repo.mkdir()
         with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                stdout="foo.rs:10:match here\n", returncode=0
-            )
-            result = _execute_tool(
-                "search_text", {"pattern": "match", "path": "."}, repo
-            )
+            mock_run.return_value = MagicMock(stdout="foo.rs:10:match here\n", returncode=0)
+            result = _execute_tool("search_text", {"pattern": "match", "path": "."}, repo)
         assert "match here" in result
 
     def test_search_text_path_traversal(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
-        result = _execute_tool(
-            "search_text", {"pattern": "x", "path": "../.."}, repo
-        )
+        result = _execute_tool("search_text", {"pattern": "x", "path": "../.."}, repo)
         assert "path outside workspace" in result.lower()
 
 
@@ -505,8 +615,12 @@ class TestRunAgentApiMultiTurn:
             return_value=mock_client,
         ):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff+repo",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff+repo",
+                max_turns=5,
+                timeout=300,
             )
 
         assert len(result.comments) == 1
@@ -539,8 +653,12 @@ class TestRunAgentApiMultiTurn:
             return_value=mock_client,
         ):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff+repo",
-                max_turns=10, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff+repo",
+                max_turns=10,
+                timeout=300,
             )
 
         assert "cost ceiling" in result.error.lower()
@@ -568,8 +686,12 @@ class TestRunAgentApiTimeout:
             patch("bugeval.agent_runner.time.monotonic", side_effect=fake_monotonic),
         ):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         assert "timeout" in result.error.lower()
@@ -598,8 +720,12 @@ class TestRunAgentApiTranscript:
             return_value=mock_client,
         ):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
                 transcript_dir=transcript_dir,
             )
 
@@ -616,7 +742,6 @@ class TestCliRunnerUsesStdin:
     @patch("bugeval.agent_runner.subprocess.run")
     def test_prompt_piped_via_stdin(self, mock_run: MagicMock) -> None:
         """Verify the CLI runner passes prompt via stdin, not as an argument."""
-        import json as json_mod
         import subprocess as sp
 
         output = {
@@ -631,8 +756,12 @@ class TestCliRunnerUsesStdin:
         )
         case = _make_case()
         result = run_agent_cli(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=60,
+            case,
+            SAMPLE_DIFF,
+            None,
+            "diff-only",
+            cli_tool="claude",
+            timeout=60,
         )
         assert result.error == ""
         assert len(result.comments) == 1
@@ -661,9 +790,7 @@ class TestRunAgentApiWithThinking:
         mock_response = MagicMock()
         mock_response.stop_reason = "end_turn"
         mock_response.content = [thinking_block, text_block]
-        mock_response.usage = MagicMock(
-            input_tokens=100, output_tokens=200
-        )
+        mock_response.usage = MagicMock(input_tokens=100, output_tokens=200)
 
         mock_client = MagicMock()
         mock_client.messages.create.return_value = mock_response
@@ -674,8 +801,12 @@ class TestRunAgentApiWithThinking:
             return_value=mock_client,
         ):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
                 transcript_dir=transcript_dir,
                 thinking_budget=8000,
             )
@@ -691,10 +822,7 @@ class TestRunAgentApiWithThinking:
         assistant_msgs = [m for m in data if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
         content = assistant_msgs[0]["content"]
-        thinking_items = [
-            c for c in content
-            if isinstance(c, dict) and c.get("type") == "thinking"
-        ]
+        thinking_items = [c for c in content if isinstance(c, dict) and c.get("type") == "thinking"]
         assert len(thinking_items) == 1
         assert thinking_items[0]["thinking"] == "Let me analyze this diff carefully..."
 
@@ -719,8 +847,12 @@ class TestRunAgentApiWithThinking:
             return_value=mock_client,
         ):
             run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
                 thinking_budget=8000,
             )
 
@@ -753,8 +885,12 @@ class TestRunAgentApiWithThinking:
             return_value=mock_client,
         ):
             run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
                 thinking_budget=0,
             )
 
@@ -767,9 +903,7 @@ class TestRunAgentApiWithThinking:
 
         thinking_block = MagicMock()
         thinking_block.type = "thinking"
-        thinking_block.thinking = (
-            '[{"file":"fake.rs","line":99,"description":"from thinking"}]'
-        )
+        thinking_block.thinking = '[{"file":"fake.rs","line":99,"description":"from thinking"}]'
 
         text_block = MagicMock()
         text_block.type = "text"
@@ -788,8 +922,12 @@ class TestRunAgentApiWithThinking:
             return_value=mock_client,
         ):
             result = run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
                 thinking_budget=8000,
             )
 
@@ -826,7 +964,9 @@ class TestSaveTranscriptThinkingBlocks:
         import json
 
         path = _save_transcript(
-            messages, tmp_path, "test-001"  # type: ignore[arg-type]
+            messages,
+            tmp_path,
+            "test-001",  # type: ignore[arg-type]
         )
         data = json.loads(Path(path).read_text())
 
@@ -856,6 +996,7 @@ class TestSaveTranscriptThinkingBlocks:
 # Agent SDK tests
 # ---------------------------------------------------------------------------
 
+
 def _make_sdk_mocks() -> tuple[types.ModuleType, types.ModuleType]:
     """Create fake claude_agent_sdk + claude_agent_sdk.types modules."""
     mod = types.ModuleType("claude_agent_sdk")
@@ -872,7 +1013,9 @@ def _make_sdk_mocks() -> tuple[types.ModuleType, types.ModuleType]:
 
     class ResultMessage:
         def __init__(
-            self, total_cost_usd: float = 0.0, session_id: str = "",
+            self,
+            total_cost_usd: float = 0.0,
+            session_id: str = "",
             result: str = "",
         ) -> None:
             self.total_cost_usd = total_cost_usd
@@ -896,18 +1039,43 @@ def _make_sdk_mocks() -> tuple[types.ModuleType, types.ModuleType]:
 
     class ToolUseBlock:
         def __init__(
-            self, id: str = "", name: str = "",
+            self,
+            id: str = "",
+            name: str = "",
             input: dict[str, object] | None = None,
         ) -> None:
             self.id = id
             self.name = name
             self.input = input or {}
 
+    class ClaudeSDKClient:
+        """Fake ClaudeSDKClient that delegates to mod.query for testing."""
+
+        def __init__(self, options: object = None) -> None:
+            self._options = options
+            self._query_fn = mod.query  # type: ignore[attr-defined]
+            self._pending_prompt: str = ""
+
+        async def __aenter__(self) -> ClaudeSDKClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        async def query(self, prompt: str) -> None:
+            self._pending_prompt = prompt
+
+        async def receive_response(self):  # type: ignore[no-untyped-def]
+            if self._query_fn is not None:
+                async for msg in self._query_fn(prompt=self._pending_prompt):
+                    yield msg
+
     mod.ClaudeAgentOptions = ClaudeAgentOptions  # type: ignore[attr-defined]
     mod.AssistantMessage = AssistantMessage  # type: ignore[attr-defined]
     mod.ResultMessage = ResultMessage  # type: ignore[attr-defined]
     mod.CLINotFoundError = CLINotFoundError  # type: ignore[attr-defined]
     mod.CLIConnectionError = CLIConnectionError  # type: ignore[attr-defined]
+    mod.ClaudeSDKClient = ClaudeSDKClient  # type: ignore[attr-defined]
     mod.query = None  # type: ignore[attr-defined]
 
     types_mod.TextBlock = TextBlock  # type: ignore[attr-defined]
@@ -935,20 +1103,28 @@ class TestRunAgentSdkSuccess:
         async def fake_query(**kwargs: object):  # type: ignore[no-untyped-def]
             yield AssistantMessage(content=[text_block])
             yield ResultMessage(
-                total_cost_usd=0.05, session_id="sess-123",
+                total_cost_usd=0.05,
+                session_id="sess-123",
                 result=findings_json,
             )
 
         sdk_mod.query = fake_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             result = run_agent_sdk(
-                case, SAMPLE_DIFF, None, "diff-only",
-                timeout=300, transcript_dir=tmp_path / "transcripts",
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=300,
+                transcript_dir=tmp_path / "transcripts",
             )
 
         assert result.case_id == "leo-001"
@@ -966,7 +1142,11 @@ class TestRunAgentSdkImportError:
         with patch.dict(sys.modules, {"claude_agent_sdk": None}):
             case = _make_case()
             result = run_agent_sdk(
-                case, SAMPLE_DIFF, None, "diff-only", timeout=60,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=60,
             )
 
         assert result.tool == "agent-sdk"
@@ -985,14 +1165,21 @@ class TestRunAgentSdkTimeout:
 
         sdk_mod.query = slow_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             # Use timeout=0 so the first check (monotonic - start > 0) triggers
             result = run_agent_sdk(
-                case, SAMPLE_DIFF, None, "diff-only", timeout=0,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=0,
             )
 
         assert "timeout" in result.error.lower()
@@ -1012,14 +1199,21 @@ class TestRunAgentSdkTranscriptSaved:
         sdk_mod.query = fake_query  # type: ignore[attr-defined]
 
         transcript_dir = tmp_path / "transcripts"
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             result = run_agent_sdk(
-                case, SAMPLE_DIFF, None, "diff-only",
-                timeout=300, transcript_dir=transcript_dir,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=300,
+                transcript_dir=transcript_dir,
             )
 
         assert result.transcript_path != ""
@@ -1043,13 +1237,20 @@ class TestRunAgentSdkCostTracking:
 
         sdk_mod.query = fake_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             result = run_agent_sdk(
-                case, SAMPLE_DIFF, None, "diff-only", timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=300,
             )
 
         assert result.cost_usd == 1.23
@@ -1077,10 +1278,13 @@ class TestRunAgentSdkDiffOnlyNoTools:
 
         sdk_mod.query = fake_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             run_agent_sdk(case, SAMPLE_DIFF, None, "diff-only", timeout=300)
 
@@ -1110,10 +1314,13 @@ class TestRunAgentSdkContextLevels:
 
         sdk_mod.query = fake_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             run_agent_sdk(case, SAMPLE_DIFF, None, "diff+repo", timeout=300)
 
@@ -1141,13 +1348,20 @@ class TestRunAgentSdkContextLevels:
 
         sdk_mod.query = fake_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             run_agent_sdk(
-                case, SAMPLE_DIFF, None, "diff+repo+domain", timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff+repo+domain",
+                timeout=300,
             )
 
         assert len(captured_options) == 1
@@ -1181,8 +1395,12 @@ class TestRunAgentApiModelOverride:
             return_value=mock_client,
         ):
             run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
                 model="claude-opus-4-6",
             )
 
@@ -1210,8 +1428,12 @@ class TestRunAgentApiModelOverride:
             return_value=mock_client,
         ):
             run_anthropic_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
                 model="",
             )
 
@@ -1243,14 +1465,21 @@ class TestRunAgentSdkModelOverride:
 
         sdk_mod.query = fake_query  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "claude_agent_sdk": sdk_mod,
-            "claude_agent_sdk.types": sdk_types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
             case = _make_case()
             run_agent_sdk(
-                case, SAMPLE_DIFF, None, "diff-only",
-                timeout=300, model="claude-opus-4-6",
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=300,
+                model="claude-opus-4-6",
             )
 
         assert len(captured_options) == 1
@@ -1263,7 +1492,9 @@ class TestRunAgentSdkModelOverride:
 
 
 def _make_google_mocks() -> tuple[
-    types.ModuleType, types.ModuleType, types.ModuleType,
+    types.ModuleType,
+    types.ModuleType,
+    types.ModuleType,
 ]:
     """Create fake google, google.genai, and google.genai.types modules."""
     google_mod = types.ModuleType("google")
@@ -1272,7 +1503,9 @@ def _make_google_mocks() -> tuple[
 
     class FunctionDeclaration:
         def __init__(
-            self, name: str = "", description: str = "",
+            self,
+            name: str = "",
+            description: str = "",
             parameters: object = None,
         ) -> None:
             self.name = name
@@ -1284,7 +1517,8 @@ def _make_google_mocks() -> tuple[
 
     class Tool:
         def __init__(
-            self, function_declarations: list[object] | None = None,
+            self,
+            function_declarations: list[object] | None = None,
             google_search: object | None = None,
         ) -> None:
             self.function_declarations = function_declarations
@@ -1292,7 +1526,9 @@ def _make_google_mocks() -> tuple[
 
     class Content:
         def __init__(
-            self, role: str = "", parts: list[object] | None = None,
+            self,
+            role: str = "",
+            parts: list[object] | None = None,
         ) -> None:
             self.role = role
             self.parts = parts or []
@@ -1308,7 +1544,8 @@ def _make_google_mocks() -> tuple[
 
         @staticmethod
         def from_function_response(
-            name: str = "", response: object = None,
+            name: str = "",
+            response: object = None,
         ) -> Part:
             p = Part()
             p.text = ""
@@ -1316,7 +1553,8 @@ def _make_google_mocks() -> tuple[
 
     class FunctionCall:
         def __init__(
-            self, name: str = "",
+            self,
+            name: str = "",
             args: dict[str, object] | None = None,
         ) -> None:
             self.name = name
@@ -1343,7 +1581,9 @@ def _make_google_mocks() -> tuple[
 
 
 def _make_google_text_response(
-    text: str, inp_tokens: int = 100, out_tokens: int = 50,
+    text: str,
+    inp_tokens: int = 100,
+    out_tokens: int = 50,
 ) -> MagicMock:
     """Build a mock Google generate_content response with text only."""
     part = MagicMock()
@@ -1367,8 +1607,10 @@ def _make_google_text_response(
 
 
 def _make_google_tool_response(
-    fn_name: str, fn_args: dict[str, object],
-    inp_tokens: int = 50, out_tokens: int = 20,
+    fn_name: str,
+    fn_args: dict[str, object],
+    inp_tokens: int = 50,
+    out_tokens: int = 20,
 ) -> MagicMock:
     """Build a mock Google response with a function call."""
     fc = MagicMock()
@@ -1400,22 +1642,27 @@ class TestRunGoogleApiDiffOnly:
         case = _make_case()
         google_mod, genai_mod, types_mod = _make_google_mocks()
 
-        text_resp = _make_google_text_response(
-            '[{"file":"f.rs","line":1,"description":"bug"}]'
-        )
+        text_resp = _make_google_text_response('[{"file":"f.rs","line":1,"description":"bug"}]')
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = text_resp
 
         genai_mod.Client = MagicMock(return_value=mock_client)  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "google": google_mod,
-            "google.genai": genai_mod,
-            "google.genai.types": types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "google": google_mod,
+                "google.genai": genai_mod,
+                "google.genai.types": types_mod,
+            },
+        ):
             result = run_google_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         assert result.case_id == "leo-001"
@@ -1427,13 +1674,20 @@ class TestRunGoogleApiDiffOnly:
         assert result.cost_usd > 0
 
     def test_import_error_returns_error_result(self) -> None:
-        with patch.dict(sys.modules, {
-            "google": None,
-            "google.genai": None,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "google": None,
+                "google.genai": None,
+            },
+        ):
             case = _make_case()
             result = run_google_api(
-                case, SAMPLE_DIFF, None, "diff-only", timeout=60,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=60,
             )
 
         assert result.tool == "agent-gemini"
@@ -1446,27 +1700,34 @@ class TestRunGoogleApiMultiTurn:
         google_mod, genai_mod, types_mod = _make_google_mocks()
 
         tool_resp = _make_google_tool_response(
-            "read_file", {"path": "foo.rs"},
+            "read_file",
+            {"path": "foo.rs"},
         )
-        text_resp = _make_google_text_response(
-            '[{"file":"foo.rs","line":1,"description":"bug"}]'
-        )
+        text_resp = _make_google_text_response('[{"file":"foo.rs","line":1,"description":"bug"}]')
 
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = [
-            tool_resp, text_resp,
+            tool_resp,
+            text_resp,
         ]
 
         genai_mod.Client = MagicMock(return_value=mock_client)  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "google": google_mod,
-            "google.genai": genai_mod,
-            "google.genai.types": types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "google": google_mod,
+                "google.genai": genai_mod,
+                "google.genai.types": types_mod,
+            },
+        ):
             result = run_google_api(
-                case, SAMPLE_DIFF, None, "diff+repo",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff+repo",
+                max_turns=5,
+                timeout=300,
             )
 
         assert len(result.comments) == 1
@@ -1481,21 +1742,30 @@ class TestRunGoogleApiCost:
         google_mod, genai_mod, types_mod = _make_google_mocks()
 
         text_resp = _make_google_text_response(
-            "[]", inp_tokens=1000, out_tokens=500,
+            "[]",
+            inp_tokens=1000,
+            out_tokens=500,
         )
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = text_resp
 
         genai_mod.Client = MagicMock(return_value=mock_client)  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "google": google_mod,
-            "google.genai": genai_mod,
-            "google.genai.types": types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "google": google_mod,
+                "google.genai": genai_mod,
+                "google.genai.types": types_mod,
+            },
+        ):
             result = run_google_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         # 1000 * 0.15/1M + 500 * 0.60/1M
@@ -1509,7 +1779,9 @@ class TestRunGoogleApiCost:
 
 
 def _make_openai_text_response(
-    text: str, inp_tokens: int = 100, out_tokens: int = 50,
+    text: str,
+    inp_tokens: int = 100,
+    out_tokens: int = 50,
 ) -> MagicMock:
     """Build a mock OpenAI chat completion response with text only."""
     message = MagicMock()
@@ -1531,8 +1803,11 @@ def _make_openai_text_response(
 
 
 def _make_openai_tool_response(
-    fn_name: str, fn_args: str, tool_call_id: str = "call_1",
-    inp_tokens: int = 50, out_tokens: int = 20,
+    fn_name: str,
+    fn_args: str,
+    tool_call_id: str = "call_1",
+    inp_tokens: int = 50,
+    out_tokens: int = 20,
 ) -> MagicMock:
     """Build a mock OpenAI response with tool calls."""
     fn = MagicMock()
@@ -1565,9 +1840,7 @@ class TestRunOpenaiApiDiffOnly:
     def test_mocked_openai_returns_result(self) -> None:
         case = _make_case()
 
-        text_resp = _make_openai_text_response(
-            '[{"file":"f.rs","line":1,"description":"bug"}]'
-        )
+        text_resp = _make_openai_text_response('[{"file":"f.rs","line":1,"description":"bug"}]')
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = text_resp
@@ -1577,8 +1850,12 @@ class TestRunOpenaiApiDiffOnly:
 
         with patch.dict(sys.modules, {"openai": openai_mod}):
             result = run_openai_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         assert result.case_id == "leo-001"
@@ -1593,7 +1870,11 @@ class TestRunOpenaiApiDiffOnly:
         with patch.dict(sys.modules, {"openai": None}):
             case = _make_case()
             result = run_openai_api(
-                case, SAMPLE_DIFF, None, "diff-only", timeout=60,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                timeout=60,
             )
 
         assert result.tool == "agent-openai"
@@ -1605,11 +1886,11 @@ class TestRunOpenaiApiMultiTurn:
         case = _make_case()
 
         tool_resp = _make_openai_tool_response(
-            "read_file", '{"path": "foo.rs"}', "call_1",
+            "read_file",
+            '{"path": "foo.rs"}',
+            "call_1",
         )
-        text_resp = _make_openai_text_response(
-            '[{"file":"foo.rs","line":1,"description":"bug"}]'
-        )
+        text_resp = _make_openai_text_response('[{"file":"foo.rs","line":1,"description":"bug"}]')
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = [tool_resp, text_resp]
@@ -1619,8 +1900,12 @@ class TestRunOpenaiApiMultiTurn:
 
         with patch.dict(sys.modules, {"openai": openai_mod}):
             result = run_openai_api(
-                case, SAMPLE_DIFF, None, "diff+repo",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff+repo",
+                max_turns=5,
+                timeout=300,
             )
 
         assert len(result.comments) == 1
@@ -1643,8 +1928,12 @@ class TestRunOpenaiApiCost:
 
         with patch.dict(sys.modules, {"openai": openai_mod}):
             result = run_openai_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         # 1000 * 1.10/1M + 500 * 4.40/1M = 0.0011 + 0.0022 = 0.0033
@@ -1668,14 +1957,21 @@ class TestRunGoogleApiSearchGrounding:
         mock_client.models.generate_content.return_value = text_resp
         genai_mod.Client = MagicMock(return_value=mock_client)  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "google": google_mod,
-            "google.genai": genai_mod,
-            "google.genai.types": types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "google": google_mod,
+                "google.genai": genai_mod,
+                "google.genai.types": types_mod,
+            },
+        ):
             run_google_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         call_kwargs = mock_client.models.generate_content.call_args
@@ -1683,14 +1979,9 @@ class TestRunGoogleApiSearchGrounding:
         tools = getattr(config, "tools", None)
         assert tools is not None
         # Should have exactly one Tool: google_search (no function decls)
-        has_search = any(
-            getattr(t, "google_search", None) is not None for t in tools
-        )
+        has_search = any(getattr(t, "google_search", None) is not None for t in tools)
         assert has_search, "Google Search grounding tool not found"
-        has_func = any(
-            getattr(t, "function_declarations", None) is not None
-            for t in tools
-        )
+        has_func = any(getattr(t, "function_declarations", None) is not None for t in tools)
         assert not has_func, "diff-only should not have function tools"
 
     def test_google_search_tool_alongside_function_tools(self) -> None:
@@ -1703,27 +1994,29 @@ class TestRunGoogleApiSearchGrounding:
         mock_client.models.generate_content.return_value = text_resp
         genai_mod.Client = MagicMock(return_value=mock_client)  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "google": google_mod,
-            "google.genai": genai_mod,
-            "google.genai.types": types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "google": google_mod,
+                "google.genai": genai_mod,
+                "google.genai.types": types_mod,
+            },
+        ):
             run_google_api(
-                case, SAMPLE_DIFF, None, "diff+repo",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff+repo",
+                max_turns=5,
+                timeout=300,
             )
 
         call_kwargs = mock_client.models.generate_content.call_args
         config = call_kwargs.kwargs.get("config")
         tools = getattr(config, "tools", None)
         assert tools is not None
-        has_search = any(
-            getattr(t, "google_search", None) is not None for t in tools
-        )
-        has_func = any(
-            getattr(t, "function_declarations", None) is not None
-            for t in tools
-        )
+        has_search = any(getattr(t, "google_search", None) is not None for t in tools)
+        has_func = any(getattr(t, "function_declarations", None) is not None for t in tools)
         assert has_search, "Google Search grounding tool not found"
         assert has_func, "Function declaration tools not found"
 
@@ -1740,14 +2033,21 @@ class TestRunGoogleApiSearchGrounding:
         mock_client.models.generate_content.return_value = text_resp
         genai_mod.Client = MagicMock(return_value=mock_client)  # type: ignore[attr-defined]
 
-        with patch.dict(sys.modules, {
-            "google": google_mod,
-            "google.genai": genai_mod,
-            "google.genai.types": types_mod,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "google": google_mod,
+                "google.genai": genai_mod,
+                "google.genai.types": types_mod,
+            },
+        ):
             result = run_google_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         # Should succeed without error (no google_search, but still works)
@@ -1773,8 +2073,12 @@ class TestRunOpenaiApiWebSearch:
 
         with patch.dict(sys.modules, {"openai": openai_mod}):
             run_openai_api(
-                case, SAMPLE_DIFF, None, "diff-only",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff-only",
+                max_turns=5,
+                timeout=300,
             )
 
         call_kwargs = mock_client.chat.completions.create.call_args
@@ -1799,8 +2103,12 @@ class TestRunOpenaiApiWebSearch:
 
         with patch.dict(sys.modules, {"openai": openai_mod}):
             run_openai_api(
-                case, SAMPLE_DIFF, None, "diff+repo",
-                max_turns=5, timeout=300,
+                case,
+                SAMPLE_DIFF,
+                None,
+                "diff+repo",
+                max_turns=5,
+                timeout=300,
             )
 
         call_kwargs = mock_client.chat.completions.create.call_args
@@ -1812,238 +2120,277 @@ class TestRunOpenaiApiWebSearch:
         assert len(func_tools) == 3  # read_file, list_directory, search_text
 
 
+class TestRunSinglePassSdk:
+    def test_sdk_import_error_returns_fallback(self) -> None:
+        with patch.dict(sys.modules, {"claude_agent_sdk": None}):
+            pr = asyncio.run(
+                _run_single_pass_sdk(
+                    workspace=None,
+                    prompt="explore",
+                    max_turns=10,
+                    model="",
+                    timeout=300,
+                )
+            )
+        assert pr.text == "(SDK not installed)"
+        assert pr.cost == 0.0
+
+    def test_sdk_path_returns_result(self, tmp_path: Path) -> None:
+        sdk_mod, sdk_types_mod = _make_sdk_mocks()
+        ResultMessage = sdk_mod.ResultMessage  # type: ignore[attr-defined]
+
+        async def fake_query(**kwargs: object):  # type: ignore[no-untyped-def]
+            yield ResultMessage(
+                total_cost_usd=0.02,
+                session_id="s1",
+                result="found stuff",
+            )
+
+        sdk_mod.query = fake_query  # type: ignore[attr-defined]
+
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
+            pr = asyncio.run(
+                _run_single_pass_sdk(
+                    workspace=tmp_path,
+                    prompt="explore",
+                    max_turns=10,
+                    model="",
+                    timeout=300,
+                )
+            )
+        assert pr.text == "found stuff"
+        assert pr.cost == 0.02
+
+
 # ---------------------------------------------------------------------------
-# Docker runner tests
+# run_agent_sdk_2pass tests
 # ---------------------------------------------------------------------------
 
 
-class TestRunDockerBuildsCorrectCommand:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_builds_correct_claude_command(
-        self, mock_run: MagicMock, tmp_path: Path,
+class TestRunAgentSdk2PassSdk:
+    def test_two_pass_sdk_path(self, tmp_path: Path) -> None:
+        sdk_mod, sdk_types_mod = _make_sdk_mocks()
+        ResultMessage = sdk_mod.ResultMessage  # type: ignore[attr-defined]
+
+        call_count = 0
+
+        async def fake_query(**kwargs: object):  # type: ignore[no-untyped-def]
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Explorer pass
+                yield ResultMessage(
+                    total_cost_usd=0.03,
+                    session_id="s1",
+                    result="## Modified Symbols\n- fn changed",
+                )
+            else:
+                # Reviewer pass
+                yield ResultMessage(
+                    total_cost_usd=0.04,
+                    session_id="s2",
+                    result='[{"file":"b.rs","line":5,"description":"off by one"}]',
+                )
+
+        sdk_mod.query = fake_query  # type: ignore[attr-defined]
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        pr_dir = ws / ".pr"
+        pr_dir.mkdir()
+        (pr_dir / "description.md").write_text("SDK PR")
+
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
+            case = _make_case()
+            result = run_agent_sdk_2pass(
+                case,
+                SAMPLE_DIFF,
+                workspace=ws,
+                context_level="diff+repo",
+                timeout=600,
+            )
+
+        assert result.tool == "agent-sdk-2pass"
+        assert len(result.comments) == 1
+        assert result.comments[0].body == "off by one"
+        assert result.cost_usd == pytest.approx(0.07)
+        assert call_count == 2
+
+    def test_explorer_empty_output_still_runs_reviewer(
+        self,
+        tmp_path: Path,
     ) -> None:
-        import subprocess as sp
+        sdk_mod, sdk_types_mod = _make_sdk_mocks()
+        ResultMessage = sdk_mod.ResultMessage  # type: ignore[attr-defined]
 
-        output = {
-            "result": '[{"file":"f.rs","line":1,"description":"bug"}]',
-            "cost": {"input_tokens": 10, "output_tokens": 5},
-        }
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout=json_mod.dumps(output), stderr="",
+        call_count = 0
+
+        async def fake_query(**kwargs: object):  # type: ignore[no-untyped-def]
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield ResultMessage(
+                    total_cost_usd=0.01,
+                    session_id="s1",
+                    result="",
+                )
+            else:
+                yield ResultMessage(
+                    total_cost_usd=0.02,
+                    session_id="s2",
+                    result="[]",
+                )
+
+        sdk_mod.query = fake_query  # type: ignore[attr-defined]
+
+        with patch.dict(
+            sys.modules,
+            {
+                "claude_agent_sdk": sdk_mod,
+                "claude_agent_sdk.types": sdk_types_mod,
+            },
+        ):
+            case = _make_case()
+            result = run_agent_sdk_2pass(
+                case,
+                SAMPLE_DIFF,
+                workspace=None,
+                context_level="diff-only",
+                timeout=600,
+            )
+
+        assert result.tool == "agent-sdk-2pass"
+        assert result.comments == []
+        assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# annotate_diff
+# ---------------------------------------------------------------------------
+
+
+class TestAnnotateDiff:
+    def test_strips_whitespace_only_hunk(self) -> None:
+        diff = (
+            "diff --git a/src/foo.rs b/src/foo.rs\n"
+            "--- a/src/foo.rs\n"
+            "+++ b/src/foo.rs\n"
+            "@@ -10,1 +10,1 @@\n"
+            "-    let x = foo();\n"
+            "+        let x = foo();\n"
         )
-        case = _make_case()
-        result = run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=600,
+        result = annotate_diff(diff)
+        # The indentation-only change should be stripped
+        assert "-    let x = foo();" not in result
+        assert "+        let x = foo();" not in result
+        assert "formatting" in result.lower() or "FORMATTING" in result
+
+    def test_preserves_real_change(self) -> None:
+        diff = (
+            "diff --git a/src/foo.rs b/src/foo.rs\n"
+            "--- a/src/foo.rs\n"
+            "+++ b/src/foo.rs\n"
+            "@@ -10,1 +10,1 @@\n"
+            "-    let x = foo();\n"
+            "+    let x = bar();\n"
         )
-        assert result.error == ""
-        cmd = mock_run.call_args[0][0]
-        assert cmd[0] == "docker"
-        assert "run" in cmd
-        assert "--rm" in cmd
-        # The inner command should contain claude
-        cmd_str = " ".join(cmd)
-        assert "claude" in cmd_str
-        assert "--dangerously-skip-permissions" in cmd_str
+        result = annotate_diff(diff)
+        assert "bar()" in result
 
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_builds_gemini_command(
-        self, mock_run: MagicMock, tmp_path: Path,
-    ) -> None:
-        import subprocess as sp
-
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout="[]", stderr="",
+    def test_annotates_scope_change(self) -> None:
+        diff = (
+            "diff --git a/src/foo.rs b/src/foo.rs\n"
+            "--- a/src/foo.rs\n"
+            "+++ b/src/foo.rs\n"
+            "@@ -380,2 +383,2 @@\n"
+            "-    vm.add_program(&p)?;\n"
+            "+            vm.add_program(&p)?;\n"
         )
-        case = _make_case()
-        run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="gemini", timeout=600,
+        result = annotate_diff(diff)
+        assert "SCOPE" in result
+
+    def test_mixed_hunks(self) -> None:
+        diff = (
+            "diff --git a/src/foo.rs b/src/foo.rs\n"
+            "--- a/src/foo.rs\n"
+            "+++ b/src/foo.rs\n"
+            "@@ -10,1 +10,1 @@\n"
+            "-    let x = foo();\n"
+            "+        let x = foo();\n"
+            "@@ -20,1 +20,1 @@\n"
+            "-    let y = bar();\n"
+            "+    let y = baz();\n"
         )
-        cmd = mock_run.call_args[0][0]
-        cmd_str = " ".join(cmd)
-        assert "gemini" in cmd_str
-        assert "--yolo" in cmd_str
+        result = annotate_diff(diff)
+        # WS-only hunk stripped, real change preserved
+        assert "baz()" in result
+        assert "1/2" in result or "FORMATTING" in result
 
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_builds_codex_command(
-        self, mock_run: MagicMock, tmp_path: Path,
-    ) -> None:
-        import subprocess as sp
+    def test_empty_diff(self) -> None:
+        assert annotate_diff("") == ""
+        assert annotate_diff("   ") == ""
 
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout="[]", stderr="",
+    def test_all_formatting_warning(self) -> None:
+        diff = (
+            "diff --git a/src/foo.rs b/src/foo.rs\n"
+            "--- a/src/foo.rs\n"
+            "+++ b/src/foo.rs\n"
+            "@@ -10,1 +10,1 @@\n"
+            "-    let x = foo();\n"
+            "+        let x = foo();\n"
         )
-        case = _make_case()
-        run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="codex", timeout=600,
+        result = annotate_diff(diff)
+        assert "WARNING" in result or "ALL" in result
+
+    def test_no_annotation_when_no_stripping(self) -> None:
+        diff = (
+            "diff --git a/src/foo.rs b/src/foo.rs\n"
+            "--- a/src/foo.rs\n"
+            "+++ b/src/foo.rs\n"
+            "@@ -10,1 +10,1 @@\n"
+            "-    let x = foo();\n"
+            "+    let x = bar();\n"
         )
-        cmd = mock_run.call_args[0][0]
-        cmd_str = " ".join(cmd)
-        assert "codex" in cmd_str
+        result = annotate_diff(diff)
+        assert "FORMATTING" not in result
+        assert "WARNING" not in result
 
 
-class TestRunDockerMountsWorkspace:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_mounts_workspace_at_work(
-        self, mock_run: MagicMock,
-    ) -> None:
-        import subprocess as sp
+class TestV3Prompts:
+    def test_v3_system_mentions_leo(self) -> None:
+        from bugeval.agent_runner import _V3_SYSTEM
 
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout="[]", stderr="",
-        )
-        case = _make_case()
-        run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=600,
-        )
-        cmd = mock_run.call_args[0][0]
-        # Find -v flag and check mount target
-        found_mount = False
-        for i, arg in enumerate(cmd):
-            if arg == "-v" and i + 1 < len(cmd):
-                mount = cmd[i + 1]
-                assert mount.endswith(":/work"), f"Expected :/work mount, got {mount}"
-                found_mount = True
-                break
-        assert found_mount, "No -v mount found in docker command"
+        assert "leo" in _V3_SYSTEM.lower()
+        assert "compiler" in _V3_SYSTEM.lower()
 
+    def test_v3_phase1_asks_for_survey_table(self) -> None:
+        from bugeval.agent_runner import _V3_PHASE1_SURVEY
 
-class TestRunDockerPassesApiKey:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_passes_anthropic_api_key(
-        self, mock_run: MagicMock,
-    ) -> None:
-        import subprocess as sp
+        assert "survey" in _V3_PHASE1_SURVEY.lower()
+        assert "caller" in _V3_PHASE1_SURVEY.lower()
+        assert "domain.md" in _V3_PHASE1_SURVEY
 
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout="[]", stderr="",
-        )
-        case = _make_case()
-        run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=600,
-        )
-        cmd = mock_run.call_args[0][0]
-        # Check -e ANTHROPIC_API_KEY is in command
-        found_env = False
-        for i, arg in enumerate(cmd):
-            if arg == "-e" and i + 1 < len(cmd):
-                if cmd[i + 1] == "ANTHROPIC_API_KEY":
-                    found_env = True
-                    break
-        assert found_env, "ANTHROPIC_API_KEY not passed via -e"
+    def test_v3_phase2_checks_spec_and_scope(self) -> None:
+        from bugeval.agent_runner import _V3_PHASE2_INVESTIGATE
 
+        assert "domain.md" in _V3_PHASE2_INVESTIGATE
+        assert "scope" in _V3_PHASE2_INVESTIGATE.lower()
+        assert "caller" in _V3_PHASE2_INVESTIGATE.lower()
 
-class TestRunDockerUsesDangerouslySkipPermissions:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_claude_has_skip_permissions(
-        self, mock_run: MagicMock,
-    ) -> None:
-        import subprocess as sp
+    def test_v3_phase3_requests_json(self) -> None:
+        from bugeval.agent_runner import _V3_PHASE3_REPORT
 
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout="[]", stderr="",
-        )
-        case = _make_case()
-        run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=600,
-        )
-        cmd = mock_run.call_args[0][0]
-        assert "--dangerously-skip-permissions" in cmd
-
-
-class TestIsDockerAvailable:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_available(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = MagicMock(returncode=0)
-        assert is_docker_available() is True
-
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_not_available_nonzero(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = MagicMock(returncode=1)
-        assert is_docker_available() is False
-
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_not_available_not_found(self, mock_run: MagicMock) -> None:
-        mock_run.side_effect = FileNotFoundError
-        assert is_docker_available() is False
-
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_not_available_timeout(self, mock_run: MagicMock) -> None:
-        import subprocess as sp
-
-        mock_run.side_effect = sp.TimeoutExpired(cmd="docker", timeout=5)
-        assert is_docker_available() is False
-
-
-class TestRunDockerSavesTranscript:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_transcript_saved(
-        self, mock_run: MagicMock, tmp_path: Path,
-    ) -> None:
-        import subprocess as sp
-
-        output = {
-            "result": "[]",
-            "cost": {"input_tokens": 10, "output_tokens": 5},
-        }
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout=json_mod.dumps(output), stderr="",
-        )
-        transcript_dir = tmp_path / "transcripts"
-        case = _make_case()
-        result = run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=600,
-            transcript_dir=transcript_dir,
-        )
-        assert result.transcript_path != ""
-        assert Path(result.transcript_path).exists()
-
-
-class TestRunDockerTimeout:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_timeout_returns_error(
-        self, mock_run: MagicMock,
-    ) -> None:
-        import subprocess as sp
-
-        mock_run.side_effect = sp.TimeoutExpired(cmd="docker", timeout=600)
-        case = _make_case()
-        result = run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=600,
-        )
-        assert "timed out" in result.error.lower()
-
-
-class TestRunDockerCustomImage:
-    @patch("bugeval.agent_runner.subprocess.run")
-    def test_custom_image_used(
-        self, mock_run: MagicMock,
-    ) -> None:
-        import subprocess as sp
-
-        mock_run.return_value = sp.CompletedProcess(
-            args=["docker"], returncode=0,
-            stdout="[]", stderr="",
-        )
-        case = _make_case()
-        run_docker(
-            case, SAMPLE_DIFF, None, "diff-only",
-            cli_tool="claude", timeout=600,
-            image="my-custom-image:latest",
-        )
-        cmd = mock_run.call_args[0][0]
-        assert "my-custom-image:latest" in cmd
+        assert "json" in _V3_PHASE3_REPORT.lower()
+        assert "[]" in _V3_PHASE3_REPORT

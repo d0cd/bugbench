@@ -76,9 +76,7 @@ class TestGoldenEntry:
 
     def test_save_load_roundtrip(self, tmp_path: Path) -> None:
         entries = {
-            "leo-001": GoldenEntry(
-                case_id="leo-001", status="confirmed", reviewer="alice"
-            ),
+            "leo-001": GoldenEntry(case_id="leo-001", status="confirmed", reviewer="alice"),
         }
         save_golden_set(tmp_path, entries)
         loaded = load_golden_set(tmp_path)

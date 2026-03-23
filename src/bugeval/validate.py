@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from bugeval.io import load_cases, load_checkpoint, save_case, save_checkpoint
 from bugeval.models import TestCase, Validation
 
 logger = logging.getLogger(__name__)
+
+_checkpoint_lock = threading.Lock()
 
 VALID_VERDICTS = {"confirmed", "disputed", "ambiguous"}
 
@@ -52,26 +55,15 @@ Respond with a JSON object (no other text):
 """
 
 
-def call_claude(prompt: str, model: str = "claude-haiku-4-5") -> str:
-    """Call Anthropic API and return the text response."""
-    import anthropic
+def call_llm(prompt: str, model: str = "", backend: str = "sdk") -> str:
+    """Delegate to the unified LLM layer, return text."""
+    from bugeval.llm import call_llm as _call_llm
 
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text  # type: ignore[union-attr]
-
-
-def call_gemini(prompt: str, model: str = "gemini-2.5-flash") -> str:
-    """Call Gemini API (placeholder — returns ambiguous)."""
-    logger.warning(
-        "Gemini dependency not installed; returning ambiguous. "
-        "Add google-genai to enable real validation."
-    )
-    return json.dumps({"verdict": "ambiguous", "reasoning": "placeholder"})
+    result = _call_llm(prompt, model, backend=backend)
+    if result.error:
+        logger.warning("LLM call failed: %s", result.error)
+        return json.dumps({"verdict": "ambiguous", "reasoning": result.error})
+    return result.text
 
 
 def parse_verdict(response: str) -> str:
@@ -110,25 +102,32 @@ def _get_introducing_diff(case: TestCase, repo_dir: Path) -> str:
 
 
 def validate_case(
-    case: TestCase, diff: str, models: list[str]
+    case: TestCase,
+    diff: str,
+    models: list[str],
+    backend: str = "sdk",
 ) -> Validation:
     """Run validation with specified models and return a Validation object."""
     prompt = build_validation_prompt(case, diff)
     claude_verdict = ""
     gemini_verdict = ""
+    openai_verdict = ""
 
     for model_name in models:
         if model_name == "claude":
-            raw = call_claude(prompt)
+            raw = call_llm(prompt, backend=backend)
             claude_verdict = parse_verdict(raw)
         elif model_name == "gemini":
-            raw = call_gemini(prompt)
+            raw = call_llm(prompt, backend="gemini")
             gemini_verdict = parse_verdict(raw)
+        elif model_name == "openai":
+            raw = call_llm(prompt, backend="openai")
+            openai_verdict = parse_verdict(raw)
         else:
             logger.warning("Unknown model: %s", model_name)
 
-    # Compute agreement: both must be present and match
-    verdicts = [v for v in [claude_verdict, gemini_verdict] if v]
+    # Compute agreement: all present verdicts must match
+    verdicts = [v for v in [claude_verdict, gemini_verdict, openai_verdict] if v]
     if len(verdicts) <= 1:
         agreement = True  # single model: vacuously true
     else:
@@ -137,6 +136,7 @@ def validate_case(
     return Validation(
         claude_verdict=claude_verdict,
         gemini_verdict=gemini_verdict,
+        openai_verdict=openai_verdict,
         agreement=agreement,
         test_validated=agreement and all(v == "confirmed" for v in verdicts),
     )
@@ -148,6 +148,7 @@ def validate_cases(
     models: list[str],
     concurrency: int,
     dry_run: bool,
+    backend: str = "sdk",
 ) -> None:
     """Orchestrate validation across all cases with checkpoint support."""
     cases = load_cases(cases_dir)
@@ -182,8 +183,14 @@ def validate_cases(
         if not diff:
             logger.warning("No diff for %s, skipping", case.id)
             return case.id
-        validation = validate_case(case, diff, models)
+        validation = validate_case(case, diff, models, backend=backend)
         case.validation = validation
+        if validation.test_validated and case.status in (
+            "draft",
+            "ground-truth",
+            "curated",
+        ):
+            case.status = "validated"
         # Find the original file path and save back
         for p in sorted(cases_dir.rglob("*.yaml")):
             if p.stem == case.id or p.name == f"{case.id}.yaml":
@@ -195,6 +202,7 @@ def validate_cases(
         futures = {pool.submit(_process, c): c for c in to_validate}
         for future in as_completed(futures):
             case_id = future.result()
-            done.add(case_id)
-            save_checkpoint(done, checkpoint_path)
+            with _checkpoint_lock:
+                done.add(case_id)
+                save_checkpoint(done, checkpoint_path)
             logger.info("Validated %s", case_id)

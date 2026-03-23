@@ -68,27 +68,20 @@ def permutation_test(
     """Two-sided permutation test for difference in means. Returns p-value."""
     combined = group_a + group_b
     na = len(group_a)
-    obs_diff = abs(
-        sum(group_a) / max(na, 1) - sum(group_b) / max(len(group_b), 1)
-    )
+    obs_diff = abs(sum(group_a) / max(na, 1) - sum(group_b) / max(len(group_b), 1))
     rng = random.Random(42)
     count = 0
     for _ in range(n_permutations):
         rng.shuffle(combined)
         perm_a = combined[:na]
         perm_b = combined[na:]
-        d = abs(
-            sum(perm_a) / max(len(perm_a), 1)
-            - sum(perm_b) / max(len(perm_b), 1)
-        )
+        d = abs(sum(perm_a) / max(len(perm_a), 1) - sum(perm_b) / max(len(perm_b), 1))
         if d >= obs_diff:
             count += 1
     return count / n_permutations
 
 
-def benjamini_hochberg(
-    p_values: list[float], alpha: float = 0.05
-) -> list[bool]:
+def benjamini_hochberg(p_values: list[float], alpha: float = 0.05) -> list[bool]:
     """Benjamini-Hochberg FDR correction. Returns list of significance bools."""
     m = len(p_values)
     if m == 0:
@@ -107,9 +100,7 @@ def benjamini_hochberg(
     return significant
 
 
-def severity_weighted_catch_rate(
-    scores: list[CaseScore], cases: list[TestCase]
-) -> float:
+def severity_weighted_catch_rate(scores: list[CaseScore], cases: list[TestCase]) -> float:
     """Catch rate weighted by severity (critical=4, high=3, medium=2, low=1)."""
     case_map = {c.id: c for c in cases}
     weighted_caught = 0.0
@@ -130,18 +121,14 @@ def severity_weighted_catch_rate(
 def median_localization_distance(scores: list[CaseScore]) -> float | None:
     """Median localization_distance for caught cases."""
     dists = [
-        s.localization_distance
-        for s in scores
-        if s.caught and s.localization_distance is not None
+        s.localization_distance for s in scores if s.caught and s.localization_distance is not None
     ]
     if not dists:
         return None
     return statistics.median(dists)
 
 
-def false_alarm_rate(
-    scores: list[CaseScore], cases: list[TestCase]
-) -> float:
+def false_alarm_rate(scores: list[CaseScore], cases: list[TestCase]) -> float:
     """Fraction of clean cases where false_alarm is True."""
     clean_ids = {c.id for c in cases if c.kind == CaseKind.clean}
     clean_scores = [s for s in scores if s.case_id in clean_ids]
@@ -162,9 +149,7 @@ def signal_to_noise(scores: list[CaseScore]) -> float:
     return useful / total
 
 
-def cost_per_bug(
-    scores: list[CaseScore], results: list[ToolResult]
-) -> float | None:
+def cost_per_bug(scores: list[CaseScore], results: list[ToolResult]) -> float | None:
     """Total cost / number of catches. None if no catches."""
     catches = sum(1 for s in scores if s.caught)
     if catches == 0:
@@ -205,7 +190,7 @@ def _get_dimension(case: TestCase, score: CaseScore, dim: str) -> str:
         return case.pr_size
     if dim == "blame_confidence":
         gt = case.truth
-        return gt.blame_confidence if gt else ""
+        return (gt.blame_confidence or "") if gt else ""
     if dim == "context_level":
         return score.context_level
     if dim == "issue_linked":
@@ -223,8 +208,7 @@ def build_comparison_table(
     for tool, scores in sorted(all_scores.items()):
         results = all_results.get(tool, [])
         bug_scores = [
-            s for s in scores
-            if any(c.id == s.case_id and c.kind == CaseKind.bug for c in cases)
+            s for s in scores if any(c.id == s.case_id and c.kind == CaseKind.bug for c in cases)
         ]
         cr = compute_catch_rate(bug_scores)
         catch_vals = [1.0 if s.caught else 0.0 for s in bug_scores]
@@ -244,20 +228,31 @@ def build_comparison_table(
         med_loc = median_localization_distance(bug_scores)
         times = [r.time_seconds for r in results if r.time_seconds > 0]
         mean_time = sum(times) / len(times) if times else 0.0
-        table.append({
-            "tool": tool,
-            "catch_rate": round(cr, 4),
-            "ci_lower": round(ci_lo, 4),
-            "ci_upper": round(ci_hi, 4),
-            "severity_weighted_catch_rate": round(swcr, 4),
-            "median_localization": med_loc,
-            "mean_quality": round(mean_q, 2),
-            "false_alarm_rate": round(far, 4),
-            "precision": round(prec, 4),
-            "snr": round(snr, 4),
-            "cost_per_bug": round(cpb, 4) if cpb is not None else None,
-            "mean_time_seconds": round(mean_time, 1),
-        })
+        judge_costs = [s.judge_cost_usd for s in scores]
+        total_judge = sum(judge_costs)
+        judge_per_case = round(total_judge / len(scores), 6) if scores else 0.0
+        total_tool_cost = sum(r.cost_usd for r in results)
+        catches = sum(1 for s in bug_scores if s.caught)
+        total_cost = total_tool_cost + total_judge
+        total_cpb = round(total_cost / catches, 4) if catches else None
+        table.append(
+            {
+                "tool": tool,
+                "catch_rate": round(cr, 4),
+                "ci_lower": round(ci_lo, 4),
+                "ci_upper": round(ci_hi, 4),
+                "severity_weighted_catch_rate": round(swcr, 4),
+                "median_localization": med_loc,
+                "mean_quality": round(mean_q, 2),
+                "false_alarm_rate": round(far, 4),
+                "precision": round(prec, 4),
+                "snr": round(snr, 4),
+                "cost_per_bug": round(cpb, 4) if cpb is not None else None,
+                "judge_cost_per_case": judge_per_case,
+                "total_cost_per_bug": total_cpb,
+                "mean_time_seconds": round(mean_time, 1),
+            }
+        )
     return table
 
 
@@ -306,9 +301,7 @@ def generate_charts(
     # 2. Detection score distribution (exclude judge failures)
     fig, ax = plt.subplots()
     for t in tools:
-        det_scores = [
-            s.detection_score for s in all_scores[t] if not s.judge_failed
-        ]
+        det_scores = [s.detection_score for s in all_scores[t] if not s.judge_failed]
         ax.hist(det_scores, bins=range(5), alpha=0.5, label=t)
     ax.set_xlabel("Detection Score")
     ax.set_ylabel("Count")
@@ -319,9 +312,7 @@ def generate_charts(
     plt.close(fig)
 
 
-def run_analysis(
-    run_dir: Path, cases_dir: Path, no_charts: bool
-) -> None:
+def run_analysis(run_dir: Path, cases_dir: Path, no_charts: bool) -> None:
     """Load scores and results, build table, export CSV, optionally chart."""
     scores_dir = run_dir / "scores"
     results_dir = run_dir / "results"
@@ -354,25 +345,26 @@ def run_analysis(
     all_scores_flat = [s for scores in all_scores.values() for s in scores]
     judge_failures = sum(1 for s in all_scores_flat if s.judge_failed)
     if judge_failures:
-        click.echo(
-            f"\nWarning: {judge_failures} cases had LLM judge failures"
-            " (scored as 0/0)"
-        )
+        click.echo(f"\nWarning: {judge_failures} cases had LLM judge failures (scored as 0/0)")
 
     # Contamination reporting
     contaminated = [s for s in all_scores_flat if s.potentially_contaminated]
     if contaminated:
-        click.echo(
-            f"\nWarning: {len(contaminated)} potentially contaminated results"
-        )
+        click.echo(f"\nWarning: {len(contaminated)} potentially contaminated results")
         for s in contaminated:
             click.echo(f"  {s.case_id} ({s.tool})")
 
     # Per-dimension slice analysis
     cases_by_id = {c.id: c for c in cases}
     dimensions = [
-        "repo", "category", "difficulty", "severity",
-        "pr_size", "blame_confidence", "context_level", "issue_linked",
+        "repo",
+        "category",
+        "difficulty",
+        "severity",
+        "pr_size",
+        "blame_confidence",
+        "context_level",
+        "issue_linked",
     ]
     for dim in dimensions:
         values: set[str] = set()
@@ -388,23 +380,24 @@ def run_analysis(
 
     # High-confidence analysis (tier A/B only)
     high_conf_scores: dict[str, list[CaseScore]] = {}
-    for tool, scores in all_scores.items():
-        filtered = [
-            s for s in scores
-            if _get_dimension(
-                cases_by_id.get(s.case_id) or cases[0],
-                s,
-                "blame_confidence",
-            ) in ("A", "B")
-            and s.case_id in cases_by_id
-        ]
-        if filtered:
-            high_conf_scores[tool] = filtered
+    if cases:
+        for tool, scores in all_scores.items():
+            filtered = [
+                s
+                for s in scores
+                if _get_dimension(
+                    cases_by_id.get(s.case_id) or cases[0],
+                    s,
+                    "blame_confidence",
+                )
+                in ("A", "B")
+                and s.case_id in cases_by_id
+            ]
+            if filtered:
+                high_conf_scores[tool] = filtered
 
     if high_conf_scores:
-        hc_results = {
-            t: all_results.get(t, []) for t in high_conf_scores
-        }
+        hc_results = {t: all_results.get(t, []) for t in high_conf_scores}
         click.echo("\n--- High-Confidence Cases Only (Tier A/B) ---")
         hc_table = build_comparison_table(high_conf_scores, hc_results, cases)
         for row in hc_table:
@@ -421,7 +414,7 @@ def run_analysis(
         p_values: list[float] = []
         pairs: list[tuple[str, str]] = []
         for i, t1 in enumerate(tool_names):
-            for t2 in tool_names[i + 1:]:
+            for t2 in tool_names[i + 1 :]:
                 catches_1 = [1.0 if s.caught else 0.0 for s in all_scores[t1]]
                 catches_2 = [1.0 if s.caught else 0.0 for s in all_scores[t2]]
                 p = permutation_test(catches_1, catches_2)

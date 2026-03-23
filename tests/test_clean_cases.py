@@ -40,7 +40,8 @@ def _make_pr(
 
 class TestFetchCleanPrs:
     def test_filters_fix_signals(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from bugeval.clean_cases import fetch_clean_prs
 
@@ -53,11 +54,14 @@ class TestFetchCleanPrs:
         ]
 
         def mock_run(
-            cmd: list[str], **kw: Any,
+            cmd: list[str],
+            **kw: Any,
         ) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout=json.dumps(prs), stderr="",
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps(prs),
+                stderr="",
             )
 
         monkeypatch.setattr(subprocess, "run", mock_run)
@@ -70,7 +74,8 @@ class TestFetchCleanPrs:
         assert 4 in numbers
 
     def test_filters_size(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from bugeval.clean_cases import fetch_clean_prs
 
@@ -81,11 +86,14 @@ class TestFetchCleanPrs:
         ]
 
         def mock_run(
-            cmd: list[str], **kw: Any,
+            cmd: list[str],
+            **kw: Any,
         ) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout=json.dumps(prs), stderr="",
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps(prs),
+                stderr="",
             )
 
         monkeypatch.setattr(subprocess, "run", mock_run)
@@ -96,23 +104,28 @@ class TestFetchCleanPrs:
         assert 2 in numbers
 
     def test_filters_non_code(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from bugeval.clean_cases import fetch_clean_prs
 
         prs = [
             _make_pr(1, files=[{"path": "README.md"}]),
             _make_pr(
-                2, files=[{"path": "src/lib.rs"}, {"path": "README.md"}],
+                2,
+                files=[{"path": "src/lib.rs"}, {"path": "README.md"}],
             ),
         ]
 
         def mock_run(
-            cmd: list[str], **kw: Any,
+            cmd: list[str],
+            **kw: Any,
         ) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout=json.dumps(prs), stderr="",
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps(prs),
+                stderr="",
             )
 
         monkeypatch.setattr(subprocess, "run", mock_run)
@@ -124,25 +137,30 @@ class TestFetchCleanPrs:
 
 class TestCheckNotSubsequentlyFixed:
     def test_clean(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from bugeval.clean_cases import check_not_subsequently_fixed
 
         pr = _make_pr(10)
 
         def mock_run(
-            cmd: list[str], **kw: Any,
+            cmd: list[str],
+            **kw: Any,
         ) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout=json.dumps([]), stderr="",
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps([]),
+                stderr="",
             )
 
         monkeypatch.setattr(subprocess, "run", mock_run)
         assert check_not_subsequently_fixed("org/repo", pr) is True
 
     def test_dirty(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from bugeval.clean_cases import check_not_subsequently_fixed
 
@@ -157,11 +175,14 @@ class TestCheckNotSubsequentlyFixed:
         ]
 
         def mock_run(
-            cmd: list[str], **kw: Any,
+            cmd: list[str],
+            **kw: Any,
         ) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout=json.dumps(fix_prs), stderr="",
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps(fix_prs),
+                stderr="",
             )
 
         monkeypatch.setattr(subprocess, "run", mock_run)
@@ -199,7 +220,9 @@ class TestBuildCleanCase:
 
 class TestMineCleanCasesCheckpoint:
     def test_checkpoint_resume(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         from bugeval.clean_cases import mine_clean_cases
 
@@ -215,7 +238,8 @@ class TestMineCleanCasesCheckpoint:
         call_log: list[str] = []
 
         def mock_run(
-            cmd: list[str], **kw: Any,
+            cmd: list[str],
+            **kw: Any,
         ) -> subprocess.CompletedProcess[str]:
             cmd_str = " ".join(cmd)
             call_log.append(cmd_str)
@@ -224,22 +248,31 @@ class TestMineCleanCasesCheckpoint:
                 search_val = cmd[search_idx + 1]
                 if "#" in search_val:
                     return subprocess.CompletedProcess(
-                        args=cmd, returncode=0,
-                        stdout=json.dumps([]), stderr="",
+                        args=cmd,
+                        returncode=0,
+                        stdout=json.dumps([]),
+                        stderr="",
                     )
             if "pr" in cmd and "list" in cmd:
                 return subprocess.CompletedProcess(
-                    args=cmd, returncode=0,
-                    stdout=json.dumps(prs), stderr="",
+                    args=cmd,
+                    returncode=0,
+                    stdout=json.dumps(prs),
+                    stderr="",
                 )
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout=json.dumps([]), stderr="",
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps([]),
+                stderr="",
             )
 
         monkeypatch.setattr(subprocess, "run", mock_run)
         cases = mine_clean_cases(
-            "org/repo", count=5, output_dir=tmp_path, since="2023-01-01",
+            "org/repo",
+            count=5,
+            output_dir=tmp_path,
+            since="2023-01-01",
         )
         case_numbers = [c.introducing_pr_number for c in cases]
         assert 10 not in case_numbers

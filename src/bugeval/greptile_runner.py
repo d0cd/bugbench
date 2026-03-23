@@ -30,9 +30,13 @@ def _trigger_greptile(fork: str, pr_number: int) -> None:
     """Comment @greptile on the PR to trigger a review."""
     try:
         run_gh(
-            "pr", "comment", str(pr_number),
-            "--repo", fork,
-            "--body", "@greptile",
+            "pr",
+            "comment",
+            str(pr_number),
+            "--repo",
+            fork,
+            "--body",
+            "@greptile",
         )
         log.info("Triggered Greptile review on PR #%d", pr_number)
     except GhError:
@@ -56,7 +60,8 @@ def scrape_greptile_comments(fork: str, pr_number: int) -> list[Comment]:
 
 
 def _scrape_raw_greptile_comments(
-    fork: str, pr_number: int,
+    fork: str,
+    pr_number: int,
 ) -> list[dict[str, Any]]:
     """Scrape all raw review comments from a PR (unfiltered)."""
     output = run_gh(
@@ -101,9 +106,13 @@ def _save_greptile_transcript(
 
 def _default_branch(fork: str) -> str:
     output = run_gh(
-        "repo", "view", fork,
-        "--json", "defaultBranchRef",
-        "-q", ".defaultBranchRef.name",
+        "repo",
+        "view",
+        fork,
+        "--json",
+        "defaultBranchRef",
+        "-q",
+        ".defaultBranchRef.name",
     )
     return output.strip() or "main"
 
@@ -136,12 +145,10 @@ def run_greptile(
         pr_number = open_eval_pr(fork, head_branch, base_branch, case)
 
         scrubbed_title = (
-            _scrub_fix_references(case.introducing_pr_title)
-            if case.introducing_pr_title else ""
+            _scrub_fix_references(case.introducing_pr_title) if case.introducing_pr_title else ""
         )
         scrubbed_body = (
-            _scrub_fix_references(case.introducing_pr_body)
-            if case.introducing_pr_body else ""
+            _scrub_fix_references(case.introducing_pr_body) if case.introducing_pr_body else ""
         )
 
         found = poll_for_greptile_review(fork, pr_number, timeout=timeout)
@@ -150,11 +157,15 @@ def run_greptile(
             elapsed = time.monotonic() - start
             if transcript_dir:
                 _save_greptile_transcript(
-                    transcript_dir, case.id,
-                    fork=fork, branch=head_branch, pr_number=pr_number,
+                    transcript_dir,
+                    case.id,
+                    fork=fork,
+                    branch=head_branch,
+                    pr_number=pr_number,
                     scrubbed_title=scrubbed_title,
                     scrubbed_body=scrubbed_body,
-                    raw_comments=[], patch_diff=patch_diff,
+                    raw_comments=[],
+                    patch_diff=patch_diff,
                     time_seconds=elapsed,
                 )
             return ToolResult(
@@ -163,6 +174,7 @@ def run_greptile(
                 context_level="diff+repo",
                 comments=[],
                 time_seconds=elapsed,
+                pr_number=pr_number,
                 error=f"Timeout waiting for Greptile review ({timeout}s)",
             )
 
@@ -173,11 +185,15 @@ def run_greptile(
         transcript_path = ""
         if transcript_dir:
             transcript_path = _save_greptile_transcript(
-                transcript_dir, case.id,
-                fork=fork, branch=head_branch, pr_number=pr_number,
+                transcript_dir,
+                case.id,
+                fork=fork,
+                branch=head_branch,
+                pr_number=pr_number,
                 scrubbed_title=scrubbed_title,
                 scrubbed_body=scrubbed_body,
-                raw_comments=raw_comments, patch_diff=patch_diff,
+                raw_comments=raw_comments,
+                patch_diff=patch_diff,
                 time_seconds=elapsed,
             )
         return ToolResult(
@@ -187,6 +203,7 @@ def run_greptile(
             comments=comments,
             time_seconds=elapsed,
             transcript_path=transcript_path,
+            pr_number=pr_number,
         )
     except Exception as exc:
         elapsed = time.monotonic() - start
@@ -196,6 +213,7 @@ def run_greptile(
             context_level="diff+repo",
             comments=[],
             time_seconds=elapsed,
+            pr_number=pr_number,
             error=str(exc),
         )
     finally:
@@ -205,5 +223,6 @@ def run_greptile(
             except Exception:
                 log.warning(
                     "Failed to clean up PR #%d on %s",
-                    pr_number, fork,
+                    pr_number,
+                    fork,
                 )

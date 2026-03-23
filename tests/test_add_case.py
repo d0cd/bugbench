@@ -20,17 +20,13 @@ from bugeval.models import CaseKind, TestCase
 
 class TestParsePrUrl:
     def test_valid_url(self) -> None:
-        owner, repo, number = parse_pr_url(
-            "https://github.com/ProvableHQ/snarkVM/pull/2345"
-        )
+        owner, repo, number = parse_pr_url("https://github.com/ProvableHQ/snarkVM/pull/2345")
         assert owner == "ProvableHQ"
         assert repo == "snarkVM"
         assert number == 2345
 
     def test_valid_url_trailing_slash(self) -> None:
-        owner, repo, number = parse_pr_url(
-            "https://github.com/owner/repo/pull/99/"
-        )
+        owner, repo, number = parse_pr_url("https://github.com/owner/repo/pull/99/")
         assert owner == "owner"
         assert repo == "repo"
         assert number == 99
@@ -58,9 +54,7 @@ class TestFindDuplicate:
             fix_pr_number=42,
         )
         case_path = tmp_path / "snarkVM-001.yaml"
-        case_path.write_text(
-            yaml.safe_dump(case.model_dump(mode="json"), sort_keys=False)
-        )
+        case_path.write_text(yaml.safe_dump(case.model_dump(mode="json"), sort_keys=False))
 
         result = find_duplicate(tmp_path, 42)
         assert result == "snarkVM-001"
@@ -74,9 +68,7 @@ class TestFindDuplicate:
             fix_pr_number=42,
         )
         case_path = tmp_path / "snarkVM-001.yaml"
-        case_path.write_text(
-            yaml.safe_dump(case.model_dump(mode="json"), sort_keys=False)
-        )
+        case_path.write_text(yaml.safe_dump(case.model_dump(mode="json"), sort_keys=False))
 
         result = find_duplicate(tmp_path, 99)
         assert result is None
@@ -94,9 +86,7 @@ class TestFindDuplicate:
             fix_pr_number=None,
         )
         case_path = tmp_path / "snarkVM-001.yaml"
-        case_path.write_text(
-            yaml.safe_dump(case.model_dump(mode="json"), sort_keys=False)
-        )
+        case_path.write_text(yaml.safe_dump(case.model_dump(mode="json"), sort_keys=False))
 
         result = find_duplicate(tmp_path, 42)
         assert result is None
@@ -220,6 +210,33 @@ class TestAddCaseDedupSkips:
 
         assert result is None
         mock_gh.assert_not_called()
+
+
+class TestAddCaseSourceManual:
+    @patch("bugeval.add_case.run_gh")
+    @patch("bugeval.add_case.fetch_pr_details_graphql")
+    def test_source_set_to_manual(
+        self,
+        mock_graphql: Any,
+        mock_gh: Any,
+        tmp_path: Path,
+    ) -> None:
+        pr_data = _make_pr_json(123)
+        mock_gh.return_value = json.dumps(pr_data)
+        mock_graphql.return_value = {}
+
+        cases_dir = tmp_path / "snarkVM"
+        cases_dir.mkdir()
+
+        result = add_case_from_pr(
+            "https://github.com/ProvableHQ/snarkVM/pull/123",
+            cases_dir,
+            repo_dir=Path(""),
+            dry_run=True,
+        )
+
+        assert result is not None
+        assert result.source == "manual"
 
 
 class TestAddCaseDryRun:

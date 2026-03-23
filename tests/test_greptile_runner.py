@@ -33,13 +33,17 @@ class TestPollForGreptileReview:
     @patch("bugeval.copilot_runner.time.sleep")
     @patch("bugeval.copilot_runner.run_gh")
     def test_found_review(
-        self, mock_gh: MagicMock, mock_sleep: MagicMock,
+        self,
+        mock_gh: MagicMock,
+        mock_sleep: MagicMock,
     ) -> None:
-        mock_gh.return_value = json.dumps({
-            "reviews": [
-                {"author": {"login": "greptile[bot]"}, "state": "COMMENTED"},
-            ],
-        })
+        mock_gh.return_value = json.dumps(
+            {
+                "reviews": [
+                    {"author": {"login": "greptile[bot]"}, "state": "COMMENTED"},
+                ],
+            }
+        )
         result = poll_for_greptile_review("testuser/leo", 99, timeout=60)
         assert result is True
 
@@ -55,7 +59,10 @@ class TestPollForGreptileReview:
         mock_gh.return_value = json.dumps({"reviews": []})
         mock_time.side_effect = [0.0, 100.0, 400.0]
         result = poll_for_greptile_review(
-            "testuser/leo", 99, timeout=300, poll_interval=15,
+            "testuser/leo",
+            99,
+            timeout=300,
+            poll_interval=15,
         )
         assert result is False
 
@@ -63,20 +70,23 @@ class TestPollForGreptileReview:
 class TestScrapeGreptileComments:
     @patch("bugeval.copilot_runner.run_gh")
     def test_parses_review_comments(self, mock_gh: MagicMock) -> None:
-        mock_gh.return_value = json.dumps([
-            {
-                "path": "src/main.rs",
-                "line": 42,
-                "body": "Potential null deref here",
-                "user": {"login": "greptile[bot]"},
-            },
-            {
-                "path": "src/lib.rs",
-                "line": 10,
-                "body": "Consider error handling",
-                "user": {"login": "greptile[bot]"},
-            },
-        ])
+        pr_comments = json.dumps(
+            [
+                {
+                    "path": "src/main.rs",
+                    "line": 42,
+                    "body": "Potential null deref here",
+                    "user": {"login": "greptile[bot]"},
+                },
+                {
+                    "path": "src/lib.rs",
+                    "line": 10,
+                    "body": "Consider error handling",
+                    "user": {"login": "greptile[bot]"},
+                },
+            ]
+        )
+        mock_gh.side_effect = [pr_comments, "[]"]
         comments = scrape_greptile_comments("testuser/leo", 99)
         assert len(comments) == 2
         assert comments[0].file == "src/main.rs"
@@ -85,27 +95,30 @@ class TestScrapeGreptileComments:
 
     @patch("bugeval.copilot_runner.run_gh")
     def test_filters_non_greptile(self, mock_gh: MagicMock) -> None:
-        mock_gh.return_value = json.dumps([
-            {
-                "path": "src/main.rs",
-                "line": 42,
-                "body": "Greptile finding",
-                "user": {"login": "greptile[bot]"},
-            },
-            {
-                "path": "src/lib.rs",
-                "line": 10,
-                "body": "Human comment",
-                "user": {"login": "somedev"},
-            },
-        ])
+        pr_comments = json.dumps(
+            [
+                {
+                    "path": "src/main.rs",
+                    "line": 42,
+                    "body": "Greptile finding",
+                    "user": {"login": "greptile[bot]"},
+                },
+                {
+                    "path": "src/lib.rs",
+                    "line": 10,
+                    "body": "Human comment",
+                    "user": {"login": "somedev"},
+                },
+            ]
+        )
+        mock_gh.side_effect = [pr_comments, "[]"]
         comments = scrape_greptile_comments("testuser/leo", 99)
         assert len(comments) == 1
         assert comments[0].body == "Greptile finding"
 
     @patch("bugeval.copilot_runner.run_gh")
     def test_empty_comments(self, mock_gh: MagicMock) -> None:
-        mock_gh.return_value = json.dumps([])
+        mock_gh.side_effect = ["[]", "[]"]
         comments = scrape_greptile_comments("testuser/leo", 99)
         assert comments == []
 
@@ -137,8 +150,12 @@ class TestRunGreptile:
         mock_open.return_value = 99
         mock_poll.return_value = True
         mock_raw.return_value = [
-            {"path": "src/main.rs", "line": 42, "body": "Bug found",
-             "user": {"login": "greptile[bot]"}},
+            {
+                "path": "src/main.rs",
+                "line": 42,
+                "body": "Bug found",
+                "user": {"login": "greptile[bot]"},
+            },
         ]
         mock_scrape.return_value = [
             Comment(file="src/main.rs", line=42, body="Bug found"),
@@ -150,7 +167,10 @@ class TestRunGreptile:
         assert len(result.comments) == 1
         assert result.error == ""
         mock_close.assert_called_once_with(
-            "testuser/leo", 99, "review-abc", "base-abc",
+            "testuser/leo",
+            99,
+            "review-abc",
+            "base-abc",
         )
 
     @patch("bugeval.greptile_runner.close_eval_pr")
@@ -180,7 +200,10 @@ class TestRunGreptile:
         assert result.tool == "greptile"
         assert "timeout" in result.error.lower()
         mock_close.assert_called_once_with(
-            "testuser/leo", 99, "review-abc", "base-abc",
+            "testuser/leo",
+            99,
+            "review-abc",
+            "base-abc",
         )
 
     @patch("bugeval.greptile_runner.ensure_tool_repo")
@@ -195,7 +218,8 @@ class TestRunGreptile:
 
         mock_diff.return_value = "diff content"
         mock_fork.side_effect = GhError(
-            ["gh", "repo", "fork"], "network error",
+            ["gh", "repo", "fork"],
+            "network error",
         )
         case = _make_case()
         result = run_greptile(case, tmp_path)
@@ -232,8 +256,7 @@ class TestGreptileTranscript:
         mock_open.return_value = 99
         mock_poll.return_value = True
         mock_raw.return_value = [
-            {"path": "f.rs", "line": 1, "body": "bug",
-             "user": {"login": "greptile[bot]"}},
+            {"path": "f.rs", "line": 1, "body": "bug", "user": {"login": "greptile[bot]"}},
         ]
         mock_scrape.return_value = [
             Comment(file="f.rs", line=1, body="bug"),
@@ -241,7 +264,9 @@ class TestGreptileTranscript:
         transcript_dir = tmp_path / "transcripts"
         case = _make_case()
         result = run_greptile(
-            case, tmp_path, org="testuser",
+            case,
+            tmp_path,
+            org="testuser",
             transcript_dir=transcript_dir,
         )
         assert result.transcript_path != ""

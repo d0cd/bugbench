@@ -1,28 +1,41 @@
-# Dockerfile for bugeval-agent: runs Claude Code CLI for code review evaluation.
-# Tools enabled: Read, Glob, Grep, Bash, WebSearch, WebFetch
-# Network: full outbound (needed for WebSearch/WebFetch and the Anthropic API)
-FROM node:22-slim
+# Dockerfile for bugeval-agent-v2: Rust toolchain + Claude Code CLI.
+# Tools enabled: Bash (cargo, clippy, rg), Read, Glob, Grep, WebSearch
+# Network: full outbound (API access, web search, crate downloads)
+#
+# Auth: Use a Docker named volume for Claude Code auth:
+#   docker run -it -v bugeval-claude-auth:/home/agent/.claude \
+#     -e CLAUDE_CONFIG_DIR=/home/agent/.claude \
+#     bugeval-agent-v2 claude /login
+FROM rust:1.82-slim
 
-# System tools useful inside agent Bash sessions:
-#   git       — repo operations
-#   curl      — HTTP requests from Bash
-#   ripgrep   — fast code search (rg)
-#   jq        — JSON parsing from Bash
-#   ca-certificates — TLS for outbound HTTPS
+# System tools + Node.js + Python for Claude Code CLI + Agent SDK
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ripgrep \
     jq \
     ca-certificates \
+    nodejs \
+    npm \
+    python3 \
+    python3-pip \
   && rm -rf /var/lib/apt/lists/*
+
+# Rust components for code analysis
+RUN rustup component add clippy rustfmt
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
-# Run as non-root for defence-in-depth; /work is owned by this user.
-RUN groupadd -r agent && useradd -r -g agent -d /work -s /bin/bash agent
-RUN mkdir /work && chown agent:agent /work
+# Install Agent SDK for Python
+RUN pip3 install --break-system-packages claude-agent-sdk
+
+# Run as non-root; /home/agent for config, /work for workspace
+RUN groupadd -r agent && useradd -r -g agent -m -d /home/agent -s /bin/bash agent
+RUN mkdir -p /work /home/agent/.claude && chown -R agent:agent /work /home/agent
+
+ENV HOME=/home/agent
+ENV CLAUDE_CONFIG_DIR=/home/agent/.claude
 
 USER agent
 WORKDIR /work

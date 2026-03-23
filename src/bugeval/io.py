@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ import yaml
 from bugeval.models import TestCase
 from bugeval.result_models import ToolResult
 from bugeval.score_models import CaseScore
+
+logger = logging.getLogger(__name__)
 
 
 def save_case(case: TestCase, path: Path) -> None:
@@ -74,7 +77,11 @@ def load_checkpoint(path: Path) -> set[str]:
     """Load a checkpoint file (JSON set of completed IDs)."""
     if not path.exists():
         return set()
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logger.warning("Corrupt checkpoint %s, starting fresh", path)
+        return set()
     return set(data)
 
 
@@ -113,7 +120,9 @@ def write_run_metadata(
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0:
             meta["code_commit"] = result.stdout.strip()
@@ -122,13 +131,9 @@ def write_run_metadata(
     # Config hash
     config_path = Path("config/config.yaml")
     if config_path.exists():
-        meta["config_sha256"] = hashlib.sha256(
-            config_path.read_bytes()
-        ).hexdigest()
+        meta["config_sha256"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
     # Case count
     if cases_dir.exists():
         meta["total_cases"] = sum(1 for _ in cases_dir.rglob("*.yaml"))
     meta["python_version"] = sys.version.split()[0]
-    (run_dir / "run_metadata.json").write_text(
-        json.dumps(meta, indent=2)
-    )
+    (run_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))

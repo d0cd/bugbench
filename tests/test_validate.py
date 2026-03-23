@@ -106,54 +106,57 @@ class TestParseVerdict:
 
 
 class TestValidateCase:
-    @patch("bugeval.validate.call_claude")
-    @patch("bugeval.validate.call_gemini")
-    def test_agreement(
-        self, mock_gemini: MagicMock, mock_claude: MagicMock
-    ) -> None:
-        mock_claude.return_value = json.dumps({"verdict": "confirmed"})
-        mock_gemini.return_value = json.dumps({"verdict": "confirmed"})
+    @patch("bugeval.validate.call_llm")
+    def test_agreement(self, mock_llm: MagicMock) -> None:
+        def _side_effect(
+            prompt: str,
+            model: str = "",
+            backend: str = "sdk",
+        ) -> str:
+            return json.dumps({"verdict": "confirmed"})
+
+        mock_llm.side_effect = _side_effect
         case = _make_case(truth=_default_truth())
         result = validate_case(case, SAMPLE_DIFF, ["claude", "gemini"])
         assert result.agreement is True
         assert result.claude_verdict == "confirmed"
         assert result.gemini_verdict == "confirmed"
 
-    @patch("bugeval.validate.call_claude")
-    @patch("bugeval.validate.call_gemini")
-    def test_disagreement(
-        self, mock_gemini: MagicMock, mock_claude: MagicMock
-    ) -> None:
-        mock_claude.return_value = json.dumps({"verdict": "confirmed"})
-        mock_gemini.return_value = json.dumps({"verdict": "disputed"})
+    @patch("bugeval.validate.call_llm")
+    def test_disagreement(self, mock_llm: MagicMock) -> None:
+        def _side_effect(
+            prompt: str,
+            model: str = "",
+            backend: str = "sdk",
+        ) -> str:
+            if backend == "gemini":
+                return json.dumps({"verdict": "disputed"})
+            return json.dumps({"verdict": "confirmed"})
+
+        mock_llm.side_effect = _side_effect
         case = _make_case(truth=_default_truth())
         result = validate_case(case, SAMPLE_DIFF, ["claude", "gemini"])
         assert result.agreement is False
         assert result.claude_verdict == "confirmed"
         assert result.gemini_verdict == "disputed"
 
-    @patch("bugeval.validate.call_claude")
-    @patch("bugeval.validate.call_gemini")
-    def test_single_model_claude_only(
-        self, mock_gemini: MagicMock, mock_claude: MagicMock
-    ) -> None:
-        mock_claude.return_value = json.dumps({"verdict": "confirmed"})
+    @patch("bugeval.validate.call_llm")
+    def test_single_model_claude_only(self, mock_llm: MagicMock) -> None:
+        mock_llm.return_value = json.dumps({"verdict": "confirmed"})
         case = _make_case(truth=_default_truth())
         result = validate_case(case, SAMPLE_DIFF, ["claude"])
         assert result.claude_verdict == "confirmed"
         assert result.gemini_verdict == ""
         # Single model: agreement is vacuously true
         assert result.agreement is True
-        mock_gemini.assert_not_called()
+        assert mock_llm.call_count == 1
 
 
 class TestValidateCases:
-    @patch("bugeval.validate.call_claude")
-    @patch("bugeval.validate.call_gemini")
+    @patch("bugeval.validate.call_llm")
     def test_dry_run_skips_llm_calls(
         self,
-        mock_gemini: MagicMock,
-        mock_claude: MagicMock,
+        mock_llm: MagicMock,
         tmp_path: Path,
     ) -> None:
         from bugeval.io import save_case
@@ -162,18 +165,13 @@ class TestValidateCases:
         save_case(case, tmp_path / "cases" / "test-001.yaml")
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
-        validate_cases(
-            tmp_path / "cases", repo_dir, ["claude", "gemini"], 1, dry_run=True
-        )
-        mock_claude.assert_not_called()
-        mock_gemini.assert_not_called()
+        validate_cases(tmp_path / "cases", repo_dir, ["claude", "gemini"], 1, dry_run=True)
+        mock_llm.assert_not_called()
 
-    @patch("bugeval.validate.call_claude")
-    @patch("bugeval.validate.call_gemini")
+    @patch("bugeval.validate.call_llm")
     def test_skips_already_validated(
         self,
-        mock_gemini: MagicMock,
-        mock_claude: MagicMock,
+        mock_llm: MagicMock,
         tmp_path: Path,
     ) -> None:
         from bugeval.io import save_case
@@ -190,18 +188,13 @@ class TestValidateCases:
         save_case(case, tmp_path / "cases" / "test-001.yaml")
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
-        validate_cases(
-            tmp_path / "cases", repo_dir, ["claude", "gemini"], 1, dry_run=False
-        )
-        mock_claude.assert_not_called()
-        mock_gemini.assert_not_called()
+        validate_cases(tmp_path / "cases", repo_dir, ["claude", "gemini"], 1, dry_run=False)
+        mock_llm.assert_not_called()
 
-    @patch("bugeval.validate.call_claude")
-    @patch("bugeval.validate.call_gemini")
+    @patch("bugeval.validate.call_llm")
     def test_skips_no_truth(
         self,
-        mock_gemini: MagicMock,
-        mock_claude: MagicMock,
+        mock_llm: MagicMock,
         tmp_path: Path,
     ) -> None:
         from bugeval.io import save_case
@@ -210,19 +203,14 @@ class TestValidateCases:
         save_case(case, tmp_path / "cases" / "test-001.yaml")
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
-        validate_cases(
-            tmp_path / "cases", repo_dir, ["claude", "gemini"], 1, dry_run=False
-        )
-        mock_claude.assert_not_called()
-        mock_gemini.assert_not_called()
+        validate_cases(tmp_path / "cases", repo_dir, ["claude", "gemini"], 1, dry_run=False)
+        mock_llm.assert_not_called()
 
     @patch("bugeval.validate._get_introducing_diff", return_value=SAMPLE_DIFF)
-    @patch("bugeval.validate.call_claude")
-    @patch("bugeval.validate.call_gemini")
+    @patch("bugeval.validate.call_llm")
     def test_checkpoint_resume(
         self,
-        mock_gemini: MagicMock,
-        mock_claude: MagicMock,
+        mock_llm: MagicMock,
         mock_diff: MagicMock,
         tmp_path: Path,
     ) -> None:
@@ -238,13 +226,59 @@ class TestValidateCases:
         # Mark case1 as already done in checkpoint
         save_checkpoint({"test-001"}, cases_dir / ".validate_checkpoint.json")
 
-        mock_claude.return_value = json.dumps({"verdict": "confirmed"})
-        mock_gemini.return_value = json.dumps({"verdict": "confirmed"})
+        mock_llm.return_value = json.dumps({"verdict": "confirmed"})
 
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
-        validate_cases(
-            cases_dir, repo_dir, ["claude", "gemini"], 1, dry_run=False
-        )
-        # Only case2 should have been processed
-        assert mock_claude.call_count == 1
+        validate_cases(cases_dir, repo_dir, ["claude", "gemini"], 1, dry_run=False)
+        # Only case2 should have been processed (2 calls: claude + gemini)
+        assert mock_llm.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Status transition in validation
+# ---------------------------------------------------------------------------
+
+
+class TestStatusTransitionInValidation:
+    @patch("bugeval.validate._get_introducing_diff", return_value=SAMPLE_DIFF)
+    @patch("bugeval.validate.call_llm")
+    def test_validated_status_set(
+        self,
+        mock_llm: MagicMock,
+        mock_diff: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        from bugeval.io import load_case, save_case
+
+        mock_llm.return_value = json.dumps({"verdict": "confirmed"})
+        case = _make_case(truth=_default_truth())
+        case.status = "curated"
+        cases_dir = tmp_path / "cases"
+        save_case(case, cases_dir / "test-001.yaml")
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        validate_cases(cases_dir, repo_dir, ["claude"], 1, dry_run=False)
+        reloaded = load_case(cases_dir / "test-001.yaml")
+        assert reloaded.status == "validated"
+
+    @patch("bugeval.validate._get_introducing_diff", return_value=SAMPLE_DIFF)
+    @patch("bugeval.validate.call_llm")
+    def test_status_not_set_when_disputed(
+        self,
+        mock_llm: MagicMock,
+        mock_diff: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        from bugeval.io import load_case, save_case
+
+        mock_llm.return_value = json.dumps({"verdict": "disputed"})
+        case = _make_case(truth=_default_truth())
+        case.status = "curated"
+        cases_dir = tmp_path / "cases"
+        save_case(case, cases_dir / "test-001.yaml")
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        validate_cases(cases_dir, repo_dir, ["claude"], 1, dry_run=False)
+        reloaded = load_case(cases_dir / "test-001.yaml")
+        assert reloaded.status == "curated"

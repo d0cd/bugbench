@@ -135,7 +135,7 @@ def sample_score() -> CaseScore:
         detection_score=3,
         review_quality=3,
         comment_scores=[
-            CommentScore(comment_index=0, verdict=CommentVerdict.tp, matched_buggy_line=0),
+            CommentScore(comment_index=0, verdict=CommentVerdict.tp, matched_buggy_line_idx=0),
             CommentScore(comment_index=1, verdict=CommentVerdict.low_value),
         ],
         reasoning="Tool correctly identified the race condition.",

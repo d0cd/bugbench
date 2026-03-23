@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from bugeval.blame import (
     blame_cases,
+    blame_enclosing_function,
     file_level_fallback,
     find_introducing_commit,
     parse_diff_added_lines,
@@ -243,9 +244,7 @@ class TestFindIntroducingCommit:
             "author A\nsummary msg\nfilename src/foo.rs\n\tline\n"
         )
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined and "fixsha123" in joined:
                 return diff_output
@@ -259,9 +258,7 @@ class TestFindIntroducingCommit:
 
         mock_fn = MagicMock(side_effect=git_side_effect)
         with patch("bugeval.blame.run_git", mock_fn):
-            sha, confidence = find_introducing_commit(
-                case, Path("/repo")
-            )
+            sha, confidence = find_introducing_commit(case, Path("/repo"))
         assert sha == "intro111intro111intro111intro111intro111"
         assert confidence == "A"
 
@@ -306,9 +303,7 @@ class TestFindIntroducingCommit:
             "author A\nsummary msg\nfilename src/foo.rs\n\tline4;\n"
         )
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined and "fixsha" in joined:
                 return diff_output
@@ -322,9 +317,7 @@ class TestFindIntroducingCommit:
 
         mock_fn = MagicMock(side_effect=git_side_effect)
         with patch("bugeval.blame.run_git", mock_fn):
-            sha, confidence = find_introducing_commit(
-                case, Path("/repo")
-            )
+            sha, confidence = find_introducing_commit(case, Path("/repo"))
         assert sha == "aaa1" * 10
         assert confidence == "B"
 
@@ -353,9 +346,7 @@ class TestFindIntroducingCommit:
             "+    fixed;\n"
         )
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined and "fixsha" in joined:
                 return diff_output
@@ -371,9 +362,7 @@ class TestFindIntroducingCommit:
 
         mock_fn = MagicMock(side_effect=git_side_effect)
         with patch("bugeval.blame.run_git", mock_fn):
-            sha, confidence = find_introducing_commit(
-                case, Path("/repo")
-            )
+            sha, confidence = find_introducing_commit(case, Path("/repo"))
         assert sha == "fallbacksha123"
         assert confidence == "C"
 
@@ -401,15 +390,13 @@ class TestFindIntroducingCommit:
             "     end;\n"
         )
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined and "fixsha" in joined:
                 return diff_output
             # blame_enclosing_function uses git log -L
             if "log" in joined and "-L" in joined:
-                return "enclosing123enclosing123enclosing12345\n"
+                return "e" * 40 + "\n"
             if "--format=%P" in joined:
                 return "singleparent\n"
             if "rev-list" in joined:
@@ -418,10 +405,8 @@ class TestFindIntroducingCommit:
 
         mock_fn = MagicMock(side_effect=git_side_effect)
         with patch("bugeval.blame.run_git", mock_fn):
-            sha, confidence = find_introducing_commit(
-                case, Path("/repo")
-            )
-        assert sha == "enclosing123enclosing123enclosing12345"
+            sha, confidence = find_introducing_commit(case, Path("/repo"))
+        assert sha == "e" * 40
         assert confidence == "D"
 
     def test_omission_falls_to_file_fallback(self) -> None:
@@ -451,9 +436,7 @@ class TestFindIntroducingCommit:
 
         call_count = {"log_l": 0, "log_h": 0}
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined and "fixsha" in joined:
                 return diff_output
@@ -473,9 +456,7 @@ class TestFindIntroducingCommit:
 
         mock_fn = MagicMock(side_effect=git_side_effect)
         with patch("bugeval.blame.run_git", mock_fn):
-            sha, confidence = find_introducing_commit(
-                case, Path("/repo")
-            )
+            sha, confidence = find_introducing_commit(case, Path("/repo"))
         # Enclosing was tried
         assert call_count["log_l"] >= 1
         assert sha == "filefallback123"
@@ -526,9 +507,7 @@ class TestFileLevelFallback:
 
         mock_fn = MagicMock(return_value="recentsha\n")
         with patch("bugeval.blame.run_git", mock_fn):
-            result = file_level_fallback(
-                ["src/a.rs", "src/b.rs"], "fixsha~1", Path("/repo")
-            )
+            result = file_level_fallback(["src/a.rs", "src/b.rs"], "fixsha~1", Path("/repo"))
         assert result == "recentsha"
 
     def test_no_prior_commit(self) -> None:
@@ -536,9 +515,7 @@ class TestFileLevelFallback:
 
         mock_fn = MagicMock(return_value="\n")
         with patch("bugeval.blame.run_git", mock_fn):
-            result = file_level_fallback(
-                ["src/a.rs"], "fixsha~1", Path("/repo")
-            )
+            result = file_level_fallback(["src/a.rs"], "fixsha~1", Path("/repo"))
         assert result is None
 
     def test_git_error_returns_none(self) -> None:
@@ -546,13 +523,9 @@ class TestFileLevelFallback:
 
         from bugeval.git_utils import GitError
 
-        mock_fn = MagicMock(
-            side_effect=GitError(["git"], "fatal")
-        )
+        mock_fn = MagicMock(side_effect=GitError(["git"], "fatal"))
         with patch("bugeval.blame.run_git", mock_fn):
-            result = file_level_fallback(
-                ["src/a.rs"], "fixsha~1", Path("/repo")
-            )
+            result = file_level_fallback(["src/a.rs"], "fixsha~1", Path("/repo"))
         assert result is None
 
 
@@ -590,9 +563,7 @@ class TestPopulateBlame:
             "\tline\n"
         )
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined and "fixsha" in joined:
                 return diff_output
@@ -611,10 +582,7 @@ class TestPopulateBlame:
             updated = populate_blame(case, Path("/repo"))
 
         assert updated.truth is not None
-        assert (
-            updated.truth.introducing_commit
-            == "introsha1introsha1introsha1introsha1intr"
-        )
+        assert updated.truth.introducing_commit == "introsha1introsha1introsha1introsha1intr"
         assert updated.truth.blame_confidence == "A"
         assert updated.base_commit == "parentofintro"
 
@@ -648,9 +616,7 @@ class TestPopulateBlame:
             "\tline\n"
         )
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined and "fixsha" in joined:
                 return diff_output
@@ -708,9 +674,7 @@ class TestBlameCases:
         for c in [case1, case2]:
             p = cases_dir / f"{c.id}.yaml"
             with open(p, "w") as f:
-                yaml.safe_dump(
-                    c.model_dump(mode="json"), f, sort_keys=False
-                )
+                yaml.safe_dump(c.model_dump(mode="json"), f, sort_keys=False)
 
         # Pre-populate checkpoint with case1 done
         ckpt = cases_dir / ".blame_checkpoint.json"
@@ -719,18 +683,14 @@ class TestBlameCases:
         # Mock populate_blame to track calls
         calls: list[str] = []
 
-        def mock_populate(
-            case: TestCase, repo_dir: Path
-        ) -> TestCase:
+        def mock_populate(case: TestCase, repo_dir: Path) -> TestCase:
             calls.append(case.id)
             if case.truth:
                 case.truth.introducing_commit = "found"
                 case.truth.blame_confidence = "A"
             return case
 
-        with mpatch(
-            "bugeval.blame.populate_blame", side_effect=mock_populate
-        ):
+        with mpatch("bugeval.blame.populate_blame", side_effect=mock_populate):
             blame_cases(cases_dir, Path("/repo"), concurrency=1)
 
         # Only case2 should have been processed
@@ -762,13 +722,17 @@ class TestResolveIntroducingPr:
             ),
         )
 
-        rest_response = json.dumps([{
-            "number": 42,
-            "title": "Add feature X",
-            "body": "This adds feature X",
-            "merged_at": "2024-01-15T10:00:00Z",
-            "user": {"login": "alice"},
-        }])
+        rest_response = json.dumps(
+            [
+                {
+                    "number": 42,
+                    "title": "Add feature X",
+                    "body": "This adds feature X",
+                    "merged_at": "2024-01-15T10:00:00Z",
+                    "user": {"login": "alice"},
+                }
+            ]
+        )
 
         graphql_data = {
             42: {
@@ -816,9 +780,7 @@ class TestResolveIntroducingPr:
         assert updated.introducing_pr_commit_shas == ["sha1", "sha2"]
         assert updated.introducing_pr_author == "alice"
         assert updated.introducing_pr_merge_date == "2024-01-15T10:00:00Z"
-        assert updated.introducing_pr_review_comments == [
-            "LGTM", "nit: rename this"
-        ]
+        assert updated.introducing_pr_review_comments == ["LGTM", "nit: rename this"]
         assert updated.introducing_pr_ci_status == "SUCCESS"
 
     def test_no_pr_found_returns_unchanged(self) -> None:
@@ -902,7 +864,9 @@ class TestRunBlameAtRevision:
         mock_fn = MagicMock(return_value=PORCELAIN_OUTPUT)
         with patch("bugeval.blame.run_git", mock_fn):
             result = run_blame(
-                "src/foo.rs", [10], cwd=Path("/repo"),
+                "src/foo.rs",
+                [10],
+                cwd=Path("/repo"),
                 at_rev="abc123~1",
             )
         assert result == {10: "abc123abc123abc123abc123abc123abc123abc1"}
@@ -938,9 +902,7 @@ class TestFixPrNumbersPopulated:
         )
 
         # Return excluded so we skip all the blame logic
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             joined = " ".join(args)
             if "diff" in joined:
                 return ""
@@ -966,9 +928,7 @@ class TestFixPrNumbersPopulated:
             fix_pr_number=None,
         )
 
-        def git_side_effect(
-            *args: str, cwd: Path, timeout: int = 60
-        ) -> str:
+        def git_side_effect(*args: str, cwd: Path, timeout: int = 60) -> str:
             return ""
 
         mock_fn = MagicMock(side_effect=git_side_effect)
@@ -977,3 +937,47 @@ class TestFixPrNumbersPopulated:
 
         assert updated.truth is not None
         assert updated.truth.fix_pr_numbers == []
+
+
+# --- blame_enclosing_function ---
+
+
+class TestBlameEnclosingFunction:
+    def test_multiline_git_log_output(self) -> None:
+        """git log -L appends diff after the SHA; only the first line is the SHA."""
+        from unittest.mock import MagicMock
+
+        sha = "a" * 40
+        multiline_output = (
+            f"{sha}\n"
+            "diff --git a/src/foo.rs b/src/foo.rs\n"
+            "--- a/src/foo.rs\n"
+            "+++ b/src/foo.rs\n"
+            "@@ -10,3 +10,3 @@ fn example() {\n"
+            "     let x = 1;\n"
+            "-    let y = 2;\n"
+            "+    let y = 3;\n"
+        )
+
+        mock_fn = MagicMock(return_value=multiline_output)
+        with patch("bugeval.blame.run_git", mock_fn):
+            result = blame_enclosing_function("src/foo.rs", 10, Path("/repo"), "HEAD~1")
+        assert result == sha
+
+    def test_invalid_sha_returns_none(self) -> None:
+        """Non-hex or wrong-length first line returns None."""
+        from unittest.mock import MagicMock
+
+        mock_fn = MagicMock(return_value="not-a-valid-sha\nsome diff\n")
+        with patch("bugeval.blame.run_git", mock_fn):
+            result = blame_enclosing_function("src/foo.rs", 10, Path("/repo"), "HEAD")
+        assert result is None
+
+    def test_empty_output_returns_none(self) -> None:
+        """Empty output returns None."""
+        from unittest.mock import MagicMock
+
+        mock_fn = MagicMock(return_value="")
+        with patch("bugeval.blame.run_git", mock_fn):
+            result = blame_enclosing_function("src/foo.rs", 10, Path("/repo"), "HEAD")
+        assert result is None
