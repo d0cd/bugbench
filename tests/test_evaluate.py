@@ -473,6 +473,11 @@ class TestEvaluateTool:
         ckpt = run_dir / "checkpoint.json"
         ckpt.write_text(json.dumps(["leo-001::agent::diff-only"]))
 
+        # Create matching result file so checkpoint entry isn't stale
+        results_dir = run_dir / "results"
+        results_dir.mkdir()
+        (results_dir / "leo-001--agent--diff-only.yaml").write_text("case_id: leo-001\n")
+
         with patch("bugeval.evaluate.process_case") as mock_process:
             evaluate_tool(
                 "agent",
@@ -987,3 +992,96 @@ class TestV3ToolConfig:
         from bugeval.evaluate import _SDK_TOOLS
 
         assert "agent-sdk-v3" in _SDK_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# is_docker_available
+# ---------------------------------------------------------------------------
+
+
+class TestIsDockerAvailable:
+    def test_docker_available(self) -> None:
+        from bugeval.evaluate import is_docker_available
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            assert is_docker_available() is True
+        mock_run.assert_called_once()
+
+    def test_docker_not_available(self) -> None:
+        from bugeval.evaluate import is_docker_available
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            assert is_docker_available() is False
+
+    def test_docker_not_found(self) -> None:
+        from bugeval.evaluate import is_docker_available
+
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert is_docker_available() is False
+
+    def test_docker_timeout(self) -> None:
+        import subprocess as sp
+
+        from bugeval.evaluate import is_docker_available
+
+        with patch("subprocess.run", side_effect=sp.TimeoutExpired("docker", 5)):
+            assert is_docker_available() is False
+
+
+# ---------------------------------------------------------------------------
+# _checkpoint_key
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointKey:
+    def test_with_context(self) -> None:
+        from bugeval.evaluate import _checkpoint_key
+
+        assert _checkpoint_key("leo-001", "agent", "diff-only") == ("leo-001::agent::diff-only")
+
+    def test_without_context(self) -> None:
+        from bugeval.evaluate import _checkpoint_key
+
+        assert _checkpoint_key("leo-001", "greptile", "") == "leo-001::greptile"
+
+    def test_complex_context(self) -> None:
+        from bugeval.evaluate import _checkpoint_key
+
+        assert _checkpoint_key("snarkVM-042", "agent", "diff+repo+domain") == (
+            "snarkVM-042::agent::diff+repo+domain"
+        )
+
+
+# ---------------------------------------------------------------------------
+# process_case dry_run behavior (via evaluate_tool)
+# ---------------------------------------------------------------------------
+
+
+class TestProcessCaseDryRun:
+    def test_dry_run_logs_but_does_not_process(self, tmp_path: Path) -> None:
+        """dry_run=True should not call process_case at all."""
+        cases_dir = tmp_path / "cases"
+        cases_dir.mkdir()
+        run_dir = tmp_path / "run"
+
+        case = _make_case()
+        with open(cases_dir / "leo-001.yaml", "w") as f:
+            yaml.safe_dump(case.model_dump(mode="json"), f)
+
+        with patch("bugeval.evaluate.process_case") as mock_process:
+            evaluate_tool(
+                "agent",
+                cases_dir,
+                run_dir,
+                "diff+repo",
+                Path("."),
+                1,
+                300,
+                True,  # dry_run
+            )
+
+        mock_process.assert_not_called()
+        # run_dir should still exist (created for metadata)
+        assert run_dir.exists()

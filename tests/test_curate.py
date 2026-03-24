@@ -22,14 +22,13 @@ from bugeval.curate import (
     REASON_PERF_OPTIMIZATION,
     REASON_RELEASE_VERSION,
     REASON_TYPO_ONLY,
-    _find_case_path,
     auto_curate_case,
     compute_quality_flags,
     curate_cases,
     find_duplicate_introducing,
     llm_classify_case,
 )
-from bugeval.io import save_case
+from bugeval.io import find_case_path, save_case
 from bugeval.models import (
     BuggyLine,
     CaseKind,
@@ -47,7 +46,7 @@ def _make_case(
     case_id: str = "test-001",
     *,
     truth: GroundTruth | None = None,
-    fix_pr_title: str = "",
+    fix_pr_title: str = "Fix something",
     introducing_pr_number: int | None = None,
     excluded: bool = False,
     excluded_reason: str = "",
@@ -85,7 +84,10 @@ def _default_truth(num_buggy_lines: int = 1) -> GroundTruth:
 
 class TestAutoCurateCase:
     def test_no_buggy_lines(self) -> None:
-        case = _make_case(truth=GroundTruth(buggy_lines=[]))
+        case = _make_case(
+            truth=GroundTruth(buggy_lines=[]),
+            fix_pr_title="Fix something",
+        )
         assert auto_curate_case(case) == REASON_NO_BUGGY_LINES
 
     def test_many_buggy_lines_not_excluded(self) -> None:
@@ -209,7 +211,7 @@ class TestFindCasePath:
     def test_found_in_root(self, tmp_path: Path) -> None:
         case_file = tmp_path / "test-001.yaml"
         case_file.write_text("id: test-001\n")
-        result = _find_case_path(tmp_path, "test-001")
+        result = find_case_path("test-001", tmp_path)
         assert result == case_file
 
     def test_found_in_subdirectory(self, tmp_path: Path) -> None:
@@ -217,20 +219,20 @@ class TestFindCasePath:
         sub.mkdir()
         case_file = sub / "test-001.yaml"
         case_file.write_text("id: test-001\n")
-        result = _find_case_path(tmp_path, "test-001")
+        result = find_case_path("test-001", tmp_path)
         assert result == case_file
 
     def test_not_found(self, tmp_path: Path) -> None:
-        result = _find_case_path(tmp_path, "nonexistent")
+        result = find_case_path("nonexistent", tmp_path)
         assert result is None
 
     def test_empty_directory(self, tmp_path: Path) -> None:
-        result = _find_case_path(tmp_path, "test-001")
+        result = find_case_path("test-001", tmp_path)
         assert result is None
 
     def test_ignores_non_yaml(self, tmp_path: Path) -> None:
         (tmp_path / "test-001.json").write_text("{}")
-        result = _find_case_path(tmp_path, "test-001")
+        result = find_case_path("test-001", tmp_path)
         assert result is None
 
 
@@ -323,7 +325,7 @@ class TestCurateCases:
     def test_valid_cases_not_excluded(self, tmp_path: Path) -> None:
         case = _make_case(
             "c-001",
-            truth=_default_truth(),
+            truth=_default_truth(5),
             fix_pr_title="Fix off-by-one",
         )
         cases_dir = self._setup_cases(tmp_path, [case])
@@ -778,10 +780,141 @@ class TestQualityFlags:
         assert "many-buggy-lines" in flags
         assert "low-blame-confidence" in flags
 
-    def test_no_truth_no_flags(self) -> None:
+    def test_no_truth_has_no_ground_truth_flag(self) -> None:
         case = _make_case(truth=None)
         flags = compute_quality_flags(case)
-        assert flags == []
+        assert flags == ["no-ground-truth"]
+
+
+# ---------------------------------------------------------------------------
+# Enhanced quality flags
+# ---------------------------------------------------------------------------
+
+
+class TestComputeQualityFlagsEnhanced:
+    def test_few_buggy_lines(self) -> None:
+        case = _make_case(truth=_default_truth(1))
+        flags = compute_quality_flags(case)
+        assert "few-buggy-lines" in flags
+
+    def test_few_buggy_lines_boundary_two(self) -> None:
+        case = _make_case(truth=_default_truth(2))
+        flags = compute_quality_flags(case)
+        assert "few-buggy-lines" in flags
+
+    def test_three_buggy_lines_no_few_flag(self) -> None:
+        case = _make_case(truth=_default_truth(3))
+        flags = compute_quality_flags(case)
+        assert "few-buggy-lines" not in flags
+
+    def test_no_ground_truth_none(self) -> None:
+        case = _make_case(truth=None)
+        flags = compute_quality_flags(case)
+        assert "no-ground-truth" in flags
+
+    def test_no_ground_truth_empty_lines(self) -> None:
+        case = _make_case(truth=GroundTruth(buggy_lines=[]))
+        flags = compute_quality_flags(case)
+        assert "no-ground-truth" in flags
+
+    def test_high_test_expectations(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(
+                    file="src/lib.rs",
+                    line=1,
+                    content="code",
+                    is_test_expectation=True,
+                ),
+                BuggyLine(
+                    file="src/lib.rs",
+                    line=2,
+                    content="code",
+                    is_test_expectation=True,
+                ),
+                BuggyLine(
+                    file="src/lib.rs",
+                    line=3,
+                    content="code",
+                    is_test_expectation=False,
+                ),
+            ],
+        )
+        case = _make_case(truth=truth)
+        flags = compute_quality_flags(case)
+        assert "high-test-expectations" in flags
+
+    def test_low_test_expectations_no_flag(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(
+                    file="src/lib.rs",
+                    line=1,
+                    content="code",
+                    is_test_expectation=True,
+                ),
+                BuggyLine(
+                    file="src/lib.rs",
+                    line=2,
+                    content="code",
+                    is_test_expectation=False,
+                ),
+                BuggyLine(
+                    file="src/lib.rs",
+                    line=3,
+                    content="code",
+                    is_test_expectation=False,
+                ),
+            ],
+        )
+        case = _make_case(truth=truth)
+        flags = compute_quality_flags(case)
+        assert "high-test-expectations" not in flags
+
+    def test_non_source_heavy(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="Cargo.toml", line=1, content="dep"),
+                BuggyLine(file="README.md", line=1, content="text"),
+                BuggyLine(file="src/lib.rs", line=1, content="code"),
+            ],
+        )
+        case = _make_case(truth=truth)
+        flags = compute_quality_flags(case)
+        assert "non-source-heavy" in flags
+
+    def test_non_source_below_threshold(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="Cargo.toml", line=1, content="dep"),
+                BuggyLine(file="src/lib.rs", line=1, content="code"),
+                BuggyLine(file="src/main.rs", line=1, content="code"),
+                BuggyLine(file="src/util.rs", line=1, content="code"),
+            ],
+        )
+        case = _make_case(truth=truth)
+        flags = compute_quality_flags(case)
+        assert "non-source-heavy" not in flags
+
+    def test_multiple_enhanced_flags(self) -> None:
+        truth = GroundTruth(
+            introducing_commit="abc123",
+            blame_confidence="D",
+            buggy_lines=[
+                BuggyLine(
+                    file="Cargo.toml",
+                    line=1,
+                    content="dep",
+                    is_test_expectation=True,
+                ),
+            ],
+        )
+        case = _make_case(truth=truth)
+        flags = compute_quality_flags(case)
+        assert "few-buggy-lines" in flags
+        assert "high-test-expectations" in flags
+        assert "non-source-heavy" in flags
+        assert "low-blame-confidence" in flags
 
 
 # ---------------------------------------------------------------------------

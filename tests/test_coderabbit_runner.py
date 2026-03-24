@@ -7,12 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bugeval.coderabbit_runner import (
-    _save_coderabbit_transcript,
     poll_for_coderabbit_review,
     run_coderabbit,
     scrape_coderabbit_comments,
 )
 from bugeval.models import CaseKind, GroundTruth, TestCase
+from bugeval.pr_utils import save_pr_transcript
 from bugeval.result_models import Comment
 
 
@@ -45,7 +45,7 @@ class TestPollForCodeRabbitReview:
         )
 
         with patch(
-            "bugeval.copilot_runner.run_gh",
+            "bugeval.pr_utils.run_gh",
             return_value=reviews_data,
         ):
             result = poll_for_coderabbit_review(
@@ -62,10 +62,10 @@ class TestPollForCodeRabbitReview:
 
         with (
             patch(
-                "bugeval.copilot_runner.run_gh",
+                "bugeval.pr_utils.run_gh",
                 return_value=no_reviews,
             ),
-            patch("bugeval.copilot_runner.time") as mock_time,
+            patch("bugeval.pr_utils.time") as mock_time,
         ):
             # First call: 0, second check: over timeout
             mock_time.monotonic.side_effect = [0.0, 0.0, 11.0]
@@ -90,10 +90,10 @@ class TestPollForCodeRabbitReview:
 
         with (
             patch(
-                "bugeval.copilot_runner.run_gh",
+                "bugeval.pr_utils.run_gh",
                 return_value=reviews_data,
             ),
-            patch("bugeval.copilot_runner.time") as mock_time,
+            patch("bugeval.pr_utils.time") as mock_time,
         ):
             mock_time.monotonic.side_effect = [0.0, 0.0, 11.0]
             mock_time.sleep = lambda _: None
@@ -132,7 +132,7 @@ class TestScrapeCodeRabbitComments:
             ]
         )
 
-        with patch("bugeval.copilot_runner.run_gh", return_value=raw):
+        with patch("bugeval.pr_utils.run_gh", side_effect=[raw, "[]"]):
             comments = scrape_coderabbit_comments("org/repo", 1)
 
         assert len(comments) == 2
@@ -152,7 +152,7 @@ class TestScrapeCodeRabbitComments:
             ]
         )
 
-        with patch("bugeval.copilot_runner.run_gh", return_value=raw):
+        with patch("bugeval.pr_utils.run_gh", side_effect=[raw, "[]"]):
             comments = scrape_coderabbit_comments("org/repo", 1)
 
         assert comments == []
@@ -160,9 +160,10 @@ class TestScrapeCodeRabbitComments:
 
 class TestSaveCodeRabbitTranscript:
     def test_saves_transcript(self, tmp_path: Path) -> None:
-        result = _save_coderabbit_transcript(
+        result = save_pr_transcript(
             tmp_path,
             "leo-001",
+            "coderabbit",
             fork="org/leo",
             branch="eval/leo-001",
             pr_number=42,

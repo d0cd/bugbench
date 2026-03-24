@@ -68,7 +68,7 @@ class TestEstimateClaudeCliCost:
 
 
 class TestRunClaudeCliJsonOutput:
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_parses_json_output(self, mock_run: MagicMock) -> None:
         output = {
             "result": '[{"file":"f.rs","line":1,"description":"bug here"}]',
@@ -101,7 +101,7 @@ class TestRunClaudeCliJsonOutput:
         assert result.cost_usd > 0
         assert result.error == ""
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_diff_only_disallows_tools(self, mock_run: MagicMock) -> None:
         output = {"result": "[]", "cost": {}}
         mock_run.return_value = sp.CompletedProcess(
@@ -116,7 +116,7 @@ class TestRunClaudeCliJsonOutput:
         cmd = mock_run.call_args[0][0]
         assert "--disallowedTools" in cmd
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_repo_context_allows_tools(
         self,
         mock_run: MagicMock,
@@ -145,7 +145,7 @@ class TestRunClaudeCliJsonOutput:
         assert "--allowedTools" in cmd
         assert "--disallowedTools" not in cmd
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_json_decode_error_fallback(self, mock_run: MagicMock) -> None:
         mock_run.return_value = sp.CompletedProcess(
             args=["claude"],
@@ -167,7 +167,7 @@ class TestRunClaudeCliJsonOutput:
         assert result.error == ""
         assert len(result.comments) == 1
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_timeout_returns_error(self, mock_run: MagicMock) -> None:
         mock_run.side_effect = sp.TimeoutExpired(cmd="claude", timeout=300)
         case = _make_case()
@@ -182,7 +182,7 @@ class TestRunClaudeCliJsonOutput:
         )
         assert "timed out" in result.error.lower()
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_not_found_returns_error(self, mock_run: MagicMock) -> None:
         mock_run.side_effect = FileNotFoundError("claude not found")
         case = _make_case()
@@ -199,7 +199,7 @@ class TestRunClaudeCliJsonOutput:
 
 
 class TestRunClaudeCliTranscript:
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_transcript_saved(
         self,
         mock_run: MagicMock,
@@ -234,7 +234,7 @@ class TestRunClaudeCliTranscript:
 
 
 class TestRunGeminiCli:
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_correct_flags(self, mock_run: MagicMock) -> None:
         output = '[{"file":"g.rs","line":5,"description":"issue"}]'
         mock_run.return_value = sp.CompletedProcess(
@@ -260,7 +260,7 @@ class TestRunGeminiCli:
         assert cmd[0] == "gemini"
         assert "-p" in cmd
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_uses_stdin(self, mock_run: MagicMock) -> None:
         """Verify Gemini CLI pipes prompt via stdin, not as CLI argument."""
         mock_run.return_value = sp.CompletedProcess(
@@ -280,7 +280,7 @@ class TestRunGeminiCli:
         # Prompt must be piped via input=
         assert call_kwargs.kwargs.get("input") is not None
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_repo_context_uses_yolo(
         self,
         mock_run: MagicMock,
@@ -307,7 +307,7 @@ class TestRunGeminiCli:
         cmd = mock_run.call_args[0][0]
         assert "--yolo" in cmd
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_timeout(self, mock_run: MagicMock) -> None:
         mock_run.side_effect = sp.TimeoutExpired(cmd="gemini", timeout=300)
         case = _make_case()
@@ -324,7 +324,7 @@ class TestRunGeminiCli:
 
 
 class TestRunCodexCli:
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_correct_flags(self, mock_run: MagicMock) -> None:
         output = '[{"file":"c.rs","line":3,"description":"codex issue"}]'
         mock_run.return_value = sp.CompletedProcess(
@@ -353,7 +353,7 @@ class TestRunCodexCli:
         idx = cmd.index("--sandbox")
         assert cmd[idx + 1] == "read-only"
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_uses_stdin(self, mock_run: MagicMock) -> None:
         """Verify Codex CLI pipes prompt via stdin, not as CLI argument."""
         mock_run.return_value = sp.CompletedProcess(
@@ -373,7 +373,7 @@ class TestRunCodexCli:
         # Prompt must be piped via input=
         assert call_kwargs.kwargs.get("input") is not None
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_repo_context_uses_workspace_write(
         self,
         mock_run: MagicMock,
@@ -401,7 +401,7 @@ class TestRunCodexCli:
         idx = cmd.index("--sandbox")
         assert cmd[idx + 1] == "workspace-write"
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_timeout(self, mock_run: MagicMock) -> None:
         mock_run.side_effect = sp.TimeoutExpired(cmd="codex", timeout=300)
         case = _make_case()
@@ -418,7 +418,7 @@ class TestRunCodexCli:
 
 
 class TestCliDispatchAllTools:
-    @patch("bugeval.agent_runner._run_claude_cli")
+    @patch("bugeval._cli_runners._run_claude_cli")
     def test_dispatch_claude(self, mock_claude: MagicMock) -> None:
         mock_claude.return_value = ToolResult(
             case_id="leo-001",
@@ -435,7 +435,7 @@ class TestCliDispatchAllTools:
         assert result.tool == "agent-cli-claude"
         mock_claude.assert_called_once()
 
-    @patch("bugeval.agent_runner._run_gemini_cli")
+    @patch("bugeval._cli_runners._run_gemini_cli")
     def test_dispatch_gemini(self, mock_gemini: MagicMock) -> None:
         mock_gemini.return_value = ToolResult(
             case_id="leo-001",
@@ -452,7 +452,7 @@ class TestCliDispatchAllTools:
         assert result.tool == "agent-cli-gemini"
         mock_gemini.assert_called_once()
 
-    @patch("bugeval.agent_runner._run_codex_cli")
+    @patch("bugeval._cli_runners._run_codex_cli")
     def test_dispatch_codex(self, mock_codex: MagicMock) -> None:
         mock_codex.return_value = ToolResult(
             case_id="leo-001",
@@ -511,7 +511,7 @@ class TestSaveCliTranscript:
 
 
 class TestCliModelOverride:
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_claude_includes_model_flag(self, mock_run: MagicMock) -> None:
         output = {"result": "[]", "cost": {}}
         mock_run.return_value = sp.CompletedProcess(
@@ -536,7 +536,7 @@ class TestCliModelOverride:
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "claude-opus-4-6"
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_claude_omits_model_flag_when_empty(
         self,
         mock_run: MagicMock,
@@ -562,7 +562,7 @@ class TestCliModelOverride:
         cmd = mock_run.call_args[0][0]
         assert "--model" not in cmd
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_gemini_includes_model_flag(self, mock_run: MagicMock) -> None:
         mock_run.return_value = sp.CompletedProcess(
             args=["gemini"],
@@ -586,7 +586,7 @@ class TestCliModelOverride:
         idx = cmd.index("-m")
         assert cmd[idx + 1] == "gemini-2.5-pro"
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_codex_includes_model_flag(self, mock_run: MagicMock) -> None:
         mock_run.return_value = sp.CompletedProcess(
             args=["codex"],
@@ -610,7 +610,7 @@ class TestCliModelOverride:
         idx = cmd.index("-m")
         assert cmd[idx + 1] == "o3"
 
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_run_agent_cli_passes_model(self, mock_run: MagicMock) -> None:
         """Verify run_agent_cli threads model to the underlying CLI runner."""
         output = {"result": "[]", "cost": {}}
@@ -1085,6 +1085,7 @@ class TestCleanupPrsHelp:
         result = runner.invoke(cli, ["cleanup-prs", "--help"])
         assert result.exit_code == 0
         assert "--org" in result.output
+        assert "--repo" in result.output
         assert "--tool" in result.output
         assert "--dry-run" in result.output
 
@@ -1132,6 +1133,8 @@ class TestCleanupPrsHelp:
                     "cleanup-prs",
                     "--org",
                     "TestOrg",
+                    "--repo",
+                    "ProvableHQ/leo",
                 ],
             )
 
@@ -1175,6 +1178,8 @@ class TestCleanupPrsHelp:
                     "cleanup-prs",
                     "--org",
                     "TestOrg",
+                    "--repo",
+                    "ProvableHQ/leo",
                     "--tool",
                     "copilot",
                 ],
@@ -1226,6 +1231,8 @@ class TestCleanupPrsHelp:
                     "cleanup-prs",
                     "--org",
                     "TestOrg",
+                    "--repo",
+                    "ProvableHQ/leo",
                     "--tool",
                     "copilot",
                     "--dry-run",

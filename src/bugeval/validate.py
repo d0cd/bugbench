@@ -13,7 +13,7 @@ from pathlib import Path
 from bugeval.io import load_cases, load_checkpoint, save_case, save_checkpoint
 from bugeval.models import TestCase, Validation
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 _checkpoint_lock = threading.Lock()
 
@@ -61,7 +61,7 @@ def call_llm(prompt: str, model: str = "", backend: str = "sdk") -> str:
 
     result = _call_llm(prompt, model, backend=backend)
     if result.error:
-        logger.warning("LLM call failed: %s", result.error)
+        log.warning("LLM call failed: %s", result.error)
         return json.dumps({"verdict": "ambiguous", "reasoning": result.error})
     return result.text
 
@@ -97,7 +97,7 @@ def _get_introducing_diff(case: TestCase, repo_dir: Path) -> str:
         )
         return result.stdout
     except subprocess.CalledProcessError:
-        logger.warning("Failed to get diff for %s commit %s", case.id, commit)
+        log.warning("Failed to get diff for %s commit %s", case.id, commit)
         return ""
 
 
@@ -124,7 +124,7 @@ def validate_case(
             raw = call_llm(prompt, backend="openai")
             openai_verdict = parse_verdict(raw)
         else:
-            logger.warning("Unknown model: %s", model_name)
+            log.warning("Unknown model: %s", model_name)
 
     # Compute agreement: all present verdicts must match
     verdicts = [v for v in [claude_verdict, gemini_verdict, openai_verdict] if v]
@@ -159,29 +159,29 @@ def validate_cases(
     to_validate: list[TestCase] = []
     for case in cases:
         if case.id in done:
-            logger.info("Skipping %s (checkpoint)", case.id)
+            log.info("Skipping %s (checkpoint)", case.id)
             continue
         if case.validation and case.validation.test_validated:
-            logger.info("Skipping %s (already validated)", case.id)
+            log.info("Skipping %s (already validated)", case.id)
             continue
         if case.truth is None:
-            logger.info("Skipping %s (no ground truth)", case.id)
+            log.info("Skipping %s (no ground truth)", case.id)
             continue
         to_validate.append(case)
 
     if not to_validate:
-        logger.info("No cases to validate")
+        log.info("No cases to validate")
         return
 
     if dry_run:
         for case in to_validate:
-            logger.info("[dry-run] Would validate %s", case.id)
+            log.info("[dry-run] Would validate %s", case.id)
         return
 
     def _process(case: TestCase) -> str:
         diff = _get_introducing_diff(case, repo_dir)
         if not diff:
-            logger.warning("No diff for %s, skipping", case.id)
+            log.warning("No diff for %s, skipping", case.id)
             return case.id
         validation = validate_case(case, diff, models, backend=backend)
         case.validation = validation
@@ -205,4 +205,4 @@ def validate_cases(
             with _checkpoint_lock:
                 done.add(case_id)
                 save_checkpoint(done, checkpoint_path)
-            logger.info("Validated %s", case_id)
+            log.info("Validated %s", case_id)

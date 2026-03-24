@@ -520,7 +520,7 @@ def detect_contamination(result: ToolResult, case: TestCase) -> bool:
         if not comment_words:
             continue
         overlap = comment_words & fix_words
-        if len(overlap) / len(comment_words) > 0.5:
+        if len(overlap) / len(comment_words) > 0.3:
             return True
 
     return False

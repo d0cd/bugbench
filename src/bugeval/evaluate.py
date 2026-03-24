@@ -24,7 +24,10 @@ from bugeval.io import (
 from bugeval.models import TestCase
 from bugeval.result_models import ToolResult
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+_GIT_TIMEOUT = 120
+_GH_TIMEOUT = 120
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "config.yaml"
 
@@ -87,7 +90,7 @@ def _run_sdk_in_docker(
     transcript_dir: Path | None = None,
     model: str = "",
     max_turns: int = 30,
-    docker_image: str = "bugeval-agent-v2",
+    docker_image: str = "bugeval-agent",
 ) -> ToolResult:
     """Run Agent SDK inside Docker container for any SDK tool.
 
@@ -132,7 +135,14 @@ def _run_sdk_in_docker(
 
     effective_model = model or MODEL
     src_dir = Path(__file__).resolve().parent.parent
-    workspace_path = str(workspace.resolve()) if workspace else "/dev/null"
+    if not workspace:
+        return ToolResult(
+            case_id=case.id,
+            tool=tool_name,
+            context_level=context_level,
+            error="No workspace provided for Docker execution",
+        )
+    workspace_path = str(workspace.resolve())
 
     config = {
         "prompt": full_prompt,
@@ -217,7 +227,14 @@ def _run_2pass_in_docker(
 
     effective_model = model or MODEL
     src_dir = Path(__file__).resolve().parent.parent
-    workspace_path = str(workspace.resolve()) if workspace else "/dev/null"
+    if not workspace:
+        return ToolResult(
+            case_id=case.id,
+            tool="agent-sdk-2pass",
+            context_level=context_level,
+            error="No workspace provided for Docker execution",
+        )
+    workspace_path = str(workspace.resolve())
 
     sanitized = sanitize_diff(diff)
     description = ""
@@ -336,7 +353,14 @@ def _run_v3_in_docker(
 
     effective_model = model or "claude-opus-4-6"
     src_dir = Path(__file__).resolve().parent.parent
-    workspace_path = str(workspace.resolve()) if workspace else "/dev/null"
+    if not workspace:
+        return ToolResult(
+            case_id=case.id,
+            tool="agent-sdk-v3",
+            context_level=context_level,
+            error="No workspace provided for Docker execution",
+        )
+    workspace_path = str(workspace.resolve())
 
     # Write annotated diff + domain file into workspace
     if workspace:
@@ -488,18 +512,28 @@ def _docker_sdk_exec(
         }
 
     if not result.stdout.strip():
-        logger.warning(
+        log.warning(
             "Docker SDK empty stdout (rc=%d): %s",
             result.returncode,
             result.stderr[:200],
         )
-        return {"result_text": "", "cost_usd": 0.0, "messages": []}
+        return {
+            "error": f"Docker returned empty stdout (rc={result.returncode})",
+            "result_text": "",
+            "cost_usd": 0.0,
+            "messages": [],
+        }
 
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
-        logger.warning("Docker SDK invalid JSON: %s", result.stdout[:200])
-        return {"result_text": "", "cost_usd": 0.0, "messages": []}
+        log.warning("Docker SDK invalid JSON: %s", result.stdout[:200])
+        return {
+            "error": "Docker returned invalid JSON",
+            "result_text": result.stdout[:500],
+            "cost_usd": 0.0,
+            "messages": [],
+        }
 
 
 def ensure_per_tool_clone(
@@ -525,7 +559,7 @@ def ensure_per_tool_clone(
                 cwd=clone_dir,
                 check=True,
                 capture_output=True,
-                timeout=120,
+                timeout=_GIT_TIMEOUT,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass  # best-effort; clone still usable
@@ -557,7 +591,7 @@ def ensure_per_tool_clone(
         )
         return clone_dir
 
-    logger.info(
+    log.info(
         "Creating per-tool clone: %s -> %s",
         repo_dir,
         clone_dir,
@@ -567,7 +601,7 @@ def ensure_per_tool_clone(
             ["git", "clone", "--local", str(repo_dir), str(clone_dir)],
             check=True,
             capture_output=True,
-            timeout=120,
+            timeout=_GIT_TIMEOUT,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         # Clean up incomplete clone directory
@@ -580,6 +614,7 @@ def ensure_per_tool_clone(
 
 
 _checkpoint_lock = threading.Lock()
+_API_SEMAPHORE = threading.Semaphore(5)  # Max 5 concurrent API calls
 
 
 def get_diff_for_case(case: TestCase, repo_dir: Path) -> str:
@@ -588,7 +623,7 @@ def get_diff_for_case(case: TestCase, repo_dir: Path) -> str:
     if case.truth and case.truth.introducing_commit:
         introducing = case.truth.introducing_commit
     if not introducing:
-        logger.warning(
+        log.warning(
             "No introducing commit for case %s, skipping",
             case.id,
         )
@@ -834,7 +869,7 @@ def process_case(
 
     # Log phase timing
     t_total = time.monotonic() - t0
-    logger.info(
+    log.info(
         "Timing %s/%s: diff=%.1fs runner=%.1fs total=%.1fs cost=$%.2f",
         case.id,
         tool,
@@ -872,7 +907,7 @@ def evaluate_tool(
     tool_timeouts = load_tool_timeouts()
     effective_timeout = resolve_timeout(tool, timeout, tool_timeouts)
     if effective_timeout != timeout:
-        logger.info(
+        log.info(
             "Using config timeout %ds for %s (CLI default: %ds)",
             effective_timeout,
             tool,
@@ -886,12 +921,32 @@ def evaluate_tool(
 
     cases = load_cases(cases_dir)
     if not cases:
-        logger.warning("No cases found in %s", cases_dir)
+        log.warning("No cases found in %s", cases_dir)
         return
 
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = run_dir / "checkpoint.json"
     done = load_checkpoint(checkpoint_path)
+
+    # Validate checkpoint consistency
+    results_dir = run_dir / "results"
+    if done:
+        stale_keys = []
+        for key in list(done):
+            parts = key.split("::")
+            case_id = parts[0]
+            # Check if result file exists
+            pattern = f"{case_id}--*"
+            if not list(results_dir.glob(pattern)):
+                stale_keys.append(key)
+        if stale_keys:
+            log.warning(
+                "Removing %d stale checkpoint entries (missing result files): %s",
+                len(stale_keys),
+                stale_keys[:5],
+            )
+            done -= set(stale_keys)
+            save_checkpoint(done, checkpoint_path)
 
     # Write run metadata
     metadata_path = run_dir / "run_metadata.json"
@@ -913,7 +968,7 @@ def evaluate_tool(
         if key not in done:
             pending.append(c)
 
-    logger.info(
+    log.info(
         "Evaluating %s: %d pending, %d done, %d total",
         tool,
         len(pending),
@@ -923,7 +978,7 @@ def evaluate_tool(
 
     if dry_run:
         for c in pending:
-            logger.info("[dry-run] Would process %s with %s", c.id, tool)
+            log.info("[dry-run] Would process %s with %s", c.id, tool)
         return
 
     checkpoint_batch_size = 5
@@ -949,13 +1004,20 @@ def evaluate_tool(
                     docker=docker,
                     docker_image=docker_image,
                 )
-            except Exception:
-                logger.exception("Error processing %s", c.id)
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+                json.JSONDecodeError,
+                KeyError,
+                ValueError,
+            ):
+                log.exception("Error processing %s", c.id)
                 continue
             key = _checkpoint_key(c.id, tool, context_level)
             pending_keys.append(key)
             completed += 1
-            logger.info("Evaluated %d/%d: %s", completed, total, c.id)
+            log.info("Evaluated %d/%d: %s", completed, total, c.id)
             if len(pending_keys) >= checkpoint_batch_size:
                 with _checkpoint_lock:
                     done.update(pending_keys)
@@ -966,10 +1028,10 @@ def evaluate_tool(
                 done.update(pending_keys)
                 save_checkpoint(done, checkpoint_path)
     else:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {
-                pool.submit(
-                    process_case,
+
+        def _throttled_process_case(c: TestCase) -> ToolResult:
+            with _API_SEMAPHORE:
+                return process_case(
                     c,
                     tool,
                     context_level,
@@ -982,9 +1044,10 @@ def evaluate_tool(
                     org=org,
                     docker=docker,
                     docker_image=docker_image,
-                ): c
-                for c in pending
-            }
+                )
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_throttled_process_case, c): c for c in pending}
             pending_keys_concurrent: list[str] = []
             for future in as_completed(futures):
                 c = futures[future]
@@ -993,14 +1056,21 @@ def evaluate_tool(
                     key = _checkpoint_key(c.id, tool, context_level)
                     pending_keys_concurrent.append(key)
                     completed += 1
-                    logger.info("Evaluated %d/%d: %s", completed, total, c.id)
+                    log.info("Evaluated %d/%d: %s", completed, total, c.id)
                     if len(pending_keys_concurrent) >= checkpoint_batch_size:
                         with _checkpoint_lock:
                             done.update(pending_keys_concurrent)
                             save_checkpoint(done, checkpoint_path)
                         pending_keys_concurrent = []
-                except Exception:
-                    logger.warning(
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                    OSError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    ValueError,
+                ):
+                    log.warning(
                         "Error processing %s, will retry next run",
                         c.id,
                     )

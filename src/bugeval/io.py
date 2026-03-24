@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +14,35 @@ from bugeval.models import TestCase
 from bugeval.result_models import ToolResult
 from bugeval.score_models import CaseScore
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    """Write data to path atomically via temp file + rename."""
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)  # atomic on POSIX
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def find_case_path(case_id: str, cases_dir: Path) -> Path | None:
+    """Find a case YAML file by ID in cases_dir (searches subdirectories)."""
+    for p in cases_dir.rglob("*.yaml"):
+        if p.stem == case_id:
+            return p
+    return None
 
 
 def save_case(case: TestCase, path: Path) -> None:
     """Serialize a TestCase to YAML."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(case.model_dump(mode="json"), f, sort_keys=False)
+    _atomic_write(path, yaml.safe_dump(case.model_dump(mode="json"), sort_keys=False))
 
 
 def load_case(path: Path) -> TestCase:
@@ -48,8 +70,7 @@ def load_cases(cases_dir: Path, *, include_excluded: bool = False) -> list[TestC
 def save_result(result: ToolResult, path: Path) -> None:
     """Serialize a ToolResult to YAML."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(result.model_dump(mode="json"), f, sort_keys=False)
+    _atomic_write(path, yaml.safe_dump(result.model_dump(mode="json"), sort_keys=False))
 
 
 def load_result(path: Path) -> ToolResult:
@@ -62,8 +83,7 @@ def load_result(path: Path) -> ToolResult:
 def save_score(score: CaseScore, path: Path) -> None:
     """Serialize a CaseScore to YAML."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(score.model_dump(mode="json"), f, sort_keys=False)
+    _atomic_write(path, yaml.safe_dump(score.model_dump(mode="json"), sort_keys=False))
 
 
 def load_score(path: Path) -> CaseScore:
@@ -80,7 +100,7 @@ def load_checkpoint(path: Path) -> set[str]:
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError:
-        logger.warning("Corrupt checkpoint %s, starting fresh", path)
+        log.warning("Corrupt checkpoint %s, starting fresh", path)
         return set()
     return set(data)
 
@@ -88,7 +108,7 @@ def load_checkpoint(path: Path) -> set[str]:
 def save_checkpoint(done: set[str], path: Path) -> None:
     """Save a checkpoint file (JSON list of completed IDs)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(sorted(done), indent=2))
+    _atomic_write(path, json.dumps(sorted(done), indent=2))
 
 
 def write_run_metadata(
@@ -136,4 +156,4 @@ def write_run_metadata(
     if cases_dir.exists():
         meta["total_cases"] = sum(1 for _ in cases_dir.rglob("*.yaml"))
     meta["python_version"] = sys.version.split()[0]
-    (run_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))
+    _atomic_write(run_dir / "run_metadata.json", json.dumps(meta, indent=2))

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from bugeval.agent_runner import _scrub_fix_references
-from bugeval.copilot_runner import (
+from bugeval.git_utils import GitError
+from bugeval.mine import GhError, run_gh
+from bugeval.models import TestCase
+from bugeval.pr_utils import (
     _get_patch_diff,
     close_eval_pr,
     create_eval_branches,
@@ -17,10 +21,9 @@ from bugeval.copilot_runner import (
     ensure_tool_repo,
     open_eval_pr,
     poll_for_review,
+    save_pr_transcript,
     scrape_pr_comments,
 )
-from bugeval.mine import GhError, run_gh
-from bugeval.models import TestCase
 from bugeval.result_models import Comment, ToolResult
 
 log = logging.getLogger(__name__)
@@ -72,51 +75,6 @@ def _scrape_raw_greptile_comments(
     return raw
 
 
-def _save_greptile_transcript(
-    transcript_dir: Path,
-    case_id: str,
-    *,
-    fork: str,
-    branch: str,
-    pr_number: int,
-    scrubbed_title: str,
-    scrubbed_body: str,
-    raw_comments: list[dict[str, Any]],
-    patch_diff: str,
-    time_seconds: float,
-) -> str:
-    """Save the Greptile interaction transcript for audit."""
-    transcript_dir.mkdir(parents=True, exist_ok=True)
-    path = transcript_dir / f"{case_id}-greptile.json"
-    data = {
-        "pr_metadata": {
-            "fork": fork,
-            "branch": branch,
-            "pr_number": pr_number,
-        },
-        "scrubbed_title": scrubbed_title,
-        "scrubbed_body": scrubbed_body,
-        "raw_comments": raw_comments,
-        "patch_diff": patch_diff,
-        "time_seconds": time_seconds,
-    }
-    path.write_text(json.dumps(data, indent=2, default=str))
-    return str(path)
-
-
-def _default_branch(fork: str) -> str:
-    output = run_gh(
-        "repo",
-        "view",
-        fork,
-        "--json",
-        "defaultBranchRef",
-        "-q",
-        ".defaultBranchRef.name",
-    )
-    return output.strip() or "main"
-
-
 def run_greptile(
     case: TestCase,
     repo_dir: Path,
@@ -156,9 +114,10 @@ def run_greptile(
         if not found:
             elapsed = time.monotonic() - start
             if transcript_dir:
-                _save_greptile_transcript(
+                save_pr_transcript(
                     transcript_dir,
                     case.id,
+                    "greptile",
                     fork=fork,
                     branch=head_branch,
                     pr_number=pr_number,
@@ -184,9 +143,10 @@ def run_greptile(
 
         transcript_path = ""
         if transcript_dir:
-            transcript_path = _save_greptile_transcript(
+            transcript_path = save_pr_transcript(
                 transcript_dir,
                 case.id,
+                "greptile",
                 fork=fork,
                 branch=head_branch,
                 pr_number=pr_number,
@@ -205,7 +165,14 @@ def run_greptile(
             transcript_path=transcript_path,
             pr_number=pr_number,
         )
-    except Exception as exc:
+    except (
+        GhError,
+        GitError,
+        subprocess.CalledProcessError,
+        OSError,
+        json.JSONDecodeError,
+        RuntimeError,
+    ) as exc:
         elapsed = time.monotonic() - start
         return ToolResult(
             case_id=case.id,
@@ -220,7 +187,7 @@ def run_greptile(
         if pr_number and fork and head_branch:
             try:
                 close_eval_pr(fork, pr_number, head_branch, base_branch)
-            except Exception:
+            except (GhError, subprocess.CalledProcessError, OSError):
                 log.warning(
                     "Failed to clean up PR #%d on %s",
                     pr_number,

@@ -9,7 +9,9 @@ from unittest.mock import patch
 import pytest
 
 from bugeval.ground_truth import (
+    _is_non_source_file,
     _is_test_expectation_file,
+    _is_test_file,
     classify_bug,
     classify_line_content,
     compute_buggy_lines,
@@ -497,11 +499,10 @@ class TestIsTestExpectationFile:
 
 
 class TestComputeBuggyLinesTestExpectation:
-    def test_out_file_lines_marked(self) -> None:
+    def test_out_file_lines_filtered_out(self) -> None:
+        """Test expectation files under tests/ are excluded from buggy lines."""
         result = compute_buggy_lines(OUT_FILE_INTRO_DIFF, [OUT_FILE_FIX_DIFF])
-        assert len(result) > 0
-        for bl in result:
-            assert bl.is_test_expectation is True
+        assert len(result) == 0
 
     def test_source_lines_not_marked(self) -> None:
         result = compute_buggy_lines(SINGLE_FILE_DIFF, [FIX_DIFF_EXACT])
@@ -1041,3 +1042,126 @@ class TestSiblingMerge:
         assert 200 in fix_prs_found  # sibling
         # fix_pr_numbers should include both
         assert 200 in result.truth.fix_pr_numbers
+
+
+# ---------------------------------------------------------------------------
+# _is_test_file
+# ---------------------------------------------------------------------------
+
+
+class TestIsTestFile:
+    def test_tests_dir(self) -> None:
+        assert _is_test_file("tests/foo.rs")
+
+    def test_test_dir(self) -> None:
+        assert _is_test_file("test/bar.rs")
+
+    def test_benches_dir(self) -> None:
+        assert _is_test_file("benches/bench.rs")
+
+    def test_examples_dir(self) -> None:
+        assert _is_test_file("examples/demo.rs")
+
+    def test_nested_tests_dir(self) -> None:
+        assert _is_test_file("compiler/tests/parser/foo.rs")
+
+    def test_expectation_ext_out(self) -> None:
+        assert _is_test_file("some/path/output.out")
+
+    def test_expectation_ext_stderr(self) -> None:
+        assert _is_test_file("some/path/output.stderr")
+
+    def test_source_file_not_test(self) -> None:
+        assert not _is_test_file("src/lib.rs")
+
+    def test_src_main_not_test(self) -> None:
+        assert not _is_test_file("src/main.rs")
+
+
+# ---------------------------------------------------------------------------
+# _is_non_source_file — new entries
+# ---------------------------------------------------------------------------
+
+
+class TestIsNonSourceFileExtended:
+    def test_cargo_toml(self) -> None:
+        assert _is_non_source_file("Cargo.toml")
+
+    def test_readme_md(self) -> None:
+        assert _is_non_source_file("README.md")
+
+    def test_readme_plain(self) -> None:
+        assert _is_non_source_file("README")
+
+    def test_changelog(self) -> None:
+        assert _is_non_source_file("CHANGELOG.md")
+
+    def test_license(self) -> None:
+        assert _is_non_source_file("LICENSE")
+
+    def test_license_mit(self) -> None:
+        assert _is_non_source_file("LICENSE-MIT")
+
+    def test_license_apache(self) -> None:
+        assert _is_non_source_file("LICENSE-APACHE")
+
+    def test_cargo_lock_still_works(self) -> None:
+        assert _is_non_source_file("Cargo.lock")
+
+    def test_source_file_not_excluded(self) -> None:
+        assert not _is_non_source_file("src/lib.rs")
+
+
+# ---------------------------------------------------------------------------
+# Category classification — Leo-specific patterns
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBugLeoPatterns:
+    def _case(self, title: str, desc: str = "") -> TestCase:
+        from bugeval.models import CaseKind
+
+        return TestCase(
+            id="t-001",
+            repo="ProvableHQ/leo",
+            kind=CaseKind.bug,
+            base_commit="abc",
+            fix_pr_title=title,
+            bug_description=desc,
+        )
+
+    def test_type_check(self) -> None:
+        result = classify_bug(self._case("Fix type check for struct literals"))
+        assert result["category"] == "type"
+
+    def test_type_system(self) -> None:
+        result = classify_bug(self._case("Fix type system inference for tuples"))
+        assert result["category"] == "type"
+
+    def test_type_mismatch(self) -> None:
+        result = classify_bug(self._case("Fix type mismatch error in assignment"))
+        assert result["category"] == "type"
+
+    def test_coercion(self) -> None:
+        result = classify_bug(self._case("Fix coercion from u8 to u16"))
+        assert result["category"] == "type"
+
+    def test_ast_parser(self) -> None:
+        result = classify_bug(self._case("Fix AST node for conditional expression"))
+        assert result["category"] == "parser"
+
+    def test_finalize_block(self) -> None:
+        result = classify_bug(self._case("Fix finalize block parsing"))
+        assert result["category"] == "parser"
+
+    def test_circuit_codegen(self) -> None:
+        result = classify_bug(self._case("Fix circuit generation for records"))
+        assert result["category"] == "codegen"
+
+    def test_constraint_codegen(self) -> None:
+        result = classify_bug(self._case("Fix constraint synthesis for conditionals"))
+        assert result["category"] == "codegen"
+
+    def test_compiler_pass(self) -> None:
+        result = classify_bug(self._case("Fix compiler transform for loop unrolling"))
+        assert result["category"] == "compiler-pass"

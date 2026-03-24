@@ -55,16 +55,19 @@ def _capture_message(
     """Extract content blocks from an AssistantMessage into messages list."""
     if isinstance(message, assistant_cls):
         entry: dict[str, Any] = {"role": "assistant", "content": []}
-        for block in message.content:
-            if hasattr(block, "text"):
+        content = getattr(message, "content", [])
+        for block in content:
+            text_val = getattr(block, "text", None)
+            name_val = getattr(block, "name", None)
+            if text_val is not None:
                 entry["content"].append(
-                    {"type": "text", "text": block.text},
+                    {"type": "text", "text": text_val},
                 )
-            elif hasattr(block, "name"):
+            elif name_val is not None:
                 entry["content"].append(
                     {
                         "type": "tool_use",
-                        "name": block.name,
+                        "name": name_val,
                         "input": getattr(block, "input", {}),
                     },
                 )

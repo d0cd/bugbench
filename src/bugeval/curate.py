@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from bugeval.io import load_cases, save_case
+from bugeval.io import find_case_path, load_cases, save_case
 from bugeval.models import TestCase
 
 log = logging.getLogger(__name__)
@@ -72,7 +72,19 @@ _TYPO_SIGNALS = re.compile(
     re.IGNORECASE,
 )
 _RELEASE_SIGNALS = re.compile(
-    r"(\[release\]|patch\s+release|version\s+bump|v\d+\.\d+\.\d+\s+patch)",
+    r"(\[release\]|patch\s+release|version\s+bump|v\d+\.\d+\.\d+\s+patch"
+    r"|postrelease\b|merge\s+mainnet|increment\s+version)",
+    re.IGNORECASE,
+)
+_TEST_ONLY_SIGNALS = re.compile(
+    r"^(implement|add|automatic)\s+tests?\b(?!.*\bfix\b)"
+    r"|^\[test\]\s"
+    r"|^test/\s"
+    r"|e2e\s+\w*\s*test",
+    re.IGNORECASE,
+)
+_MIGRATION_SIGNALS = re.compile(
+    r"\b(migrat\w+\s+namespace|rename\w*\s+(?:from|to)\b)",
     re.IGNORECASE,
 )
 _PERF_SIGNALS = re.compile(
@@ -94,6 +106,20 @@ def auto_curate_case(
     truth = case.truth
     fix_title = case.fix_pr_title.lower()
 
+    # Empty title — can't evaluate without knowing what was fixed
+    if not fix_title.strip():
+        return REASON_FEATURE_NOT_FIX
+
+    # Reverts (without "fix" — a revert of a fix is a regression, keep those)
+    if "revert" in fix_title and "fix" not in fix_title:
+        return REASON_FEATURE_NOT_FIX
+
+    # Merge/staging branches — not targeted fixes
+    if fix_title.startswith("merge ") and (
+        "staging" in fix_title or "mainnet" in fix_title or "master" in fix_title
+    ):
+        return REASON_RELEASE_VERSION
+
     # Dependency bumps (dependabot, renovate, version bumps)
     if fix_title.startswith("bump ") or fix_title.startswith("chore(deps"):
         return REASON_DEPENDENCY_BUMP
@@ -107,9 +133,14 @@ def auto_curate_case(
         if not source_lines:
             return REASON_CI_FIX
 
-    # Doc-only fixes
+    # Doc-only fixes — but only if no substantial code buggy lines
+    # (some PRs titled "doc fixes" also contain real code changes)
     if any(sig in fix_title for sig in _DOC_SIGNALS):
-        return REASON_DOC_FIX
+        if truth is None or not truth.buggy_lines:
+            return REASON_DOC_FIX
+        source_lines = [bl for bl in truth.buggy_lines if not bl.is_test_expectation]
+        if len(source_lines) < 5:
+            return REASON_DOC_FIX
 
     # Clippy / lint / formatting fixes
     if _LINT_SIGNALS.search(fix_title):
@@ -130,6 +161,14 @@ def auto_curate_case(
     # Deprecation warning removal
     if _DEPRECATION_SIGNALS.search(fix_title):
         return REASON_DEPRECATION
+
+    # Test-only additions (not fixing a bug, just adding tests)
+    if _TEST_ONLY_SIGNALS.search(fix_title):
+        return REASON_FEATURE_NOT_FIX
+
+    # Namespace migration / rename (not a bug fix)
+    if _MIGRATION_SIGNALS.search(fix_title):
+        return REASON_FEATURE_NOT_FIX
 
     # Fix PR is actually a feature
     if any(kw.lower() in fix_title for kw in FEATURE_KEYWORDS):
@@ -273,11 +312,31 @@ def compute_quality_flags(case: TestCase) -> list[str]:
     flags: list[str] = []
     truth = case.truth
 
-    if truth and truth.buggy_lines and len(truth.buggy_lines) > MAX_BUGGY_LINES:
-        flags.append("many-buggy-lines")
+    if truth and truth.buggy_lines:
+        n = len(truth.buggy_lines)
+        if n > MAX_BUGGY_LINES:
+            flags.append("many-buggy-lines")
+        elif n <= 2:
+            flags.append("few-buggy-lines")
+
+        # Check for high test-expectation ratio
+        test_exp = sum(1 for bl in truth.buggy_lines if bl.is_test_expectation)
+        if n > 0 and test_exp / n > 0.5:
+            flags.append("high-test-expectations")
+
+        # Check for non-source files in buggy lines
+        non_source = sum(
+            1 for bl in truth.buggy_lines if bl.file.endswith((".toml", ".md", ".lock", ".json"))
+        )
+        if n > 0 and non_source / n > 0.3:
+            flags.append("non-source-heavy")
 
     if truth and truth.blame_confidence and truth.blame_confidence in ("C", "D"):
         flags.append("low-blame-confidence")
+
+    # Check for missing ground truth
+    if not truth or not truth.buggy_lines:
+        flags.append("no-ground-truth")
 
     return flags
 
@@ -318,7 +377,7 @@ def curate_cases(
                 case.excluded = False
                 case.excluded_reason = ""
                 if not dry_run:
-                    path = _find_case_path(cases_dir, case.id)
+                    path = find_case_path(case.id, cases_dir)
                     if path:
                         save_case(case, path)
         return results
@@ -342,7 +401,7 @@ def curate_cases(
             if not dry_run:
                 case.excluded = True
                 case.excluded_reason = reason
-                path = _find_case_path(cases_dir, case.id)
+                path = find_case_path(case.id, cases_dir)
                 if path:
                     save_case(case, path)
 
@@ -353,23 +412,17 @@ def curate_cases(
                     case.status = "curated"
                     status_changed = True
             flags = compute_quality_flags(case)
-            if flags:
+            flags_changed = flags != (case.quality_flags or [])
+            if flags_changed:
                 case.quality_flags = flags
+            if flags:
                 results.setdefault("quality-flagged", []).append(case.id)
-            if not dry_run and (flags or status_changed):
-                path = _find_case_path(cases_dir, case.id)
+            if not dry_run and (flags_changed or status_changed):
+                path = find_case_path(case.id, cases_dir)
                 if path:
                     save_case(case, path)
 
     return results
-
-
-def _find_case_path(cases_dir: Path, case_id: str) -> Path | None:
-    """Find the YAML file for a case ID."""
-    for p in cases_dir.rglob("*.yaml"):
-        if p.stem == case_id:
-            return p
-    return None
 
 
 @click.command()

@@ -30,8 +30,8 @@ def _make_case(**overrides: object) -> TestCase:
 
 
 class TestPollForGreptileReview:
-    @patch("bugeval.copilot_runner.time.sleep")
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.time.sleep")
+    @patch("bugeval.pr_utils.run_gh")
     def test_found_review(
         self,
         mock_gh: MagicMock,
@@ -47,9 +47,9 @@ class TestPollForGreptileReview:
         result = poll_for_greptile_review("testuser/leo", 99, timeout=60)
         assert result is True
 
-    @patch("bugeval.copilot_runner.time.sleep")
-    @patch("bugeval.copilot_runner.time.monotonic")
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.time.sleep")
+    @patch("bugeval.pr_utils.time.monotonic")
+    @patch("bugeval.pr_utils.run_gh")
     def test_timeout(
         self,
         mock_gh: MagicMock,
@@ -68,7 +68,7 @@ class TestPollForGreptileReview:
 
 
 class TestScrapeGreptileComments:
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_parses_review_comments(self, mock_gh: MagicMock) -> None:
         pr_comments = json.dumps(
             [
@@ -93,7 +93,7 @@ class TestScrapeGreptileComments:
         assert comments[0].line == 42
         assert comments[0].body == "Potential null deref here"
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_filters_non_greptile(self, mock_gh: MagicMock) -> None:
         pr_comments = json.dumps(
             [
@@ -116,7 +116,7 @@ class TestScrapeGreptileComments:
         assert len(comments) == 1
         assert comments[0].body == "Greptile finding"
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_empty_comments(self, mock_gh: MagicMock) -> None:
         mock_gh.side_effect = ["[]", "[]"]
         comments = scrape_greptile_comments("testuser/leo", 99)

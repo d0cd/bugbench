@@ -114,6 +114,8 @@ class CaseStats(BaseModel):
 
 
 class TestCase(BaseModel):
+    __test__ = False  # Prevent pytest collection warning
+
     # Identity
     id: str
     repo: str

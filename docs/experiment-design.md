@@ -43,6 +43,10 @@ Each vendor's CLI brings its own system prompt, tool set, and agent loop. Scores
 | Tool | Runner | Default Model |
 |------|--------|---------------|
 | `agent-sdk` | `agent_runner.run_agent_sdk` | `claude-sonnet-4-6` |
+| `agent-sdk-2pass` | `agent_runner.run_agent_sdk_2pass` | `claude-sonnet-4-6` |
+| `agent-sdk-v3` | `agent_runner.run_agent_sdk_v3` | `claude-opus-4-6` |
+
+The two-pass variant separates exploration from analysis: Pass 1 (Explorer) gathers context with full tool access, Pass 2 (Reviewer) synthesizes findings from explorer notes + diff. The v3 variant uses a three-phase approach: survey → investigate → report.
 
 All models are configurable via `--model` flag. API runners support extended thinking via `--thinking-budget`. A per-case cost ceiling of `$2.00` is enforced for all API runners.
 
@@ -59,7 +63,7 @@ All models are configurable via `--model` flag. API runners support extended thi
 
 The pipeline runs five sequential stages, each with its own CLI command and checkpoint file:
 
-### 3.1 Mine (`bugeval mine`)
+### 3.1 Mine (`bugbench mine`)
 
 **Module:** `mine.py`
 
@@ -70,7 +74,7 @@ For each fix PR, fetches rich metadata via GraphQL batch queries (commits, revie
 **Outputs:** `cases/<repo>/<repo>-NNN.yaml` with `kind: bug`, fix PR fields populated, ground truth empty.
 **Checkpoint:** `.mine_checkpoint.json` (keyed by PR number).
 
-### 3.2 Blame (`bugeval blame`)
+### 3.2 Blame (`bugbench blame`)
 
 **Module:** `blame.py`
 
@@ -88,7 +92,7 @@ After identifying the introducing commit, resolves it to its parent PR via the G
 **Outputs:** Updates existing case YAMLs with `truth.introducing_commit`, `truth.blame_confidence`, `introducing_pr_*` fields, `base_commit`.
 **Checkpoint:** `.blame_checkpoint.json` (keyed by case ID).
 
-### 3.3 Ground Truth (`bugeval ground-truth`)
+### 3.3 Ground Truth (`bugbench ground-truth`)
 
 **Module:** `ground_truth.py`
 
@@ -99,7 +103,7 @@ Also extracts bug descriptions (priority: issue body > PR body > PR title > comm
 **Outputs:** Updates case YAMLs with `truth.buggy_lines`, `bug_description`, `category`, `difficulty`, `severity`, `bug_latency_days`, `same_author_fix`.
 **Checkpoint:** `.ground_truth_checkpoint.json` (keyed by case ID).
 
-### 3.4 Validate (`bugeval validate`)
+### 3.4 Validate (`bugbench validate`)
 
 **Module:** `validate.py`
 
@@ -110,7 +114,9 @@ Agreement requires both models to return the same verdict. A case is `test_valid
 **Outputs:** Updates case YAMLs with `validation.claude_verdict`, `validation.gemini_verdict`, `validation.agreement`, `validation.test_validated`.
 **Checkpoint:** `.validate_checkpoint.json` (keyed by case ID).
 
-### 3.5 Clean Cases (`bugeval clean-cases`)
+> **Status:** Implemented but not yet executed against the dataset. All 311 leo cases have `validation: null`. The `bugbench validate` command is functional; running it would populate verdicts and enable the `require_validation` gate in curation. Planned for the next evaluation phase.
+
+### 3.5 Clean Cases (`bugbench clean-cases`)
 
 **Module:** `clean_cases.py`
 
@@ -152,6 +158,8 @@ The `TestCase` model (defined in `models.py`) separates tool-visible data from g
 ### Relationship Graph
 - `related_prs: list[PRRelation]` -- role is one of: introducing, partial_fix, full_fix, revert, regression, related
 - `linked_issues`, `issue_bodies`, `issue_labels`, `referenced_issues`
+
+> **Note:** `issue_bodies` is populated by the mine pipeline when linked issues have body text. It is consumed by `ground_truth.py` to extract bug descriptions. For repos where issues are sparse or terse, this dict may be empty.
 
 ### Derived Metadata
 - `bug_latency_days` -- days between introducing merge and fix merge
@@ -241,7 +249,7 @@ LLM verdicts override mechanical comment classifications, and TP/FP/novel counts
 
 Judge failures (API errors, parse failures) are tracked via `judge_failed`. Failed cases are excluded from quality-dependent metrics (review_quality, comment verdicts) but **included** in catch rate (the mechanical metric is unaffected).
 
-When `--dry-run` is passed to `bugeval score`, only mechanical scoring runs (no LLM calls).
+When `--dry-run` is passed to `bugbench score`, only mechanical scoring runs (no LLM calls).
 
 ### Contamination Detection
 

@@ -226,7 +226,7 @@ class TestRunAgentApiDiffOnly:
         mock_client = MagicMock()
         mock_client.messages.create.return_value = mock_response
 
-        with patch("bugeval.agent_runner.anthropic.Anthropic", return_value=mock_client):
+        with patch("bugeval._anthropic_runner.anthropic.Anthropic", return_value=mock_client):
             result = run_anthropic_api(
                 case,
                 SAMPLE_DIFF,
@@ -250,7 +250,7 @@ class TestRunAgentApiDiffOnly:
         mock_client = MagicMock()
         mock_client.messages.create.side_effect = RuntimeError("API down")
 
-        with patch("bugeval.agent_runner.anthropic.Anthropic", return_value=mock_client):
+        with patch("bugeval._anthropic_runner.anthropic.Anthropic", return_value=mock_client):
             result = run_anthropic_api(
                 case,
                 SAMPLE_DIFF,
@@ -611,7 +611,7 @@ class TestRunAgentApiMultiTurn:
         mock_client.messages.create.side_effect = [resp1, resp2]
 
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             result = run_anthropic_api(
@@ -649,7 +649,7 @@ class TestRunAgentApiMultiTurn:
         mock_client.messages.create.return_value = resp
 
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             result = run_anthropic_api(
@@ -680,10 +680,10 @@ class TestRunAgentApiTimeout:
 
         with (
             patch(
-                "bugeval.agent_runner.anthropic.Anthropic",
+                "bugeval._anthropic_runner.anthropic.Anthropic",
                 return_value=mock_client,
             ),
-            patch("bugeval.agent_runner.time.monotonic", side_effect=fake_monotonic),
+            patch("bugeval._anthropic_runner.time.monotonic", side_effect=fake_monotonic),
         ):
             result = run_anthropic_api(
                 case,
@@ -716,7 +716,7 @@ class TestRunAgentApiTranscript:
 
         transcript_dir = tmp_path / "transcripts"
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             result = run_anthropic_api(
@@ -739,7 +739,7 @@ class TestRunAgentApiTranscript:
 
 
 class TestCliRunnerUsesStdin:
-    @patch("bugeval.agent_runner.subprocess.run")
+    @patch("bugeval._cli_runners.subprocess.run")
     def test_prompt_piped_via_stdin(self, mock_run: MagicMock) -> None:
         """Verify the CLI runner passes prompt via stdin, not as an argument."""
         import subprocess as sp
@@ -797,7 +797,7 @@ class TestRunAgentApiWithThinking:
 
         transcript_dir = tmp_path / "transcripts"
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             result = run_anthropic_api(
@@ -843,7 +843,7 @@ class TestRunAgentApiWithThinking:
         mock_client.messages.create.return_value = mock_response
 
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             run_anthropic_api(
@@ -881,7 +881,7 @@ class TestRunAgentApiWithThinking:
         mock_client.messages.create.return_value = mock_response
 
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             run_anthropic_api(
@@ -918,7 +918,7 @@ class TestRunAgentApiWithThinking:
         mock_client.messages.create.return_value = mock_response
 
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             result = run_anthropic_api(
@@ -1391,7 +1391,7 @@ class TestRunAgentApiModelOverride:
         mock_client.messages.create.return_value = mock_response
 
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             run_anthropic_api(
@@ -1424,7 +1424,7 @@ class TestRunAgentApiModelOverride:
         mock_client.messages.create.return_value = mock_response
 
         with patch(
-            "bugeval.agent_runner.anthropic.Anthropic",
+            "bugeval._anthropic_runner.anthropic.Anthropic",
             return_value=mock_client,
         ):
             run_anthropic_api(

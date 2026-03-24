@@ -1966,3 +1966,259 @@ class TestFindingsPerGroup:
         assert score.findings_total == 0
         assert score.findings_caught == 0
         assert score.diffuse_ground_truth is False
+
+
+# ---------------------------------------------------------------------------
+# detect_contamination — threshold boundary tests
+# ---------------------------------------------------------------------------
+
+
+class TestDetectContaminationThreshold:
+    def test_above_threshold(self) -> None:
+        """Overlap > 0.3 triggers contamination."""
+        case = TestCase(
+            id="ct-001",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="aaa",
+            fix_pr_title="Fix the overflow in validator rotation counter logic",
+            fix_pr_body="",
+        )
+        # Comment words that heavily overlap with fix_pr_title
+        result = ToolResult(
+            case_id="ct-001",
+            tool="copilot",
+            comments=[
+                Comment(
+                    file="f.rs",
+                    line=10,
+                    body="overflow in validator rotation counter logic",
+                ),
+            ],
+        )
+        assert detect_contamination(result, case) is True
+
+    def test_below_threshold(self) -> None:
+        """Overlap <= 0.3 does not trigger contamination."""
+        case = TestCase(
+            id="ct-002",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="aaa",
+            fix_pr_title="Fix the overflow in validator rotation counter logic",
+            fix_pr_body="",
+        )
+        # Comment words that barely overlap with fix_pr_title
+        result = ToolResult(
+            case_id="ct-002",
+            tool="copilot",
+            comments=[
+                Comment(
+                    file="f.rs",
+                    line=10,
+                    body=(
+                        "This function has potential memory safety issues "
+                        "related to buffer indexing and bounds checking "
+                        "that could lead to undefined behavior overflow"
+                    ),
+                ),
+            ],
+        )
+        assert detect_contamination(result, case) is False
+
+    def test_short_fix_text_returns_false(self) -> None:
+        """When fix words < 3, contamination is not flagged."""
+        case = TestCase(
+            id="ct-003",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="aaa",
+            fix_pr_title="ok",
+            fix_pr_body="",
+        )
+        result = ToolResult(
+            case_id="ct-003",
+            tool="copilot",
+            comments=[
+                Comment(file="f.rs", line=10, body="ok ok ok"),
+            ],
+        )
+        assert detect_contamination(result, case) is False
+
+    def test_empty_comments(self) -> None:
+        """No comments means no contamination."""
+        case = TestCase(
+            id="ct-004",
+            repo="org/repo",
+            kind=CaseKind.bug,
+            base_commit="aaa",
+            fix_pr_title="Fix the overflow in validator rotation",
+            fix_pr_body="",
+        )
+        result = ToolResult(case_id="ct-004", tool="copilot", comments=[])
+        assert detect_contamination(result, case) is False
+
+
+# ---------------------------------------------------------------------------
+# mechanical_catch — tolerance variations
+# ---------------------------------------------------------------------------
+
+
+class TestMechanicalCatchTolerances:
+    def test_tolerance_5(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/main.rs", line=100, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(file="src/main.rs", line=105, body="Bug on this line here"),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth, tolerance=5)
+        assert caught is True
+        assert dist == 5
+
+    def test_tolerance_5_miss(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/main.rs", line=100, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(file="src/main.rs", line=106, body="Bug on this line here"),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth, tolerance=5)
+        assert caught is False
+        assert dist is None
+
+    def test_tolerance_15(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/main.rs", line=100, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(file="src/main.rs", line=115, body="Bug on this line here"),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth, tolerance=15)
+        assert caught is True
+        assert dist == 15
+
+    def test_no_ground_truth_returns_false(self) -> None:
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(file="src/main.rs", line=10, body="Bug on this line here"),
+            ],
+        )
+        caught, dist = mechanical_catch(result, None)
+        assert caught is False
+        assert dist is None
+
+    def test_empty_buggy_lines_returns_false(self) -> None:
+        truth = GroundTruth(buggy_lines=[])
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(file="src/main.rs", line=10, body="Bug on this line here"),
+            ],
+        )
+        caught, dist = mechanical_catch(result, truth)
+        assert caught is False
+        assert dist is None
+
+
+# ---------------------------------------------------------------------------
+# classify_comments — extended coverage
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyCommentsExtended:
+    def test_empty_comments_list(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="f.rs", line=10, content="bad"),
+            ],
+        )
+        result = ToolResult(case_id="t", tool="t", comments=[])
+        scores = classify_comments(result, truth)
+        assert scores == []
+
+    def test_empty_buggy_lines(self) -> None:
+        """Non-low-value comments with empty buggy_lines are FP."""
+        truth = GroundTruth(buggy_lines=[])
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(
+                    file="f.rs",
+                    line=10,
+                    body="This variable is used incorrectly here",
+                ),
+            ],
+        )
+        scores = classify_comments(result, truth)
+        assert len(scores) == 1
+        assert scores[0].verdict == CommentVerdict.fp
+
+    def test_generic_body_is_low_value(self) -> None:
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="f.rs", line=10, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(file="f.rs", line=10, body="nit"),
+            ],
+        )
+        scores = classify_comments(result, truth)
+        assert len(scores) == 1
+        assert scores[0].verdict == CommentVerdict.low_value
+
+    def test_mixed_verdicts(self) -> None:
+        """Multiple comments produce TP, FP, and low_value in one call."""
+        truth = GroundTruth(
+            buggy_lines=[
+                BuggyLine(file="src/main.rs", line=10, content="bad"),
+            ],
+        )
+        result = ToolResult(
+            case_id="t",
+            tool="t",
+            comments=[
+                Comment(
+                    file="src/main.rs",
+                    line=10,
+                    body="This is definitely the problematic line",
+                ),
+                Comment(
+                    file="other.rs",
+                    line=50,
+                    body="This function has issues with error handling",
+                ),
+                Comment(file="src/main.rs", line=0, body="General comment"),
+            ],
+        )
+        scores = classify_comments(result, truth)
+        assert len(scores) == 3
+        assert scores[0].verdict == CommentVerdict.tp
+        assert scores[1].verdict == CommentVerdict.fp
+        assert scores[2].verdict == CommentVerdict.low_value

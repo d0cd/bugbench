@@ -162,7 +162,7 @@ def _call_gemini(prompt: str, model: str, max_tokens: int) -> LLMResult:
 
 
 def _call_openai(prompt: str, model: str, max_tokens: int) -> LLMResult:
-    import openai
+    import openai  # type: ignore[import-untyped,import-not-found]
 
     client = openai.OpenAI()
     response = client.chat.completions.create(

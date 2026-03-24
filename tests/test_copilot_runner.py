@@ -43,7 +43,7 @@ def _make_case(**overrides: object) -> TestCase:
 
 
 class TestEnsureFork:
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_returns_fork_name(self, mock_gh: MagicMock) -> None:
         mock_gh.side_effect = [
             # fork command
@@ -60,7 +60,7 @@ class TestEnsureFork:
             "--clone=false",
         )
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_fork_already_exists(self, mock_gh: MagicMock) -> None:
         from bugeval.mine import GhError
 
@@ -71,7 +71,7 @@ class TestEnsureFork:
         result = ensure_fork("AleoNet/snarkVM")
         assert result == "testuser/snarkVM"
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_fork_with_org_returns_org_name(self, mock_gh: MagicMock) -> None:
         # When org is provided, only the fork command is called — no whoami
         mock_gh.return_value = ""
@@ -85,7 +85,7 @@ class TestEnsureFork:
 
 
 class TestCreateEvalBranches:
-    @patch("bugeval.copilot_runner.subprocess.run")
+    @patch("bugeval.pr_utils.subprocess.run")
     def test_creates_branches_and_pushes(
         self,
         mock_run: MagicMock,
@@ -111,7 +111,7 @@ class TestCreateEvalBranches:
         first_call_args = mock_run.call_args_list[0][0][0]
         assert "abc123~1" in first_call_args
 
-    @patch("bugeval.copilot_runner.subprocess.run")
+    @patch("bugeval.pr_utils.subprocess.run")
     def test_uses_introducing_commit_from_truth(
         self,
         mock_run: MagicMock,
@@ -135,8 +135,8 @@ class TestCreateEvalBranches:
         first_call_args = mock_run.call_args_list[0][0][0]
         assert "intro999~1" in first_call_args
 
-    @patch("bugeval.copilot_runner._delete_remote_branch")
-    @patch("bugeval.copilot_runner.subprocess.run")
+    @patch("bugeval.pr_utils._delete_remote_branch")
+    @patch("bugeval.pr_utils.subprocess.run")
     def test_cleans_up_on_push_failure(
         self,
         mock_run: MagicMock,
@@ -185,8 +185,8 @@ class TestCreateEvalBranches:
         assert call_args[0] == "testuser/snarkVM"
         assert call_args[1].startswith("base-")
 
-    @patch("bugeval.copilot_runner._delete_remote_branch")
-    @patch("bugeval.copilot_runner.subprocess.run")
+    @patch("bugeval.pr_utils._delete_remote_branch")
+    @patch("bugeval.pr_utils.subprocess.run")
     def test_aborts_cherrypick_on_failure(
         self,
         mock_run: MagicMock,
@@ -236,8 +236,8 @@ class TestCreateEvalBranches:
         ]
         assert len(abort_calls) >= 1
 
-    @patch("bugeval.copilot_runner._delete_remote_branch")
-    @patch("bugeval.copilot_runner.subprocess.run")
+    @patch("bugeval.pr_utils._delete_remote_branch")
+    @patch("bugeval.pr_utils.subprocess.run")
     def test_resets_working_tree(
         self,
         mock_run: MagicMock,
@@ -287,7 +287,7 @@ class TestCreateEvalBranches:
 
 
 class TestDeleteRemoteBranch:
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_deletes_branch(self, mock_gh: MagicMock) -> None:
         mock_gh.return_value = ""
         _delete_remote_branch("testuser/snarkVM", "base-abc123")
@@ -295,7 +295,7 @@ class TestDeleteRemoteBranch:
         call_args = mock_gh.call_args[0]
         assert "repos/testuser/snarkVM/git/refs/heads/base-abc123" in call_args
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_ignores_404(self, mock_gh: MagicMock) -> None:
         mock_gh.side_effect = GhError(["gh"], "404")
         # Should not raise
@@ -303,7 +303,7 @@ class TestDeleteRemoteBranch:
 
 
 class TestOpenEvalPr:
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_returns_pr_number(
         self,
         mock_gh: MagicMock,
@@ -318,7 +318,7 @@ class TestOpenEvalPr:
         )
         assert result == 99
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_targets_base_branch(
         self,
         mock_gh: MagicMock,
@@ -336,7 +336,7 @@ class TestOpenEvalPr:
         base_idx = list(call_args).index("--base")
         assert call_args[base_idx + 1] == "base-abc"
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_uses_pr_metadata(self, mock_gh: MagicMock) -> None:
         mock_gh.return_value = "https://github.com/testuser/snarkVM/pull/7\n"
         case = _make_case(
@@ -355,7 +355,7 @@ class TestOpenEvalPr:
         # Body is written to a temp file (--body-file), not in CLI args
         assert "--body-file" in call_args
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_scrubs_fix_references_in_title(
         self,
         mock_gh: MagicMock,
@@ -377,7 +377,7 @@ class TestOpenEvalPr:
 
 
 class TestScrapePrComments:
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_parses_review_comments(self, mock_gh: MagicMock) -> None:
         pr_comments = json.dumps(
             [
@@ -403,7 +403,7 @@ class TestScrapePrComments:
         assert comments[0].line == 42
         assert comments[0].body == "Potential null deref here"
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_filters_non_copilot(self, mock_gh: MagicMock) -> None:
         pr_comments = json.dumps(
             [
@@ -426,7 +426,7 @@ class TestScrapePrComments:
         assert len(comments) == 1
         assert comments[0].body == "Copilot finding"
 
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_empty_comments(self, mock_gh: MagicMock) -> None:
         mock_gh.side_effect = ["[]", "[]"]
         comments = scrape_pr_comments("testuser/snarkVM", 99)
@@ -434,7 +434,7 @@ class TestScrapePrComments:
 
 
 class TestCloseEvalPr:
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_closes_and_deletes_branches(
         self,
         mock_gh: MagicMock,
@@ -450,8 +450,8 @@ class TestCloseEvalPr:
 
 
 class TestPollForReview:
-    @patch("bugeval.copilot_runner.time.sleep")
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.time.sleep")
+    @patch("bugeval.pr_utils.run_gh")
     def test_found_review(
         self,
         mock_gh: MagicMock,
@@ -467,9 +467,9 @@ class TestPollForReview:
         result = poll_for_review("testuser/snarkVM", 99, timeout=60)
         assert result is True
 
-    @patch("bugeval.copilot_runner.time.sleep")
-    @patch("bugeval.copilot_runner.time.monotonic")
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.time.sleep")
+    @patch("bugeval.pr_utils.time.monotonic")
+    @patch("bugeval.pr_utils.run_gh")
     def test_timeout(
         self,
         mock_gh: MagicMock,
@@ -599,7 +599,7 @@ class TestRunCopilot:
 
 
 class TestGetPatchDiff:
-    @patch("bugeval.copilot_runner.run_git")  # patched at import location
+    @patch("bugeval.pr_utils.run_git")
     def test_uses_introducing_commit(self, mock_git: MagicMock, tmp_path: Path) -> None:
         mock_git.return_value = "diff output"
         case = _make_case(
@@ -614,7 +614,7 @@ class TestGetPatchDiff:
             cwd=tmp_path,
         )
 
-    @patch("bugeval.copilot_runner.run_git")  # patched at import location
+    @patch("bugeval.pr_utils.run_git")
     def test_falls_back_to_base_commit(
         self,
         mock_git: MagicMock,
@@ -727,7 +727,7 @@ class TestCopilotTranscript:
 
 
 class TestEnsureForkOrgReturn:
-    @patch("bugeval.copilot_runner.run_gh")
+    @patch("bugeval.pr_utils.run_gh")
     def test_org_returns_org_not_username(self, mock_gh: MagicMock) -> None:
         """When org is given, return org/name even if fork raises."""
         from bugeval.mine import GhError

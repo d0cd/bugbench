@@ -25,10 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN rustup component add clippy rustfmt
 
 # Install Claude Code CLI globally
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code@1.0.3
 
 # Install Agent SDK for Python
-RUN pip3 install --break-system-packages claude-agent-sdk
+RUN pip3 install --break-system-packages claude-agent-sdk==0.0.14
 
 # Run as non-root; /home/agent for config, /work for workspace
 RUN groupadd -r agent && useradd -r -g agent -m -d /home/agent -s /bin/bash agent

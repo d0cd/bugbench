@@ -209,9 +209,7 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
     @app.route("/api/dataset-stats")
     def api_dataset_stats() -> Any:
         c_dir: Path = app.config["CASES_DIR"]
-        cases: list[TestCase] = _cached(
-            f"cases:{c_dir}", lambda: load_all_cases(c_dir)
-        )
+        cases: list[TestCase] = _cached(f"cases:{c_dir}", lambda: load_all_cases(c_dir))
         bug = sum(1 for c in cases if c.kind == CaseKind.bug)
         clean = sum(1 for c in cases if c.kind == CaseKind.clean)
         repos = sorted({c.repo for c in cases})
@@ -545,11 +543,13 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
                 try:
                     score_data = yaml.safe_load(p.read_text())
                     if score_data:
-                        run_links.append({
-                            "run": rd.name,
-                            "tool": score_data.get("tool", ""),
-                            "caught": score_data.get("caught", False),
-                        })
+                        run_links.append(
+                            {
+                                "run": rd.name,
+                                "tool": score_data.get("tool", ""),
+                                "caught": score_data.get("caught", False),
+                            }
+                        )
                 except (yaml.YAMLError, OSError):
                     pass
 
@@ -574,9 +574,7 @@ def create_app(cases_dir: Path, results_dir: Path) -> Flask:
         entry = golden.get(case_id)
         current_status = entry.status if entry else "unreviewed"
         new_status = status if status else current_status
-        set_golden_status(
-            c_dir, case_id, new_status, reviewer="dashboard", notes=notes
-        )
+        set_golden_status(c_dir, case_id, new_status, reviewer="dashboard", notes=notes)
         return redirect(url_for("case_detail", case_id=case_id))
 
     # ------------------------------------------------------------------

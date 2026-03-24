@@ -4,14 +4,28 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    """Write data to path atomically via temp file + rename."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)  # atomic on POSIX
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 class RunNote(BaseModel):
@@ -53,7 +67,7 @@ def load_run_notes(run_dir: Path) -> list[RunNote]:
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError:
-        logger.warning("Corrupt notes file %s, returning empty", path)
+        log.warning("Corrupt notes file %s, returning empty", path)
         return []
     return [RunNote(**n) for n in data]
 
@@ -61,7 +75,7 @@ def load_run_notes(run_dir: Path) -> list[RunNote]:
 def save_run_notes(run_dir: Path, notes: list[RunNote]) -> None:
     """Persist run notes to JSON sidecar."""
     path = _notes_path(run_dir)
-    path.write_text(json.dumps([n.model_dump(mode="json") for n in notes], indent=2))
+    _atomic_write(path, json.dumps([n.model_dump(mode="json") for n in notes], indent=2))
 
 
 def add_run_note(run_dir: Path, text: str) -> RunNote:
@@ -90,7 +104,7 @@ def load_golden_set(cases_dir: Path) -> dict[str, GoldenEntry]:
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError:
-        logger.warning("Corrupt golden set %s, returning empty", path)
+        log.warning("Corrupt golden set %s, returning empty", path)
         return {}
     return {k: GoldenEntry(**v) for k, v in data.items()}
 
@@ -98,11 +112,12 @@ def load_golden_set(cases_dir: Path) -> dict[str, GoldenEntry]:
 def save_golden_set(cases_dir: Path, entries: dict[str, GoldenEntry]) -> None:
     """Persist golden set entries to JSON sidecar."""
     path = _golden_path(cases_dir)
-    path.write_text(
+    _atomic_write(
+        path,
         json.dumps(
             {k: v.model_dump(mode="json") for k, v in entries.items()},
             indent=2,
-        )
+        ),
     )
 
 
@@ -154,7 +169,7 @@ def save_human_score(run_dir: Path, score: HumanScore) -> None:
     safe_case = score.case_id.replace("/", "_")
     safe_tool = score.tool.replace("/", "_")
     path = hs_dir / f"{safe_case}__{safe_tool}.yaml"
-    path.write_text(yaml.safe_dump(score.model_dump(mode="json"), sort_keys=False))
+    _atomic_write(path, yaml.safe_dump(score.model_dump(mode="json"), sort_keys=False))
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +214,7 @@ def save_experiments(results_dir: Path, store: ExperimentStore) -> None:
     """Write experiments to results/experiments.yaml."""
     results_dir.mkdir(parents=True, exist_ok=True)
     path = results_dir / "experiments.yaml"
-    path.write_text(yaml.safe_dump(store.model_dump(mode="json"), sort_keys=False))
+    _atomic_write(path, yaml.safe_dump(store.model_dump(mode="json"), sort_keys=False))
 
 
 def current_date_iso() -> str:

@@ -1,0 +1,309 @@
+id: snarkOS-038
+repo: ProvableHQ/snarkOS
+kind: bug
+language: rust
+base_commit: 1615850b831c20da685b5b8f9d425b0889d9c507
+fix_commit: fea092cffe24661b5d4b183f22c9d7886b516d6d
+fix_pr_number: 3321
+introducing_pr_number: 2686
+introducing_pr_title: Unifies the synchronization module
+introducing_pr_body: "<!-- Thank you for filing a PR! Help us understand by explaining\
+  \ your changes. Happy contributing! -->\r\n\r\n## Motivation\r\n\r\nUnifies the\
+  \ synchronization module\r\n"
+introducing_pr_commit_messages: []
+introducing_pr_commit_shas: []
+introducing_pr_author: howardwu
+introducing_pr_merge_date: '2023-09-25T08:01:12Z'
+introducing_pr_review_comments: []
+introducing_pr_review_threads: []
+introducing_pr_ci_status: ''
+fix_pr_title: 'fix(sync): Fix client sync RwLock deadlock and client block request
+  stall'
+fix_pr_body: "<!-- Thank you for filing a PR! Help us understand by explaining your\
+  \ changes. Happy contributing! -->\r\n\r\n## Motivation\r\n\r\nWe have observed\
+  \ two different kinds of stalls while we conduct client-sync acceptance tests on\
+  \ canarynet. These issues are most noticeable and reproducible when block response\
+  \ processing takes a sufficient amount of time. These two issues can be classified\
+  \ as follows:\r\n\r\n- process.write deadlock during block response\r\n- block request\
+  \ starvation\r\n\r\n## `process.write` Deadlock\r\n\r\n### Background\r\n\r\nThere\
+  \ are two places during block sync where `process` is write locked ([`atomic_speculate`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L268)\
+  \ and [`atomic_finalize`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L573)),\
+  \ and two places where `process` is read locked ([`check_execution_internal`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/verify.rs#L307)\
+  \ and [`check_fee_internal`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/verify.rs#L338)).\
+  \ Both of the write locks occur in the same [`try_advancing_with_block_responses`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L338-L359)\
+  \ in series in [`check_next_block`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/ledger/src/check_next_block.rs#L73)\
+  \ and [`add_next_block`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/mod.rs#L424).\r\
+  \n\r\nThis code is primarily run during a [`BlockResponse`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/router/src/inbound.rs#L134)\
+  \ message that invokes [`advance_with_sync_blocks`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/src/client/router.rs#L218-L227).\
+  \ It has a [guard before calling `try_advancing_with_block_responses`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L325-L328)\
+  \ to ensure no block responses are trying to write in parallel (thus creating a\
+  \ deadlock).\r\n\r\nWe have observed that [this particular area in `atomic_post_ratify`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L1238-L1241)\
+  \ can take quite a while (more than 5 seconds) while [holding the write lock](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L268)\
+  \ in `atomic_speculate`.\r\n\r\nClient nodes have [this loop that kicks off the\
+  \ block requests](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/src/client/mod.rs#L168-L179)\
+  \ firing every 5 seconds that coincidentally also calls [`try_advancing_with_block_responses`\
+  \ but without guards](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L233-L240)\
+  \ to check if another try_advance is running from the aforementioned block responses.\r\
+  \n\r\nIf an `atomic_speculate` took long enough and continued into the 5 second\
+  \ client sync loop while no block requests were active, this issue would occur and\
+  \ result in a permanent stall without block advancement until the node is restarted.\r\
+  \n\r\n### Fix\r\n\r\nWe added a guard to the `try_block_sync` and stopped running\
+  \ into this issue\r\n\r\n## Block Request Starvation\r\n\r\n### Background\r\n\r\
+  \nIn order for block requests to be created for a given height it must meet the\
+  \ following criteria (outlined in [`check_block_request`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L538-L555)):\r\
+  \n- Height must be greater than current canon height\r\n- A request for this height\
+  \ must not already exist\r\n- A response for this height must not already exist\r\
+  \n- A request timestamp for this height must not already exist\r\n\r\nExisting block\
+  \ requests, responses, and timestamps are removed given the following (issue relevant)\
+  \ criteria:\r\n- A peer disconnects and [all associated block requests and timestamps\
+  \ are removed](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L638-L657)\r\
+  \n- The [next block is advancing](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L339)\
+  \ and [the request is \"complete\"](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L605)\
+  \ by having an empty peer ips set but not if the request is missing, [even though\
+  \ peer requests can be removed when the peer ips are empty](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L647-L650)\r\
+  \n- A [peer provides a block response](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L507-L533),\
+  \ which removes the peer ip from the request set without removing the request.\r\
+  \n- A [request is timed out or for a block that has been added already](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L661-L704)\r\
+  \n\r\nIf the last peer for a block request disconnects and the [block request and\
+  \ timestamp is removed](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L647-L653),\
+  \ a block response will be left in a cycle where [new requests will not be created](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L548)\
+  \ and [the request will not be considered complete](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L605)\
+  \ for continuing block advancement. This condition results in a permanent stall\
+  \ without block advancement until the node is restarted.\r\n\r\nIf that alone is\
+  \ fixed, the node will still reach a state where [request timestamps are retained\
+  \ until timeout](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L684-L685)\
+  \ as an \"incomplete request\" would be one where the request's peer set exists\
+  \ and is not empty OR one where the peer set has been removed (technically empty\
+  \ and not incomplete). This condition results in repeated temporary stalls until\
+  \ the block request is timed out as [new block requests will not be created until\
+  \ the `request_timestamp` is timed out](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L552)\r\
+  \n\r\n### Fix\r\n\r\nBy flipping the `unwrap_or(false)` to `unwrap_or(true)` in\
+  \ `requests.get(height).map(|(_, _, peer_ips)| peer_ips.is_empty()).unwrap_or(false)`,\
+  \ we are treating the empty `peer_ips` set as a \"completed\" peer request and allowing\
+  \ both block advancement to continue and real incomplete blocks to be removed\r\n\
+  \r\n## Test Plan\r\n\r\nWe have successfully deployed this and synced 7 clients\
+  \ (1 alone on a 3995WX, 2 on a shared 2xEPYC 9354, and 4 on standalone GCP 16vCPU\
+  \ 64GB `e2-standard-16` instances) through canary blocks 28,000 through 35,000 that\
+  \ were particularly stressful on clients.\r\n\r\nLast week we ran a 100 client sync\
+  \ test with constant stalling as low as block 8000\r\n![image](https://github.com/AleoNet/snarkOS/assets/4142480/436c85d5-6908-4afc-b2b2-45402600985b)\r\
+  \n\r\nToday we have two pairs of 100 clients syncing the troublesome blocks right\
+  \ now\r\n![image](https://github.com/AleoNet/snarkOS/assets/4142480/6a6cca1d-70e0-434e-be59-f38f4b28dfb9)\r\
+  \n\r\nThe stall in this screenshot is discovering and fixing the temporary stall\
+  \ issue\r\n![image](https://github.com/AleoNet/snarkOS/assets/4142480/df7dafc4-5619-4483-b119-978726507a5a)\r\
+  \n\r\nNote that the servers running these clients are still properly syncing without\
+  \ stalls despite both being under spec and running 10 clients each...\r\n\r\n##\
+  \ Related PRs\r\n\r\n- Helps with #3063\r\n- Fixes #2916 \r\n- Fixes #2978 \r\n"
+fix_pr_commit_messages: []
+fix_pr_commit_shas: []
+fix_pr_merge_date: '2024-06-21T16:14:00Z'
+fix_pr_review_comments: []
+fix_pr_review_threads: []
+fix_pr_discussion_comments: []
+fix_pr_merge_method: ''
+fix_pr_ci_status: ''
+linked_issues:
+- 2916
+- 2978
+issue_bodies:
+  '2978': "## \U0001F41B Bug Report\r\n\r\n<!-- What's the bug in snarkOS that you\
+    \ found? How serious is this bug and what is affected? -->\r\nThe log (with reduced\
+    \ sync and heartbeat intervals):\r\n\r\n```\r\n\r\n2024-01-08T17:30:46.360076Z\
+    \ DEBUG snarkos_node_router::handshake: Connecting to 35.224.50.150:4133...\r\n\
+    2024-01-08T17:30:46.498847Z  INFO snarkos_node_router::handshake: Connected to\
+    \ '35.224.50.150:4133'\r\n2024-01-08T17:30:47.318394Z TRACE snarkos_node_sync::block_sync:\
+    \ Updating is_block_synced: greatest_peer_height = 1138544, canon_height = 1127749\r\
+    \n2024-01-08T17:30:47.320073Z TRACE snarkos_node_sync::block_sync: Prepared 50\
+    \ block requests\r\n2024-01-08T17:30:53.013389Z TRACE snarkos_node_sync::block_sync:\
+    \ Updating is_block_synced: greatest_peer_height = 1138544, canon_height = 1127750\r\
+    \n2024-01-08T17:30:53.015090Z TRACE snarkos_node_sync::block_sync: Prepared 1\
+    \ block requests\r\n2024-01-08T17:30:53.023921Z  INFO snarkos_node_bft_ledger_service::ledger:\r\
+    \n\r\nAdvanced to block 1127750 at round 2352850 - ab1l7l6x3jej9fzdqwecs96lp6m9sqpverqg4uwkpmgha2r0fjeeszs40f346\r\
+    \n\r\n2024-01-08T17:30:58.089332Z TRACE snarkos_node_sync::block_sync: Updating\
+    \ is_block_synced: greatest_peer_height = 1138544, canon_height = 1127751\r\n\
+    2024-01-08T17:30:58.091648Z TRACE snarkos_node_sync::block_sync: Prepared 1 block\
+    \ requests\r\n2024-01-08T17:30:58.091869Z DEBUG snarkos_node_router::heartbeat:\
+    \ Connected to 1 peer: [35.224.50.150:4133]\r\n2024-01-08T17:30:58.099467Z  INFO\
+    \ snarkos_node_bft_ledger_service::ledger:\r\n\r\nAdvanced to block 1127751 at\
+    \ round 2352852 - ab1mq3v8ypsrfepjh35t0thje9l9mv3djm5ls8negr589mkkpw5mqrsxe73qs\r\
+    \n\r\n2024-01-08T17:31:01.103764Z TRACE snarkos_node_sync::block_sync: Updating\
+    \ is_block_synced: greatest_peer_height = 1138544, canon_height = 1127751\r\n\
+    2024-01-08T17:31:01.104716Z TRACE snarkos_node_sync::block_sync: Prepared 1 block\
+    \ requests\r\n2024-01-08T17:31:04.119788Z TRACE snarkos_node_sync::block_sync:\
+    \ Updating is_block_synced: greatest_peer_height = 1138544, canon_height = 1127751\r\
+    \n2024-01-08T17:31:04.120722Z TRACE snarkos_node_sync::block_sync: Prepared 47\
+    \ block requests\r\n2024-01-08T17:31:07.695287Z TRACE snarkos_node_sync::block_sync:\
+    \ Updating is_block_synced: greatest_peer_height = 1138544, canon_height = 1127751\r\
+    \n2024-01-08T17:31:07.696388Z TRACE snarkos_node_sync::block_sync: Prepared 0\
+    \ block requests\r\n2024-01-08T17:31:08.092324Z DEBUG snarkos_node_router::heartbeat:\
+    \ Connected to 1 peer: [35.224.50.150:4133]\r\n2024-01-08T17:31:10.698087Z TRACE\
+    \ snarkos_node_sync::block_sync: Updating is_block_synced: greatest_peer_height\
+    \ = 1138544, canon_height = 1127751\r\n2024-01-08T17:31:10.699059Z TRACE snarkos_node_sync::block_sync:\
+    \ Prepared 1 block requests\r\n2024-01-08T17:31:14.683545Z TRACE snarkos_node_sync::block_sync:\
+    \ Updating is_block_synced: greatest_peer_height = 1138544, canon_height = 1127752\r\
+    \n2024-01-08T17:31:14.685213Z TRACE snarkos_node_sync::block_sync: Prepared 2\
+    \ block requests\r\n2024-01-08T17:31:14.705284Z  INFO snarkos_node_bft_ledger_service::ledger:\r\
+    \n\r\nAdvanced to block 1127752 at round 2352854 - ab18upqaram79ewsruj2rgce0v3gp9kvmxcvv9atvy9a5vrquas9yxqgpguut\r\
+    \n\r\n2024-01-08T17:31:19.283766Z TRACE snarkos_node_sync::block_sync: Updating\
+    \ is_block_synced: greatest_peer_height = 1138544, canon_height = 1127753\r\n\
+    2024-01-08T17:31:19.284845Z TRACE snarkos_node_sync::block_sync: Prepared 1 block\
+    \ requests\r\n2024-01-08T17:31:19.284983Z DEBUG snarkos_node_router::heartbeat:\
+    \ Connected to 1 peer: [35.224.50.150:4133]\r\n2024-01-08T17:31:19.294601Z  INFO\
+    \ snarkos_node_bft_ledger_service::ledger:\r\nAdvanced to block 1127753 at round\
+    \ 2352856 - ab1pjjhfy26khq6rlywvvknfxy4d4x3c7r6kckats8q7nw0zvhjpq9s8qqhs7\r\n\r\
+    \n2024-01-08T17:31:24.324350Z TRACE snarkos_node_sync::block_sync: Updating is_block_synced:\
+    \ greatest_peer_height = 0, canon_height = 1127754\r\n2024-01-08T17:31:24.324450Z\
+    \ TRACE snarkos_node_sync::block_sync: Prepared 0 block requests\r\n2024-01-08T17:31:24.333724Z\
+    \  INFO snarkos_node_bft_ledger_service::ledger:\r\n\r\nAdvanced to block 1127754\
+    \ at round 2352858 - ab1gt0msxch423xswydku6axhx4dx8knem5jdlf4pkw20wa5gf5t5zsye4j8g\r\
+    \n\r\n2024-01-08T17:31:24.717928Z TRACE snarkos_node_sync::block_sync: Block sync\
+    \ is removing all block requests to peer 35.224.50.150:4133...\r\n2024-01-08T17:31:24.718075Z\
+    \  WARN snarkos_node::client::router: The sync pool did not request block 1127755\r\
+    \n2024-01-08T17:31:24.718286Z  WARN snarkos_node::client::router: Disconnecting\
+    \ from '35.224.50.150:4133' - Peer '35.224.50.150:4133' sent an invalid block\
+    \ response\r\n2024-01-08T17:31:24.718746Z TRACE snarkos_node_sync::block_sync:\
+    \ Block sync is removing all block requests to peer 35.224.50.150:4133...\r\n\
+    ```\r\n\r\nI believe this should not happen even with reduced intervals as advancing\
+    \ blocks is pretty slow right now.\r\n\r\n## Steps to Reproduce\r\n\r\n<!-- How\
+    \ do I reproduce this issue in snarkOS? Are there error messages or stack traces\
+    \ that would help debug this issue? -->\r\nTry to sync. Eventually it will happen.\
+    \ Best observed when there is only 1 connection.\r\n\r\n## Expected Behavior\r\
+    \n\r\n<!-- What was supposed to happen in snarkOS? What happened instead? -->\r\
+    \nThis should not happen.\r\n\r\n## Your Environment\r\n\r\n- <!-- snarkOS Version\
+    \ -->testnet3\r\n- <!-- Rust Version -->\r\n- <!-- Computer OS -->\r\n"
+issue_labels:
+- bug
+referenced_issues: []
+related_prs:
+- pr_number: 3321
+  role: full_fix
+  commit: fea092cffe24661b5d4b183f22c9d7886b516d6d
+  title: 'fix(sync): Fix client sync RwLock deadlock and client block request stall'
+  merge_date: '2024-06-21T16:14:00Z'
+  author: Meshiest
+truth:
+  introducing_commit: caa70252a22888e55b98bf909ddc80fca2157295
+  blame_confidence: B
+  buggy_lines:
+  - file: node/sync/src/block_sync.rs
+    line: 522
+    content: '        let is_request_complete = requests.get(&height).map(|(_, _,
+      peer_ips)| peer_ips.is_empty()).unwrap_or(false);'
+    is_test_expectation: false
+    line_type: code
+    fix_pr_number: 3321
+  - file: node/sync/src/block_sync.rs
+    line: 258
+    content: '    pub fn process_next_block(&self, next_height: u32) -> Option<Block<N>>
+      {'
+    is_test_expectation: false
+    line_type: code
+    fix_pr_number: 3410
+  - file: node/sync/src/block_sync.rs
+    line: 260
+    content: '        self.remove_block_response(next_height)'
+    is_test_expectation: false
+    line_type: code
+    fix_pr_number: 3410
+  fix_summary: null
+  fix_pr_numbers:
+  - 3321
+  - 3410
+  - 2692
+  - 2693
+  - 2712
+  - 3249
+  - 3499
+  introduction_summary: ''
+validation: null
+category: concurrency
+difficulty: medium
+severity: medium
+pr_size: small
+stats:
+  lines_added: 12
+  lines_deleted: 2
+  files_changed: 1
+bug_description: "<!-- Thank you for filing a PR! Help us understand by explaining\
+  \ your changes. Happy contributing! -->\r\n\r\n## Motivation\r\n\r\nWe have observed\
+  \ two different kinds of stalls while we conduct client-sync acceptance tests on\
+  \ canarynet. These issues are most noticeable and reproducible when block response\
+  \ processing takes a sufficient amount of time. These two issues can be classified\
+  \ as follows:\r\n\r\n- process.write deadlock during block response\r\n- block request\
+  \ starvation\r\n\r\n## `process.write` Deadlock\r\n\r\n### Background\r\n\r\nThere\
+  \ are two places during block sync where `process` is write locked ([`atomic_speculate`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L268)\
+  \ and [`atomic_finalize`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L573)),\
+  \ and two places where `process` is read locked ([`check_execution_internal`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/verify.rs#L307)\
+  \ and [`check_fee_internal`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/verify.rs#L338)).\
+  \ Both of the write locks occur in the same [`try_advancing_with_block_responses`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L338-L359)\
+  \ in series in [`check_next_block`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/ledger/src/check_next_block.rs#L73)\
+  \ and [`add_next_block`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/mod.rs#L424).\r\
+  \n\r\nThis code is primarily run during a [`BlockResponse`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/router/src/inbound.rs#L134)\
+  \ message that invokes [`advance_with_sync_blocks`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/src/client/router.rs#L218-L227).\
+  \ It has a [guard before calling `try_advancing_with_block_responses`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L325-L328)\
+  \ to ensure no block responses are trying to write in parallel (thus creating a\
+  \ deadlock).\r\n\r\nWe have observed that [this particular area in `atomic_post_ratify`](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L1238-L1241)\
+  \ can take quite a while (more than 5 seconds) while [holding the write lock](https://github.com/AleoNet/snarkVM/blob/mainnet-staging/synthesizer/src/vm/finalize.rs#L268)\
+  \ in `atomic_speculate`.\r\n\r\nClient nodes have [this loop that kicks off the\
+  \ block requests](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/src/client/mod.rs#L168-L179)\
+  \ firing every 5 seconds that coincidentally also calls [`try_advancing_with_block_responses`\
+  \ but without guards](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L233-L240)\
+  \ to check if another try_advance is running from the aforementioned block responses.\r\
+  \n\r\nIf an `atomic_speculate` took long enough and continued into the 5 second\
+  \ client sync loop while no block requests were active, this issue would occur and\
+  \ result in a permanent stall without block advancement until the node is restarted.\r\
+  \n\r\n### Fix\r\n\r\nWe added a guard to the `try_block_sync` and stopped running\
+  \ into this issue\r\n\r\n## Block Request Starvation\r\n\r\n### Background\r\n\r\
+  \nIn order for block requests to be created for a given height it must meet the\
+  \ following criteria (outlined in [`check_block_request`](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L538-L555)):\r\
+  \n- Height must be greater than current canon height\r\n- A request for this height\
+  \ must not already exist\r\n- A response for this height must not already exist\r\
+  \n- A request timestamp for this height must not already exist\r\n\r\nExisting block\
+  \ requests, responses, and timestamps are removed given the following (issue relevant)\
+  \ criteria:\r\n- A peer disconnects and [all associated block requests and timestamps\
+  \ are removed](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L638-L657)\r\
+  \n- The [next block is advancing](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L339)\
+  \ and [the request is \"complete\"](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L605)\
+  \ by having an empty peer ips set but not if the request is missing, [even though\
+  \ peer requests can be removed when the peer ips are empty](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L647-L650)\r\
+  \n- A [peer provides a block response](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L507-L533),\
+  \ which removes the peer ip from the request set without removing the request.\r\
+  \n- A [request is timed out or for a block that has been added already](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L661-L704)\r\
+  \n\r\nIf the last peer for a block request disconnects and the [block request and\
+  \ timestamp is removed](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L647-L653),\
+  \ a block response will be left in a cycle where [new requests will not be created](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L548)\
+  \ and [the request will not be considered complete](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L605)\
+  \ for continuing block advancement. This condition results in a permanent stall\
+  \ without block advancement until the node is restarted.\r\n\r\nIf that alone is\
+  \ fixed, the node will still reach a state where [request timestamps are retained\
+  \ until timeout](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L684-L685)\
+  \ as an \"incomplete request\" would be one where the request's peer set exists\
+  \ and is not empty OR one where the peer set has been removed (technically empty\
+  \ and not incomplete). This condition results in repeated temporary stalls until\
+  \ the block request is timed out as [new block requests will not be created until\
+  \ the `request_timestamp` is timed out](https://github.com/AleoNet/snarkOS/blob/mainnet-staging/node/sync/src/block_sync.rs#L552)\r\
+  \n\r\n### Fix\r\n\r\nBy flipping the `unwrap_or(false)` to `unwrap_or(true)` in\
+  \ `requests.get(height).map(|(_, _, peer_ips)| peer_ips.is_empty()).unwrap_or(false)`,\
+  \ we are treating the empty `peer_ips` set as a \"completed\" peer request and allowing\
+  \ both block advancement to continue and real incomplete blocks to be removed\r\n\
+  \r\n## Test Plan\r\n\r\nWe have successfully deployed this and synced 7 clients\
+  \ (1 alone on a 3995WX, 2 on a shared 2xEPYC 9354, and 4 on standalone GCP 16vCPU\
+  \ 64GB `e2-standard-16` instances) through canary blocks 28,000 through 35,000 that\
+  \ were particularly stressful on clients.\r\n\r\nLast week we ran a 100 client sync\
+  \ test with constant stalling as low as block 8000\r\n![image](https://github.com/AleoNet/snarkOS/assets/4142480/436c85d5-6908-4afc-b2b2-45402600985b)\r\
+  \n\r\nToday we have two pairs of 100 clients syncing the troublesome blocks right\
+  \ now\r\n![image](https://github.com/AleoNet/snarkOS/assets/4142480/6a6cca1d-70e0-434e-be59-f38f4b28dfb9)\r\
+  \n\r\nThe stall in this screenshot is discovering and fixing the temporary stall\
+  \ issue\r\n![image](https://github.com/AleoNet/snarkOS/assets/4142480/df7dafc4-5619-4483-b119-978726507a5a)\r\
+  \n\r\nNote that the servers running these clients are still properly syncing without\
+  \ stalls despite both being under spec and running 10 clients each...\r\n\r\n##\
+  \ Related PRs\r\n\r\n- Helps with #3063\r\n- Fixes #2916 \r\n- Fixes #2978"
+bug_description_source: pr_body
+bug_summary: ''
+bug_latency_days: 270
+same_author_fix: false
+source: issue-mining
+status: ground-truth
+fix_pr_files: []
+excluded: true
+excluded_reason: merged-sibling
+quality_flags: []

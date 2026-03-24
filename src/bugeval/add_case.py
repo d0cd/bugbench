@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from bugeval.blame import populate_blame
+from bugeval.git_utils import GitError
 from bugeval.ground_truth import compute_buggy_lines
 from bugeval.io import save_case
 from bugeval.mine import build_case_from_pr, fetch_pr_details_graphql, run_gh
@@ -121,7 +122,7 @@ def add_case_from_pr(
                     cwd=repo_dir,
                 )
                 case.truth.buggy_lines = compute_buggy_lines(intro_diff, [fix_diff])
-            except Exception:
+            except (GitError, OSError, ValueError, KeyError):
                 log.debug(
                     "Ground truth computation failed for %s",
                     case_id,

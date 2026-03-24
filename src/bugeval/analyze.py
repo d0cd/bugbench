@@ -33,7 +33,16 @@ def load_scores(scores_dir: Path) -> list[CaseScore]:
 
 
 def compute_catch_rate(scores: list[CaseScore]) -> float:
-    """Fraction of cases where the bug was caught."""
+    """Fraction of cases where the bug was caught (detection_score >= 2)."""
+    if not scores:
+        return 0.0
+    return sum(1 for s in scores if s.detection_score is not None and s.detection_score >= 2) / len(
+        scores
+    )
+
+
+def mechanical_catch_rate(scores: list[CaseScore]) -> float:
+    """Fraction of cases where mechanical matcher flagged a catch."""
     if not scores:
         return 0.0
     return sum(1 for s in scores if s.caught) / len(scores)
@@ -143,6 +152,18 @@ def signal_to_noise(scores: list[CaseScore]) -> float:
     total = 0
     for s in scores:
         total += len(s.comment_scores)
+        useful += s.tp_count
+    if total == 0:
+        return 0.0
+    return useful / total
+
+
+def signal_to_noise_inclusive(scores: list[CaseScore]) -> float:
+    """Useful comments (including novel) / total comments."""
+    useful = 0
+    total = 0
+    for s in scores:
+        total += len(s.comment_scores)
         useful += s.tp_count + s.novel_count
     if total == 0:
         return 0.0
@@ -198,6 +219,37 @@ def _get_dimension(case: TestCase, score: CaseScore, dim: str) -> str:
     return ""
 
 
+def tolerance_sensitivity(
+    all_scores: dict[str, list[CaseScore]],
+    all_results: dict[str, list[ToolResult]],
+    cases: list[TestCase],
+    tolerances: list[int] | None = None,
+) -> dict[str, dict[int, float]]:
+    """Compute mechanical catch rate at each tolerance level per tool."""
+    from bugeval.score import mechanical_catch
+
+    if tolerances is None:
+        tolerances = [3, 5, 10, 15, 20]
+    out: dict[str, dict[int, float]] = {}
+    cases_by_id = {c.id: c for c in cases}
+    for tool, results in all_results.items():
+        sweep: dict[int, float] = {}
+        for tol in tolerances:
+            caught = 0
+            total = 0
+            for r in results:
+                c = cases_by_id.get(r.case_id)
+                if not c or c.kind != "bug" or not c.truth:
+                    continue
+                total += 1
+                hit, _ = mechanical_catch(r, c.truth, tolerance=tol)
+                if hit:
+                    caught += 1
+            sweep[tol] = caught / total if total else 0.0
+        out[tool] = sweep
+    return out
+
+
 def build_comparison_table(
     all_scores: dict[str, list[CaseScore]],
     all_results: dict[str, list[ToolResult]],
@@ -219,9 +271,11 @@ def build_comparison_table(
         mean_q = sum(quals) / len(quals) if quals else 0.0
         far = false_alarm_rate(scores, cases)
         snr = signal_to_noise(scores)
+        snr_incl = signal_to_noise_inclusive(scores)
+        total_novel = sum(s.novel_count for s in scores)
         cpb = cost_per_bug(scores, results)
         # Precision: TP / (TP + FP)
-        total_tp = sum(s.tp_count + s.novel_count for s in scores)
+        total_tp = sum(s.tp_count for s in scores)
         total_fp = sum(s.fp_count for s in scores)
         prec = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0.0
         swcr = severity_weighted_catch_rate(scores, cases)
@@ -247,6 +301,8 @@ def build_comparison_table(
                 "false_alarm_rate": round(far, 4),
                 "precision": round(prec, 4),
                 "snr": round(snr, 4),
+                "novel_count": total_novel,
+                "snr_inclusive": round(snr_incl, 4),
                 "cost_per_bug": round(cpb, 4) if cpb is not None else None,
                 "judge_cost_per_case": judge_per_case,
                 "total_cost_per_bug": total_cpb,
@@ -366,17 +422,42 @@ def run_analysis(run_dir: Path, cases_dir: Path, no_charts: bool) -> None:
         "context_level",
         "issue_linked",
     ]
+    all_slice_p_values: list[float] = []
+    all_slice_labels: list[str] = []
     for dim in dimensions:
         values: set[str] = set()
         for s in all_scores_flat:
             c = cases_by_id.get(s.case_id)
             if c:
                 values.add(_get_dimension(c, s, dim))
-        for val in sorted(v for v in values if v):
+        sorted_vals = sorted(v for v in values if v)
+        sliced_groups: dict[str, list[CaseScore]] = {}
+        for val in sorted_vals:
             sliced = slice_scores(all_scores_flat, cases, dim, val)
             if sliced:
                 rate = compute_catch_rate(sliced)
                 click.echo(f"  {dim}={val}: catch_rate={rate:.2%} (n={len(sliced)})")
+                sliced_groups[val] = sliced
+        # Pairwise permutation tests within this dimension
+        group_keys = sorted(sliced_groups.keys())
+        for i, k1 in enumerate(group_keys):
+            for k2 in group_keys[i + 1 :]:
+                g1 = [1.0 if s.caught else 0.0 for s in sliced_groups[k1]]
+                g2 = [1.0 if s.caught else 0.0 for s in sliced_groups[k2]]
+                if g1 and g2:
+                    p = permutation_test(g1, g2)
+                    all_slice_p_values.append(p)
+                    all_slice_labels.append(f"{dim}: {k1} vs {k2}")
+
+    if all_slice_p_values:
+        sig_flags = benjamini_hochberg(all_slice_p_values)
+        sig_pairs = [
+            (lbl, pv) for lbl, pv, sf in zip(all_slice_labels, all_slice_p_values, sig_flags) if sf
+        ]
+        if sig_pairs:
+            click.echo("\n--- Significant Slice Differences (BH-corrected) ---")
+            for lbl, pv in sig_pairs:
+                click.echo(f"  {lbl}: p={pv:.4f} *")
 
     # High-confidence analysis (tier A/B only)
     high_conf_scores: dict[str, list[CaseScore]] = {}
@@ -406,6 +487,36 @@ def run_analysis(run_dir: Path, cases_dir: Path, no_charts: bool) -> None:
                 f"  quality={row['mean_quality']}"
                 f"  precision={row['precision']:.2%}"
             )
+
+    # Contamination impact analysis
+    contaminated = {
+        t: [s for s in scores if s.potentially_contaminated] for t, scores in all_scores.items()
+    }
+    clean = {
+        t: [s for s in scores if not s.potentially_contaminated] for t, scores in all_scores.items()
+    }
+    has_contamination = any(len(v) > 0 for v in contaminated.values())
+    if has_contamination:
+        click.echo("\n--- Contamination Impact ---")
+        for tool in sorted(all_scores):
+            c_count = len(contaminated[tool])
+            total = len(all_scores[tool])
+            if c_count:
+                clean_rate = compute_catch_rate(clean[tool])
+                full_rate = compute_catch_rate(all_scores[tool])
+                click.echo(
+                    f"  {tool}: {c_count}/{total} contaminated,"
+                    f" catch_rate {full_rate:.0%} (all)"
+                    f" vs {clean_rate:.0%} (clean only)"
+                )
+
+    # Tolerance sensitivity
+    if all_results:
+        click.echo("\n--- Tolerance Sensitivity ---")
+        sweep = tolerance_sensitivity(dict(all_scores), dict(all_results), cases)
+        for tool, rates in sorted(sweep.items()):
+            row = "  ".join(f"\u00b1{t}={r:.0%}" for t, r in sorted(rates.items()))
+            click.echo(f"  {tool}: {row}")
 
     # Pairwise tool comparisons
     tool_names = sorted(all_scores.keys())

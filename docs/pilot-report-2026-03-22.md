@@ -113,6 +113,44 @@ All 7 configurations scored by Opus LLM judge on detection (0-3) and quality (0-
 Larger PRs have higher catch rates — more code to review means more chances to
 find the buggy lines, but also the bugs may be more obvious in large refactors.
 
+### Mechanical vs LLM-Judged Scoring
+
+| Tool | Mechanical (+/-10 lines) | LLM-Judged (Det>=2) |
+|------|--------------------------|----------------------|
+| Copilot | 60% | 29% |
+| Opus diff-only | 34% | 22% |
+| Sonnet diff-only | 38% | 21% |
+| Greptile | 45% | 14% |
+| CodeRabbit | 3% | 3% |
+
+The mechanical scorer awards "caught" when any tool comment falls within +/-10
+lines of a buggy line. This inflates rates for tools that post many comments
+(Copilot averages 8-10 comments per PR), since more comments means more chances
+for statistical coincidence with buggy lines regardless of whether the comment
+actually addresses the bug.
+
+The LLM-judged Det>=2 metric requires an LLM judge (claude-opus-4-6) to confirm
+the tool actually identified and described the bug, not just commented near it.
+This is a substantially higher bar and reflects real-world usefulness more
+accurately.
+
+The 60% to 29% drop for Copilot is the largest discrepancy, explained by
+Copilot's high comment volume creating statistical coincidence with buggy lines.
+Many of its comments flag style or best-practice issues that happen to land near
+the buggy code without actually identifying the bug itself.
+
+CodeRabbit shows no discrepancy (3% both ways) because it rarely posts
+line-specific comments — its walkthrough summaries either identify the bug or
+they do not, with no opportunity for accidental proximity matches.
+
+Across all tools, 192 novel true positives were found — bugs not in the ground
+truth set that tools discovered independently. This shows tools provide value
+beyond catching known bugs and suggests the ground truth underestimates actual
+tool effectiveness for bug-adjacent issues.
+
+**Recommendation:** Use Det>=2 as the primary metric for future evaluations;
+report mechanical catch rate as supplementary context only.
+
 ## Pipeline Improvements Made During Pilot
 
 ### Dataset Construction

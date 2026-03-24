@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -12,8 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 from bugeval.git_utils import GitError, run_git
-from bugeval.io import load_cases, load_checkpoint, save_case, save_checkpoint
-from bugeval.mine import fetch_pr_details_graphql, run_gh
+from bugeval.io import find_case_path, load_cases, load_checkpoint, save_case, save_checkpoint
+from bugeval.mine import GhError, fetch_pr_details_graphql, run_gh
 from bugeval.models import CaseKind, GroundTruth, TestCase
 
 log = logging.getLogger(__name__)
@@ -319,7 +320,7 @@ def resolve_introducing_pr(case: TestCase, repo: str) -> TestCase:
             "Accept: application/vnd.github.v3+json",
         )
         prs = json.loads(output)
-    except Exception:
+    except (GhError, subprocess.CalledProcessError, json.JSONDecodeError, OSError):
         return case
 
     if not prs:
@@ -443,7 +444,7 @@ def blame_cases(cases_dir: Path, repo_dir: Path, concurrency: int) -> None:
     if concurrency <= 1:
         for case in pending:
             updated = process(case)
-            case_path = _find_case_path(cases_dir, case.id)
+            case_path = find_case_path(case.id, cases_dir)
             if case_path:
                 save_case(updated, case_path)
             with _checkpoint_lock:
@@ -458,7 +459,7 @@ def blame_cases(cases_dir: Path, repo_dir: Path, concurrency: int) -> None:
                 case = futures[future]
                 try:
                     updated = future.result()
-                    case_path = _find_case_path(cases_dir, case.id)
+                    case_path = find_case_path(case.id, cases_dir)
                     if case_path:
                         save_case(updated, case_path)
                     with _checkpoint_lock:
@@ -466,7 +467,7 @@ def blame_cases(cases_dir: Path, repo_dir: Path, concurrency: int) -> None:
                         save_checkpoint(done, checkpoint_path)
                     completed += 1
                     log.info("Blamed %d/%d: %s", completed, total, case.id)
-                except Exception as exc:
+                except (GitError, OSError, ValueError) as exc:
                     log.warning(
                         "Blame failed for %s: %s",
                         case.id,
@@ -474,10 +475,3 @@ def blame_cases(cases_dir: Path, repo_dir: Path, concurrency: int) -> None:
                     )
 
     log.info("Blame complete: %d/%d cases processed", completed, total)
-
-
-def _find_case_path(cases_dir: Path, case_id: str) -> Path | None:
-    for p in cases_dir.rglob("*.yaml"):
-        if p.stem == case_id:
-            return p
-    return None

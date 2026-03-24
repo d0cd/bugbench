@@ -12,7 +12,7 @@ from typing import Any
 
 from bugeval.blame import parse_diff_deleted_lines
 from bugeval.git_utils import GitError, run_git
-from bugeval.io import load_cases, load_checkpoint, save_case, save_checkpoint
+from bugeval.io import find_case_path, load_cases, load_checkpoint, save_case, save_checkpoint
 from bugeval.models import BugCategory, BuggyLine, GroundTruth, TestCase
 
 log = logging.getLogger(__name__)
@@ -34,9 +34,34 @@ _TEST_EXPECTATION_EXTS = {
     ".stdout",
 }
 
-_NON_SOURCE_FILES = {"Cargo.lock", "package-lock.json", "yarn.lock", "poetry.lock"}
+_NON_SOURCE_FILES = {
+    "Cargo.lock",
+    "Cargo.toml",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "README.md",
+    "README",
+    "CHANGELOG.md",
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+}
 _NON_SOURCE_EXTS = {".lock", ".sum"}  # go.sum, etc.
 _CI_PREFIXES = (".github/workflows/", ".circleci/")
+
+
+def _is_test_file(path: str) -> bool:
+    """Return True if path is a test file (not production source)."""
+    normalized = path.replace("\\", "/")
+    # Test directories
+    if any(part in ("tests", "test", "benches", "examples") for part in normalized.split("/")):
+        return True
+    # Test expectation files
+    p = Path(path)
+    if p.suffix.lower() in {".out", ".expected", ".snap", ".stderr", ".stdout"}:
+        return True
+    return False
 
 
 def _is_non_source_file(path: str) -> bool:
@@ -182,7 +207,7 @@ def compute_buggy_lines(
     added = {
         f: lines
         for f, lines in parse_diff_added_lines(introducing_diff).items()
-        if not _is_non_source_file(f)
+        if not _is_non_source_file(f) and not _is_test_file(f)
     }
     if not added:
         return []
@@ -374,17 +399,20 @@ def _get_fix_author(case: TestCase) -> str:
 
 
 _PARSER_RE = re.compile(
-    r"\b(pars(e[sd]?|er|ing)|tokeniz\w*|lexer|syntax\s+error|grammar)\b",
+    r"\b(pars(e[sd]?|er|ing)|tokeniz\w*|lexer|syntax\s+error|grammar"
+    r"|ast|finalize.?block)\b",
     re.IGNORECASE,
 )
 _CODEGEN_RE = re.compile(
     r"\b(code\s*gen\w*|emit\w*|lowering|monomorphiz\w*|flatten\w*"
-    r"|destructur\w*|inlin\w+|\bssa\b|code\s+generation)\b",
+    r"|destructur\w*|inlin\w+|\bssa\b|code\s+generation"
+    r"|aleo.?instruction|r1cs|constraint|synthesiz\w*|circuit)\b",
     re.IGNORECASE,
 )
 _COMPILER_PASS_RE = re.compile(
     r"\b(pass\b|transform\w*|visitor|traversal|unroll\w*"
-    r"|const\s+prop\w*|write\s*transform\w*)\b",
+    r"|const\s+prop\w*|write\s*transform\w*"
+    r"|compiler|compil\w*|lower\w*|flatten\w*)\b",
     re.IGNORECASE,
 )
 _INTERPRETER_RE = re.compile(
@@ -421,7 +449,8 @@ _SECURITY_RE = re.compile(
     re.IGNORECASE,
 )
 _TYPE_RE = re.compile(
-    r"\b(type|cast|convert|serializ\w*|deserializ\w*)\b",
+    r"\b(type.?check|type.?system|type.?inference|type.?mismatch"
+    r"|cast|coerci\w*|convert|serializ\w*|deserializ\w*)\b",
     re.IGNORECASE,
 )
 
@@ -695,7 +724,7 @@ def build_ground_truth(cases_dir: Path, repo_dir: Path, concurrency: int) -> Non
     if concurrency <= 1:
         for case in pending:
             updated = process(case)
-            case_path = _find_case_path(cases_dir, case.id)
+            case_path = find_case_path(case.id, cases_dir)
             if case_path:
                 save_case(updated, case_path)
             with _checkpoint_lock:
@@ -710,7 +739,7 @@ def build_ground_truth(cases_dir: Path, repo_dir: Path, concurrency: int) -> Non
                 case = futures[future]
                 try:
                     updated = future.result()
-                    case_path = _find_case_path(cases_dir, case.id)
+                    case_path = find_case_path(case.id, cases_dir)
                     if case_path:
                         save_case(updated, case_path)
                     with _checkpoint_lock:
@@ -735,10 +764,3 @@ def build_ground_truth(cases_dir: Path, repo_dir: Path, concurrency: int) -> Non
         completed,
         total,
     )
-
-
-def _find_case_path(cases_dir: Path, case_id: str) -> Path | None:
-    for p in cases_dir.rglob("*.yaml"):
-        if p.stem == case_id:
-            return p
-    return None

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import random
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+import yaml
+
+from bugeval.mine import GhError
 
 if TYPE_CHECKING:
     from bugeval.models import TestCase
@@ -45,8 +49,7 @@ def mine(
 
     if from_git:
         if not repo_dir:
-            click.echo("Error: --repo-dir required with --from-git")
-            raise SystemExit(1)
+            raise click.ClickException("--repo-dir required with --from-git")
         from bugeval.mine import mine_from_git
 
         cases = mine_from_git(
@@ -142,7 +145,7 @@ def clean_cases(repo: str, count: int, cases_dir: str, since: str) -> None:
     required=True,
     help="Tool: copilot, greptile, coderabbit, agent, agent-gemini,"
     " agent-openai, agent-cli-claude, agent-cli-gemini, agent-cli-codex,"
-    " agent-sdk, agent-sdk-2pass",
+    " agent-sdk, agent-sdk-2pass, agent-sdk-v3",
 )
 @click.option("--cases-dir", default="cases", help="Test cases directory")
 @click.option("--run-dir", required=True, help="Output directory for results")
@@ -362,17 +365,13 @@ def _preflight_open_prs(
     Returns True if all critical checks pass.
     Prints warnings for non-critical issues.
     """
-    import random
-
     # 1. Cases exist
     if not cases:
-        click.echo(f"Error: No active cases found in {cases_path}")
-        raise SystemExit(1)
+        raise click.ClickException(f"No active cases found in {cases_path}")
 
     # 2. repo_dir is a git repo
     if not repo_path.exists() or not (repo_path / ".git").exists():
-        click.echo(f"Error: repo_dir {repo_path} is not a git repository")
-        raise SystemExit(1)
+        raise click.ClickException(f"repo_dir {repo_path} is not a git repository")
 
     # 3. GitHub auth
     try:
@@ -383,8 +382,7 @@ def _preflight_open_prs(
             text=True,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
-        click.echo("Error: GitHub auth failed. Run: gh auth login")
-        raise SystemExit(1)
+        raise click.ClickException("GitHub auth failed. Run: gh auth login")
 
     # 4. Per-tool repo exists (warning, not error)
     repos_seen: set[str] = set()
@@ -474,7 +472,7 @@ def open_prs(
     from bugeval.io import load_cases, load_result, save_result
     from bugeval.result_models import ToolResult
 
-    logger = logging.getLogger(__name__)
+    log = logging.getLogger(__name__)
 
     cases_path = Path(cases_dir)
     run_path = Path(run_dir)
@@ -513,7 +511,7 @@ def open_prs(
                 # Error result: remove stale file so we retry
                 if existing.error:
                     result_path.unlink(missing_ok=True)
-            except Exception:
+            except (OSError, yaml.YAMLError, ValueError):
                 # Corrupt file — remove and retry
                 result_path.unlink(missing_ok=True)
         pending.append(case)
@@ -535,7 +533,7 @@ def open_prs(
                 existing = load_result(path)
                 if existing.pr_state == "pending-review":
                     return False
-            except Exception:
+            except (OSError, yaml.YAMLError, ValueError):
                 pass
         save_result(result, path)
         return True
@@ -557,8 +555,8 @@ def open_prs(
                     click.echo(f"Opened PR #{result.pr_number} for {case.id} ({completed}/{total})")
                 else:
                     click.echo(f"Error for {case.id}: {result.error} ({completed}/{total})")
-            except Exception:
-                logger.exception("Failed to open PR for %s", case.id)
+            except (OSError, RuntimeError, ValueError, yaml.YAMLError):
+                log.exception("Failed to open PR for %s", case.id)
                 completed += 1
 
     click.echo(f"Done: {completed}/{total} cases processed")
@@ -581,7 +579,7 @@ def scrape_prs(run_dir: str, cases_dir: str, org: str, close: bool) -> None:
     from bugeval.copilot_runner import scrape_pr_for_case
     from bugeval.io import load_cases, load_result, save_result
 
-    logger = logging.getLogger(__name__)
+    log = logging.getLogger(__name__)
 
     results_dir = Path(run_dir) / "results"
     if not results_dir.exists():
@@ -598,8 +596,8 @@ def scrape_prs(run_dir: str, cases_dir: str, org: str, close: bool) -> None:
     for p in sorted(results_dir.glob("*.yaml")):
         try:
             result = load_result(p)
-        except Exception:
-            logger.exception("Failed to load %s", p)
+        except (OSError, yaml.YAMLError, ValueError):
+            log.exception("Failed to load %s", p)
             errors += 1
             continue
 
@@ -608,7 +606,7 @@ def scrape_prs(run_dir: str, cases_dir: str, org: str, close: bool) -> None:
 
         case = case_map.get(result.case_id)
         if not case:
-            logger.warning("No case found for %s, skipping", result.case_id)
+            log.warning("No case found for %s, skipping", result.case_id)
             errors += 1
             continue
 
@@ -617,8 +615,8 @@ def scrape_prs(run_dir: str, cases_dir: str, org: str, close: bool) -> None:
 
         try:
             updated = scrape_pr_for_case(result, fork, close=close)
-        except Exception:
-            logger.exception("Failed to scrape PR for %s", result.case_id)
+        except (GhError, subprocess.CalledProcessError, OSError):
+            log.exception("Failed to scrape PR for %s", result.case_id)
             errors += 1
             continue
 
@@ -636,9 +634,10 @@ def scrape_prs(run_dir: str, cases_dir: str, org: str, close: bool) -> None:
 
 @cli.command("cleanup-prs")
 @click.option("--org", required=True, help="GitHub org")
+@click.option("--repo", required=True, help="Source repo (e.g. ProvableHQ/leo)")
 @click.option("--tool", default="", help="Specific tool (default: all PR tools)")
 @click.option("--dry-run", is_flag=True, help="Show what would be cleaned without acting")
-def cleanup_prs(org: str, tool: str, dry_run: bool) -> None:
+def cleanup_prs(org: str, repo: str, tool: str, dry_run: bool) -> None:
     """Clean up orphaned PRs and stale branches on tool repos."""
     import json
     import logging
@@ -650,12 +649,14 @@ def cleanup_prs(org: str, tool: str, dry_run: bool) -> None:
     )
     from bugeval.mine import run_gh
 
-    logger = logging.getLogger(__name__)
+    log = logging.getLogger(__name__)
 
     pr_tools = [tool] if tool else ["copilot", "greptile", "coderabbit"]
 
+    repo_slug = repo.split("/", 1)[-1] if "/" in repo else repo
+
     for t in pr_tools:
-        fork = f"{org}/leo-{t}"
+        fork = f"{org}/{repo_slug}-{t}"
 
         # 1. List and close open PRs
         try:
@@ -670,8 +671,8 @@ def cleanup_prs(org: str, tool: str, dry_run: bool) -> None:
                 "number,headRefName,baseRefName",
             )
             prs = json.loads(raw) if raw.strip() else []
-        except Exception:
-            logger.warning("Failed to list PRs on %s", fork)
+        except (GhError, subprocess.CalledProcessError, FileNotFoundError, OSError):
+            log.warning("Failed to list PRs on %s", fork)
             prs = []
 
         closed = 0
@@ -685,8 +686,8 @@ def cleanup_prs(org: str, tool: str, dry_run: bool) -> None:
                 try:
                     close_eval_pr(fork, pr_num, head, base)
                     closed += 1
-                except Exception:
-                    logger.warning(
+                except (GhError, subprocess.CalledProcessError, OSError):
+                    log.warning(
                         "Failed to close PR #%d on %s",
                         pr_num,
                         fork,
@@ -701,8 +702,8 @@ def cleanup_prs(org: str, tool: str, dry_run: bool) -> None:
                 ".[].ref",
             )
             refs = [r.strip() for r in refs_raw.splitlines() if r.strip()]
-        except Exception:
-            logger.warning(
+        except (GhError, subprocess.CalledProcessError, FileNotFoundError, OSError):
+            log.warning(
                 "Failed to list branches on %s",
                 fork,
             )
@@ -732,8 +733,8 @@ def cleanup_prs(org: str, tool: str, dry_run: bool) -> None:
                 try:
                     _delete_remote_branch(fork, branch)
                     deleted += 1
-                except Exception:
-                    logger.warning(
+                except (GhError, subprocess.CalledProcessError, OSError):
+                    log.warning(
                         "Failed to delete branch %s on %s",
                         branch,
                         fork,

@@ -242,7 +242,7 @@ errors (timeouts, 500s, rate limits).
 | `bugbench curate` | Auto-exclude bad cases (bumps, CI fixes, features, etc.) |
 | `bugbench validate` | Cross-model validation (Claude + Gemini) |
 | `bugbench clean-cases` | Generate negative control cases (clean PRs) |
-| `bugbench evaluate` | Run a tool against test cases (agents + single-phase PR) |
+| `bugbench evaluate` | Run a tool against test cases (tools: copilot, greptile, coderabbit, agent, agent-gemini, agent-openai, agent-cli-claude, agent-cli-gemini, agent-cli-codex, agent-sdk, agent-sdk-2pass, agent-sdk-v3) |
 | `bugbench open-prs` | Phase 1: Open PRs for PR tools (no waiting) |
 | `bugbench scrape-prs` | Phase 2: Scrape reviews from open PRs |
 | `bugbench cleanup-prs` | Close orphaned PRs and delete stale branches |
