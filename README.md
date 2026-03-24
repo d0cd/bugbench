@@ -8,44 +8,7 @@ Mines historical bug-fix PRs, reconstructs the introducing changes, presents the
 
 **[View the presentation](https://d0cd.github.io/bugbench/presentation.html)** | **[Launch the dashboard](#dashboard)** for interactive case exploration
 
-## Architecture
-
-```
-                     ┌──────────────────────────────────┐
-                     │       Dataset Construction       │
-                     │                                  │
-  Fix PRs ──→ mine ──→ blame ──→ ground-truth ──→ curate
-                     │                                  │
-                     └──────────────┬───────────────────┘
-                                    │
-                              cases/*.yaml
-                                    │
-                     ┌──────────────▼───────────────────┐
-                     │         Evaluation Layer          │
-                     │                                  │
-                     │  ┌──────────┐  ┌──────────────┐  │
-                     │  │ PR Tools │  │ Agent Runners │  │
-                     │  │──────────│  │──────────────│  │
-                     │  │ Copilot  │  │ Claude API   │  │
-                     │  │ Greptile │  │ Gemini API   │  │
-                     │  │CodeRabbit│  │ OpenAI API   │  │
-                     │  │          │  │ Claude CLI   │  │
-                     │  │          │  │ Gemini CLI   │  │
-                     │  │          │  │ Codex CLI    │  │
-                     │  │          │  │ Claude SDK   │  │
-                     │  └──────────┘  └──────────────┘  │
-                     └──────────────┬───────────────────┘
-                                    │
-                              results/run-*/
-                                    │
-                     ┌──────────────▼───────────────────┐
-                     │     Scoring & Analysis Layer      │
-                     │                                  │
-                     │  score (mechanical + LLM judge)  │
-                     │  analyze (stats, charts, tables) │
-                     │  dashboard (web UI)              │
-                     └──────────────────────────────────┘
-```
+**Pipeline:** `mine` → `blame` → `ground-truth` → `curate` → `evaluate` → `score` → `analyze` (see [experiment design](docs/experiment-design.md) for full architecture)
 
 ## Quick Start
 
@@ -59,65 +22,51 @@ Mines historical bug-fix PRs, reconstructs the introducing changes, presents the
 ### Setup
 
 ```bash
-# Install dependencies
-uv sync
+uv sync                          # core dependencies
+uv sync --extra sdk              # + Claude Agent SDK
+uv sync --extra google           # + Gemini
+uv sync --extra openai           # + OpenAI
 
-# Install optional providers
-uv sync --extra sdk      # Claude Agent SDK
-uv sync --extra google   # Gemini support
-uv sync --extra openai   # OpenAI support
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your API keys
-
-# Verify setup
-uv run bugbench --help
+cp .env.example .env             # configure API keys
+uv run bugbench --help           # verify
 ```
 
 ### Run the Pipeline
 
 ```bash
-# 1. Mine bug-fix PRs from a repository
+# Build dataset
 uv run bugbench mine --repo ProvableHQ/leo --limit 50
-
-# 2. Find introducing commits
 uv run bugbench blame --cases-dir cases --repo-dir repos/leo
-
-# 3. Compute ground truth (buggy lines)
 uv run bugbench ground-truth --cases-dir cases --repo-dir repos/leo
-
-# 4. Curate dataset (exclude bad cases)
 uv run bugbench curate --cases-dir cases
 
-# 5. Evaluate a tool
-uv run bugbench evaluate --tool agent --context-level diff-only
+# Evaluate
+uv run bugbench evaluate --tool agent --context diff-only \
+    --cases-dir cases --run-dir results/my-run
 
-# 6. Score results
-uv run bugbench score --run-dir results/run-2026-03-22
-
-# 7. Analyze and generate reports
-uv run bugbench analyze --run-dir results/run-2026-03-22
+# Score and analyze
+uv run bugbench score --run-dir results/my-run --cases-dir cases
+uv run bugbench analyze --run-dir results/my-run --cases-dir cases
 ```
 
 ## Tools Evaluated
 
 ### Commercial (PR-based)
 
-These tools review code through GitHub's PR interface. The framework manages the full lifecycle: fork repo, create branch, open PR, wait for review, scrape comments, close PR.
+Review through GitHub's PR interface. The framework manages the full lifecycle: fork, branch, open PR, wait for review, scrape comments, close PR.
 
-| Tool | Runner | Command |
-|------|--------|---------|
-| GitHub Copilot | `copilot_runner.py` | `bugbench evaluate --tool copilot` |
-| Greptile | `greptile_runner.py` | `bugbench evaluate --tool greptile` |
-| CodeRabbit | `coderabbit_runner.py` | `bugbench evaluate --tool coderabbit` |
+| Tool | Command |
+|------|---------|
+| GitHub Copilot | `bugbench evaluate --tool copilot` |
+| Greptile | `bugbench evaluate --tool greptile` |
+| CodeRabbit | `bugbench evaluate --tool coderabbit` |
 
 ### In-House Agents (API)
 
 Same tools, prompts, and execution engine — only the model differs. Measures **model capability**.
 
-| Tool | Model | Command |
-|------|-------|---------|
+| Tool | Default Model | Command |
+|------|---------------|---------|
 | Claude | `claude-sonnet-4-6` | `bugbench evaluate --tool agent` |
 | Gemini | `gemini-2.5-flash` | `bugbench evaluate --tool agent-gemini` |
 | OpenAI | `o4-mini` | `bugbench evaluate --tool agent-openai` |
@@ -126,63 +75,63 @@ Same tools, prompts, and execution engine — only the model differs. Measures *
 
 Each vendor's CLI with its own system prompt and agent loop. Measures **product capability**.
 
-| Tool | Binary | Command |
-|------|--------|---------|
-| Claude Code | `claude` | `bugbench evaluate --tool agent-cli-claude` |
-| Gemini CLI | `gemini` | `bugbench evaluate --tool agent-cli-gemini` |
-| Codex CLI | `codex` | `bugbench evaluate --tool agent-cli-codex` |
-
-### In-House Agent (SDK)
-
 | Tool | Command |
 |------|---------|
-| Claude Agent SDK | `bugbench evaluate --tool agent-sdk` |
-| Claude Agent SDK (2-pass) | `bugbench evaluate --tool agent-sdk-2pass` |
-| Claude Agent SDK (v3) | `bugbench evaluate --tool agent-sdk-v3` |
+| Claude Code | `bugbench evaluate --tool agent-cli-claude` |
+| Gemini CLI | `bugbench evaluate --tool agent-cli-gemini` |
+| Codex CLI | `bugbench evaluate --tool agent-cli-codex` |
+
+### In-House Agents (SDK)
+
+| Tool | Strategy | Command |
+|------|----------|---------|
+| Claude Agent SDK | Single-pass | `bugbench evaluate --tool agent-sdk` |
+| Claude Agent SDK (2-pass) | Explorer + reviewer | `bugbench evaluate --tool agent-sdk-2pass` |
+| Claude Agent SDK (v3) | Survey + investigate + report | `bugbench evaluate --tool agent-sdk-v3` |
 
 ## CLI Reference
 
-```
-bugbench mine           Scrape fix PRs, build test cases
-bugbench blame          Find introducing commits via git blame
-bugbench ground-truth   Compute buggy lines from diff intersection
-bugbench curate         Auto-exclude bad cases (LLM-powered)
-bugbench clean-cases    Generate negative control cases
-bugbench validate       Cross-model ground truth validation
-bugbench add-case       Manually add a case from a PR URL
-bugbench evaluate       Run a tool against test cases
-bugbench open-prs       Phase 1: Open PRs for PR-based tools
-bugbench scrape-prs     Phase 2: Scrape reviews from open PRs
-bugbench cleanup-prs    Close orphaned PRs and stale branches
-bugbench score          Mechanical + LLM judge scoring
-bugbench analyze        Generate stats, tables, and charts
-bugbench dashboard      Launch local web review dashboard
-```
+| Command | Purpose |
+|---------|---------|
+| `bugbench mine` | Scrape fix PRs, build test cases |
+| `bugbench blame` | Find introducing commits via git blame |
+| `bugbench ground-truth` | Compute buggy lines from diff intersection |
+| `bugbench curate` | Auto-exclude bad cases (LLM-powered) |
+| `bugbench clean-cases` | Generate negative control cases |
+| `bugbench validate` | Cross-model ground truth validation |
+| `bugbench add-case` | Manually add a case from a PR URL |
+| `bugbench evaluate` | Run a tool against test cases |
+| `bugbench open-prs` | Phase 1: Open PRs for PR-based tools |
+| `bugbench scrape-prs` | Phase 2: Scrape reviews from open PRs |
+| `bugbench cleanup-prs` | Close orphaned PRs and stale branches |
+| `bugbench score` | Mechanical + LLM judge scoring |
+| `bugbench analyze` | Stats, comparison tables, and charts |
+| `bugbench dashboard` | Local web UI for experiment review |
 
-All commands support `--help` for detailed options. Most support `--dry-run` for safe testing.
+All commands support `--help`. Most support `--dry-run`.
 
 ## Scoring
 
-**Bug Detection (0-3):** How accurately the tool identified the known bug.
+**Bug Detection (0–3)**
 
 | Score | Meaning |
 |-------|---------|
 | 0 | Missed — no relevant comment |
-| 1 | Wrong area — commented on the right file but wrong location |
+| 1 | Wrong area — right file, wrong location |
 | 2 | Correct identification — found the bug |
 | 3 | Correct identification + suggested fix |
 
-**Review Quality (0-4):** Overall usefulness of the review.
+**Review Quality (0–4)**
 
 | Score | Meaning |
 |-------|---------|
 | 0 | Useless |
-| 1 | Shallow — surface-level comments only |
+| 1 | Shallow — surface-level only |
 | 2 | Adequate — some useful observations |
-| 3 | Strong — thorough, actionable review |
+| 3 | Strong — thorough, actionable |
 | 4 | Exceptional — catches subtle issues with clear reasoning |
 
-**Comment Classification:** Each comment is tagged as TP-expected, TP-novel, FP, or low-value.
+**Comment Classification:** TP-expected, TP-novel, FP, or low-value.
 
 ## Adding a New Tool
 
@@ -205,37 +154,22 @@ def run_my_tool(
     repo_dir: Path,
     timeout: int,
 ) -> ToolResult:
-    # Call your tool's API with the diff
     findings = call_my_tool_api(diff)
-
-    comments = [
-        Comment(file=f["file"], line=f["line"], body=f["message"])
-        for f in findings
-    ]
 
     return ToolResult(
         case_id=case.id,
         tool="my-tool",
         context_level=context_level,
-        comments=comments,
+        comments=[
+            Comment(file=f["file"], line=f["line"], body=f["message"])
+            for f in findings
+        ],
         time_seconds=elapsed,
         cost_usd=cost,
     )
 ```
 
-### 2. Register in config
-
-Add your tool to `config/config.yaml`:
-
-```yaml
-tools:
-  my-tool:
-    type: api
-    display_name: My Tool
-    timeout_seconds: 300
-```
-
-### 3. Add dispatch
+### 2. Add dispatch
 
 In `src/bugeval/evaluate.py`, add your tool to the runner dispatch:
 
@@ -245,7 +179,7 @@ elif tool == "my-tool":
     result = run_my_tool(case, diff, workspace, context_level, repo_dir, timeout)
 ```
 
-### 4. Run
+### 3. Run
 
 ```bash
 bugbench evaluate --tool my-tool --cases-dir cases --run-dir results/run-mytool
@@ -255,22 +189,49 @@ bugbench analyze --run-dir results/run-mytool --cases-dir cases
 
 The scoring, judging, and analysis pipeline is tool-agnostic — it works on any `ToolResult`.
 
+## Dashboard
+
+```bash
+uv run bugbench dashboard --port 5050
+```
+
+Case browser with filtering, code-level buggy line viewer, golden set review workflow (confirm/dispute + notes), run metrics with tool comparison tables, and experiment grouping.
+
 ## Project Structure
 
 ```
-cases/              Test case YAML definitions (immutable during runs)
-patches/            git format-patch outputs
-src/bugeval/        Python package — all source code
-tests/              pytest test suite (960+ tests)
-results/            Run outputs (gitignored)
-config/             config.yaml, prompt templates
-docs/               Experiment design, analysis, reports
-  analysis.md       Detailed case-by-case findings
-  experiment-design.md   Full methodology
-  pilot-report-*.md      Results from pilot runs
-  presentation.html      Stakeholder presentation
-  runbook.md             Operational procedures
-  future-work.md         Extension proposals
+src/bugeval/
+  agent_runner.py       Shared agent utilities (prompts, tools, workspace)
+  _anthropic_runner.py  Claude API multi-turn runner
+  _gemini_runner.py     Gemini API runner
+  _openai_runner.py     OpenAI API runner
+  _cli_runners.py       CLI subprocess runners (claude, gemini, codex)
+  _sdk_runner.py        Claude Agent SDK runner
+  _two_pass.py          Two-pass and three-phase review architectures
+  copilot_runner.py     GitHub Copilot PR lifecycle
+  greptile_runner.py    Greptile PR lifecycle
+  coderabbit_runner.py  CodeRabbit PR lifecycle
+  pr_utils.py           Shared PR tool utilities
+  evaluate.py           Evaluation orchestrator and dispatch
+  score.py              Mechanical + LLM judge scoring
+  analyze.py            Statistics, charts, comparison tables
+  models.py             Core Pydantic schemas (TestCase, GroundTruth)
+  result_models.py      ToolResult and Comment schemas
+  score_models.py       CaseScore schema
+  io.py                 YAML I/O with atomic writes
+  mine.py               GitHub PR scraping and case construction
+  blame.py              Git blame for introducing commits
+  ground_truth.py       Diff intersection for buggy lines
+  curate.py             LLM-powered case quality filtering
+  validate.py           Cross-model ground truth validation
+  dashboard.py          Flask web UI
+  cli.py                Click CLI entry point
+
+tests/                  963 tests, 82% coverage
+cases/                  Test case YAML definitions (immutable during runs)
+results/                Run outputs (gitignored)
+config/                 config.yaml, domain prompts
+docs/                   Experiment design, analysis, reports, presentation
 ```
 
 ## Key Documents
@@ -280,33 +241,18 @@ docs/               Experiment design, analysis, reports
 | [Experiment Design](docs/experiment-design.md) | Full methodology (11 sections) |
 | [Pilot Report](docs/pilot-report-2026-03-22.md) | Pilot results and scoring methodology |
 | [Analysis](docs/analysis.md) | Case-by-case findings and tool comparison |
-| [Runbook](docs/runbook.md) | Operational procedures and troubleshooting |
-| [Future Work](docs/future-work.md) | SWE-bench style patch generation extension |
-| [Presentation](https://d0cd.github.io/bugbench/presentation.html) | Stakeholder presentation |
 | [Architectural Decisions](docs/architectural-decisions.md) | Design rationale and key findings |
-| [Audit](docs/audit.md) | Codebase audit and handoff checklist |
-
-## Dashboard
-
-Local web UI for exploring cases, reviewing ground truth, and comparing tool results.
-
-```bash
-uv run bugbench dashboard --port 5050
-```
-
-Features: case browser with filtering, case detail with code-level buggy line viewer, golden set review workflow (confirm/dispute + notes), run metrics with tool comparison tables, and experiment grouping.
+| [Runbook](docs/runbook.md) | Operational procedures and troubleshooting |
+| [Future Work](docs/future-work.md) | 8 experiment directions with priority order |
+| [Presentation](https://d0cd.github.io/bugbench/presentation.html) | Stakeholder presentation |
 
 ## Development
 
 ```bash
-# Run all checks
-uv run ruff check src/ tests/
-uv run ruff format --check src/ tests/
-uv run pyright src/
-uv run pytest
-
-# Launch dashboard
-uv run bugbench dashboard
+uv run ruff check src/ tests/       # lint
+uv run ruff format --check src/     # format
+uv run pyright src/                  # type check
+uv run pytest                        # test (963 tests)
 ```
 
 ## Environment Variables
