@@ -261,7 +261,7 @@ async def _run_single_pass_sdk(
             break
         if isinstance(message, AssistantMessage):
             entry: dict[str, Any] = {"role": "assistant", "content": []}
-            for block in message.content:
+            for block in getattr(message, "content", []):
                 text_val = getattr(block, "text", None)
                 name_val = getattr(block, "name", None)
                 if text_val is not None:
@@ -349,7 +349,7 @@ def run_agent_sdk_2pass(
                     "role": "assistant",
                     "content": [],
                 }
-                for block in message.content:
+                for block in getattr(message, "content", []):
                     text_val = getattr(block, "text", None)
                     name_val = getattr(block, "name", None)
                     if text_val is not None:
@@ -568,7 +568,7 @@ def run_agent_sdk_v3(
                     "role": "assistant",
                     "content": [],
                 }
-                for block in msg.content:
+                for block in getattr(msg, "content", []):
                     text_val = getattr(block, "text", None)
                     name_val = getattr(block, "name", None)
                     if text_val is not None:

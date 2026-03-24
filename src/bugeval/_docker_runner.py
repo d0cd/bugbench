@@ -76,7 +76,7 @@ def _capture_message(
 
 async def run(config: dict[str, Any]) -> dict[str, Any]:
     """Run SDK query inside Docker and return structured result."""
-    from claude_agent_sdk import (
+    from claude_agent_sdk import (  # type: ignore[import-untyped,import-not-found]
         AssistantMessage,
         ClaudeAgentOptions,
         ClaudeSDKClient,

@@ -53,10 +53,10 @@ async def _run_agent_sdk_async(
         from claude_agent_sdk.types import (  # type: ignore[import-untyped]
             TextBlock as _SdkTextBlock,
         )
-        from claude_agent_sdk.types import (
+        from claude_agent_sdk.types import (  # type: ignore[import-untyped,import-not-found]
             ThinkingBlock as _SdkThinkingBlock,
         )
-        from claude_agent_sdk.types import (
+        from claude_agent_sdk.types import (  # type: ignore[import-untyped,import-not-found]
             ToolUseBlock as _SdkToolUseBlock,
         )
     except ImportError:
@@ -73,7 +73,7 @@ async def _run_agent_sdk_async(
     ) -> None:
         if isinstance(message, AssistantMessage):
             msg_entry: dict[str, Any] = {"role": "assistant", "content": []}
-            for block in message.content:
+            for block in getattr(message, "content", []):
                 if isinstance(block, _SdkTextBlock):
                     msg_entry["content"].append({"type": "text", "text": block.text})
                 elif isinstance(block, _SdkThinkingBlock):
