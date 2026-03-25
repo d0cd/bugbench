@@ -271,6 +271,10 @@ class TestRunCodeRabbit:
                 return_value="org/leo-coderabbit",
             ),
             patch(
+                "bugeval.coderabbit_runner.ensure_fork",
+                return_value="user/leo",
+            ),
+            patch(
                 "bugeval.coderabbit_runner.create_eval_branches",
                 return_value=("base-abc", "review-abc"),
             ),
@@ -284,7 +288,7 @@ class TestRunCodeRabbit:
             ),
             patch("bugeval.coderabbit_runner.close_eval_pr"),
         ):
-            result = run_coderabbit(case, repo_dir, timeout=10)
+            result = run_coderabbit(case, repo_dir, timeout=10, org="org")
 
         assert "Timeout" in result.error
         assert result.comments == []
