@@ -313,7 +313,13 @@ def dashboard(port: int, cases_dir: str, results_dir: str, debug: bool) -> None:
     """Launch the local review dashboard."""
     from pathlib import Path
 
-    from bugeval.dashboard import create_app
+    try:
+        from bugeval.dashboard import create_app
+    except ImportError as e:
+        raise click.ClickException(
+            f"Dashboard dependencies not installed ({e.name}). "
+            "Install with: uv sync --extra dashboard"
+        ) from e
 
     app = create_app(Path(cases_dir), Path(results_dir))
     click.echo(f"Dashboard -> http://localhost:{port}")

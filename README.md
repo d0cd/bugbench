@@ -1,5 +1,7 @@
 # bugbench
 
+> **⚠️ Maintenance mode** (as of 2026-04-23). No new features or experiments planned. Bug fixes and dependency updates only. See [`docs/audit-2026-03-23.md`](docs/audit-2026-03-23.md) for the last full audit and [`docs/BACKLOG.md`](docs/BACKLOG.md) for out-of-scope work.
+
 **Evaluation framework for AI code review tools.** Measures how well commercial services and in-house agents detect real bugs — on your codebase, with your code.
 
 Mines historical bug-fix PRs, reconstructs the introducing changes, presents them to each tool as if reviewing the original PR, and scores detection accuracy against ground truth.
@@ -26,6 +28,7 @@ uv sync                          # core dependencies
 uv sync --extra sdk              # + Claude Agent SDK
 uv sync --extra google           # + Gemini
 uv sync --extra openai           # + OpenAI
+uv sync --extra dashboard        # + Flask dashboard
 
 cp .env.example .env             # configure API keys
 uv run bugbench --help           # verify

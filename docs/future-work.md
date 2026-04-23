@@ -100,7 +100,7 @@ Combined: ~$400 instead of ~$800 for a 250-case evaluation.
 3. Measures inter-rater agreement (Cohen's kappa)
 4. Identifies and overrides systematic biases
 
-See [audit.md §10](audit.md) for the detailed design, data model, and UI mockup.
+See [audit-2026-03-23.md §10](audit-2026-03-23.md) for the detailed design, data model, and UI mockup.
 
 ---
 
@@ -137,6 +137,6 @@ See [audit.md §10](audit.md) for the detailed design, data model, and UI mockup
 | 3 | Scale to 250 cases | Medium | High | Ready now | `bugbench blame/ground-truth/curate` on snarkOS + snarkVM cases |
 | 4 | SWE-bench patch gen | Large | High | Needs new mode | Add `--mode patch` to evaluate, new scoring logic |
 | 5 | Cost optimization | Small | Medium | Code changes | Add cache_control, batch API, early termination |
-| 6 | Judge calibration | Medium | Medium | Needs new UI | Dashboard extension (see audit.md §10) |
+| 6 | Judge calibration | Medium | Medium | Needs new UI | Dashboard extension (see audit-2026-03-23.md §10) |
 | 7 | Cross-model judge | Small | Medium | Ready now | `bugbench score --judge-models claude-haiku-4-5,claude-sonnet-4-6,claude-opus-4-6` |
 | 8 | Domain prompts | Small | Low-Medium | Ready now | `bugbench evaluate --tool agent --context diff+repo+domain` |
